@@ -1,0 +1,20 @@
+# Gradle / Android
+.gradle/
+build/
+/local.properties
+/captures
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.keystore
+!debug.keystore
+# IDE
+.idea/
+*.iml
+.DS_Store
+.kotlin/
+# Rust
+/native/target/
+# Generated JNI libs (built by the cargoBuild task)
+/app/src/main/jniLibs/
