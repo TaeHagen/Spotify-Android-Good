@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
+import com.taehagen.spotifygood.download.DownloadActivity
 import com.taehagen.spotifygood.download.DownloadItem
 import com.taehagen.spotifygood.model.DownloadState
 import kotlinx.coroutines.Dispatchers
@@ -16,6 +17,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
@@ -29,6 +31,8 @@ data class DownloadsUiState(
     val content: DownloadsContent = DownloadsContent(),
     val offline: Boolean = false,
     val nowPlaying: NowPlaying = NowPlaying(),
+    /** Live downloader state (header progress, why a run stopped). */
+    val activity: DownloadActivity = DownloadActivity(),
 )
 
 class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
@@ -38,8 +42,17 @@ class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
     /** Decoded metadata per URI (metadata JSON never changes for a download). */
     private val metadataCache = ConcurrentHashMap<String, DownloadMetadata>()
 
-    private val content: Flow<DownloadsContent?> = combine(graph.downloads.items, graph.downloadedCollectionsFlow()) { items, collections ->
-        buildDownloadsContent(items, collections, ::metadataOf)
+    /** The item the downloader works on right now (null while it is not running). */
+    private val activeUri: Flow<String?> = graph.downloads.activity
+        .map { activity -> activity.currentUri.takeIf { activity.running } }
+        .distinctUntilChanged()
+
+    private val content: Flow<DownloadsContent?> = combine(
+        graph.downloads.items,
+        graph.downloadedCollectionsFlow(),
+        activeUri,
+    ) { items, collections, active ->
+        buildDownloadsContent(items, collections, ::metadataOf, active)
     }.distinctUntilChanged()
         .flowOn(Dispatchers.Default)
         .catch { emit(DownloadsContent()) }
@@ -50,13 +63,15 @@ class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
         graph.downloads.usedBytes.onStart { emit(0L) }.catch { emit(0L) },
         graph.offlineFlow(),
         graph.nowPlayingFlow(),
-    ) { content, used, offline, nowPlaying ->
+        graph.downloads.activity,
+    ) { content, used, offline, nowPlaying, activity ->
         DownloadsUiState(
             isLoading = content == null,
             usedBytes = used,
             content = content ?: DownloadsContent(),
             offline = offline,
             nowPlaying = nowPlaying,
+            activity = activity,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DownloadsUiState())
 

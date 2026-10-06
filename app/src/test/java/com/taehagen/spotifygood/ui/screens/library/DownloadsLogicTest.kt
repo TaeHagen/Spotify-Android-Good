@@ -59,6 +59,21 @@ class DownloadsLogicTest {
     }
 
     @Test
+    fun activeItemFollowsTheDownloader() {
+        val items = listOf(
+            // Left DOWNLOADING by a killed run; the downloader works on track 2 meanwhile.
+            item("spotify:track:1", DownloadState.DOWNLOADING, bytes = 10, total = 100),
+            item("spotify:track:2", DownloadState.PREPARING),
+            item("spotify:track:3", DownloadState.COMPLETED),
+        )
+        val collections = listOf(collection("spotify:album:a", CollectionType.ALBUM, listOf("spotify:track:2")))
+        assertEquals("spotify:track:2", buildDownloadsContent(items, collections, metadata, "spotify:track:2").active?.uri)
+        // A finished item is no longer active even if the downloader has not moved on yet.
+        assertEquals(null, buildDownloadsContent(items, collections, metadata, "spotify:track:3").active)
+        assertEquals("spotify:track:1", buildDownloadsContent(items, collections, metadata).active?.uri)
+    }
+
+    @Test
     fun emptyContent() {
         val content = buildDownloadsContent(emptyList(), emptyList(), metadata)
         assertTrue(content.isEmpty)

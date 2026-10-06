@@ -1,8 +1,9 @@
 package com.taehagen.spotifygood.ui.screens.library
 
-import com.taehagen.spotifygood.data.db.DownloadCollectionEntity
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
+import com.taehagen.spotifygood.download.CollectionRef
 import com.taehagen.spotifygood.download.CollectionType
+import com.taehagen.spotifygood.download.DownloadedCollection as StoredCollection
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.MediaType
 import com.taehagen.spotifygood.model.NativeErrorInfo
@@ -133,23 +134,27 @@ class BrowseLogicTest {
     }
 
     @Test
-    fun downloadedCollectionDecoding() {
-        val entity = DownloadCollectionEntity(
-            uri = "spotify:user:me:collection",
-            type = "collection",
-            name = "Liked Songs",
-            itemUrisJson = """["spotify:track:a","spotify:track:b"]""",
+    fun downloadedCollectionMapping() {
+        val stored = StoredCollection(
+            ref = CollectionRef("spotify:user:me:collection", CollectionType.LIKED_SONGS, "Liked Songs", "https://i.scdn.co/image/x"),
+            itemUris = listOf("spotify:track:a", "spotify:track:b"),
             addedAt = 1,
         )
-        val collection = entity.toDownloadedCollection(json)
+        val collection = stored.toDownloadedCollection()
+        assertEquals("spotify:user:me:collection", collection.uri)
         assertEquals(CollectionType.LIKED_SONGS, collection.type)
         assertEquals(MediaType.COLLECTION, collection.mediaType)
+        assertEquals("https://i.scdn.co/image/x", collection.imageUrl)
         assertEquals(listOf("spotify:track:a", "spotify:track:b"), collection.itemUris)
+        assertEquals(1L, collection.addedAt)
+        assertEquals(2, stored.itemCount)
+    }
 
-        val broken = entity.copy(type = "album", itemUrisJson = "not json").toDownloadedCollection(json)
-        assertEquals(CollectionType.ALBUM, broken.type)
-        assertTrue(broken.itemUris.isEmpty())
-        assertEquals(CollectionType.PLAYLIST, collectionTypeOf("unknown"))
+    @Test
+    fun collectionTypesFromWire() {
+        assertEquals(CollectionType.LIKED_SONGS, CollectionType.fromWire("collection"))
+        assertEquals(CollectionType.ALBUM, CollectionType.fromWire("album"))
+        assertNull(CollectionType.fromWire("unknown"))
     }
 
     @Test
