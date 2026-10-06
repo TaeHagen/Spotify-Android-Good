@@ -4,10 +4,13 @@ import android.app.job.JobInfo
 import android.app.job.JobScheduler
 import android.content.ComponentName
 import android.content.Context
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.util.Log
 import androidx.annotation.RequiresApi
+import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.room.withTransaction
 import androidx.work.BackoffPolicy
@@ -17,23 +20,24 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.auth.CredentialStore
 import com.taehagen.spotifygood.data.SpotifyUris
-import com.taehagen.spotifygood.data.callUnitOffMain
 import com.taehagen.spotifygood.data.db.AppDatabase
 import com.taehagen.spotifygood.data.db.DownloadCollectionEntity
 import com.taehagen.spotifygood.data.db.DownloadEntity
 import com.taehagen.spotifygood.data.db.DownloadFileRow
-import com.taehagen.spotifygood.data.putStrings
-import com.taehagen.spotifygood.data.rpcArgs
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.engine.SpotifyEngine
 import com.taehagen.spotifygood.model.DownloadState
+import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.model.OfflineTrackRecord
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeEvents
+import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.nativebridge.NativeRpc
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -44,7 +48,6 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -55,7 +58,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
 import java.io.File
@@ -122,8 +124,14 @@ data class DownloadActivity(
  * * Downloaded collections are re-synced daily ([DownloadSyncWorker]) and when the session comes
  *   online after 12 h: new items are queued, dropped ones removed (respecting shared membership),
  *   and downloads older than 30 days are re-validated. Items the user removed individually from a
- *   downloaded collection stay removed until the collection is downloaded again.
+ *   downloaded collection stay removed until the collection is downloaded again. Only a complete
+ *   resolution drops items ([CollectionResolver.Resolved.complete]): a failed or short lookup never
+ *   deletes downloads. A collection whose sync keeps failing is retried with a growing backoff
+ *   ([DownloadRules.nextSyncAt]). Members the catalog reports as not playable here are kept in the
+ *   membership but not queued, and do not hold the collection status back.
  * * Removal deletes files, rows and the native offline index entries.
+ * * The native offline index follows the database through numbered changes ([OfflineIndexSync]):
+ *   every commit and removal takes its number under [mutex] with its database write.
  */
 class DownloadManager(
     context: Context,
@@ -141,20 +149,21 @@ class DownloadManager(
     private val json = rpc.json
     private val itemsSerializer = ListSerializer(String.serializer())
 
-    /** Serializes membership changes, removals and the runner's commits. */
+    /** Serializes membership changes, removals, the runner's commits and offline index snapshots. */
     private val mutex = Mutex()
     private val syncMutex = Mutex()
     private val keys = KeyCache()
     private val resolver = CollectionResolver(rpc, json)
+    private val index = OfflineIndexSync(rpc)
 
     internal val storage = DownloadStorage(appContext)
     internal val notifications = DownloadNotifications(appContext)
     internal val runner = DownloadRunner(
-        appContext, database, rpc, events, engine, settings, credentialStore, storage, notifications, keys, mutex,
+        appContext, database, rpc, events, engine, settings, credentialStore, storage, notifications, keys, mutex, index,
     )
 
-    /** Network policy (`downloadOverCellular`) of what this process scheduled last; null = nothing. */
-    @Volatile private var scheduledCellular: Boolean? = null
+    /** True while [DownloadJobService] runs a job (it must not be replaced then, see [scheduleExecution]). */
+    @Volatile internal var jobExecuting = false
 
     /** URIs of completed downloads (hot), iterating newest download first (Android Auto queue order). */
     val downloadedUris: StateFlow<Set<String>> = dao.observeCompletedUris()
@@ -189,8 +198,9 @@ class DownloadManager(
     init {
         scope.launch {
             try {
-                // Resume after process death / reboot (a non-persisted job does not survive a reboot).
-                if (dao.pendingCount() > 0) scheduleExecution()
+                // Resume after process death / reboot (a non-persisted job does not survive a reboot);
+                // work left in a long backoff by an earlier process starts again now.
+                if (dao.pendingCount() > 0) scheduleExecution(kick = true)
                 updateSyncSchedule(collectionDao.count() > 0)
             } catch (e: CancellationException) {
                 throw e
@@ -200,15 +210,45 @@ class DownloadManager(
         }
         scope.launch {
             // Network policy or offline mode changed: reschedule with the new constraints.
+            var previousCellular: Boolean? = null
             settings.settings.map { it.downloadOverCellular to it.offlineMode }
                 .distinctUntilChanged()
-                .drop(1)
                 .collect { (cellular, offline) ->
-                    if (!offline) scheduleExecution(replace = scheduledCellular?.let { it != cellular } ?: false)
+                    val first = previousCellular == null
+                    val policyChanged = !first && previousCellular != cellular
+                    previousCellular = cellular
+                    if (first || offline) return@collect
+                    if (policyChanged && runner.isRunning) {
+                        // The running job / worker keeps the old network constraint (and downloads over
+                        // the mobile data the user just turned off): stop it; its item resumes from the
+                        // .part under the new constraint.
+                        runner.stopAndAwaitIdle()
+                    }
+                    scheduleExecution(replace = policyChanged)
                 }
         }
         scope.launch {
-            engine.isOnline.filter { it }.collect { syncIfStale() }
+            engine.isOnline.filter { it }.collect {
+                syncIfStale()
+                // Work waiting out a backoff from an unreachable network starts now.
+                if (!runner.isRunning && dao.pendingCount() > 0) scheduleExecution(kick = true)
+            }
+        }
+        scope.launch(Dispatchers.Main) {
+            // Back in the app: resume a queue that stopped (storage was full, retries ran out …).
+            ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
+                override fun onStart(owner: LifecycleOwner) {
+                    scope.launch {
+                        try {
+                            if (!runner.isRunning && dao.pendingCount() > 0) scheduleExecution(kick = true)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Resuming downloads failed", e)
+                        }
+                    }
+                }
+            })
         }
     }
 
@@ -216,9 +256,11 @@ class DownloadManager(
 
     fun collectionStatus(uri: String): Flow<CollectionDownloadStatus> =
         combine(
-            collectionDao.observe(uri).map { entity -> entity?.let { decodeItems(it.itemUrisJson) } }.distinctUntilChanged(),
+            collectionDao.observe(uri)
+                .map { entity -> entity?.let { decodeItems(it.itemUrisJson) to decodeItems(it.unavailableUrisJson).toHashSet() } }
+                .distinctUntilChanged(),
             states,
-        ) { items, states -> DownloadRules.collectionStatus(items, states) }
+        ) { members, states -> DownloadRules.collectionStatus(members?.first, states, members?.second.orEmpty()) }
             .distinctUntilChanged()
             .flowOn(Dispatchers.Default)
 
@@ -232,7 +274,13 @@ class DownloadManager(
      * re-queues failed and individually removed items.
      */
     suspend fun downloadCollection(ref: CollectionRef) {
-        val resolved = requireNotNull(resolver.resolve(ref.type, ref.uri))
+        val found = requireNotNull(resolver.resolve(ref.type, ref.uri))
+        if (found.items.isEmpty() && !found.complete) {
+            // Nothing listed and the lookup is not trustworthy: report it instead of storing an empty
+            // collection that would show as downloaded.
+            throw NativeException(NativeErrorInfo(NativeErrorCode.NETWORK, "Could not load the items of ${ref.name.ifBlank { ref.uri }}"))
+        }
+        val resolved = withMetadata(found, known = emptySet())
         val removed = mutex.withLock {
             val existing = collectionDao.get(ref.uri)
             val now = System.currentTimeMillis()
@@ -245,12 +293,15 @@ class DownloadManager(
                 revision = existing?.revision,
                 addedAt = existing?.addedAt ?: now,
                 lastSyncedAt = existing?.lastSyncedAt,
+                lastAttemptAt = existing?.lastAttemptAt,
+                syncFailures = existing?.syncFailures ?: 0,
+                unavailableUrisJson = existing?.unavailableUrisJson ?: EMPTY_ITEMS,
             )
-            applyMembershipLocked(entity, resolved, userInitiated = true).removed
+            applyMembershipLocked(entity, resolved, userInitiated = true).removal
         }
-        afterRemoval(removed)
+        afterRemoval(listOf(removed))
         updateSyncSchedule(true)
-        scheduleExecution()
+        scheduleExecution(kick = true)
     }
 
     /** Stops keeping [uri] offline; deletes its items unless another download still needs them. */
@@ -266,9 +317,9 @@ class DownloadManager(
                 deleteRows(toDelete)
             }
             deleteFiles(files)
-            toDelete
+            Removal(toDelete, index.next())
         }
-        afterRemoval(removed)
+        afterRemoval(listOf(removed))
         if (collectionDao.count() == 0) updateSyncSchedule(false)
     }
 
@@ -298,7 +349,7 @@ class DownloadManager(
                 metadata.forEach { (uri, meta) -> dao.fillMetadata(uri, meta) }
             }
         }
-        scheduleExecution()
+        scheduleExecution(kick = true)
     }
 
     /** Deletes the given downloads (files, rows, offline index), whatever collection they belong to. */
@@ -310,16 +361,16 @@ class DownloadManager(
             val files = fileRows(targets)
             database.withTransaction { deleteRows(targets) }
             deleteFiles(files)
-            files.map { it.uri }
+            Removal(files.map { it.uri }, index.next())
         }
-        afterRemoval(removed)
+        afterRemoval(listOf(removed))
     }
 
     /** Deletes every download and collection and cancels pending work (settings "Remove all", logout). */
     suspend fun removeAll() {
         cancelScheduledWork()
         runner.stop()
-        val uris = mutex.withLock {
+        val removal = mutex.withLock {
             val all = dao.allUris()
             database.withTransaction {
                 dao.deleteAll()
@@ -327,21 +378,28 @@ class DownloadManager(
             }
             withContext(Dispatchers.IO) { storage.deleteAll() }
             keys.clear()
-            all
+            Removal(all, index.next())
         }
-        scheduledCellular = null
         notifications.cancelAll()
-        if (uris.isNotEmpty()) offlineRemove(uris)
+        index.remove(removal.uris, removal.seq)
     }
 
-    /** Puts failed and cancelled downloads back into the queue. */
+    /**
+     * Puts failed and cancelled downloads back into the queue and (re)starts the queue, also when only
+     * pending items wait (a run stopped because storage was full).
+     */
     suspend fun retryFailed() {
-        if (dao.requeueFailed() > 0) scheduleExecution()
+        dao.requeueFailed()
+        scheduleExecution(kick = true)
     }
 
-    /** Decrypted records of all completed downloads (engine pushes them to `offline.setIndex`). */
+    /**
+     * Decrypted records of all completed downloads: the snapshot the engine pushes with
+     * `offline.setIndex`. It is announced natively (`offline.beginIndex`) with the number of the last
+     * change it contains, so commits and removals made while it is built and sent survive the push.
+     */
     suspend fun offlineRecords(): List<OfflineTrackRecord> = withContext(Dispatchers.IO) {
-        val rows = dao.withState(DownloadState.COMPLETED)
+        val (seq, rows) = mutex.withLock { index.last() to dao.withState(DownloadState.COMPLETED) }
         val records = ArrayList<OfflineTrackRecord>(rows.size)
         val undecryptable = ArrayList<String>()
         val missing = ArrayList<String>()
@@ -365,10 +423,11 @@ class DownloadManager(
         }
         val now = System.currentTimeMillis()
         undecryptable.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, appContext.getString(R.string.data_dl_error_key), now) }
-        missing.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, appContext.getString(R.string.data_dl_error_missing_file), now) }
+        missing.chunked(SQL_CHUNK).forEach { dao.markMissing(it, appContext.getString(R.string.data_dl_error_missing_file), now) }
         if (undecryptable.isNotEmpty() || missing.isNotEmpty()) {
             Log.w(TAG, "Skipped ${undecryptable.size} undecryptable and ${missing.size} missing downloads")
         }
+        index.beginSnapshot(seq)
         records
     }
 
@@ -381,11 +440,15 @@ class DownloadManager(
         sync()
     }
 
-    /** [syncCollections]; false when it could not run because the session did not come online. */
-    internal suspend fun sync(): Boolean {
+    /**
+     * [syncCollections]; false when it could not run because the session did not come online. With
+     * [onlyDue], collections whose next sync ([DownloadRules.nextSyncAt]) is still ahead are skipped.
+     */
+    internal suspend fun sync(onlyDue: Boolean = false): Boolean {
         if (!syncMutex.tryLock()) return true // another sync is running
         try {
             if (settings.settings.value.offlineMode) return true
+            val startedAt = System.currentTimeMillis()
             val all = collectionDao.getAll()
             if (all.isEmpty()) {
                 updateSyncSchedule(false)
@@ -395,28 +458,34 @@ class DownloadManager(
             try {
                 if (!engine.awaitOnline(SYNC_ONLINE_TIMEOUT_MS)) return false
                 var added = 0
-                val removed = ArrayList<String>()
+                val removed = ArrayList<Removal>()
                 for (collection in all) {
                     val type = CollectionType.fromWire(collection.type) ?: continue
+                    if (onlyDue && DownloadRules.nextSyncAt(collection.lastSyncedAt, collection.lastAttemptAt, collection.syncFailures) > startedAt) continue
                     val resolved = try {
                         resolver.resolve(type, collection.uri, collection.revision)
+                            ?.let { withMetadata(it, known = decodeItems(collection.itemUrisJson).toHashSet()) }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
                         Log.w(TAG, "Sync of ${collection.uri} failed", e)
+                        mutex.withLock { collectionDao.recordSyncFailure(collection.uri, System.currentTimeMillis()) }
                         continue
                     }
+                    if (resolved != null && !resolved.complete) Log.w(TAG, "Sync of ${collection.uri} was incomplete: nothing removed")
                     val result = mutex.withLock {
                         val current = collectionDao.get(collection.uri) ?: return@withLock null // removed meanwhile
                         if (resolved == null) {
-                            collectionDao.upsert(current.copy(lastSyncedAt = System.currentTimeMillis())) // unchanged
+                            // Unchanged playlist revision.
+                            val now = System.currentTimeMillis()
+                            collectionDao.upsert(current.copy(lastSyncedAt = now, lastAttemptAt = now, syncFailures = 0))
                             null
                         } else {
                             applyMembershipLocked(current, resolved, userInitiated = false)
                         }
                     } ?: continue
                     added += result.added
-                    removed += result.removed
+                    removed += result.removal
                 }
                 revalidate()
                 afterRemoval(removed)
@@ -436,7 +505,10 @@ class DownloadManager(
 
     // ---- membership ----------------------------------------------------------------------------------
 
-    private class MembershipResult(val added: Int, val removed: List<String>)
+    private class MembershipResult(val added: Int, val removal: Removal)
+
+    /** Downloads deleted by one change of the offline index ([OfflineIndexSync.next]). */
+    private class Removal(val uris: List<String>, val seq: Long)
 
     /**
      * Must hold [mutex]. Stores [resolved] as the new membership of [entity], queues items (all of
@@ -448,8 +520,14 @@ class DownloadManager(
         resolved: CollectionResolver.Resolved,
         userInitiated: Boolean,
     ): MembershipResult {
-        val newItems = resolved.items.map { it.uri }
-        val diff = DownloadRules.diff(decodeItems(entity.itemUrisJson), newItems)
+        val diff = DownloadRules.updateMembership(decodeItems(entity.itemUrisJson), resolved.items.map { it.uri }, resolved.complete)
+        val newItems = diff.items
+        val availability = DownloadRules.updateAvailability(
+            old = decodeItems(entity.unavailableUrisJson).toHashSet(),
+            listed = resolved.items.mapTo(HashSet()) { it.uri },
+            listedUnavailable = resolved.items.filter { it.unavailable }.mapTo(HashSet()) { it.uri },
+            complete = resolved.complete,
+        )
         val others = collectionDao.getAll().filter { it.uri != entity.uri }.map { decodeItems(it.itemUrisJson) }
         val toDelete = if (diff.dropped.isEmpty()) {
             emptyList()
@@ -458,23 +536,50 @@ class DownloadManager(
         }
         runner.cancelItems(toDelete)
         val files = fileRows(toDelete)
-        val toQueue = if (userInitiated) resolved.items else diff.added.toHashSet().let { added -> resolved.items.filter { it.uri in added } }
+        // Not playable here: kept as members, never queued (the download would fail every time).
+        // Members that became playable again are queued like new ones.
+        val toQueue = if (userInitiated) {
+            resolved.items.filter { !it.unavailable }
+        } else {
+            val wanted = diff.added.toHashSet() + availability.revived
+            resolved.items.filter { it.uri in wanted && !it.unavailable }
+        }
         val now = System.currentTimeMillis()
         val quality = settings.settings.value.downloadQuality.kbps
         database.withTransaction {
             collectionDao.upsert(
                 entity.copy(
                     itemUrisJson = json.encodeToString(itemsSerializer, newItems),
-                    revision = resolved.revision ?: entity.revision,
-                    lastSyncedAt = now,
+                    // Incomplete: try the whole listing again next time (the revision would skip it).
+                    revision = if (resolved.complete) resolved.revision ?: entity.revision else entity.revision,
+                    lastSyncedAt = if (resolved.complete) now else entity.lastSyncedAt,
+                    lastAttemptAt = now,
+                    syncFailures = if (resolved.complete) 0 else entity.syncFailures + 1,
+                    unavailableUrisJson = json.encodeToString(itemsSerializer, newItems.filter { it in availability.unavailable }),
                 ),
             )
             insertRows(toQueue, quality, individual = false, now = now)
-            if (userInitiated) newItems.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+            if (userInitiated) newItems.filter { it !in availability.unavailable }.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
             deleteRows(toDelete)
         }
         deleteFiles(files)
-        return MembershipResult(toQueue.size, toDelete)
+        return MembershipResult(toQueue.size, Removal(toDelete, index.next()))
+    }
+
+    /**
+     * [resolved] with display metadata for the items that lack it (Liked Songs list URIs only) and will
+     * get a new row: not in [known] (the stored membership; sync only queues new items) and without a
+     * row yet. Best effort: rows without metadata get it from the downloaded record.
+     */
+    private suspend fun withMetadata(resolved: CollectionResolver.Resolved, known: Set<String>): CollectionResolver.Resolved {
+        val candidates = resolved.items.filter { it.metadataJson == null && it.uri !in known }.map { it.uri }
+        if (candidates.isEmpty()) return resolved
+        val existing = candidates.chunked(SQL_CHUNK).flatMap { dao.existingUris(it) }.toHashSet()
+        val wanted = candidates.filter { it !in existing }
+        if (wanted.isEmpty()) return resolved
+        val metadata = resolver.metadataBestEffort(wanted, COLLECTION_METADATA_TIMEOUT_MS)
+        if (metadata.isEmpty()) return resolved
+        return resolved.copy(items = resolved.items.map { item -> metadata[item.uri]?.let { item.copy(metadataJson = it) } ?: item })
     }
 
     private suspend fun insertRows(items: List<CollectionResolver.Item>, quality: Int, individual: Boolean, now: Long) {
@@ -499,36 +604,31 @@ class DownloadManager(
 
     private suspend fun fileRows(uris: List<String>): List<DownloadFileRow> = uris.chunked(SQL_CHUNK).flatMap { dao.fileRows(it) }
 
-    /** Deletes the audio of [rows] and their images unless a remaining download still uses them. */
+    /**
+     * Must hold [mutex], after [rows] were deleted. Deletes their audio and images unless a remaining
+     * download still uses them (two downloads can share one file: relinking, the same recording in
+     * two releases). Partial files are left to garbage collection, which knows whether an unfinished
+     * download still resumes them.
+     */
     private suspend fun deleteFiles(rows: List<DownloadFileRow>) {
         if (rows.isEmpty()) return
+        val audio = DownloadRules.audioToDelete(rows.map { it.path }, dao.allPaths(), dao.allFileIds())
         val remainingImages = dao.allImagePaths().toHashSet()
         withContext(Dispatchers.IO) {
+            audio.forEach(storage::deleteAudio)
             rows.forEach { row ->
-                storage.deleteAudio(row.path)
                 if (row.imagePath != null && row.imagePath !in remainingImages) storage.deleteImage(row.imagePath)
             }
         }
     }
 
     /** After deletions (outside [mutex]): drop them from the native index and collect orphans. */
-    private suspend fun afterRemoval(uris: List<String>) {
-        if (uris.isEmpty()) return
-        offlineRemove(uris)
+    private suspend fun afterRemoval(removals: List<Removal>) {
+        val nonEmpty = removals.filter { it.uris.isNotEmpty() }
+        if (nonEmpty.isEmpty()) return
+        // Each with its own number: a later commit of one of these URIs (downloaded again) must win.
+        nonEmpty.forEach { index.remove(it.uris, it.seq) }
         runner.collectGarbageIfIdle()
-    }
-
-    private suspend fun offlineRemove(uris: List<String>) {
-        try {
-            withTimeoutOrNull(NATIVE_CALL_TIMEOUT_MS) {
-                uris.chunked(SQL_CHUNK).forEach { chunk -> rpc.callUnitOffMain("offline.remove", rpcArgs { putStrings("uris", chunk) }) }
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // Not fatal: the engine rebuilds its index from offlineRecords() at the next start.
-            Log.w(TAG, "offline.remove failed", e)
-        }
     }
 
     private suspend fun revalidate() {
@@ -549,17 +649,22 @@ class DownloadManager(
         if (gone.isNotEmpty()) {
             // Marked failed (not playable offline any more); the file stays until the user removes it.
             val message = appContext.getString(R.string.data_dl_error_unplayable)
-            gone.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, message, now) }
-            keys.remove(gone)
-            offlineRemove(gone)
+            val seq = mutex.withLock {
+                gone.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, message, now) }
+                keys.remove(gone)
+                index.next()
+            }
+            index.remove(gone, seq)
         }
     }
 
     private suspend fun syncIfStale() {
         try {
-            val oldest = collectionDao.oldestSyncedAt() ?: return
-            if (System.currentTimeMillis() - oldest < SYNC_STALE_MS) return
-            syncCollections()
+            val now = System.currentTimeMillis()
+            val due = collectionDao.syncStates().any {
+                CollectionType.fromWire(it.type) != null && DownloadRules.nextSyncAt(it.lastSyncedAt, it.lastAttemptAt, it.syncFailures) <= now
+            }
+            if (due) sync(onlyDue = true)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -597,9 +702,14 @@ class DownloadManager(
     /**
      * Makes sure pending items get downloaded: nothing to do while a run is active (it picks new rows
      * up); otherwise a user-initiated job when allowed (API 34+, app visible), else WorkManager.
-     * [replace] re-creates pending work with the current network constraints.
+     *
+     * Pending work is kept unless: [replace] (the network policy changed; the caller stopped a running
+     * run first), its network constraint does not match the setting (scheduled by an earlier process),
+     * or [kick] (a user action, app start, coming online) while it waits out a retry backoff, which
+     * the system would otherwise let grow to hours. A job that is executing is never replaced except
+     * for [replace].
      */
-    private suspend fun scheduleExecution(replace: Boolean = false): Unit = withContext(Dispatchers.IO) {
+    private suspend fun scheduleExecution(replace: Boolean = false, kick: Boolean = false): Unit = withContext(Dispatchers.IO) {
         try {
             if (runner.isRunning) return@withContext
             val pending = dao.pendingCount()
@@ -608,17 +718,27 @@ class DownloadManager(
             if (current.offlineMode) return@withContext
             val cellular = current.downloadOverCellular
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val scheduler = appContext.getSystemService(JobScheduler::class.java)
+                val job = scheduler?.getPendingJob(JOB_ID)
+                val jobStale = job != null && job.requiresUnmetered() == cellular
                 // A pending (or just started) user-initiated job will drain the queue; a WorkManager
                 // fallback next to it would only start and find the queue taken.
-                if (!replace && hasUserInitiatedJob()) return@withContext
+                if (job != null && DownloadRules.keepPendingJob(replace, kick, jobExecuting, jobStale)) return@withContext
                 val estimate = DownloadRules.estimateBytes(pending, current.downloadQuality.kbps)
+                // Scheduling with the same id replaces the pending job: new constraint, no backoff.
                 if (isAppVisible() && scheduleUserInitiatedJob(cellular, estimate)) {
-                    scheduledCellular = cellular
+                    if (replace) cancelWorker()
                     return@withContext
                 }
+                if (job != null) {
+                    // Cannot re-create a user-initiated job from the background: keep a good one, and
+                    // let the worker below take over from one with the wrong network constraint.
+                    if (!replace && !jobStale) return@withContext
+                    scheduler.cancel(JOB_ID)
+                }
             }
-            enqueueWorker(cellular, replace)
-            scheduledCellular = cellular
+            enqueueWorker(cellular, replace, kick)
+            if (replace) appContext.getSystemService(JobScheduler::class.java)?.cancel(JOB_ID)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -626,12 +746,22 @@ class DownloadManager(
         }
     }
 
+    /** True when the job may only run on an unmetered network. */
+    @RequiresApi(Build.VERSION_CODES.P)
+    private fun JobInfo.requiresUnmetered(): Boolean =
+        requiredNetwork?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == true
+
+    private fun cancelWorker() {
+        try {
+            WorkManager.getInstance(appContext).cancelUniqueWork(WORK_NAME)
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "WorkManager unavailable", e)
+        }
+    }
+
     private suspend fun isAppVisible(): Boolean = withContext(Dispatchers.Main.immediate) {
         ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
     }
-
-    private fun hasUserInitiatedJob(): Boolean =
-        appContext.getSystemService(JobScheduler::class.java)?.getPendingJob(JOB_ID) != null
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private fun scheduleUserInitiatedJob(cellular: Boolean, estimatedBytes: Long): Boolean {
@@ -652,17 +782,32 @@ class DownloadManager(
         }
     }
 
-    private fun enqueueWorker(cellular: Boolean, replace: Boolean) {
+    /** Blocking (reads the pending work): call off the main thread. See [scheduleExecution]. */
+    private fun enqueueWorker(cellular: Boolean, replace: Boolean, kick: Boolean) {
+        val network = if (cellular) NetworkType.CONNECTED else NetworkType.UNMETERED
         val constraints = Constraints.Builder()
-            .setRequiredNetworkType(if (cellular) NetworkType.CONNECTED else NetworkType.UNMETERED)
+            .setRequiredNetworkType(network)
             .setRequiresStorageNotLow(true)
             .build()
         val request = OneTimeWorkRequestBuilder<DownloadWorker>()
             .setConstraints(constraints)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, WORK_BACKOFF_S, TimeUnit.SECONDS)
             .build()
-        WorkManager.getInstance(appContext)
-            .enqueueUniqueWork(WORK_NAME, if (replace) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP, request)
+        val workManager = WorkManager.getInstance(appContext)
+        val existing = try {
+            workManager.getWorkInfosForUniqueWork(WORK_NAME).get().firstOrNull { !it.state.isFinished }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not read the pending download work", e)
+            null
+        }
+        val recreate = DownloadRules.replaceWork(
+            replace = replace,
+            kick = kick,
+            enqueued = existing?.state == WorkInfo.State.ENQUEUED,
+            stale = existing != null && existing.constraints.requiredNetworkType != network,
+            runAttempts = existing?.runAttemptCount ?: 0,
+        )
+        workManager.enqueueUniqueWork(WORK_NAME, if (recreate) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP, request)
     }
 
     private fun updateSyncSchedule(enabled: Boolean) {
@@ -708,9 +853,8 @@ class DownloadManager(
         private const val SQL_CHUNK = 500
         private const val STATES_STOP_TIMEOUT_MS = 5_000L
         private const val METADATA_TIMEOUT_MS = 10_000L
-        private const val NATIVE_CALL_TIMEOUT_MS = 10_000L
+        private const val COLLECTION_METADATA_TIMEOUT_MS = 60_000L
         private const val SYNC_ONLINE_TIMEOUT_MS = 60_000L
-        private const val SYNC_STALE_MS = 12L * 60 * 60 * 1000
         private const val JOB_BACKOFF_MS = 30_000L
         private const val WORK_BACKOFF_S = 30L
         private const val SYNC_BACKOFF_MIN = 15L

@@ -12,7 +12,18 @@
 //! they never touch the disk from async code.
 //!
 //! Removing a record never deletes files: Kotlin owns the files (`DownloadManager` deletes the
-//! audio file and its `.part` when a download is removed).
+//! audio file when no remaining download uses it).
+//!
+//! Ordering: the RPCs that change the index run as independent tasks, so they can be applied in
+//! another order than Kotlin sent them, and a full snapshot (`setIndex`) can be read before and
+//! applied after a later `add` / `remove`. Kotlin therefore numbers every change of its downloads
+//! (`seq`, increasing within the process, assigned when the change is written to the database)
+//! and every snapshot (the number of the last change it contains). The index keeps, per URI, the
+//! number of the newest change it applied since the last snapshot and
+//! * ignores a change older than that (or than the last snapshot: it is part of it),
+//! * lets a snapshot set only the URIs that did not change after it was taken.
+//!
+//! The result does not depend on arrival order. Calls without `seq` are applied unconditionally.
 
 use super::convert;
 use super::format::{self, parse_file_id, parse_format, parse_key};
@@ -142,9 +153,36 @@ struct Maps {
     primary: HashMap<String, Arc<IndexEntry>>,
     /// By `record.uri` and `record.playedUri`.
     lookup: HashMap<String, Arc<IndexEntry>>,
+    /// `seq` of the newest change applied per URI (added or removed) after the last snapshot.
+    versions: HashMap<String, u64>,
+    /// `seq` of the last snapshot applied with one: changes up to it are part of the index.
+    floor: u64,
+    /// `seq` announced by [`OfflineIndex::announce_snapshot`] for the next snapshot without one.
+    announced: Option<u64>,
 }
 
 impl Maps {
+    /// Whether a change of `uri` numbered `seq` is newer than what the index holds; if so it is
+    /// recorded as the URI's newest change.
+    fn admit(&mut self, uri: &str, seq: Option<u64>) -> bool {
+        let Some(seq) = seq else { return true };
+        if seq <= self.floor {
+            return false;
+        }
+        match self.versions.get(uri) {
+            Some(&newest) if newest > seq => false,
+            _ => {
+                self.versions.insert(uri.to_owned(), seq);
+                true
+            }
+        }
+    }
+
+    /// True if `uri` changed after the snapshot numbered `seq`.
+    fn changed_after(&self, uri: &str, seq: u64) -> bool {
+        self.versions.get(uri).is_some_and(|&v| v > seq)
+    }
+
     fn rebuild_lookup(&mut self) {
         let mut lookup = HashMap::with_capacity(self.primary.len() * 2);
         for e in self.primary.values() {
@@ -170,37 +208,84 @@ impl OfflineIndex {
         Self::default()
     }
 
-    /// Replaces the whole index.
-    pub fn replace(&self, entries: Vec<IndexEntry>) {
-        let mut maps = Maps::default();
-        for e in entries {
-            maps.primary.insert(e.record.uri.clone(), Arc::new(e));
+    /// Replaces the whole index with a snapshot of Kotlin's downloads taken after change `seq`
+    /// (`None`: the one announced with [`OfflineIndex::announce_snapshot`], if any). URIs that
+    /// changed after the snapshot keep their current state. A snapshot older than the last one
+    /// applied is ignored; without any number the index is replaced as is. Returns whether the
+    /// snapshot was applied.
+    pub fn replace(&self, entries: Vec<IndexEntry>, seq: Option<u64>) -> bool {
+        let mut maps = self.maps.write();
+        let announced = maps.announced.take();
+        let Some(snapshot) = seq.or(announced) else {
+            let mut primary = HashMap::with_capacity(entries.len());
+            for e in entries {
+                primary.insert(e.record.uri.clone(), Arc::new(e));
+            }
+            maps.primary = primary;
+            maps.versions.clear();
+            maps.rebuild_lookup();
+            return true;
+        };
+        if snapshot < maps.floor {
+            log::warn!("offline index: ignoring a snapshot older than the current index ({snapshot} < {})", maps.floor);
+            return false;
         }
+        let mut primary = HashMap::with_capacity(entries.len());
+        for e in entries {
+            if !maps.changed_after(&e.record.uri, snapshot) {
+                primary.insert(e.record.uri.clone(), Arc::new(e));
+            }
+        }
+        for (uri, e) in std::mem::take(&mut maps.primary) {
+            if maps.changed_after(&uri, snapshot) {
+                primary.insert(uri, e);
+            }
+        }
+        maps.primary = primary;
+        maps.versions.retain(|_, v| *v > snapshot);
+        maps.floor = snapshot;
         maps.rebuild_lookup();
-        *self.maps.write() = maps;
+        true
     }
 
-    /// Adds or replaces entries (keyed by `uri`).
-    pub fn add(&self, entries: Vec<IndexEntry>) {
+    /// The next [`OfflineIndex::replace`] without its own number is a snapshot taken after change
+    /// `seq`. If an earlier announcement was not used yet the older number is kept: treating a
+    /// snapshot as older than it is only re-applies changes it already contains.
+    pub fn announce_snapshot(&self, seq: u64) {
+        let mut maps = self.maps.write();
+        maps.announced = Some(maps.announced.map_or(seq, |a| a.min(seq)));
+    }
+
+    /// Adds or replaces entries (keyed by `uri`) as change `seq`; entries of URIs that already
+    /// saw a newer change are skipped. Returns how many were applied.
+    pub fn add(&self, entries: Vec<IndexEntry>, seq: Option<u64>) -> usize {
         if entries.is_empty() {
-            return;
+            return 0;
         }
         let mut maps = self.maps.write();
+        let mut applied = 0;
         for e in entries {
-            maps.primary.insert(e.record.uri.clone(), Arc::new(e));
+            if maps.admit(&e.record.uri, seq) {
+                maps.primary.insert(e.record.uri.clone(), Arc::new(e));
+                applied += 1;
+            }
         }
-        maps.rebuild_lookup();
+        if applied > 0 {
+            maps.rebuild_lookup();
+        }
+        applied
     }
 
-    /// Removes the records whose `uri` (or, failing that, `playedUri`) is in `uris`. Files are
+    /// Removes the records whose `uri` is in `uris` as change `seq` (a record is never removed
+    /// through another record's `playedUri`: that one is still a download of its own). Files are
     /// left alone. Returns how many records were removed.
-    pub fn remove(&self, uris: &[String]) -> usize {
+    pub fn remove(&self, uris: &[String], seq: Option<u64>) -> usize {
         let mut maps = self.maps.write();
         let before = maps.primary.len();
         for uri in uris {
             let uri = uri.trim();
-            if maps.primary.remove(uri).is_none() {
-                maps.primary.retain(|_, e| e.record.played_uri.as_deref() != Some(uri));
+            if maps.admit(uri, seq) {
+                maps.primary.remove(uri);
             }
         }
         let removed = before - maps.primary.len();
@@ -431,7 +516,7 @@ pub(crate) mod tests {
         let other = record("spotify:track:0000000000000000000001", &f2, 3);
         let (entries, rejected) = build_entries(vec![relinked.clone(), other.clone(), record("bad", &f1, 1)]);
         assert_eq!(rejected, vec!["bad".to_owned()]);
-        index.replace(entries);
+        assert!(index.replace(entries, None));
         assert_eq!(index.len(), 2);
         assert!(index.is_downloaded(TRACK_URI));
         assert!(index.is_downloaded(ALT_URI), "reachable by playedUri");
@@ -449,25 +534,30 @@ pub(crate) mod tests {
         let mut replacement = record(TRACK_URI, &f1, 5);
         replacement.track = Some(track_model(TRACK_URI, "Renamed"));
         let alt_owner = record(ALT_URI, &f2, 3);
-        index.add(build_entries(vec![replacement, alt_owner]).0);
+        assert_eq!(index.add(build_entries(vec![replacement, alt_owner]).0, None), 2);
         assert_eq!(index.len(), 3);
         assert_eq!(index.lookup(&uri(TRACK_URI)).map(|t| t.audio_item.name), Some("Renamed".into()));
         assert_eq!(index.get(ALT_URI).map(|e| e.record().uri.clone()), Some(ALT_URI.to_owned()));
 
         // remove by uri, unknown uris are ignored, files are kept.
-        assert_eq!(index.remove(&[TRACK_URI.into(), "spotify:track:nope".into()]), 1);
+        assert_eq!(index.remove(&[TRACK_URI.into(), "spotify:track:nope".into()], None), 1);
         assert!(!index.is_downloaded(TRACK_URI));
         assert!(index.downloaded_record(TRACK_URI).is_none());
         assert!(f1.exists(), "remove never deletes files");
 
-        // remove by playedUri.
+        // Removing a URI that is only another record's playedUri leaves that record alone (it is
+        // a download of its own; Kotlin removes by its own row URIs).
         let mut relinked2 = record("spotify:track:0000000000000000000002", &f1, 5);
         relinked2.played_uri = Some("spotify:track:0000000000000000000003".into());
-        index.add(build_entries(vec![relinked2]).0);
-        assert_eq!(index.remove(&["spotify:track:0000000000000000000003".into()]), 1);
+        index.add(build_entries(vec![relinked2]).0, None);
+        assert_eq!(index.remove(&["spotify:track:0000000000000000000003".into()], None), 0);
+        assert!(index.is_downloaded("spotify:track:0000000000000000000002"));
+        assert!(index.is_downloaded("spotify:track:0000000000000000000003"), "alias kept");
+        assert_eq!(index.remove(&["spotify:track:0000000000000000000002".into()], None), 1);
+        assert!(!index.is_downloaded("spotify:track:0000000000000000000003"), "alias gone with its record");
 
         // replace drops everything else.
-        index.replace(build_entries(vec![other]).0);
+        index.replace(build_entries(vec![other]).0, None);
         assert_eq!(index.len(), 1);
         assert!(!index.is_downloaded(ALT_URI));
         let _ = std::fs::remove_dir_all(dir);
@@ -478,7 +568,7 @@ pub(crate) mod tests {
         let dir = scratch_dir("exists");
         let f = dir.join("file");
         let index = OfflineIndex::new();
-        index.replace(build_entries(vec![record(TRACK_URI, &f, 4)]).0);
+        index.replace(build_entries(vec![record(TRACK_URI, &f, 4)]).0, None);
         assert!(!index.is_downloaded(TRACK_URI), "missing at registration");
         assert!(index.lookup(&uri(TRACK_URI)).is_none());
 
@@ -493,6 +583,89 @@ pub(crate) mod tests {
         assert!(index.lookup_with_ttl(&uri(TRACK_URI), Duration::ZERO).is_none(), "wrong size");
         assert!(!index.is_downloaded(TRACK_URI));
         assert!(index.all_records().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const URI_A: &str = "spotify:track:000000000000000000000a";
+    const URI_B: &str = "spotify:track:000000000000000000000b";
+    const URI_C: &str = "spotify:track:000000000000000000000c";
+
+    fn entries(uris: &[&str], file: &Path) -> Vec<IndexEntry> {
+        build_entries(uris.iter().map(|u| record(u, file, 0)).collect()).0
+    }
+
+    fn uris_of(index: &OfflineIndex) -> Vec<String> {
+        index.all_records().into_iter().map(|r| r.uri).collect()
+    }
+
+    #[test]
+    fn a_stale_snapshot_keeps_later_changes() {
+        let dir = scratch_dir("seq-snapshot");
+        let f = dir.join("f");
+        std::fs::write(&f, b"x").expect("write");
+        let index = OfflineIndex::new();
+        index.replace(entries(&[URI_A, URI_B], &f), Some(10));
+
+        // Kotlin reads the snapshot after change 11, then C completes (12) and A is removed (13);
+        // both RPCs overtake the slow setIndex.
+        index.announce_snapshot(11);
+        assert_eq!(index.add(entries(&[URI_C], &f), Some(12)), 1);
+        assert_eq!(index.remove(&[URI_A.into()], Some(13)), 1);
+        assert!(index.replace(entries(&[URI_A, URI_B], &f), None), "uses the announced number");
+        assert_eq!(uris_of(&index), vec![URI_B.to_owned(), URI_C.to_owned()]);
+
+        // Late duplicates of changes the snapshot already contains are ignored.
+        assert_eq!(index.add(entries(&[URI_A], &f), Some(9)), 0);
+        assert_eq!(index.remove(&[URI_B.into()], Some(11)), 0);
+        assert_eq!(uris_of(&index), vec![URI_B.to_owned(), URI_C.to_owned()]);
+
+        // A snapshot older than the applied one is ignored, a newer one applies.
+        assert!(!index.replace(entries(&[URI_A], &f), Some(5)));
+        assert_eq!(uris_of(&index), vec![URI_B.to_owned(), URI_C.to_owned()]);
+        assert!(index.replace(entries(&[URI_A], &f), Some(13)));
+        assert_eq!(uris_of(&index), vec![URI_A.to_owned()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn changes_apply_in_sequence_order_whatever_the_arrival_order() {
+        let dir = scratch_dir("seq-order");
+        let f = dir.join("f");
+        std::fs::write(&f, b"x").expect("write");
+        let index = OfflineIndex::new();
+        // Completed (5), removed (6): the add arrives last and must not resurrect it.
+        assert_eq!(index.remove(&[URI_A.into()], Some(6)), 0);
+        assert_eq!(index.add(entries(&[URI_A], &f), Some(5)), 0);
+        assert!(!index.is_downloaded(URI_A));
+        // Removed (7), downloaded again (8): the remove arrives last.
+        assert_eq!(index.add(entries(&[URI_B], &f), Some(8)), 1);
+        assert_eq!(index.remove(&[URI_B.into()], Some(7)), 0);
+        assert!(index.is_downloaded(URI_B));
+        // A snapshot taken before both: A stays removed, B stays added.
+        assert!(index.replace(entries(&[URI_A], &f), Some(4)));
+        assert_eq!(uris_of(&index), vec![URI_B.to_owned()]);
+        // Unnumbered calls apply unconditionally.
+        assert_eq!(index.add(entries(&[URI_C], &f), None), 1);
+        assert_eq!(index.remove(&[URI_B.into()], None), 1);
+        assert_eq!(uris_of(&index), vec![URI_C.to_owned()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unused_announcements_keep_the_oldest_number() {
+        let dir = scratch_dir("seq-announce");
+        let f = dir.join("f");
+        std::fs::write(&f, b"x").expect("write");
+        let index = OfflineIndex::new();
+        // A push whose setIndex never arrived (20), then the next one (30).
+        index.announce_snapshot(20);
+        index.announce_snapshot(30);
+        assert_eq!(index.add(entries(&[URI_A], &f), Some(25)), 1);
+        assert!(index.replace(entries(&[URI_B], &f), None));
+        assert_eq!(uris_of(&index), vec![URI_A.to_owned(), URI_B.to_owned()], "change 25 survives");
+        // The announcement is used once.
+        assert!(index.replace(entries(&[URI_C], &f), None));
+        assert_eq!(uris_of(&index), vec![URI_C.to_owned()]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

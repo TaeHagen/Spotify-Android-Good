@@ -36,6 +36,7 @@ class DownloadJobService : JobService() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return false
         val manager = (application as App).graph.downloads
         stopped = false
+        manager.jobExecuting = true
         // Must happen right away for user-initiated jobs.
         setNotification(
             params,
@@ -64,6 +65,7 @@ class DownloadJobService : JobService() {
                 Log.e(TAG, "Download run failed", e)
                 RunOutcome.RESCHEDULE
             }
+            manager.jobExecuting = false
             if (!stopped) jobFinished(params, outcome == RunOutcome.RESCHEDULE)
         }
         return true
@@ -71,6 +73,7 @@ class DownloadJobService : JobService() {
 
     override fun onStopJob(params: JobParameters): Boolean {
         stopped = true
+        (application as App).graph.downloads.jobExecuting = false
         run?.cancel()
         // Remaining items continue when the system runs the job again (with backoff).
         return true
