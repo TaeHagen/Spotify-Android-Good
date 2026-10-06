@@ -3,6 +3,7 @@ package com.taehagen.spotifygood.playback
 import android.util.Log
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.RepeatMode
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.nativebridge.NativeRpc
 import kotlinx.coroutines.CancellationException
@@ -47,11 +48,16 @@ data class PlayRequest(
  * timeout, so a lost native reply cannot wedge the queue). Bursty commands (seek, volume) are
  * conflated: a new value replaces a still-queued one of the same kind if nothing was queued in
  * between, so ordering relative to other commands is preserved.
+ *
+ * With no active Connect device (cold start, or the last device went away) the engine rejects
+ * transport commands with NOT_ACTIVE_DEVICE: play / resume then load the last local session from
+ * [resumeStore] instead, and next / previous / seek fail silently.
  */
 class PlayerController(
     private val scope: CoroutineScope,
     private val rpc: NativeRpc,
     private val playback: PlaybackRepository,
+    private val resumeStore: ResumeStore,
 ) {
     private val _errors = MutableSharedFlow<String>(extraBufferCapacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
@@ -71,6 +77,8 @@ class PlayerController(
         val name: String,
         val conflateKey: String?,
         val timeoutMs: Long,
+        /** NOT_ACTIVE_DEVICE is expected (nothing loaded): log only, no snackbar. */
+        val quietWhenInactive: Boolean,
         /** Replaced (under [lock]) when a newer value of the same conflatable command arrives. */
         var block: suspend () -> Unit,
     ) {
@@ -124,7 +132,7 @@ class PlayerController(
 
     fun togglePlayPause() {
         val playing = playback.snapshot.value.let { it.status == PlaybackStatus.PLAYING || it.status == PlaybackStatus.LOADING }
-        send("player.togglePlay", startsPlayback = !playing)
+        if (playing) send("player.togglePlay") else sendResuming("player.togglePlay")
     }
 
     fun next() {
@@ -207,16 +215,21 @@ class PlayerController(
     internal fun playAsync(request: PlayRequest): Deferred<Boolean> =
         send("player.load", loadArgs(request), startsPlayback = request.play, timeoutMs = LOAD_TIMEOUT_MS)
 
-    internal fun resumeAsync(): Deferred<Boolean> = send("player.play", startsPlayback = true)
+    /** Also used by the media session (play button, Bluetooth play after a cold start). */
+    internal fun resumeAsync(): Deferred<Boolean> = sendResuming("player.play")
 
     internal fun pauseAsync(): Deferred<Boolean> = send("player.pause")
 
-    internal fun nextAsync(): Deferred<Boolean> = send("player.next")
+    internal fun nextAsync(): Deferred<Boolean> = send("player.next", quietWhenInactive = true)
 
-    internal fun previousAsync(): Deferred<Boolean> = send("player.prev")
+    internal fun previousAsync(): Deferred<Boolean> = send("player.prev", quietWhenInactive = true)
 
-    internal fun seekAsync(positionMs: Long): Deferred<Boolean> =
-        send("player.seek", buildJsonObject { put("positionMs", positionMs.coerceAtLeast(0)) }, conflateKey = "seek")
+    internal fun seekAsync(positionMs: Long): Deferred<Boolean> = send(
+        "player.seek",
+        buildJsonObject { put("positionMs", positionMs.coerceAtLeast(0)) },
+        conflateKey = "seek",
+        quietWhenInactive = true,
+    )
 
     internal fun setShuffleAsync(enabled: Boolean): Deferred<Boolean> {
         pendingShuffle = null
@@ -293,15 +306,25 @@ class PlayerController(
         conflateKey: String? = null,
         startsPlayback: Boolean = false,
         timeoutMs: Long = COMMAND_TIMEOUT_MS,
+        quietWhenInactive: Boolean = false,
     ): Deferred<Boolean> {
         if (startsPlayback) onPlaybackRequested?.invoke()
-        return enqueue(method, conflateKey, timeoutMs) { rpc.callUnit(method, args) }
+        return enqueue(method, conflateKey, timeoutMs, quietWhenInactive) { rpc.callUnit(method, args) }
+    }
+
+    /** [method] (play / toggle) with the last-session fallback, in one queued command. */
+    private fun sendResuming(method: String): Deferred<Boolean> {
+        onPlaybackRequested?.invoke()
+        return enqueue(method, timeoutMs = LOAD_TIMEOUT_MS) {
+            resumeOrLoadLast(method, { m, args -> rpc.callUnit(m, args) }, resumeStore::read)
+        }
     }
 
     private fun enqueue(
         name: String,
         conflateKey: String? = null,
         timeoutMs: Long = COMMAND_TIMEOUT_MS,
+        quietWhenInactive: Boolean = false,
         block: suspend () -> Unit,
     ): Deferred<Boolean> {
         synchronized(lock) {
@@ -312,7 +335,7 @@ class PlayerController(
                 last.block = block
                 return last.done
             }
-            val command = Command(name, conflateKey, timeoutMs, block)
+            val command = Command(name, conflateKey, timeoutMs, quietWhenInactive, block)
             lastQueued = command
             if (queue.trySend(command).isFailure) command.done.complete(false)
             return command.done
@@ -333,7 +356,8 @@ class PlayerController(
             throw e
         } catch (e: NativeException) {
             Log.w(TAG, "${command.name} failed: ${e.code}")
-            PlaybackErrorKind.fromCode(e.code)?.let { report(it, e.info.message) }
+            val quiet = command.quietWhenInactive && e.code == NativeErrorCode.NOT_ACTIVE_DEVICE
+            if (!quiet) PlaybackErrorKind.fromCode(e.code)?.let { report(it, e.info.message) }
             command.done.complete(false)
         } catch (e: Exception) {
             Log.w(TAG, "${command.name} failed", e)
@@ -356,11 +380,30 @@ class PlayerController(
     @Serializable
     private data class RadioContext(val contextUri: String)
 
-    private companion object {
-        const val TAG = "PlayerController"
-        const val COMMAND_TIMEOUT_MS = 15_000L
-        const val LOAD_TIMEOUT_MS = 30_000L
-        const val PENDING_VALID_NANOS = 2_000_000_000L
+    internal companion object {
+        private const val TAG = "PlayerController"
+        private const val COMMAND_TIMEOUT_MS = 15_000L
+        private const val LOAD_TIMEOUT_MS = 30_000L
+        private const val PENDING_VALID_NANOS = 2_000_000_000L
+
+        /**
+         * Runs [method] (`player.play` / `player.togglePlay`). When no device is active
+         * (NOT_ACTIVE_DEVICE) it loads the [last] local session instead; the error is rethrown
+         * only when there is nothing to resume.
+         */
+        suspend fun resumeOrLoadLast(
+            method: String,
+            call: suspend (method: String, args: JsonObject) -> Unit,
+            last: suspend () -> ResumeState?,
+        ) {
+            try {
+                call(method, NativeRpc.EMPTY)
+            } catch (e: NativeException) {
+                if (e.code != NativeErrorCode.NOT_ACTIVE_DEVICE) throw e
+                val state = last() ?: throw e
+                call("player.load", loadArgs(state.toPlayRequest()))
+            }
+        }
 
         fun loadArgs(request: PlayRequest): JsonObject = buildJsonObject {
             request.contextUri?.let { put("contextUri", it) }

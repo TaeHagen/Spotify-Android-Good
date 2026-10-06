@@ -236,7 +236,7 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
     }
 
     /** The last locally played item (for "recent" roots of non-SysUI browsers). */
-    private suspend fun recentItem(): MediaItem? = ResumeStore(context).read()?.let(::resumeItem)
+    private suspend fun recentItem(): MediaItem? = graph.resumeStore.read()?.let(::resumeItem)
 
     fun resumeItem(state: ResumeState): MediaItem = MediaItem.Builder()
         .setMediaId(state.mediaId)

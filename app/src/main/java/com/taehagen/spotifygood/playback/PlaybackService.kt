@@ -98,7 +98,7 @@ class PlaybackService : MediaLibraryService() {
         graph = (application as App).graph
         coordinator = PlaybackCoordinator.install(this)
         playbackHolder = graph.engine.acquire(HolderType.PLAYBACK)
-        resumeStore = ResumeStore(this)
+        resumeStore = graph.resumeStore
         tree = LibraryTree(this, graph)
         presence = PresenceController(this, graph)
         player = SpotifyPlayer(

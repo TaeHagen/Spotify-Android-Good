@@ -22,6 +22,7 @@ import com.taehagen.spotifygood.playback.OutputRouteManager
 import com.taehagen.spotifygood.playback.PlaybackRepository
 import com.taehagen.spotifygood.playback.PlaybackServiceConnector
 import com.taehagen.spotifygood.playback.PlayerController
+import com.taehagen.spotifygood.playback.ResumeStore
 import com.taehagen.spotifygood.playback.SleepTimer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -69,7 +70,9 @@ class AppGraph(val app: Application) {
     val auth: AuthRepository by lazy { AuthRepository(app, appScope, engine, credentialStore, httpClient) }
 
     val playback: PlaybackRepository by lazy { PlaybackRepository(appScope, events) }
-    val player: PlayerController by lazy { PlayerController(appScope, rpc, playback) }
+    /** Last local session (playback resumption, cold-start play); one DataStore per process. */
+    val resumeStore: ResumeStore by lazy { ResumeStore(app) }
+    val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore) }
     val devices: DevicesRepository by lazy { DevicesRepository(appScope, rpc, events) }
     val outputs: OutputRouteManager by lazy {
         OutputRouteManager(app, appScope, audioSink, rpc).also { manager ->
