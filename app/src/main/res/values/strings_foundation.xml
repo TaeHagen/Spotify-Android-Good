@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Foundation strings: notification channels, login flows. -->
+<resources>
+    <!-- Notification channels -->
+    <string name="foundation_channel_downloads_name">Downloads</string>
+    <string name="foundation_channel_downloads_description">Progress of music and podcast downloads for offline listening</string>
+    <string name="foundation_channel_presence_name">Spotify Connect availability</string>
+    <string name="foundation_channel_presence_description">Shown while this phone stays available as a Spotify Connect speaker</string>
+    <string name="foundation_channel_alerts_name">Alerts</string>
+    <string name="foundation_channel_alerts_description">Actions that need your attention, such as resuming playback</string>
+
+    <!-- Login errors (LoginState.Failed.message) -->
+    <string name="foundation_login_error_expired">The code expired. Start again to get a new one.</string>
+    <string name="foundation_login_error_denied">The login was declined.</string>
+    <string name="foundation_login_error_network">Couldn\'t reach Spotify. Check your connection and try again.</string>
+    <string name="foundation_login_error_timeout">The login took too long. Try again.</string>
+    <string name="foundation_login_error_premium">SpotifyGood needs a Spotify Premium account.</string>
+    <string name="foundation_login_error_playback_refused">Spotify doesn\'t allow this account to play music in SpotifyGood.</string>
+    <string name="foundation_login_error_rejected">Spotify rejected the login. Try again.</string>
+    <string name="foundation_login_error_port_in_use">Couldn\'t start the browser login because another app is using its port. Try the code login instead.</string>
+    <string name="foundation_login_error_no_browser">No web browser is installed. Install one, or approve the login from another device.</string>
+    <string name="foundation_login_error_engine">The playback engine couldn\'t start on this device.</string>
+    <string name="foundation_login_error_zeroconf">No Spotify app on this network handed over a login. Make sure both devices are on the same Wi-Fi and try again.</string>
+    <string name="foundation_login_error_generic">Login failed (%1$s).</string>
+
+    <!-- Page shown in the browser by the login loopback server -->
+    <string name="foundation_login_page_title">SpotifyGood</string>
+    <string name="foundation_login_page_success">You\'re logged in. You can return to the app.</string>
+    <string name="foundation_login_page_failure">The login didn\'t complete. Return to the app to try again.</string>
+    <string name="foundation_login_page_link">Return to SpotifyGood</string>
+</resources>
