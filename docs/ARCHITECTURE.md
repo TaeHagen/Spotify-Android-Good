@@ -163,13 +163,14 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
     ▲   ◀── session.stop ──┤  ▲  failed (retryable)                                   │
     │                      │  └──────────── Reconnecting(backoff 1s,2s,4s…60s) ◀──────┘
     │                      └─ BAD_CREDENTIALS / PREMIUM_REQUIRED ─▶ Error (no retry)
-    └── session.stop (from any state; graceful, bounded to 5 s)
+    └── session.stop (from any state; graceful, bounded to 10 s)
  Offline mode (settings.offline or no network): Player runs without Spirc; only downloaded
  tracks playable; OfflineController owns the queue; emits the same playback snapshots.
 ```
 
 * `session.start` creates `Session::new(SessionConfig{client_id: KEYMASTER, device_id,
-  tmp_dir: cacheDir/librespot-tmp, autoplay: Some(settings.autoplay) ..}, Some(Cache))`,
+  tmp_dir: cacheDir/librespot-tmp, autoplay: None ..}, Some(Cache))` (autoplay is applied with the patched
+  `spirc.set_autoplay` after `Spirc::new`, so it can change at runtime),
   the `Player` (once; re-bound with `player.set_session` on reconnect), the `AndroidMixer`,
   and `Spirc::new(ConnectConfig{name, device_type: Smartphone, initial_volume:
   <current Android volume>, auto_takeover: false, volume_steps: 64 ..})`, spawns the spirc
@@ -183,7 +184,7 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   while Online (cheap, no network), reacts to `session.setNetworkAvailable`. Backoff
   1→60 s, reset on success; at most one attempt in flight; no attempts while the network
   is known to be down. On reconnect: `Session::new`, `player.set_session`, `Spirc::new`.
-* `session.stop`: `spirc.shutdown()`, await task ≤ 5 s (abort + `dealer().close()` on
+* `session.stop`: `spirc.shutdown()`, await task ≤ 10 s (abort + `dealer().close()` on
   timeout), `session.shutdown()`, drop Spirc/Session; the Player is dropped on a blocking
   thread (its Drop joins the player thread) only on `session.stop {releasePlayer:true}`
   (logout / process trim); otherwise kept for the offline mode.
@@ -244,7 +245,7 @@ queue keeps playing; the next `player.load` goes through Spirc again.
 | `credentials` | `{"username","authType","authData"}` — store encrypted, replaces previous |
 | `playback` | `PlaybackSnapshot` (full snapshot, only on change) |
 | `devices` | `DeviceList` |
-| `queueMetadata` | `{"tracks":[Track|Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri) |
+| `queueMetadata` | `{"tracks":[Track…],"episodes":[Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri) |
 | `download` | `DownloadProgress` |
 | `error` | `{"code","message","context":"playback|connect|session|…"}` user-visible, transient |
 | `log` | not used (logs go to logcat via android_logger, tag `spotcore`) |
