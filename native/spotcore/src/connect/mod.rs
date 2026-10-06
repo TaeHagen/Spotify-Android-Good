@@ -97,7 +97,7 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
         "queue.clear" => control(Ctl::QueueClear).await,
         "queue.skipTo" => control(Ctl::SkipTo(parse_args::<UidArgs>(args)?.uid)).await,
         "connect.transfer" => transfer(parse_args(args)?).await,
-        "connect.refreshDevices" => to_value(&hub::force_publish_devices()),
+        "connect.refreshDevices" => to_value(&hub::refresh_devices().await),
         _ => Err(AppError::invalid(format!("unknown method {method}"))),
     }
 }

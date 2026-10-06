@@ -230,6 +230,7 @@ enum SpircCommand {
     // SPOTIFYGOOD: allowed while inactive
     SetAudioOutput(AudioOutputKind, Option<String>),
     SetAutoplay(bool),
+    RefreshCluster,
 }
 
 // SPOTIFYGOOD: names used in the reported command errors
@@ -262,6 +263,7 @@ impl SpircCommand {
             SmartShuffle(_) => "smart_shuffle",
             SetAudioOutput(..) => "set_audio_output",
             SetAutoplay(_) => "set_autoplay",
+            RefreshCluster => "refresh_cluster",
         }
     }
 }
@@ -727,6 +729,15 @@ impl Spirc {
     pub fn set_autoplay(&self, autoplay: bool) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::SetAutoplay(autoplay))?)
     }
+
+    /// Fetches the connect cluster (the devices of the account) from spotify again
+    ///
+    /// Puts the current state, the cluster in the response is published like any other (see
+    /// [Spirc::subscribe_cluster]), also when it didn't change. Also works while we are not the
+    /// active device.
+    pub fn refresh_cluster(&self) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::RefreshCluster)?)
+    }
 }
 
 impl SpircTask {
@@ -1106,6 +1117,14 @@ impl SpircTask {
             }
             // SPOTIFYGOOD: allowed while not active
             SpircCommand::SetAutoplay(autoplay) => self.handle_set_autoplay(autoplay)?,
+            // SPOTIFYGOOD: allowed while not active, the response of the state put contains the
+            // cluster. A failure isn't reported, the refresh is a background request.
+            SpircCommand::RefreshCluster => {
+                if let Err(why) = self.notify().await {
+                    debug!("cluster refresh failed: {why}")
+                }
+                return Ok(());
+            }
             SpircCommand::Transfer(..) | SpircCommand::Activate => {
                 warn!("SpircCommand::{cmd:?} will be ignored while already active")
             }

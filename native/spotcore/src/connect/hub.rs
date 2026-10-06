@@ -61,7 +61,7 @@ pub(crate) static HUB: LazyLock<Mutex<HubState>> = LazyLock::new(|| Mutex::new(H
 pub(crate) static CLUSTER_CHANGED: Notify = Notify::const_new();
 
 #[derive(Default)]
-struct EmitState {
+pub(crate) struct EmitState {
     playback: String,
     devices: String,
 }
@@ -337,8 +337,13 @@ pub(crate) fn publish_devices() -> DeviceList {
     if !runtime::is_initialized() {
         return DeviceList::default();
     }
+    publish_devices_locked(&mut EMIT.lock())
+}
+
+/// Composes under `EMIT` (like `publish`), so that a caller holding an older hub state can't
+/// emit its list after a newer one.
+fn publish_devices_locked(emit: &mut EmitState) -> DeviceList {
     let list = device_list();
-    let mut emit = EMIT.lock();
     match serde_json::to_string(&list) {
         Ok(json) if json != emit.devices => {
             bridge::post_event(events::DEVICES, &json);
@@ -350,8 +355,67 @@ pub(crate) fn publish_devices() -> DeviceList {
     list
 }
 
-/// Re-emits the device list even if unchanged (`connect.refreshDevices`).
+/// Re-emits the device list even if unchanged.
 pub(crate) fn force_publish_devices() -> DeviceList {
-    EMIT.lock().devices.clear();
-    publish_devices()
+    if !runtime::is_initialized() {
+        return DeviceList::default();
+    }
+    let mut emit = EMIT.lock();
+    emit.devices.clear();
+    publish_devices_locked(&mut emit)
+}
+
+/// At most one cluster refresh from Spotify per this interval (`connect.refreshDevices`).
+const REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(2500);
+/// How long `connect.refreshDevices` waits for the refreshed cluster.
+const REFRESH_WAIT: Duration = Duration::from_secs(3);
+
+static LAST_REFRESH: Mutex<Option<std::time::Instant>> = parking_lot::const_mutex(None);
+
+/// Whether a refresh may be sent now (records it).
+fn refresh_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    let due = last.is_none_or(|at| now.saturating_duration_since(at) >= REFRESH_MIN_INTERVAL);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+/// `connect.refreshDevices`: fetches the cluster (device list) from Spotify again, debounced, and
+/// emits and returns the new list (the cached one if the refresh is debounced, fails or times out).
+pub(crate) async fn refresh_devices() -> DeviceList {
+    let spirc = if engine::is_online() { spirc() } else { None };
+    if let Some(spirc) = spirc {
+        if refresh_due(&mut LAST_REFRESH.lock(), std::time::Instant::now()) {
+            let notified = CLUSTER_CHANGED.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match spirc.refresh_cluster() {
+                Ok(()) => {
+                    if tokio::time::timeout(REFRESH_WAIT, notified).await.is_err() {
+                        log::debug!("no cluster after the device refresh");
+                    }
+                }
+                Err(e) => log::debug!("device refresh not sent: {e}"),
+            }
+        }
+    }
+    force_publish_devices()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn device_refresh_is_debounced() {
+        let mut last = None;
+        let t0 = Instant::now();
+        assert!(refresh_due(&mut last, t0));
+        assert!(!refresh_due(&mut last, t0 + Duration::from_millis(1000)));
+        assert!(!refresh_due(&mut last, t0 + Duration::from_millis(2400)));
+        assert!(refresh_due(&mut last, t0 + Duration::from_millis(2600)));
+        assert!(!refresh_due(&mut last, t0 + Duration::from_millis(3000)));
+    }
 }

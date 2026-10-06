@@ -339,7 +339,7 @@ active** → connect-state command to that device.
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
 | `connect.transfer` | `{"deviceId":"…","play":true?}` (self = pull, other = push) |
-| `connect.refreshDevices` | `{}` → `DeviceList` |
+| `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 
 ### 6.3 Catalog (Spotify internal APIs, JSON shaped for the UI)
 
