@@ -368,9 +368,19 @@ active** → connect-state command to that device.
 
 | method | args | result |
 |---|---|---|
-| `download.track` | `{"uri","bitrate":160,"dir":"…/offline/audio","imageDir":"…/offline/images"}` | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`) |
-| `offline.setIndex` | `{"tracks":[OfflineTrackRecord]}` | `{}` or `{"rejected":["uri",…]}` (replaces the in-memory resolver index; malformed records are skipped) |
-| `offline.add` / `offline.remove` | `{"tracks":[…]}` / `{"uris":[…]}` | `{}` (`add` may also return `"rejected"`; `remove` never deletes files — Kotlin owns deletion) |
+| `download.track` | `{"uri","bitrate":160,"dir":"…/offline/audio","imageDir":"…/offline/images"}` | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`; waits ≤ 10 s for the session country, else `NOT_CONNECTED`; a CDN `429` asking for more than 30 s, or a second `429`, fails at once with `RATE_LIMITED` and the server's `retryAfterMs`) |
+| `download.fileId` | `{"uri"}` | `{"fileId"}` (omitted when unknown): the file the last `download.track` of `uri` in this process chose, also after it failed or was cancelled |
+| `offline.setIndex` | `{"tracks":[OfflineTrackRecord],"seq"?}` | `{}` or `{"rejected":["uri",…]}` (replaces the in-memory resolver index, except URIs changed after `seq`; malformed records are skipped) |
+| `offline.add` / `offline.remove` | `{"tracks":[…],"seq"?}` / `{"uris":[…],"seq"?}` | `{}` (`add` may also return `"rejected"`; `remove` matches a record's `uri` only, never its `playedUri`, and never deletes files — Kotlin owns deletion) |
+| `offline.beginIndex` | `{"seq"}` | `{}` (the next `setIndex` without `seq` is a snapshot containing the changes up to `seq`) |
+
+Ordering: the index RPCs run as independent native tasks and may take effect out of order.
+Kotlin numbers every change of its completed downloads (`seq`, increasing within the process,
+taken under the `DownloadManager` lock together with the database write) and every snapshot
+(the last change it contains; `DownloadManager.offlineRecords()` announces it with
+`offline.beginIndex` before the engine sends `offline.setIndex`). The index applies each URI's
+newest change, ignores older ones, and a snapshot only sets URIs that did not change after it.
+Calls without `seq` apply unconditionally.
 
 `OfflineTrackRecord`:
 `{"uri","playedUri","fileId","format","keyHex","path","sizeBytes","normalisation":{"trackGainDb","trackPeak","albumGainDb","albumPeak"},"track":Track|"episode":Episode,"imagePath":"…"}`.
@@ -561,12 +571,23 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `nativeCancel`), stores records (encrypted key), updates `offline.add`, retries failures
   with backoff (max 3), stops gracefully on `onStopped`/timeout (Android 15 6 h limit),
   re-enqueues itself if work remains.
+* Queue-wide pauses (`QueueBreaker`): `RATE_LIMITED` requeues the item without counting an
+  attempt and pauses the whole queue for the server's `retryAfterMs` (else 1 min, doubling);
+  three consecutive connectivity failures while the session is online (CDN unreachable) pause
+  it for 1, 4, 16 min …; at most 30 min. Every pending row is held back (`retryAt`), so the run
+  waits inline (≤ 2 min) or reschedules; a completed download resets the breaker.
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
   of another downloaded collection).
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
   `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks start at 2 MiB and adapt between 1 and
   4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all".
+* Files are shared: the downloader reuses a verified `<fileId>`, so several rows (relinking, the
+  same recording in two releases) can use one file. Removal deletes a completed file only when no
+  remaining row has it as its `path` or `fileId`. Unfinished rows record the file their download
+  writes (`download.fileId`, stored in `fileId`); garbage collection (when the queue is idle)
+  keeps a `.part` while an unfinished row (pending, failed, cancelled) names it, so "Retry
+  failed" resumes it, and deletes files and `.part`s no row names.
 * Downloads require Premium (they are always Premium here) and are wiped on logout.
 
 ### 9.8 Data layer
