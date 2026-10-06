@@ -299,7 +299,7 @@ active** → connect-state command to that device.
 
 | method | args | result |
 |---|---|---|
-| `session.start` | `{"credentials":{…}?,"accessToken":"…"?,"settings":EngineSettings}` | `{}` once Online (or error) |
+| `session.start` | `{"credentials":{…}?,"accessToken":"…"?,"settings":EngineSettings,"initialVolume":0..65535}` | `{}` once Online (or error). `initialVolume` = current `STREAM_MUSIC` volume mapped to 0..65535 (used for the mixer and Connect so startup never changes the system volume) |
 | `session.stop` | `{"releasePlayer":false}` | `{}` |
 | `session.setNetworkAvailable` | `{"available":true,"metered":false}` | `{}` |
 | `session.updateSettings` | `EngineSettings` | `{}` |
