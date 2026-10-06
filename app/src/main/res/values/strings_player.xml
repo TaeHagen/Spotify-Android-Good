@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Player area: mini player, now playing, queue, lyrics, devices, sleep timer. -->
+<resources>
+    <!-- Context header -->
+    <string name="player_from_playlist">PLAYING FROM PLAYLIST</string>
+    <string name="player_from_album">PLAYING FROM ALBUM</string>
+    <string name="player_from_artist">PLAYING FROM ARTIST</string>
+    <string name="player_from_library">PLAYING FROM YOUR LIBRARY</string>
+    <string name="player_from_search">PLAYING FROM SEARCH</string>
+    <string name="player_from_podcast">PLAYING FROM PODCAST</string>
+    <string name="player_from_radio">PLAYING FROM RADIO</string>
+    <string name="player_now_playing_header">NOW PLAYING</string>
+    <string name="player_liked_songs">Liked Songs</string>
+    <string name="player_autoplay_context">Autoplay</string>
+    <string name="player_open_context">Open %1$s</string>
+
+    <!-- Now playing -->
+    <string name="player_collapse">Collapse now playing</string>
+    <string name="player_more_options">More options</string>
+    <string name="player_add_to_playlist">Add to playlist</string>
+    <string name="player_go_to_album">Go to album</string>
+    <string name="player_go_to_artist">Go to artist</string>
+    <string name="player_go_to_podcast">Go to podcast</string>
+    <string name="player_share">Share</string>
+    <string name="player_share_chooser">Share via</string>
+    <string name="player_share_failed">No app available to share</string>
+    <string name="player_sleep_timer">Sleep timer</string>
+    <string name="player_sleep_timer_active">Sleep timer · %1$s</string>
+    <string name="player_start_radio">Go to song radio</string>
+    <string name="player_more_actions">More actions</string>
+    <string name="player_artwork">Artwork for %1$s</string>
+    <string name="player_unavailable">This content is unavailable right now</string>
+    <string name="player_nothing_playing">Nothing is playing</string>
+    <string name="player_open_album">Open album</string>
+
+    <!-- Transport controls -->
+    <string name="player_play">Play</string>
+    <string name="player_pause">Pause</string>
+    <string name="player_state_playing">Playing</string>
+    <string name="player_state_paused">Paused</string>
+    <string name="player_state_loading">Loading</string>
+    <string name="player_next">Next track</string>
+    <string name="player_previous">Previous track</string>
+    <string name="player_shuffle">Shuffle</string>
+    <string name="player_shuffle_state_off">Off</string>
+    <string name="player_shuffle_state_on">On</string>
+    <string name="player_shuffle_state_smart">Smart shuffle</string>
+    <string name="player_repeat">Repeat</string>
+    <string name="player_repeat_state_off">Off</string>
+    <string name="player_repeat_state_all">Repeat all</string>
+    <string name="player_repeat_state_one">Repeat one</string>
+    <string name="player_like">Save to Liked Songs</string>
+    <string name="player_like_state_on">Liked</string>
+    <string name="player_like_state_off">Not liked</string>
+    <string name="player_like_failed">Couldn\'t update Liked Songs</string>
+    <string name="player_seek">Playback position</string>
+    <string name="player_seek_state">%1$s of %2$s</string>
+    <string name="player_volume">Volume</string>
+    <string name="player_volume_state">%1$d percent</string>
+    <string name="player_open_now_playing">Open now playing</string>
+    <string name="player_open_queue">Queue</string>
+    <string name="player_open_lyrics">Show lyrics</string>
+    <string name="player_devices">Connect to a device</string>
+    <string name="player_playing_on">Playing on %1$s</string>
+
+    <!-- Queue -->
+    <string name="player_queue_title">Queue</string>
+    <string name="player_close">Close</string>
+    <string name="player_queue_now_playing">Now playing</string>
+    <string name="player_queue_next_in_queue">Next in queue</string>
+    <string name="player_queue_next_from">Next from: %1$s</string>
+    <string name="player_queue_next_up">Next up</string>
+    <string name="player_queue_clear">Clear queue</string>
+    <string name="player_queue_remove">Remove from queue</string>
+    <string name="player_queue_remove_suggestion">Remove suggestion</string>
+    <string name="player_queue_add_suggestion">Add to playlist</string>
+    <string name="player_queue_drag_handle">Drag to reorder</string>
+    <string name="player_queue_move_up">Move up</string>
+    <string name="player_queue_move_down">Move down</string>
+    <string name="player_queue_autoplay">Autoplay</string>
+    <string name="player_queue_autoplay_description">Similar music plays when your music ends</string>
+    <string name="player_queue_empty">Nothing up next</string>
+    <string name="player_queue_empty_message">Add songs to your queue or play an album or playlist.</string>
+    <string name="player_track_loading">Loading…</string>
+
+    <!-- Lyrics -->
+    <string name="player_lyrics">Lyrics</string>
+    <string name="player_lyrics_provided_by">Lyrics provided by %1$s</string>
+    <string name="player_lyrics_unsynced_note">These lyrics aren\'t synced to the song yet.</string>
+    <string name="player_lyrics_none">No lyrics for this one</string>
+    <string name="player_lyrics_none_message">Lyrics aren\'t available for this song yet.</string>
+    <string name="player_lyrics_error">Couldn\'t load lyrics. Check your connection.</string>
+    <string name="player_lyrics_seek_line">Play from this line</string>
+    <string name="player_lyrics_resume_sync">Back to current line</string>
+    <string name="player_lyrics_instrumental">♪</string>
+
+    <!-- Devices -->
+    <string name="player_devices_title">Connect to a device</string>
+    <string name="player_devices_current">Current device</string>
+    <string name="player_devices_this_phone">This phone</string>
+    <string name="player_devices_tap_to_play">Tap to play here</string>
+    <string name="player_devices_automatic">Automatic</string>
+    <string name="player_devices_automatic_description">Let Android choose the audio output</string>
+    <string name="player_devices_routed">Playing through this output</string>
+    <string name="player_devices_more">More devices…</string>
+    <string name="player_devices_more_description">Cast, Bluetooth and other outputs</string>
+    <string name="player_devices_connect">Spotify Connect</string>
+    <string name="player_devices_playing">Playing</string>
+    <string name="player_devices_group">Group</string>
+    <string name="player_devices_cannot_play">Can\'t play here</string>
+    <string name="player_devices_connecting">Connecting…</string>
+    <string name="player_devices_refresh">Refresh devices</string>
+    <string name="player_devices_none">No other devices found</string>
+    <string name="player_devices_tip_account">Make sure your other devices are signed in to the same Spotify account.</string>
+    <string name="player_devices_tip_network">Some speakers and TVs only show up on the same Wi-Fi network.</string>
+    <string name="player_devices_hint">Devices appear here while their Spotify app is open.</string>
+    <string name="player_devices_transfer_failed">Couldn\'t play on %1$s</string>
+    <string name="player_devices_transfer_failed_network">Couldn\'t reach %1$s. Check your connection.</string>
+    <string name="player_devices_refresh_failed">Couldn\'t refresh devices</string>
+    <string name="player_devices_switcher_unavailable">The system output picker isn\'t available on this phone</string>
+    <string name="player_output_speaker">Phone speaker</string>
+    <string name="player_output_selected">Selected</string>
+
+    <!-- Sleep timer -->
+    <string name="player_sleep_title">Sleep timer</string>
+    <plurals name="player_sleep_minutes">
+        <item quantity="one">%d minute</item>
+        <item quantity="other">%d minutes</item>
+    </plurals>
+    <string name="player_sleep_end_of_track">End of track</string>
+    <string name="player_sleep_end_of_episode">End of episode</string>
+    <string name="player_sleep_off">Turn off timer</string>
+    <string name="player_sleep_remaining">Stops in %1$s</string>
+    <string name="player_sleep_ends_at">Ends at %1$s</string>
+    <string name="player_sleep_at_end_of_track">Stops at the end of this track</string>
+    <string name="player_sleep_short_end_of_track">end of track</string>
+</resources>
