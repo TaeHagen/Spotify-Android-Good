@@ -105,6 +105,8 @@ class AppGraph(val app: Application) {
     suspend fun logout() {
         engine.logout()
         downloads.removeAll()
+        // The playback service clears it too, but only while it runs.
+        resumeStore.clear()
         responseCache.clear()
         kotlinx.coroutines.withContext(Dispatchers.IO) { database.clearAllTables() }
         events.reset()

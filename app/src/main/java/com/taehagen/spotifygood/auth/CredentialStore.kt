@@ -44,8 +44,9 @@ class CredentialStore(context: Context) {
     /** Guards the files and their in-memory copies. */
     private val fileLock = Any()
     @Volatile private var cachedDeviceId: String? = null
-    private var credentialsLoaded = false
-    private var cachedCredentials: StoredCredentials? = null
+    // Written under fileLock; volatile so [hasCredentials] can read them without the lock.
+    @Volatile private var credentialsLoaded = false
+    @Volatile private var cachedCredentials: StoredCredentials? = null
     private var refreshTokenLoaded = false
     private var cachedRefreshToken: String? = null
 
@@ -54,6 +55,14 @@ class CredentialStore(context: Context) {
         get() = cachedDeviceId ?: synchronized(fileLock) {
             cachedDeviceId ?: loadOrCreateDeviceId().also { cachedDeviceId = it }
         }
+
+    /**
+     * Whether reusable credentials are stored (i.e. logged in), cheap enough for the main thread
+     * (media button receiver): the loaded value once known, otherwise whether the file exists. No
+     * Keystore access and no lock, so it never waits for a concurrent [loadCredentials].
+     */
+    fun hasCredentials(): Boolean =
+        if (credentialsLoaded) cachedCredentials != null else File(dir, CREDENTIALS_FILE).exists()
 
     fun loadCredentials(): StoredCredentials? = synchronized(fileLock) {
         if (!credentialsLoaded) {

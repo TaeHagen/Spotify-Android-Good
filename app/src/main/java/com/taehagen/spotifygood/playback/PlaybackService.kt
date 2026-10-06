@@ -50,7 +50,6 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
@@ -592,8 +591,10 @@ class PlaybackService : MediaLibraryService() {
             isForPlayback: Boolean,
         ): ListenableFuture<MediaItemsWithStartPosition> = lifecycleScope.future {
             val last = resumeStore.read()
-            val loggedIn = !isForPlayback || graph.engine.isLoggedIn.value ||
-                withTimeoutOrNull(LOGIN_WAIT_MS) { graph.engine.isLoggedIn.first { it } } == true
+            // Logged out: neither resume nor offer (SysUI resumption card) the previous session.
+            // Once the stored credentials are read (awaitReady) isLoggedIn is accurate.
+            val loggedIn = graph.engine.isLoggedIn.value ||
+                (withTimeoutOrNull(LOGIN_WAIT_MS) { graph.engine.awaitReady() } != null && graph.engine.isLoggedIn.value)
             if (last == null || !loggedIn) {
                 if (isForPlayback) satisfyForegroundContract()
                 throw UnsupportedOperationException("Nothing to resume")
