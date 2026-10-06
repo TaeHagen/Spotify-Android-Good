@@ -1,0 +1,29 @@
+{
+  "results": {
+    "tracks": {
+      "hits": [
+        {
+          "name": "Never Gonna Give You Up",
+          "uri": "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+          "image": "https://i.scdn.co/image/ab67616d00001e0215ebbedaacef61af244262a8",
+          "duration": 213573,
+          "explicit": false,
+          "popularity": 77,
+          "artists": [{"name": "Rick Astley", "uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt"}],
+          "album": {"name": "Whenever You Need Somebody", "uri": "spotify:album:6XhjNHCyCDyyGJRM5mg40G"}
+        },
+        {"name": "broken", "uri": "spotify:track:nope"}
+      ],
+      "total": 800
+    },
+    "albums": {"hits": [{"name": "Whenever You Need Somebody", "uri": "spotify:album:6XhjNHCyCDyyGJRM5mg40G", "image": "https://i.scdn.co/image/x", "artists": [{"name": "Rick Astley", "uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt"}]}], "total": 1},
+    "artists": {"hits": [{"name": "Rick Astley", "uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt", "image": "https://i.scdn.co/image/y"}], "total": 1},
+    "playlists": {"hits": [{"name": "This Is Rick Astley", "uri": "spotify:user:spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", "image": "https://i.scdn.co/image/z", "followersCount": 1000, "author": "spotify"}], "total": 1},
+    "profiles": {"hits": [], "total": 0},
+    "genres": {"hits": [], "total": 0},
+    "audioepisodes": {"hits": [{"name": "Rick talks", "uri": "spotify:episode:512ojhOuo1ktJprKbVcKyQ", "image": "https://i.scdn.co/image/e", "duration": 3600000}], "total": 1},
+    "topHit": {"hits": [{"name": "Rick Astley", "uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt", "image": "https://i.scdn.co/image/y"}], "total": 1}
+  },
+  "requestId": "abc",
+  "categoriesOrder": ["topHit", "tracks", "artists", "albums", "playlists", "audioepisodes"]
+}

@@ -1,0 +1,171 @@
+{
+  "data": {
+    "searchV2": {
+      "__typename": "SearchResponse",
+      "chipOrder": {"items": [{"typeName": "TOP_RESULTS"}, {"typeName": "TRACKS"}]},
+      "albumsV2": {
+        "__typename": "AlbumResponseWrapperPage",
+        "totalCount": 120,
+        "items": [
+          {
+            "__typename": "AlbumResponseWrapper",
+            "data": {
+              "__typename": "Album",
+              "uri": "spotify:album:6XhjNHCyCDyyGJRM5mg40G",
+              "name": "Whenever You Need Somebody",
+              "type": "ALBUM",
+              "artists": {"items": [{"uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt", "profile": {"name": "Rick Astley"}}]},
+              "coverArt": {
+                "extractedColors": {"colorDark": {"hex": "#535353", "isFallback": false}},
+                "sources": [
+                  {"url": "https://i.scdn.co/image/ab67616d00001e0215ebbedaacef61af244262a8", "width": 300, "height": 300},
+                  {"url": "https://i.scdn.co/image/ab67616d0000485115ebbedaacef61af244262a8", "width": 64, "height": 64},
+                  {"url": "https://i.scdn.co/image/ab67616d0000b27315ebbedaacef61af244262a8", "width": 640, "height": 640}
+                ]
+              },
+              "date": {"year": 1987},
+              "playability": {"playable": true, "reason": "PLAYABLE"}
+            }
+          },
+          {"__typename": "AlbumResponseWrapper", "data": {"__typename": "NotFound"}}
+        ]
+      },
+      "artists": {
+        "totalCount": 30,
+        "items": [
+          {
+            "__typename": "ArtistResponseWrapper",
+            "data": {
+              "__typename": "Artist",
+              "uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt",
+              "profile": {"name": "Rick Astley", "verified": true},
+              "visuals": {"avatarImage": {"sources": [
+                {"url": "https://i.scdn.co/image/ab6761610000e5eb2e5c4bdc5ab7c4b4c4b4c4b4", "width": 640, "height": 640},
+                {"url": "https://i.scdn.co/image/ab6761610000f1782e5c4bdc5ab7c4b4c4b4c4b4", "width": 160, "height": 160}
+              ]}}
+            }
+          }
+        ]
+      },
+      "episodes": {
+        "totalCount": 5,
+        "items": [
+          {
+            "__typename": "EpisodeOrChapterResponseWrapper",
+            "data": {
+              "__typename": "Episode",
+              "uri": "spotify:episode:512ojhOuo1ktJprKbVcKyQ",
+              "name": "Rick talks about everything",
+              "description": "In this episode &amp; more",
+              "duration": {"totalMilliseconds": 3600000},
+              "releaseDate": {"isoString": "2025-01-31T08:00:00Z", "precision": "DAY"},
+              "contentRating": {"label": "NONE"},
+              "playability": {"reason": "PLAYABLE"},
+              "coverArt": {"sources": [{"url": "https://i.scdn.co/image/ab6765630000ba8a0000000000000000000000aa", "width": 640, "height": 640}]},
+              "podcastV2": {"data": {"__typename": "Podcast", "uri": "spotify:show:5CfCWKI5pZ28U0uOzXkDHe", "name": "The Rick Show", "publisher": {"name": "Rick Talks"}}}
+            }
+          }
+        ]
+      },
+      "genres": {"totalCount": 0, "items": []},
+      "playlists": {
+        "totalCount": 1000,
+        "items": [
+          {
+            "__typename": "PlaylistResponseWrapper",
+            "data": {
+              "__typename": "Playlist",
+              "uri": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+              "name": "This Is Rick Astley",
+              "description": "The essential tracks, all in one playlist. <a href=\"spotify:artist:0gxyHStUsqpMadRV0Di1Qt\">Rick</a>",
+              "format": "",
+              "images": {"items": [{"extractedColors": {}, "sources": [{"url": "https://i.scdn.co/image/ab67706f00000002aaaa", "width": null, "height": null}]}]},
+              "ownerV2": {"data": {"__typename": "User", "name": "Spotify", "uri": "spotify:user:spotify", "username": "spotify"}}
+            }
+          }
+        ]
+      },
+      "podcasts": {
+        "totalCount": 3,
+        "items": [
+          {
+            "__typename": "PodcastOrAudiobookResponseWrapper",
+            "data": {
+              "__typename": "Podcast",
+              "uri": "spotify:show:5CfCWKI5pZ28U0uOzXkDHe",
+              "name": "The Rick Show",
+              "mediaType": "AUDIO",
+              "publisher": {"name": "Rick Talks"},
+              "coverArt": {"sources": [{"url": "https://i.scdn.co/image/ab6765630000ba8a0000000000000000000000bb", "width": 300, "height": 300}]}
+            }
+          }
+        ]
+      },
+      "tracksV2": {
+        "totalCount": 800,
+        "items": [
+          {
+            "item": {
+              "__typename": "TrackResponseWrapper",
+              "data": {
+                "__typename": "Track",
+                "uri": "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                "id": "4uLU6hMCjMI75M1A2tKUQC",
+                "name": "Never Gonna Give You Up",
+                "albumOfTrack": {
+                  "uri": "spotify:album:6XhjNHCyCDyyGJRM5mg40G",
+                  "name": "Whenever You Need Somebody",
+                  "id": "6XhjNHCyCDyyGJRM5mg40G",
+                  "coverArt": {"sources": [{"url": "https://i.scdn.co/image/ab67616d0000485115ebbedaacef61af244262a8", "width": 64, "height": 64}]}
+                },
+                "artists": {"items": [{"uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt", "profile": {"name": "Rick Astley"}}]},
+                "contentRating": {"label": "NONE"},
+                "duration": {"totalMilliseconds": 213573},
+                "playability": {"playable": true}
+              }
+            },
+            "matchedFields": []
+          },
+          {
+            "item": {"__typename": "TrackResponseWrapper", "data": {"__typename": "NotFound"}}
+          },
+          {
+            "item": {
+              "__typename": "TrackResponseWrapper",
+              "data": {
+                "__typename": "Track",
+                "uri": "spotify:track:7GhIk7Il098yCjg4BQjzvb",
+                "name": "Never Gonna Give You Up (Explicit Remix)",
+                "albumOfTrack": {"uri": "spotify:album:2takcwOaAZWiXQijPHIx7B", "name": "Remixes", "coverArt": {"sources": []}},
+                "artists": {"items": [{"uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt", "profile": {"name": "Rick Astley"}}]},
+                "contentRating": {"label": "EXPLICIT"},
+                "duration": {"totalMilliseconds": 199000},
+                "playability": {"playable": true},
+                "associationsV3": {"videoAssociations": {"totalCount": 0}}
+              }
+            }
+          }
+        ]
+      },
+      "topResultsV2": {
+        "featured": [],
+        "itemsV2": [
+          {
+            "item": {
+              "__typename": "ArtistResponseWrapper",
+              "data": {
+                "__typename": "Artist",
+                "uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt",
+                "profile": {"name": "Rick Astley"},
+                "visuals": {"avatarImage": {"sources": [{"url": "https://i.scdn.co/image/ab6761610000f1782e5c4bdc5ab7c4b4c4b4c4b4", "width": 160, "height": 160}]}}
+              }
+            },
+            "matchedFields": ["NAME"]
+          }
+        ]
+      },
+      "users": {"totalCount": 0, "items": []}
+    }
+  },
+  "extensions": {"requestIds": {"/searchV2": {"search-api": "abc"}}}
+}
