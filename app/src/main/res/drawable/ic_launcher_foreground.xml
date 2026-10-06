@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Adaptive icon foreground: equalizer bars in a rounded square (original artwork). -->
+<!--
+  Adaptive icon foreground (original artwork): a rounded green tile with three rounded
+  equalizer bars cut out of it. The bars are holes (evenOdd), so the same drawable works as the
+  monochrome layer for themed icons and shows the dark background through on the splash screen.
+  Everything sits inside the 66dp safe zone of the 108dp canvas.
+-->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
@@ -7,8 +12,6 @@
     android:viewportHeight="108">
     <path
         android:fillColor="#FF1ED760"
-        android:pathData="M36,28h36a8,8 0,0 1,8 8v36a8,8 0,0 1,-8 8h-36a8,8 0,0 1,-8 -8v-36a8,8 0,0 1,8 -8z" />
-    <path android:fillColor="#FF121212" android:pathData="M38,58h6a1.5,1.5 0,0 1,1.5 1.5v11h-9v-11a1.5,1.5 0,0 1,1.5 -1.5z" />
-    <path android:fillColor="#FF121212" android:pathData="M49,40h6a1.5,1.5 0,0 1,1.5 1.5v29h-9v-29a1.5,1.5 0,0 1,1.5 -1.5z" />
-    <path android:fillColor="#FF121212" android:pathData="M60,49h6a1.5,1.5 0,0 1,1.5 1.5v20h-9v-20a1.5,1.5 0,0 1,1.5 -1.5z" />
+        android:fillType="evenOdd"
+        android:pathData="M42,30h24a12,12 0,0 1,12 12v24a12,12 0,0 1,-12 12h-24a12,12 0,0 1,-12 -12v-24a12,12 0,0 1,12 -12z M42,55h2a2.5,2.5 0,0 1,2.5 2.5v9a2.5,2.5 0,0 1,-2.5 2.5h-2a2.5,2.5 0,0 1,-2.5 -2.5v-9a2.5,2.5 0,0 1,2.5 -2.5z M53,42h2a2.5,2.5 0,0 1,2.5 2.5v22a2.5,2.5 0,0 1,-2.5 2.5h-2a2.5,2.5 0,0 1,-2.5 -2.5v-22a2.5,2.5 0,0 1,2.5 -2.5z M64,49h2a2.5,2.5 0,0 1,2.5 2.5v15a2.5,2.5 0,0 1,-2.5 2.5h-2a2.5,2.5 0,0 1,-2.5 -2.5v-15a2.5,2.5 0,0 1,2.5 -2.5z" />
 </vector>

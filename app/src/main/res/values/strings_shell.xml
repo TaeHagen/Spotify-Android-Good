@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- UI shell strings: navigation, shared components, sheets, login, settings, status screens. -->
+<resources>
+    <!-- Navigation -->
+    <string name="shell_tab_home">Home</string>
+    <string name="shell_tab_search">Search</string>
+    <string name="shell_tab_library">Your Library</string>
+
+    <!-- Common -->
+    <string name="shell_cancel">Cancel</string>
+    <string name="shell_save">Save</string>
+    <string name="shell_create">Create</string>
+    <string name="shell_delete">Delete</string>
+    <string name="shell_remove">Remove</string>
+    <string name="shell_close">Close</string>
+    <string name="shell_retry">Retry</string>
+    <string name="shell_try_again">Try again</string>
+    <string name="shell_allow">Allow</string>
+    <string name="shell_not_now">Not now</string>
+    <string name="shell_turn_on">Turn on</string>
+    <string name="shell_loading">Loading</string>
+    <string name="shell_see_all">See all</string>
+    <string name="shell_show_more">Show more</string>
+    <string name="shell_show_less">Show less</string>
+    <string name="shell_share_title">Share link</string>
+    <string name="shell_logout">Log out</string>
+
+    <!-- Content descriptions / states (TalkBack) -->
+    <string name="shell_cd_back">Back</string>
+    <string name="shell_cd_play">Play</string>
+    <string name="shell_cd_pause">Pause</string>
+    <string name="shell_cd_more_options_for">More options for %1$s</string>
+    <string name="shell_cd_explicit">Explicit</string>
+    <string name="shell_cd_suggested">Suggested</string>
+    <string name="shell_cd_download_queued">Waiting to download</string>
+    <string name="shell_cd_downloading">Downloading</string>
+    <string name="shell_cd_downloaded">Downloaded</string>
+    <string name="shell_cd_download_failed">Download failed</string>
+    <string name="shell_state_now_playing">Now playing</string>
+    <string name="shell_state_unavailable">Unavailable</string>
+
+    <!-- Rows / formatting -->
+    <string name="shell_duration_hr_min">%1$d hr %2$d min</string>
+    <string name="shell_duration_hr">%1$d hr</string>
+    <string name="shell_duration_min">%1$d min</string>
+    <string name="shell_episode_time_left">%1$s left</string>
+    <string name="shell_episode_played">Played</string>
+    <string name="shell_offline_banner">You\'re offline. Only downloaded music is available.</string>
+    <string name="shell_type_artist">Artist</string>
+    <string name="shell_type_playlist">Playlist</string>
+    <string name="shell_type_podcast">Podcast</string>
+    <string name="shell_playlist_by">Playlist • %1$s</string>
+
+    <!-- Action sheet -->
+    <string name="shell_action_play">Play</string>
+    <string name="shell_action_add_to_queue">Add to queue</string>
+    <string name="shell_action_like">Add to Liked Songs</string>
+    <string name="shell_action_unlike">Remove from Liked Songs</string>
+    <string name="shell_action_add_to_playlist">Add to playlist</string>
+    <string name="shell_action_remove_from_playlist">Remove from this playlist</string>
+    <string name="shell_action_remove_from_queue">Remove from queue</string>
+    <string name="shell_action_download">Download</string>
+    <string name="shell_action_remove_download">Remove download</string>
+    <string name="shell_action_go_to_album">Go to album</string>
+    <string name="shell_action_go_to_artist">Go to artist</string>
+    <string name="shell_action_go_to_artists">Go to artists</string>
+    <string name="shell_action_go_to_show">Go to podcast</string>
+    <string name="shell_action_view_artist">View artist</string>
+    <string name="shell_action_view_episode">View episode</string>
+    <string name="shell_action_start_radio">Go to radio</string>
+    <string name="shell_action_share">Share</string>
+    <string name="shell_action_save_to_library">Add to Your Library</string>
+    <string name="shell_action_remove_from_library">Remove from Your Library</string>
+    <string name="shell_action_save_to_episodes">Save to Your Episodes</string>
+    <string name="shell_action_remove_from_episodes">Remove from Your Episodes</string>
+    <string name="shell_action_follow">Follow</string>
+    <string name="shell_action_unfollow">Unfollow</string>
+    <string name="shell_action_rename">Rename playlist</string>
+    <string name="shell_action_delete_playlist">Delete playlist</string>
+    <string name="shell_choose_artist">Choose artist</string>
+    <string name="shell_rename_playlist">Rename playlist</string>
+    <string name="shell_playlist_name">Playlist name</string>
+    <string name="shell_delete_playlist_title">Delete playlist?</string>
+    <string name="shell_delete_playlist_message">“%1$s” will be removed from your library. This can\'t be undone.</string>
+
+    <!-- Add to playlist / create playlist -->
+    <string name="shell_add_to_playlist_title">Add to playlist</string>
+    <string name="shell_new_playlist">New playlist</string>
+    <string name="shell_no_editable_playlists">You don\'t have any playlists you can add to yet.</string>
+    <string name="shell_create_playlist_title">Give your playlist a name</string>
+    <string name="shell_new_playlist_default_name">My playlist</string>
+
+    <!-- Snackbar messages -->
+    <string name="shell_msg_added_to_queue">Added to queue</string>
+    <string name="shell_msg_added_n_to_queue">Added %1$d items to queue</string>
+    <string name="shell_msg_liked">Added to Liked Songs</string>
+    <string name="shell_msg_unliked">Removed from Liked Songs</string>
+    <string name="shell_msg_added_to_playlist">Added to %1$s</string>
+    <string name="shell_msg_added_to_new_playlist">Added to your new playlist</string>
+    <string name="shell_msg_removed_from_playlist">Removed from playlist</string>
+    <string name="shell_msg_removed_from_queue">Removed from queue</string>
+    <string name="shell_msg_download_started">Downloading</string>
+    <string name="shell_msg_download_removed">Download removed</string>
+    <string name="shell_msg_saved_to_library">Added to Your Library</string>
+    <string name="shell_msg_removed_from_library">Removed from Your Library</string>
+    <string name="shell_msg_saved_episode">Saved to Your Episodes</string>
+    <string name="shell_msg_removed_episode">Removed from Your Episodes</string>
+    <string name="shell_msg_following">Following</string>
+    <string name="shell_msg_unfollowed">Unfollowed</string>
+    <string name="shell_msg_starting_radio">Starting radio…</string>
+    <string name="shell_msg_playlist_renamed">Playlist renamed</string>
+    <string name="shell_msg_playlist_deleted">Playlist deleted</string>
+    <string name="shell_msg_cannot_share">This can\'t be shared</string>
+    <string name="shell_msg_unsupported_link">This link isn\'t supported</string>
+    <string name="shell_msg_no_link_in_share">No Spotify link found in the shared text</string>
+    <string name="shell_msg_login_first">Log in first to play music</string>
+    <string name="shell_msg_no_results">Nothing found for “%1$s”</string>
+    <string name="shell_msg_voice_search_failed">Couldn\'t search right now. Try again.</string>
+    <string name="shell_msg_cache_cleared">Cache cleared</string>
+    <string name="shell_msg_downloads_removed">All downloads removed</string>
+    <string name="shell_msg_retrying_downloads">Retrying failed downloads</string>
+
+    <!-- Errors -->
+    <string name="shell_error_network">No connection. Check your network and try again.</string>
+    <string name="shell_error_rate_limited">Spotify is busy right now. Try again in a moment.</string>
+    <string name="shell_error_not_found">This isn\'t available.</string>
+    <string name="shell_error_premium">Spotify Premium is required for this.</string>
+    <string name="shell_error_session">Your session expired. Log in again.</string>
+    <string name="shell_error_unavailable">That isn\'t available on the current device.</string>
+    <string name="shell_error_not_active_device">Start playback on a device first.</string>
+    <string name="shell_error_playback_refused">Spotify refused playback for this account.</string>
+    <string name="shell_error_cancelled">Cancelled</string>
+    <string name="shell_error_generic">Something went wrong. Try again.</string>
+
+    <!-- Notification permission -->
+    <string name="shell_notifications_title">Allow notifications?</string>
+    <string name="shell_notifications_rationale">SpotifyGood uses notifications to show download progress and to let you resume playback when it couldn\'t start. Playback controls work either way.</string>
+
+    <!-- Login -->
+    <string name="shell_login_tagline">Millions of songs and podcasts. An unofficial, open-source client.</string>
+    <string name="shell_login_primary">Log in with Spotify</string>
+    <string name="shell_login_browser">Log in with browser</string>
+    <string name="shell_login_zeroconf">Use another Spotify app on this Wi-Fi</string>
+    <string name="shell_login_premium_note">Requires Spotify Premium</string>
+    <string name="shell_login_disclaimer">Not affiliated with or endorsed by Spotify.</string>
+    <string name="shell_login_code_title">Approve this login</string>
+    <string name="shell_login_code_body">Open the approval page and confirm the code below, or go to %1$s on any device and enter it.</string>
+    <string name="shell_login_code_label">Login code</string>
+    <string name="shell_login_code_copied">Code copied</string>
+    <string name="shell_login_copy_code">Copy code</string>
+    <string name="shell_login_code_expires">Expires in %1$s</string>
+    <string name="shell_login_code_expired">This code expired</string>
+    <string name="shell_login_new_code">Get a new code</string>
+    <string name="shell_login_open_approval">Open approval page</string>
+    <string name="shell_login_waiting_approval">Waiting for approval…</string>
+    <string name="shell_login_browser_title">Finish logging in in your browser</string>
+    <string name="shell_login_browser_body">After you approve, you\'ll come back here automatically.</string>
+    <string name="shell_login_zeroconf_title">Waiting for another device</string>
+    <string name="shell_login_zeroconf_body">Keep this screen open while you hand over the login from another Spotify app.</string>
+    <string name="shell_login_zeroconf_step1">Open Spotify on a computer, phone or tablet connected to the same Wi-Fi.</string>
+    <string name="shell_login_zeroconf_step2">Play something and open the device picker (Spotify Connect).</string>
+    <string name="shell_login_zeroconf_step3">Choose “%1$s” from the list.</string>
+    <string name="shell_login_connecting">Connecting to Spotify…</string>
+
+    <!-- Status screens -->
+    <string name="shell_premium_title">Spotify Premium required</string>
+    <string name="shell_premium_body">SpotifyGood streams with the same protocol as Spotify\'s own apps, which only works for Premium accounts. Log in with a Premium account to keep listening.</string>
+    <string name="shell_premium_body_account">SpotifyGood streams with the same protocol as Spotify\'s own apps, which only works for Premium accounts. The account %1$s isn\'t on Premium.</string>
+    <string name="shell_premium_learn_more">Learn about Premium</string>
+    <string name="shell_refused_title">Playback isn\'t available</string>
+    <string name="shell_refused_body">Spotify refused to send the audio keys this phone needs to play music for your account. You can still browse, manage your library and control playback on your other devices.</string>
+    <string name="shell_refused_detail">This is a known limitation of librespot, the open-source engine SpotifyGood uses: Spotify blocks third-party playback for some accounts. Trying again later sometimes helps.</string>
+    <string name="shell_refused_continue">Continue browsing</string>
+    <string name="shell_refused_banner">Playback on this phone isn\'t available for your account. Tap for details.</string>
+
+    <!-- Settings -->
+    <string name="shell_settings_title">Settings</string>
+    <string name="shell_settings_account">Account</string>
+    <string name="shell_settings_account_unknown">Spotify account</string>
+    <string name="shell_settings_view_profile">View profile</string>
+    <string name="shell_settings_logout_summary">Removes your account, downloads and cached data from this phone</string>
+    <string name="shell_logout_confirm_title">Log out?</string>
+    <string name="shell_logout_confirm_message">Your downloads and cached data will be removed from this phone. Your playlists and library stay in your Spotify account.</string>
+
+    <string name="shell_settings_playback">Playback</string>
+    <string name="shell_settings_quality_wifi">Streaming quality on Wi-Fi</string>
+    <string name="shell_settings_quality_cellular">Streaming quality on mobile data</string>
+    <string name="shell_quality_low">Low (96 kbit/s)</string>
+    <string name="shell_quality_normal">Normal (160 kbit/s)</string>
+    <string name="shell_quality_high">Very high (320 kbit/s)</string>
+    <string name="shell_settings_gapless">Gapless playback</string>
+    <string name="shell_settings_gapless_summary">No silence between tracks</string>
+    <string name="shell_settings_normalize">Normalize volume</string>
+    <string name="shell_settings_normalize_summary">Play all tracks at a similar loudness</string>
+    <string name="shell_settings_volume_level">Volume level</string>
+    <string name="shell_level_quiet">Quiet</string>
+    <string name="shell_level_normal">Normal</string>
+    <string name="shell_level_loud">Loud</string>
+    <string name="shell_settings_autoplay">Autoplay</string>
+    <string name="shell_settings_autoplay_summary">Keep listening to similar content when your music ends</string>
+    <string name="shell_settings_hide_explicit">Hide explicit content</string>
+    <string name="shell_settings_hide_explicit_summary">Explicit tracks are skipped and greyed out</string>
+    <string name="shell_settings_sleep_timer">Sleep timer</string>
+    <string name="shell_sleep_off">Off</string>
+    <string name="shell_sleep_end_of_track">At the end of this track</string>
+    <string name="shell_sleep_running">Stops in %1$d min</string>
+
+    <string name="shell_settings_connect">Spotify Connect</string>
+    <string name="shell_settings_device_name">Device name</string>
+    <string name="shell_settings_device_name_default">%1$s (default)</string>
+    <string name="shell_settings_device_name_help">How this phone appears in the device list of your other Spotify apps. Leave empty to use the default.</string>
+    <string name="shell_settings_presence">Stay available for Spotify Connect</string>
+    <string name="shell_settings_presence_summary">Lets your other devices start music on this phone while the app is closed. Uses more battery.</string>
+    <string name="shell_presence_confirm_title">Stay available?</string>
+    <string name="shell_presence_confirm_message">SpotifyGood will keep a quiet notification and a connection to Spotify open while idle so other devices can play on this phone. This uses noticeably more battery.</string>
+
+    <string name="shell_settings_downloads">Downloads</string>
+    <string name="shell_settings_download_quality">Download quality</string>
+    <string name="shell_settings_download_cellular">Download using mobile data</string>
+    <string name="shell_settings_download_cellular_summary">Otherwise downloads wait for Wi-Fi</string>
+    <string name="shell_settings_storage_used">Downloaded music</string>
+    <string name="shell_settings_storage_used_summary">%1$s used · %2$d items</string>
+    <string name="shell_settings_retry_failed">Retry failed downloads</string>
+    <string name="shell_settings_retry_failed_summary">%1$d downloads failed</string>
+    <string name="shell_settings_remove_downloads">Remove all downloads</string>
+    <string name="shell_settings_remove_downloads_summary">Frees up space on this phone</string>
+    <string name="shell_remove_downloads_confirm_title">Remove all downloads?</string>
+    <string name="shell_remove_downloads_confirm_message">This frees %1$s. You won\'t be able to play this music offline until you download it again.</string>
+
+    <string name="shell_settings_offline">Offline</string>
+    <string name="shell_settings_offline_mode">Offline mode</string>
+    <string name="shell_settings_offline_mode_summary">Only play downloaded music, even when you\'re online</string>
+
+    <string name="shell_settings_storage">Storage</string>
+    <string name="shell_settings_cache_size">Streaming cache</string>
+    <string name="shell_settings_cache_size_summary">Up to %1$s for faster replays</string>
+    <string name="shell_settings_clear_cache">Clear cache</string>
+    <string name="shell_settings_clear_cache_summary">Removes cached pages and images. Downloads are kept.</string>
+
+    <string name="shell_settings_display">Display</string>
+    <string name="shell_settings_theme">Theme</string>
+    <string name="shell_theme_system">System default</string>
+    <string name="shell_theme_dark">Dark</string>
+    <string name="shell_theme_light">Light</string>
+    <string name="shell_settings_dynamic_color">Dynamic color</string>
+    <string name="shell_settings_dynamic_color_summary">Use colors from your wallpaper</string>
+    <string name="shell_settings_lyrics">Lyrics on Now Playing</string>
+    <string name="shell_settings_lyrics_summary">Show a lyrics preview below the player when available</string>
+    <string name="shell_settings_library_view">Library layout</string>
+    <string name="shell_library_view_list">List</string>
+    <string name="shell_library_view_grid">Grid</string>
+    <string name="shell_settings_library_sort">Library sort order</string>
+    <string name="shell_sort_recent">Recents</string>
+    <string name="shell_sort_recently_added">Recently added</string>
+    <string name="shell_sort_alphabetical">Alphabetical</string>
+    <string name="shell_sort_creator">Creator</string>
+
+    <string name="shell_settings_audio">Audio</string>
+    <string name="shell_settings_equalizer">Equalizer</string>
+    <string name="shell_settings_equalizer_summary">Open your phone\'s sound settings</string>
+    <string name="shell_settings_equalizer_unavailable">No equalizer app found on this phone</string>
+
+    <string name="shell_settings_about">About</string>
+    <string name="shell_settings_version">Version</string>
+    <string name="shell_settings_licenses">Open-source licenses</string>
+    <string name="shell_settings_licenses_summary">librespot and the other projects this app is built on</string>
+    <string name="shell_licenses_intro">SpotifyGood is built on these open-source projects. Thank you to their authors.</string>
+    <string name="shell_settings_disclaimer">SpotifyGood is an unofficial client. It is not affiliated with, endorsed or sponsored by Spotify AB. Spotify is a trademark of Spotify AB. Playback uses librespot, an open-source implementation of Spotify\'s protocols, and requires a Spotify Premium account.</string>
+</resources>
