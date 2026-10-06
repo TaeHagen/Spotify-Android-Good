@@ -29,8 +29,11 @@ import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.engine.SpotifyEngine
 import com.taehagen.spotifygood.model.DownloadState
+import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.model.OfflineTrackRecord
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeEvents
+import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.nativebridge.NativeRpc
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -118,7 +121,9 @@ data class DownloadActivity(
  * * Downloaded collections are re-synced daily ([DownloadSyncWorker]) and when the session comes
  *   online after 12 h: new items are queued, dropped ones removed (respecting shared membership),
  *   and downloads older than 30 days are re-validated. Items the user removed individually from a
- *   downloaded collection stay removed until the collection is downloaded again.
+ *   downloaded collection stay removed until the collection is downloaded again. Only a complete
+ *   resolution drops items ([CollectionResolver.Resolved.complete]): a failed or short lookup never
+ *   deletes downloads.
  * * Removal deletes files, rows and the native offline index entries.
  * * The native offline index follows the database through numbered changes ([OfflineIndexSync]):
  *   every commit and removal takes its number under [mutex] with its database write.
@@ -231,7 +236,13 @@ class DownloadManager(
      * re-queues failed and individually removed items.
      */
     suspend fun downloadCollection(ref: CollectionRef) {
-        val resolved = requireNotNull(resolver.resolve(ref.type, ref.uri))
+        val found = requireNotNull(resolver.resolve(ref.type, ref.uri))
+        if (found.items.isEmpty() && !found.complete) {
+            // Nothing listed and the lookup is not trustworthy: report it instead of storing an empty
+            // collection that would show as downloaded.
+            throw NativeException(NativeErrorInfo(NativeErrorCode.NETWORK, "Could not load the items of ${ref.name.ifBlank { ref.uri }}"))
+        }
+        val resolved = withMetadata(found, known = emptySet())
         val removed = mutex.withLock {
             val existing = collectionDao.get(ref.uri)
             val now = System.currentTimeMillis()
@@ -404,12 +415,14 @@ class DownloadManager(
                     val type = CollectionType.fromWire(collection.type) ?: continue
                     val resolved = try {
                         resolver.resolve(type, collection.uri, collection.revision)
+                            ?.let { withMetadata(it, known = decodeItems(collection.itemUrisJson).toHashSet()) }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
                         Log.w(TAG, "Sync of ${collection.uri} failed", e)
                         continue
                     }
+                    if (resolved != null && !resolved.complete) Log.w(TAG, "Sync of ${collection.uri} was incomplete: nothing removed")
                     val result = mutex.withLock {
                         val current = collectionDao.get(collection.uri) ?: return@withLock null // removed meanwhile
                         if (resolved == null) {
@@ -455,8 +468,8 @@ class DownloadManager(
         resolved: CollectionResolver.Resolved,
         userInitiated: Boolean,
     ): MembershipResult {
-        val newItems = resolved.items.map { it.uri }
-        val diff = DownloadRules.diff(decodeItems(entity.itemUrisJson), newItems)
+        val diff = DownloadRules.updateMembership(decodeItems(entity.itemUrisJson), resolved.items.map { it.uri }, resolved.complete)
+        val newItems = diff.items
         val others = collectionDao.getAll().filter { it.uri != entity.uri }.map { decodeItems(it.itemUrisJson) }
         val toDelete = if (diff.dropped.isEmpty()) {
             emptyList()
@@ -472,8 +485,9 @@ class DownloadManager(
             collectionDao.upsert(
                 entity.copy(
                     itemUrisJson = json.encodeToString(itemsSerializer, newItems),
-                    revision = resolved.revision ?: entity.revision,
-                    lastSyncedAt = now,
+                    // Incomplete: try the whole listing again next time (the revision would skip it).
+                    revision = if (resolved.complete) resolved.revision ?: entity.revision else entity.revision,
+                    lastSyncedAt = if (resolved.complete) now else entity.lastSyncedAt,
                 ),
             )
             insertRows(toQueue, quality, individual = false, now = now)
@@ -482,6 +496,22 @@ class DownloadManager(
         }
         deleteFiles(files)
         return MembershipResult(toQueue.size, Removal(toDelete, index.next()))
+    }
+
+    /**
+     * [resolved] with display metadata for the items that lack it (Liked Songs list URIs only) and will
+     * get a new row: not in [known] (the stored membership; sync only queues new items) and without a
+     * row yet. Best effort: rows without metadata get it from the downloaded record.
+     */
+    private suspend fun withMetadata(resolved: CollectionResolver.Resolved, known: Set<String>): CollectionResolver.Resolved {
+        val candidates = resolved.items.filter { it.metadataJson == null && it.uri !in known }.map { it.uri }
+        if (candidates.isEmpty()) return resolved
+        val existing = candidates.chunked(SQL_CHUNK).flatMap { dao.existingUris(it) }.toHashSet()
+        val wanted = candidates.filter { it !in existing }
+        if (wanted.isEmpty()) return resolved
+        val metadata = resolver.metadataBestEffort(wanted, COLLECTION_METADATA_TIMEOUT_MS)
+        if (metadata.isEmpty()) return resolved
+        return resolved.copy(items = resolved.items.map { item -> metadata[item.uri]?.let { item.copy(metadataJson = it) } ?: item })
     }
 
     private suspend fun insertRows(items: List<CollectionResolver.Item>, quality: Int, individual: Boolean, now: Long) {
@@ -713,6 +743,7 @@ class DownloadManager(
         private const val SQL_CHUNK = 500
         private const val STATES_STOP_TIMEOUT_MS = 5_000L
         private const val METADATA_TIMEOUT_MS = 10_000L
+        private const val COLLECTION_METADATA_TIMEOUT_MS = 60_000L
         private const val SYNC_ONLINE_TIMEOUT_MS = 60_000L
         private const val SYNC_STALE_MS = 12L * 60 * 60 * 1000
         private const val JOB_BACKOFF_MS = 30_000L

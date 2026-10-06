@@ -126,6 +126,31 @@ class DownloadRulesTest {
     // ---- membership ----------------------------------------------------------------------------------
 
     @Test
+    fun anEmptyIncompleteResolutionDeletesNothing() {
+        // The album's track metadata failed: catalog.album came back without tracks.
+        val update = DownloadRules.updateMembership(listOf("a", "b", "c"), resolved = emptyList(), complete = false)
+        assertEquals(listOf("a", "b", "c"), update.items)
+        assertEquals(emptyList<String>(), update.dropped)
+        assertEquals(emptyList<String>(), update.added)
+    }
+
+    @Test
+    fun aShortResolutionOnlyAddsItems() {
+        val update = DownloadRules.updateMembership(listOf("a", "b", "c"), resolved = listOf("b", "d"), complete = false)
+        assertEquals(listOf("b", "d", "a", "c"), update.items)
+        assertEquals(listOf("d"), update.added)
+        assertEquals(emptyList<String>(), update.dropped)
+    }
+
+    @Test
+    fun aCompleteResolutionReplacesTheMembership() {
+        val update = DownloadRules.updateMembership(listOf("a", "b", "c"), resolved = listOf("b", "d", "b"), complete = true)
+        assertEquals(listOf("b", "d"), update.items)
+        assertEquals(listOf("d"), update.added)
+        assertEquals(listOf("a", "c"), update.dropped)
+    }
+
+    @Test
     fun removingACollectionKeepsItemsSharedWithOtherCollections() {
         val album = listOf("t1", "t2", "t3")
         val playlist = listOf("t2", "t9")

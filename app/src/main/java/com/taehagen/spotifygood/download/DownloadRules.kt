@@ -130,6 +130,20 @@ internal object DownloadRules {
 
     data class MembershipDiff(val added: List<String>, val dropped: List<String>)
 
+    /** New membership of a collection: its [items] and what joined / left it. */
+    data class MembershipUpdate(val items: List<String>, val added: List<String>, val dropped: List<String>)
+
+    /**
+     * Membership after a resolution listing [resolved]. Only a [complete] resolution replaces [old]
+     * (and so may drop items, which deletes their downloads); an incomplete one (failed or short
+     * lookup) only adds: items it does not list are unknown and kept.
+     */
+    fun updateMembership(old: List<String>, resolved: List<String>, complete: Boolean): MembershipUpdate {
+        val items = if (complete) resolved.distinct() else (resolved + old).distinct()
+        val diff = diff(old, items)
+        return MembershipUpdate(items, diff.added, diff.dropped)
+    }
+
     /** Items that joined / left a collection between two resolutions (order of [new] / [old] kept). */
     fun diff(old: List<String>, new: List<String>): MembershipDiff {
         val oldSet = old.toHashSet()
