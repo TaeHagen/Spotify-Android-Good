@@ -85,6 +85,7 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
     private val lyricsRepository = graph.lyrics
     private val sleepTimer = graph.sleepTimer
     private val outputs = graph.outputs
+    private val devices = graph.devices
 
     val snapshot: StateFlow<PlaybackSnapshot> = playback.snapshot
 
@@ -122,6 +123,15 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
             viewModelScope,
             SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
             deviceIndicator(snapshot.value, outputs.current.value),
+        )
+
+    /** The remote device playing takes volume changes (false while this phone plays). */
+    val remoteVolumeSupported: StateFlow<Boolean> = combine(snapshot, devices.devices, ::remoteVolumeSupported)
+        .distinctUntilChanged()
+        .stateIn(
+            viewModelScope,
+            SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
+            remoteVolumeSupported(snapshot.value, devices.devices.value),
         )
 
     val sleepTimerState: StateFlow<SleepTimerState> = sleepTimer.state

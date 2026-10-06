@@ -2,6 +2,8 @@ package com.taehagen.spotifygood.ui.screens.player
 
 import com.taehagen.spotifygood.model.ActiveDeviceRef
 import com.taehagen.spotifygood.model.ArtistRef
+import com.taehagen.spotifygood.model.ConnectDevice
+import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.DeviceType
 import com.taehagen.spotifygood.model.LyricsLine
 import com.taehagen.spotifygood.model.PlaybackSnapshot
@@ -287,6 +289,22 @@ class DeviceAndShareTest {
         assertEquals(DeviceIndicator.None, deviceIndicator(snapshot, output(OutputKind.SPEAKER)))
         assertEquals(DeviceIndicator.None, deviceIndicator(snapshot, null))
         assertEquals(DeviceIndicator.None, deviceIndicator(PlaybackSnapshot(source = PlaybackSource.REMOTE), null))
+    }
+
+    @Test
+    fun remoteVolumeFollowsTheDevicesSupportsVolume() {
+        val kitchen = ActiveDeviceRef(id = "d", name = "Kitchen", type = DeviceType.SPEAKER)
+        val remote = PlaybackSnapshot(source = PlaybackSource.REMOTE, activeDevice = kitchen)
+        val fixed = DeviceList(activeDeviceId = "d", devices = listOf(ConnectDevice(id = "d", name = "Kitchen", supportsVolume = false)))
+        val adjustable = DeviceList(activeDeviceId = "d", devices = listOf(ConnectDevice(id = "d", name = "Kitchen")))
+        assertFalse(remoteVolumeSupported(remote, fixed))
+        assertTrue(remoteVolumeSupported(remote, adjustable))
+        // Not (yet) listed, or no device reference: assume it works, like the playback service.
+        assertTrue(remoteVolumeSupported(remote, DeviceList()))
+        assertTrue(remoteVolumeSupported(PlaybackSnapshot(source = PlaybackSource.REMOTE), fixed))
+        // This phone plays: no remote volume slider at all.
+        assertFalse(remoteVolumeSupported(PlaybackSnapshot(source = PlaybackSource.LOCAL), adjustable))
+        assertFalse(remoteVolumeSupported(PlaybackSnapshot.EMPTY, adjustable))
     }
 
     @Test

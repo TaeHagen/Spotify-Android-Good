@@ -2,6 +2,7 @@ package com.taehagen.spotifygood.ui.screens.player
 
 import androidx.compose.runtime.Immutable
 import com.taehagen.spotifygood.model.AlbumRef
+import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.DeviceType
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.LyricsLine
@@ -264,6 +265,17 @@ internal fun deviceIndicator(snapshot: PlaybackSnapshot, output: AudioOutput?): 
             DeviceIndicator.LocalOutput(output.name, output.kind)
         else -> DeviceIndicator.None
     }
+}
+
+/**
+ * Whether the remote Connect device playing [snapshot] takes volume changes (false for local or no
+ * playback). An unknown or unlisted device counts as supporting it, like the playback service and
+ * the [com.taehagen.spotifygood.model.ConnectDevice.supportsVolume] default.
+ */
+internal fun remoteVolumeSupported(snapshot: PlaybackSnapshot, devices: DeviceList): Boolean {
+    if (snapshot.source != PlaybackSource.REMOTE) return false
+    val active = snapshot.activeDevice ?: return true
+    return devices.devices.firstOrNull { it.id == active.id }?.supportsVolume != false
 }
 
 internal const val MAX_CONNECT_VOLUME = 65535

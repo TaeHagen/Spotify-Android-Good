@@ -116,6 +116,7 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
     val snapshot by viewModel.snapshot.collectAsStateWithLifecycle()
     val liked by viewModel.isLiked.collectAsStateWithLifecycle()
     val indicator by viewModel.indicator.collectAsStateWithLifecycle()
+    val remoteVolumeSupported by viewModel.remoteVolumeSupported.collectAsStateWithLifecycle()
     val lyricsPreview by viewModel.lyricsPreview.collectAsStateWithLifecycle()
     val sleepTimer by viewModel.sleepTimerState.collectAsStateWithLifecycle()
     val navigator = LocalAppNavigator.current
@@ -199,6 +200,7 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
                     track = track,
                     liked = liked,
                     indicator = indicator,
+                    remoteVolumeSupported = remoteVolumeSupported,
                     lyrics = (lyricsPreview as? LyricsState.Loaded)?.lyrics,
                     lyricsFallbackColor = artworkColor,
                     sleepTimer = sleepTimer,
@@ -236,6 +238,7 @@ private fun NowPlayingBody(
     track: PlaybackTrack,
     liked: Boolean,
     indicator: DeviceIndicator,
+    remoteVolumeSupported: Boolean,
     lyrics: Lyrics?,
     lyricsFallbackColor: State<Color>,
     sleepTimer: SleepTimerState,
@@ -312,7 +315,8 @@ private fun NowPlayingBody(
             onNext = viewModel::next,
             onRepeat = viewModel::cycleRepeat,
         )
-        if (isRemote) {
+        // Fixed-volume receivers and some groups ignore volume changes (the thumb would snap back).
+        if (isRemote && remoteVolumeSupported) {
             VolumeSlider(
                 volume = snapshot.volume,
                 onVolumeChange = viewModel::setVolume,
