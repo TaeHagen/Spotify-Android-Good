@@ -9,7 +9,7 @@
 //! sent exactly once (no librespot retry loop).
 
 use super::http::{self, HttpError, JSON, PROTOBUF};
-use super::metadata;
+use super::metadata::{self, Fetched};
 use super::proto::playlist4_external as p4;
 use super::util::{decode_plus, encode_component, file_id_hex, now_ms, parse_kind, strip_html, UriKind};
 use crate::engine;
@@ -311,12 +311,10 @@ pub(crate) async fn playlist(args: Value) -> AppResult<Value> {
     let episode_uris: Vec<String> =
         page.iter().filter_map(|i| parse_kind(i.uri(), UriKind::Episode)).map(|p| p.uri()).collect();
     let (tracks, episodes) =
-        tokio::join!(metadata::track_map(&session, &track_uris), metadata::episode_map(&session, &episode_uris));
-    let tracks = tracks.unwrap_or_else(|e| {
-        log::warn!("playlist track metadata failed: {e}");
-        HashMap::new()
-    });
-    let episodes = episodes.unwrap_or_default();
+        tokio::join!(metadata::track_lookup(&session, &track_uris), metadata::episode_lookup(&session, &episode_uris));
+    let tracks = Fetched::or_all_failed(tracks, &track_uris);
+    let episodes = Fetched::or_all_failed(episodes, &episode_uris);
+    let partial = page_partial(&tracks, &track_uris, &episodes, &episode_uris)?;
 
     let uri = p.uri();
     let header = header_from_list(&uri, &list);
@@ -340,9 +338,31 @@ pub(crate) async fn playlist(args: Value) -> AppResult<Value> {
         revision: revision_hex(list.revision()),
         offset: a.offset,
         total,
-        items: build_items(&page, &tracks, &episodes),
+        items: build_items(&page, &tracks.map, &episodes.map),
         following,
+        partial,
     })
+}
+
+/// Whether a page whose item metadata came from `tracks`/`episodes` is partial (some requests
+/// failed; those items become placeholders). Fails when requests failed and nothing resolved:
+/// a page of nameless placeholders is not worth returning.
+pub(crate) fn page_partial(
+    tracks: &Fetched<Track>,
+    track_uris: &[String],
+    episodes: &Fetched<Episode>,
+    episode_uris: &[String],
+) -> AppResult<bool> {
+    let partial = tracks.any_failed(track_uris.iter()) || episodes.any_failed(episode_uris.iter());
+    if !partial {
+        return Ok(false);
+    }
+    let error = tracks.error.clone().or_else(|| episodes.error.clone());
+    if tracks.map.is_empty() && episodes.map.is_empty() {
+        return Err(metadata::page_error(error.unwrap_or_else(|| AppError::unavailable("item metadata unavailable"))));
+    }
+    log::warn!("playlist page partial: item metadata failed ({error:?})");
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1152,6 +1172,22 @@ mod tests {
         assert!(!out[3].track.as_ref().unwrap().playable, "unresolved track placeholder");
         assert!(out[4].track.is_none() && out[4].episode.is_none());
         let _ = gid("4uLU6hMCjMI75M1A2tKUQC");
+    }
+
+    #[test]
+    fn pages_with_failed_metadata_are_partial_or_fail() {
+        use crate::catalog::pages::tests::fetched;
+        let t = vec!["spotify:track:a".to_string(), "spotify:track:b".to_string()];
+        let none: Vec<String> = Vec::new();
+        let no_episodes = || fetched::<Episode>(&[], &[]);
+        let a = Track { uri: t[0].clone(), name: "A".into(), ..Default::default() };
+        // Complete (b merely has no data): not partial.
+        assert!(!page_partial(&fetched(&[(t[0].as_str(), a.clone())], &[]), &t, &no_episodes(), &none).unwrap());
+        // b's request failed: partial.
+        assert!(page_partial(&fetched(&[(t[0].as_str(), a)], &[t[1].as_str()]), &t, &no_episodes(), &none).unwrap());
+        // Every request failed: a retryable error instead of a page of placeholders.
+        let err = page_partial(&fetched::<Track>(&[], &[t[0].as_str(), t[1].as_str()]), &t, &no_episodes(), &none).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Network);
     }
 
     #[test]

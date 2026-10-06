@@ -11,10 +11,10 @@
 
 use super::context;
 use super::http::{self, HttpError, JSON};
-use super::metadata;
+use super::metadata::{self, Fetched};
 use super::playlist;
 use super::proto::collection2v2 as c2;
-use super::util::{now_ms, parse_uri, ParsedUri, UriKind};
+use super::util::{now_ms, parse_kind, parse_uri, ParsedUri, UriKind};
 use crate::engine;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{AlbumRef, ArtistRef, Episode, ShowRef, Track};
@@ -477,8 +477,33 @@ pub(crate) fn window(items: &[CollItem], kind: UriKind, offset: u32, limit: u32)
     (total, page)
 }
 
-fn page_value<T: Serialize>(total: u32, items: Vec<Saved<T>>) -> AppResult<Value> {
-    to_value(&json!({ "total": total, "items": items }))
+/// A `library.*` page: exactly one item per window slot, so `items.len() == min(limit, total -
+/// offset)` and offset paging stays aligned. Entries without metadata keep their slot as a
+/// placeholder carrying only the URI; `partial` is set when some of them are only missing
+/// because their request failed (docs §6.3, §6.5).
+pub(crate) fn saved_page<M, V: Serialize>(
+    total: u32,
+    page: &[CollItem],
+    kind: UriKind,
+    fetched: &Fetched<M>,
+    item: impl Fn(&str, Option<&M>) -> V,
+) -> AppResult<Value> {
+    let keys: Vec<String> = page.iter().map(|i| parse_kind(&i.uri, kind).map(|p| p.uri()).unwrap_or_else(|| i.uri.clone())).collect();
+    let items: Vec<Saved<V>> = page
+        .iter()
+        .zip(&keys)
+        .map(|(i, key)| Saved { added_at: added_ms(i.added_at), value: item(key, fetched.map.get(key).map(|m| &**m)) })
+        .collect();
+    let mut out = json!({ "total": total, "items": items });
+    if fetched.any_failed(keys.iter()) {
+        log::warn!("library {} page partial: {:?}", kind.as_str(), fetched.error);
+        out["partial"] = json!(true);
+    }
+    to_value(&out)
+}
+
+fn window_uris(page: &[CollItem]) -> Vec<String> {
+    page.iter().map(|i| i.uri.clone()).collect()
 }
 
 async fn liked_from_context(session: &Session, offset: u32, limit: u32) -> AppResult<(u32, Vec<CollItem>)> {
@@ -513,15 +538,10 @@ pub(crate) async fn tracks(args: Value) -> AppResult<Value> {
         let uris: Vec<&str> = page.iter().map(|i| i.uri.as_str()).collect();
         return Ok(json!({ "total": total, "items": [], "uris": uris }));
     }
-    let uris: Vec<String> = page.iter().map(|i| i.uri.clone()).collect();
-    let map = metadata::track_map(&session, &uris).await?;
-    let items = page
-        .iter()
-        .filter_map(|i| {
-            Some(Saved { added_at: added_ms(i.added_at), value: TrackItem { track: (**map.get(&i.uri)?).clone() } })
-        })
-        .collect();
-    page_value(total, items)
+    let fetched = metadata::track_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
+    saved_page(total, &page, UriKind::Track, &fetched, |uri, t| TrackItem {
+        track: t.cloned().unwrap_or_else(|| metadata::placeholder_track(uri)),
+    })
 }
 
 pub(crate) async fn albums(args: Value) -> AppResult<Value> {
@@ -529,15 +549,10 @@ pub(crate) async fn albums(args: Value) -> AppResult<Value> {
     let session = engine::session()?;
     let snap = snapshot(&session, Set::Collection, LIST_MAX_AGE).await?;
     let (total, page) = window(&snap, UriKind::Album, a.offset, a.limit.clamp(1, MAX_LIMIT));
-    let uris: Vec<String> = page.iter().map(|i| i.uri.clone()).collect();
-    let map = metadata::albums(&session, &uris).await?;
-    let items = page
-        .iter()
-        .filter_map(|i| {
-            Some(Saved { added_at: added_ms(i.added_at), value: AlbumItem { album: map.get(&i.uri)?.album.clone() } })
-        })
-        .collect();
-    page_value(total, items)
+    let fetched = metadata::album_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
+    saved_page(total, &page, UriKind::Album, &fetched, |uri, m| AlbumItem {
+        album: m.map(|m| m.album.clone()).unwrap_or_else(|| AlbumRef { uri: uri.to_string(), ..Default::default() }),
+    })
 }
 
 pub(crate) async fn artists(args: Value) -> AppResult<Value> {
@@ -545,15 +560,10 @@ pub(crate) async fn artists(args: Value) -> AppResult<Value> {
     let session = engine::session()?;
     let snap = snapshot(&session, Set::Artist, LIST_MAX_AGE).await?;
     let (total, page) = window(&snap, UriKind::Artist, a.offset, a.limit.clamp(1, MAX_LIMIT));
-    let uris: Vec<String> = page.iter().map(|i| i.uri.clone()).collect();
-    let map = metadata::artists(&session, &uris).await?;
-    let items = page
-        .iter()
-        .filter_map(|i| {
-            Some(Saved { added_at: added_ms(i.added_at), value: ArtistItem { artist: map.get(&i.uri)?.artist.clone() } })
-        })
-        .collect();
-    page_value(total, items)
+    let fetched = metadata::artist_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
+    saved_page(total, &page, UriKind::Artist, &fetched, |uri, m| ArtistItem {
+        artist: m.map(|m| m.artist.clone()).unwrap_or_else(|| ArtistRef { uri: uri.to_string(), ..Default::default() }),
+    })
 }
 
 pub(crate) async fn shows(args: Value) -> AppResult<Value> {
@@ -561,13 +571,10 @@ pub(crate) async fn shows(args: Value) -> AppResult<Value> {
     let session = engine::session()?;
     let snap = snapshot(&session, Set::Show, LIST_MAX_AGE).await?;
     let (total, page) = window(&snap, UriKind::Show, a.offset, a.limit.clamp(1, MAX_LIMIT));
-    let uris: Vec<String> = page.iter().map(|i| i.uri.clone()).collect();
-    let map = metadata::shows(&session, &uris).await?;
-    let items = page
-        .iter()
-        .filter_map(|i| Some(Saved { added_at: added_ms(i.added_at), value: ShowItem { show: map.get(&i.uri)?.show.clone() } }))
-        .collect();
-    page_value(total, items)
+    let fetched = metadata::show_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
+    saved_page(total, &page, UriKind::Show, &fetched, |uri, m| ShowItem {
+        show: m.map(|m| m.show.clone()).unwrap_or_else(|| ShowRef { uri: uri.to_string(), ..Default::default() }),
+    })
 }
 
 pub(crate) async fn episodes(args: Value) -> AppResult<Value> {
@@ -575,15 +582,10 @@ pub(crate) async fn episodes(args: Value) -> AppResult<Value> {
     let session = engine::session()?;
     let snap = snapshot(&session, Set::ListenLater, LIST_MAX_AGE).await?;
     let (total, page) = window(&snap, UriKind::Episode, a.offset, a.limit.clamp(1, MAX_LIMIT));
-    let uris: Vec<String> = page.iter().map(|i| i.uri.clone()).collect();
-    let map = metadata::episode_map(&session, &uris).await?;
-    let items = page
-        .iter()
-        .filter_map(|i| {
-            Some(Saved { added_at: added_ms(i.added_at), value: EpisodeItem { episode: (**map.get(&i.uri)?).clone() } })
-        })
-        .collect();
-    page_value(total, items)
+    let fetched = metadata::episode_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
+    saved_page(total, &page, UriKind::Episode, &fetched, |uri, e| EpisodeItem {
+        episode: e.cloned().unwrap_or_else(|| metadata::placeholder_episode(uri)),
+    })
 }
 
 pub(crate) async fn contains_rpc(args: Value) -> AppResult<Value> {
@@ -702,6 +704,41 @@ mod tests {
         assert_eq!(v["addedAt"], 1_700_000_000_000i64);
         assert_eq!(v["album"]["uri"], "spotify:album:x");
         assert_eq!(added_ms(0), None);
+    }
+
+    #[test]
+    fn library_pages_keep_one_item_per_window_slot() {
+        use crate::catalog::pages::tests::fetched;
+        let (a, b, c) = ("spotify:track:4uLU6hMCjMI75M1A2tKUQC", "spotify:track:7GhIk7Il098yCjg4BQjzvb", "spotify:track:2takcwOaAZWiXQijPHIx7B");
+        let album = "spotify:album:6XhjNHCyCDyyGJRM5mg40G";
+        let items: Vec<CollItem> = [a, album, b, c]
+            .iter()
+            .enumerate()
+            .map(|(i, u)| CollItem { uri: u.to_string(), added_at: 100 - i as i64 })
+            .collect();
+        let (total, page) = window(&items, UriKind::Track, 0, 10);
+        let ta = Track { uri: a.into(), name: "A".into(), ..Default::default() };
+        let track_item = |uri: &str, t: Option<&Track>| TrackItem { track: t.cloned().unwrap_or_else(|| metadata::placeholder_track(uri)) };
+        // b has no data on the server, c's request failed.
+        let v = saved_page(total, &page, UriKind::Track, &fetched(&[(a, ta.clone())], &[c]), track_item).unwrap();
+        assert_eq!(v["total"], 3);
+        let got: Vec<&str> = v["items"].as_array().unwrap().iter().map(|i| i["track"]["uri"].as_str().unwrap()).collect();
+        assert_eq!(got, [a, b, c]);
+        assert_eq!(v["items"][0]["track"]["name"], "A");
+        assert_eq!(v["items"][1]["track"]["playable"], false);
+        assert_eq!(v["items"][1]["addedAt"], 98_000);
+        assert_eq!(v["partial"], true);
+        // Missing data alone does not make a page partial.
+        let v = saved_page(total, &page, UriKind::Track, &fetched(&[(a, ta)], &[]), track_item).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 3);
+        assert!(v.get("partial").is_none());
+        // Albums keep their slot as a bare reference.
+        let (total, page) = window(&items, UriKind::Album, 0, 10);
+        let v = saved_page(total, &page, UriKind::Album, &fetched::<metadata::AlbumMeta>(&[], &[]), |uri, m| AlbumItem {
+            album: m.map(|m| m.album.clone()).unwrap_or_else(|| AlbumRef { uri: uri.to_string(), ..Default::default() }),
+        })
+        .unwrap();
+        assert_eq!(v["items"][0]["album"]["uri"], album);
     }
 
     #[test]

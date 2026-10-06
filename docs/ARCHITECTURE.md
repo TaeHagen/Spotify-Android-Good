@@ -351,8 +351,8 @@ active** → connect-state command to that device.
 | `catalog.recentlyPlayed` | `{"limit":50}` | `{"items":[MediaRef]}` |
 | `catalog.user` | `{"username"?}` | `User` (me when omitted) |
 | `library.playlists` | `{}` | `{"items":[RootlistEntry]}` (rootlist, folders preserved) |
-| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}]}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` |
-| `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"}` | paged `{"total","items":[…]}` |
+| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}],"partial"?}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` (no metadata involved: the membership source for downloads) |
+| `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"≤500}` | paged `{"total","items":[…],"partial"?}` |
 | `library.contains` | `{"uris":[…]}` | `{"contains":[bool]}` |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
 | — | | Playlist revision conflicts (stale `revision`) fail with `INVALID_ARGUMENT` and a message containing "revision"; clients reload and retry. |
@@ -363,6 +363,23 @@ active** → connect-state command to that device.
 | `playlist.updateDetails` | `{"uri","name"?,"description"?}` | `{}` |
 | `playlist.delete` | `{"uri"}` | `{}` (removes from rootlist; unfollow) |
 | `playlist.follow` / `playlist.unfollow` | `{"uri"}` | `{}` |
+
+**Item metadata failures** (pages that list tracks/episodes/albums/artists/shows: `catalog.album`,
+`catalog.artist`, `catalog.playlist`, `catalog.show`, `library.*`). A metadata failure is never
+returned as an authoritative but shorter list:
+* If no item metadata of the page could be fetched (and some was requested), the call fails with a
+  retryable `NETWORK`, `RATE_LIMITED` or `UNAVAILABLE` (never `NOT_FOUND`: the page exists).
+* If only some requests failed, the affected items keep their slot as a placeholder that carries
+  only `uri` (`playable:false`, empty `name`) and the result has `"partial": true`. Clients must not
+  cache a partial result as fresh, nor treat its item list as authoritative (e.g. to delete
+  downloads); retry later instead.
+* Items the server has no data for (taken down, undecodable) are not failures: they never set
+  `partial`. `library.*` and `catalog.playlist` keep them as placeholders too, so a page always has
+  exactly one item per slot (`library.*`: `items.length == min(limit, total - offset)`; page by
+  `offset += limit` until `offset >= total`). `catalog.album` and `catalog.show` drop them.
+* `catalog.show` episode lists that do not come with `SHOW_V4` (`SHOW_V4_EPISODES_ASSOC`, else
+  context-resolve) are cached for 30 min and shared by all pages; if neither source answers, the
+  call fails instead of returning an empty show.
 
 ### 6.4 Downloads / offline
 
@@ -387,17 +404,21 @@ Track        {"uri","name","artists":[ArtistRef],"album":AlbumRef,"durationMs","
               "trackNumber"?,"discNumber"?,"popularity"?,"hasLyrics"?}
 Episode      {"uri","name","show":{"uri","name","images"},"description","durationMs","releaseDate","images",
               "explicit","playable","resumePositionMs"?,"fullyPlayed"?}
-Album        AlbumRef + {"label"?,"copyrights":[String],"tracks":[Track],"releaseDatePrecision"?}
+Album        AlbumRef + {"label"?,"copyrights":[String],"tracks":[Track],"releaseDatePrecision"?,"partial"?:true}
 Artist       {"uri","name","images","headerImages"?,"biography"?,"topTracks":[Track],"albums":[AlbumRef],
-              "singles":[AlbumRef],"compilations":[AlbumRef],"appearsOn":[AlbumRef],"related":[ArtistRef],"following"?:bool}
+              "singles":[AlbumRef],"compilations":[AlbumRef],"appearsOn":[AlbumRef],"related":[ArtistRef],"following"?:bool,
+              "partial"?:true}
 PlaylistRef  {"uri","name","description"?,"images","owner":{"username","displayName"?},"totalTracks"?}
 Playlist     PlaylistRef + {"collaborative","isOwnedByMe","canEdit","revision","offset","total",
-              "items":[{"uid"?,"addedAt"?,"addedBy"?,"track"?:Track,"episode"?:Episode}],"following"?:bool}
+              "items":[{"uid"?,"addedAt"?,"addedBy"?,"track"?:Track,"episode"?:Episode}],"following"?:bool,"partial"?:true}
              (items never drop out, so indexes stay aligned for edits: local files and unresolved
               items keep their slot as a `track`/`episode` with `playable:false`; local files have
               empty `artists`)
 ShowRef      {"uri","name","publisher"?,"images"}
-Show         ShowRef + {"description","episodes":[Episode],"total","offset","following"?}
+Show         ShowRef + {"description","episodes":[Episode],"total","offset","following"?,"partial"?:true}
+partial      present (true) only when some item metadata could not be fetched right now; those items
+             are placeholders with just `uri` (and `playable:false`). Artist: some top tracks,
+             releases or related artists are missing. Do not cache as fresh; retry (§6.3).
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
 HomeSection  {"id","title","items":[MediaRef]}
