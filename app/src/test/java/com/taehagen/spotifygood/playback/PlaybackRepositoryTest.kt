@@ -80,6 +80,21 @@ class PlaybackRepositoryTest {
     }
 
     @Test
+    fun metadataSentBeforeTheRepositoryExistsIsNotLost() = runTest {
+        val events = NativeEvents(json)
+        events.snapshot(PlaybackSnapshot(track = PlaybackTrack(uri = "spotify:track:a", uid = "u1"), status = PlaybackStatus.PAUSED))
+        events.dispatch("queueMetadata", json.encodeToString(QueueMetadataEvent(tracks = listOf(fullTrack))))
+
+        val repo = repository(events)
+        runCurrent()
+        assertEquals("Song A", repo.snapshot.value.track?.name)
+
+        // Logout drops the replayed metadata with the rest of the account state.
+        events.reset()
+        assertEquals(0, events.queueMetadata.replayCache.size)
+    }
+
+    @Test
     fun positionIsExtrapolatedOnlyWhilePlaying() = runTest {
         val events = NativeEvents(json)
         val repo = repository(events)
