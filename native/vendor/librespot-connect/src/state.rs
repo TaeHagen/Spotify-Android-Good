@@ -4,17 +4,28 @@ mod metadata;
 mod options;
 pub(super) mod provider;
 mod restrictions;
+// SPOTIFYGOOD: local smart shuffle (suggestion interleaving)
+mod smart_shuffle;
+// SPOTIFYGOOD: builds the public ConnectSnapshot
+mod snapshot;
+// SPOTIFYGOOD: tests of the patches
+#[cfg(test)]
+mod tests;
 mod tracks;
 mod transfer;
 
+// SPOTIFYGOOD: + AudioOutputKind, AudioOutputDeviceInfo, Metadata
 use crate::{
     core::{
         Error, Session, config::DeviceType, date::Date, dealer::protocol::Request,
         spclient::SpClientResult, version,
     },
-    model::SpircPlayStatus,
+    model::{AudioOutputKind, SpircPlayStatus},
     protocol::{
-        connect::{Capabilities, Device, DeviceInfo, MemberType, PutStateReason, PutStateRequest},
+        connect::{
+            AudioOutputDeviceInfo, Capabilities, Device, DeviceInfo, MemberType, PutStateReason,
+            PutStateRequest,
+        },
         media::AudioQuality,
         player::{
             ContextIndex, ContextPlayerOptions, PlayOrigin, PlayerState, ProvidedTrack,
@@ -23,6 +34,8 @@ use crate::{
     },
     state::{
         context::{ContextType, ResetContext, StateContext},
+        // SPOTIFYGOOD: is_suggestion
+        metadata::Metadata,
         options::ShuffleState,
         provider::{IsProvider, Provider},
     },
@@ -30,7 +43,8 @@ use crate::{
 use log::LevelFilter;
 use protobuf::{EnumOrUnknown, MessageField};
 use std::{
-    collections::hash_map::DefaultHasher,
+    // SPOTIFYGOOD: BTreeMap/HashSet for skipped uids and smart shuffle suggestions
+    collections::{BTreeMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -59,6 +73,9 @@ pub(super) enum StateError {
     UnsupportedLocalPlayback,
     #[error("track uri <{0:?}> contains invalid characters")]
     InvalidTrackUri(Option<String>),
+    // SPOTIFYGOOD: local queue commands
+    #[error("no track with uid <{0}> in the next tracks")]
+    CanNotFindTrackInQueue(String),
 }
 
 impl From<StateError> for Error {
@@ -69,7 +86,9 @@ impl From<StateError> for Error {
             | NoContext(_)
             | CanNotFindTrackInContext(_, _)
             | ContextHasNoTracks
-            | InvalidTrackUri(_) => Error::failed_precondition(err),
+            | InvalidTrackUri(_)
+            // SPOTIFYGOOD
+            | CanNotFindTrackInQueue(_) => Error::failed_precondition(err),
             CurrentlyDisallowed { .. } | UnsupportedLocalPlayback => Error::unavailable(err),
         }
     }
@@ -90,6 +109,13 @@ pub struct ConnectConfig {
     pub disable_volume: bool,
     /// Number of incremental steps (default: 64)
     pub volume_steps: u16,
+    // SPOTIFYGOOD: stock librespot always takes over (and may start playing) the last
+    // session on startup, which is surprising on a phone
+    /// Automatically take over the last playback session on startup, when no other device is
+    /// active (default: false)
+    ///
+    /// Even when enabled the playback is only restored paused, it never starts audio on its own.
+    pub auto_takeover: bool,
 }
 
 impl Default for ConnectConfig {
@@ -101,6 +127,8 @@ impl Default for ConnectConfig {
             initial_volume: u16::MAX / 2,
             disable_volume: false,
             volume_steps: 64,
+            // SPOTIFYGOOD: see field docs
+            auto_takeover: false,
         }
     }
 }
@@ -131,6 +159,18 @@ pub(super) struct ConnectState {
 
     /// The volume adjustment per step when handling individual volume adjustments.
     pub volume_step_size: u16,
+
+    // SPOTIFYGOOD: uids of context tracks removed from the next tracks by the user, they are
+    // skipped by every fill up until the context is reset completely
+    skipped_uids: HashSet<String>,
+    // SPOTIFYGOOD: local smart shuffle, see state/smart_shuffle.rs
+    smart_shuffle: bool,
+    /// smart shuffle suggestions, keyed by the position in the (shuffled) default context
+    /// after which they are inserted. Never part of [StateContext::tracks], so that
+    /// unshuffling is unaffected.
+    suggestions: BTreeMap<usize, ProvidedTrack>,
+    /// uris that were already suggested for the current context
+    used_suggestion_uris: HashSet<String>,
 }
 
 impl ConnectState {
@@ -283,6 +323,29 @@ impl ConnectState {
             .volume = volume;
     }
 
+    // SPOTIFYGOOD: report the audio output (bluetooth, speaker, ...) to spotify
+    /// Updates the audio output info, returns whether it changed
+    pub fn set_audio_output(&mut self, kind: AudioOutputKind, name: Option<String>) -> bool {
+        let info = AudioOutputDeviceInfo {
+            audio_output_device_type: Some(EnumOrUnknown::new(kind.into())),
+            device_name: name,
+            ..Default::default()
+        };
+
+        let device_info = self
+            .device_mut()
+            .device_info
+            .as_mut()
+            .expect("the device_info has to be always given");
+
+        if device_info.audio_output_device_info.as_ref() == Some(&info) {
+            return false;
+        }
+
+        device_info.audio_output_device_info = MessageField::some(info);
+        true
+    }
+
     pub fn set_last_command(&mut self, command: Request) {
         self.request.last_command_message_id = command.message_id;
         self.request.last_command_sent_by_device_id = command.sent_by_device_id;
@@ -400,7 +463,10 @@ impl ConnectState {
         self.update_context_index(self.active_context, new_index + 1)?;
         self.fill_up_context = self.active_context;
 
-        if !self.current_track(|t| t.is_queue() || self.is_skip_track(t, None)) {
+        // SPOTIFYGOOD: a playing smart shuffle suggestion is not part of the context, keep it
+        // (like a queued track) instead of replacing it with the track it follows
+        if !self.current_track(|t| t.is_queue() || t.is_suggestion() || self.is_skip_track(t, None))
+        {
             self.set_current_track(new_index)?;
         }
 
@@ -486,6 +552,13 @@ impl ConnectState {
     /// Notifies the remote server about a new volume
     pub async fn notify_volume_changed(&mut self, session: &Session) -> SpClientResult {
         self.send_with_reason(session, PutStateReason::VOLUME_CHANGED)
+            .await
+    }
+
+    // SPOTIFYGOOD: see [ConnectState::set_audio_output]
+    /// Notifies the remote server about a new audio output
+    pub async fn notify_audio_output_changed(&mut self, session: &Session) -> SpClientResult {
+        self.send_with_reason(session, PutStateReason::AUDIO_DRIVER_INFO_CHANGED)
             .await
     }
 

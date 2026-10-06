@@ -127,7 +127,8 @@ pub struct ContextResolver {
 }
 
 // time after which an unavailable context is retried
-const RETRY_UNAVAILABLE: Duration = Duration::from_secs(3600);
+// SPOTIFYGOOD: was 3600s, too long for flaky mobile networks
+const RETRY_UNAVAILABLE: Duration = Duration::from_secs(60);
 
 impl ContextResolver {
     pub fn new(session: Session) -> Self {
@@ -139,10 +140,12 @@ impl ContextResolver {
     }
 
     pub fn add(&mut self, resolve: ResolveContext) {
+        // SPOTIFYGOOD: the arguments were swapped (`then.duration_since(now)` saturates to zero),
+        // so an unavailable context was never retried
         let last_try = self
             .unavailable_contexts
             .get(&resolve)
-            .map(|i| i.duration_since(Instant::now()));
+            .map(|i| Instant::now().duration_since(*i));
 
         let last_try = if matches!(last_try, Some(last_try) if last_try > RETRY_UNAVAILABLE) {
             let _ = self.unavailable_contexts.remove(&resolve);
@@ -188,6 +191,12 @@ impl ContextResolver {
         self.queue = VecDeque::new()
     }
 
+    // SPOTIFYGOOD: see Spirc::set_autoplay
+    pub fn remove_autoplay(&mut self) {
+        self.queue
+            .retain(|resolve| resolve.update != ContextType::Autoplay)
+    }
+
     fn find_next(&self) -> Option<(&ResolveContext, &str, usize)> {
         for idx in 0..self.queue.len() {
             let next = self.queue.get(idx)?;
@@ -204,6 +213,11 @@ impl ContextResolver {
 
     pub fn has_next(&self) -> bool {
         self.find_next().is_some()
+    }
+
+    // SPOTIFYGOOD: smart shuffle needs to know when the default context changed
+    pub fn next_update(&self) -> Option<ContextType> {
+        self.find_next().map(|(next, _, _)| next.update)
     }
 
     pub async fn get_next_context(

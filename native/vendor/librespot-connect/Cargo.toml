@@ -70,11 +70,15 @@ version = "1.0"
 [dependencies.thiserror]
 version = "2"
 
+# SPOTIFYGOOD: "rt" (tokio::spawn for smart-shuffle fetches) and "time" (sleep, shutdown
+# timeouts) were only available through feature unification with librespot-core.
 [dependencies.tokio]
 version = "1"
 features = [
     "macros",
+    "rt",
     "sync",
+    "time",
 ]
 
 [dependencies.tokio-stream]

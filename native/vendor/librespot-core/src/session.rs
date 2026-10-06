@@ -3,7 +3,7 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    process::exit,
+    // SPOTIFYGOOD: removed `process::exit` (check_catalogue no longer exits the process)
     sync::{Arc, OnceLock, RwLock, Weak},
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -76,6 +76,21 @@ impl From<quick_xml::encoding::EncodingError> for Error {
 
 pub type UserAttributes = HashMap<String, String>;
 
+// SPOTIFYGOOD: replaces the `exit(1)` in check_catalogue with a queryable reason.
+/// Why librespot invalidated (shut down) a [Session] on its own.
+///
+/// See [Session::invalid_reason].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum SessionInvalidReason {
+    /// The account is not a Premium account (`type` user attribute != `premium`).
+    #[error("{account_type:?} accounts are not supported, a Premium account is required")]
+    NonPremiumAccount {
+        /// The value of the `type` user attribute, e.g. `free` or `open`.
+        account_type: String,
+    },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UserData {
     pub country: String,
@@ -94,6 +109,8 @@ struct SessionData {
     auth_data: Vec<u8>,
     time_delta: i64,
     invalid: bool,
+    // SPOTIFYGOOD: why librespot invalidated the session itself, see [Session::invalid_reason]
+    invalid_reason: Option<SessionInvalidReason>,
     user_data: UserData,
 }
 
@@ -361,14 +378,27 @@ impl Session {
         );
     }
 
-    fn check_catalogue(attributes: &UserAttributes) {
+    // SPOTIFYGOOD: was an associated fn calling `std::process::exit(1)` for non-Premium
+    // accounts, which kills the Android app process. Now a method that records the reason
+    // (see [Session::invalid_reason]) and shuts the session down instead.
+    fn check_catalogue(&self, attributes: &UserAttributes) {
         if let Some(account_type) = attributes.get("type") {
             if account_type != "premium" {
+                {
+                    let mut data = self.0.data.write().expect(SESSION_DATA_POISON_MSG);
+                    if data.invalid_reason.is_some() {
+                        // already reported and shut down
+                        return;
+                    }
+                    data.invalid_reason = Some(SessionInvalidReason::NonPremiumAccount {
+                        account_type: account_type.clone(),
+                    });
+                }
+
                 error!("librespot does not support {account_type:?} accounts.");
                 info!("Please support Spotify and your artists and sign up for a premium account.");
 
-                // TODO: logout instead of exiting
-                exit(1);
+                self.shutdown();
             }
         }
     }
@@ -597,7 +627,8 @@ impl Session {
     pub fn set_user_attribute(&self, key: &str, value: &str) -> Option<String> {
         let mut dummy_attributes = UserAttributes::new();
         dummy_attributes.insert(key.to_owned(), value.to_owned());
-        Self::check_catalogue(&dummy_attributes);
+        // SPOTIFYGOOD: check_catalogue is a method now (records the reason + shutdown)
+        self.check_catalogue(&dummy_attributes);
 
         self.0
             .data
@@ -609,7 +640,8 @@ impl Session {
     }
 
     pub fn set_user_attributes(&self, attributes: UserAttributes) {
-        Self::check_catalogue(&attributes);
+        // SPOTIFYGOOD: check_catalogue is a method now (records the reason + shutdown)
+        self.check_catalogue(&attributes);
 
         self.0
             .data
@@ -644,6 +676,21 @@ impl Session {
 
     pub fn is_invalid(&self) -> bool {
         self.0.data.read().expect(SESSION_DATA_POISON_MSG).invalid
+    }
+
+    // SPOTIFYGOOD: lets the app tell *why* the session was invalidated by librespot itself
+    // (e.g. a non-Premium account), instead of the process just exiting.
+    /// The reason librespot invalidated this session on its own, if any.
+    ///
+    /// `None` while the session is valid, or when it was shut down for another reason
+    /// (an explicit [Session::shutdown], a lost connection, ...).
+    pub fn invalid_reason(&self) -> Option<SessionInvalidReason> {
+        self.0
+            .data
+            .read()
+            .expect(SESSION_DATA_POISON_MSG)
+            .invalid_reason
+            .clone()
     }
 }
 
@@ -844,7 +891,8 @@ where
                 }
 
                 trace!("Received product info: {user_attributes:#?}");
-                Session::check_catalogue(&user_attributes);
+                // SPOTIFYGOOD: check_catalogue is a method now (records the reason + shutdown)
+                session.check_catalogue(&user_attributes);
 
                 session
                     .0

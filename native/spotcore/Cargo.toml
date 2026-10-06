@@ -9,14 +9,18 @@ description = "librespot-based Spotify engine exposed to the Android app over JN
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# librespot crates are pinned exactly: core, connect and playback are vendored and patched
+# (see ../vendor/README.md); the others must match their 0.8.0 APIs.
 [dependencies]
-librespot-core = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
-librespot-connect = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
-librespot-playback = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
-librespot-metadata = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
-librespot-audio = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
-librespot-oauth = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
-librespot-protocol = "0.8.0"
+librespot-core = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-connect = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-playback = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-metadata = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-audio = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-oauth = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-discovery = { version = "=0.8.0", default-features = false, features = ["with-libmdns"] }
+librespot-protocol = "=0.8.0"
+
 jni = "0.21"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "fs"] }
 futures-util = "0.3"
@@ -26,8 +30,26 @@ log = "0.4"
 thiserror = "2"
 parking_lot = "0.12"
 protobuf = "3.7"
+protobuf-json-mapping = "3.7"
 hex = "0.4"
 bytes = "1"
+http = "1"
+url = "2"
+percent-encoding = "2"
+base64 = "0.22"
+rand = { version = "0.9", features = ["small_rng"] }
+uuid = { version = "1", features = ["v4"] }
+lru = "0.12"
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
+
+[build-dependencies]
+protobuf-codegen = "3.7"
+# librespot-core 0.8.0's build script breaks with vergen 9.1 (vergen-lib 9 vs 0.1); pin the
+# whole graph to the last compatible release. Not used by our build script.
+vergen = { version = "=9.0.6", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

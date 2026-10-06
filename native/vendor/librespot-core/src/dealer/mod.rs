@@ -703,13 +703,31 @@ where
                         break
                     },
                     e = get_url() => e
-                }?;
+                };
+
+                // SPOTIFYGOOD: a failing `get_url()` (transient login5/apresolve error) used to
+                // end the dealer permanently via `?`, silently killing Connect. Log, wait and
+                // retry instead, while still honouring close.
+                let url = match url {
+                    Ok(url) => url,
+                    Err(e) => {
+                        error!("Error while resolving the dealer url: {e}");
+                        select! {
+                            () = shared.closed() => break,
+                            () = tokio::time::sleep(RECONNECT_INTERVAL) => continue,
+                        }
+                    }
+                };
 
                 match connect(&url, proxy.as_ref(), &shared).await {
                     Ok((s, r)) => tasks = (init_task(s), init_task(r)),
                     Err(e) => {
                         error!("Error while connecting: {e}");
-                        tokio::time::sleep(RECONNECT_INTERVAL).await;
+                        // SPOTIFYGOOD: don't make `Dealer::close` wait out the reconnect delay
+                        select! {
+                            () = shared.closed() => break,
+                            () = tokio::time::sleep(RECONNECT_INTERVAL) => (),
+                        }
                     }
                 }
             }

@@ -1,5 +1,9 @@
+// SPOTIFYGOOD: + AudioOutputDeviceType
 use crate::{
-    core::dealer::protocol::SkipTo, protocol::context_player_options::ContextPlayerOptionOverrides,
+    core::dealer::protocol::SkipTo,
+    protocol::{
+        connect::AudioOutputDeviceType, context_player_options::ContextPlayerOptionOverrides,
+    },
 };
 
 use std::ops::Deref;
@@ -70,6 +74,12 @@ pub struct Options {
     pub repeat: bool,
     /// Start the context, repeating the first track until skipped or manually disabled
     pub repeat_track: bool,
+    // SPOTIFYGOOD: allows a load to start directly in (local) smart shuffle mode
+    /// Start the context in smart shuffle mode (implies `shuffle`)
+    ///
+    /// Suggested tracks are interleaved into the shuffled context, see
+    /// [Spirc::smart_shuffle](crate::Spirc::smart_shuffle).
+    pub smart_shuffle: bool,
 }
 
 impl From<ContextPlayerOptionOverrides> for Options {
@@ -78,6 +88,44 @@ impl From<ContextPlayerOptionOverrides> for Options {
             shuffle: value.shuffling_context.unwrap_or_default(),
             repeat: value.repeating_context.unwrap_or_default(),
             repeat_track: value.repeating_track.unwrap_or_default(),
+            // SPOTIFYGOOD: spotify's own smart shuffle protocol (`modes`) is unknown
+            smart_shuffle: false,
+        }
+    }
+}
+
+// SPOTIFYGOOD: reported to spotify as `DeviceInfo.audio_output_device_info`,
+// see [Spirc::set_audio_output](crate::Spirc::set_audio_output)
+/// The kind of audio output the device currently plays to
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioOutputKind {
+    /// Unknown or not reported
+    #[default]
+    Unknown,
+    /// The speaker of the device itself
+    BuiltInSpeaker,
+    /// A wired output (headphones, line out, usb)
+    LineOut,
+    /// A bluetooth device
+    Bluetooth,
+    /// An airplay receiver
+    Airplay,
+    /// A car audio system
+    Automotive,
+    /// A projected car system (android auto, carplay)
+    CarProjected,
+}
+
+impl From<AudioOutputKind> for AudioOutputDeviceType {
+    fn from(value: AudioOutputKind) -> Self {
+        match value {
+            AudioOutputKind::Unknown => AudioOutputDeviceType::UNKNOWN_AUDIO_OUTPUT_DEVICE_TYPE,
+            AudioOutputKind::BuiltInSpeaker => AudioOutputDeviceType::BUILT_IN_SPEAKER,
+            AudioOutputKind::LineOut => AudioOutputDeviceType::LINE_OUT,
+            AudioOutputKind::Bluetooth => AudioOutputDeviceType::BLUETOOTH,
+            AudioOutputKind::Airplay => AudioOutputDeviceType::AIRPLAY,
+            AudioOutputKind::Automotive => AudioOutputDeviceType::AUTOMOTIVE,
+            AudioOutputKind::CarProjected => AudioOutputDeviceType::CAR_PROJECTED,
         }
     }
 }

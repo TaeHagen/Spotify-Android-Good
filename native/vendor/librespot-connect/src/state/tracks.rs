@@ -58,7 +58,8 @@ impl<'ct> ConnectState {
     }
 
     /// top => bottom, aka the first track of the list is the next track
-    fn next_tracks_mut(&mut self) -> &mut Vec<ProvidedTrack> {
+    // SPOTIFYGOOD: pub(super) for the local queue commands in state/handle.rs
+    pub(super) fn next_tracks_mut(&mut self) -> &mut Vec<ProvidedTrack> {
         &mut self.player_mut().next_tracks
     }
 
@@ -210,10 +211,21 @@ impl<'ct> ConnectState {
         self.fill_up_next_tracks()?;
         self.set_track(new_track);
 
-        if self.player().index.track == 0 {
-            warn!("prev: trying to skip into negative, index update skipped")
-        } else {
-            self.update_current_index(|i| i.track -= 1)
+        // SPOTIFYGOOD: prefer the context index of the track itself, decrementing blindly is
+        // wrong while shuffled and for smart shuffle suggestions
+        let context_index = self.current_track(|t| {
+            if t.is_queue() {
+                None
+            } else {
+                t.get_context_index()
+            }
+        });
+        match context_index {
+            Some(index) => self.update_current_index(|i| i.track = index as u32),
+            None if self.player().index.track == 0 => {
+                warn!("prev: trying to skip into negative, index update skipped")
+            }
+            None => self.update_current_index(|i| i.track -= 1),
         }
 
         self.update_restrictions();
@@ -288,6 +300,8 @@ impl<'ct> ConnectState {
 
         while self.next_tracks().len() < SPOTIFY_MAX_NEXT_TRACKS_SIZE {
             let ctx = self.get_context(self.fill_up_context)?;
+            // SPOTIFYGOOD: smart shuffle suggestion that follows the pushed context track
+            let mut suggestion = None;
             let track = match ctx.tracks.get(new_index) {
                 None if self.repeat_context() => {
                     let delimiter = Self::new_delimiter(iteration.into());
@@ -322,7 +336,12 @@ impl<'ct> ConnectState {
                     }
                 }
                 None => break,
-                Some(ct) if ct.is_unavailable() || self.is_skip_track(ct, Some(iteration)) => {
+                // SPOTIFYGOOD: also skip tracks the user removed from the next tracks
+                Some(ct)
+                    if ct.is_unavailable()
+                        || self.is_skip_track(ct, Some(iteration))
+                        || self.skipped_uids.contains(&ct.uid) =>
+                {
                     debug!(
                         "skipped track {} during fillup as it's unavailable or should be skipped",
                         ct.uri
@@ -331,12 +350,21 @@ impl<'ct> ConnectState {
                     continue;
                 }
                 Some(ct) => {
+                    // SPOTIFYGOOD: smart shuffle
+                    suggestion = self.suggestion_after(new_index, ct);
                     new_index += 1;
                     ct.clone()
                 }
             };
 
             self.next_tracks_mut().push(track);
+
+            // SPOTIFYGOOD: smart shuffle, the suggestion never displaces a context track
+            if let Some(suggestion) = suggestion {
+                if self.next_tracks().len() < SPOTIFY_MAX_NEXT_TRACKS_SIZE {
+                    self.next_tracks_mut().push(suggestion)
+                }
+            }
         }
 
         debug!(
@@ -435,5 +463,77 @@ impl<'ct> ConnectState {
             self.update_queue_revision();
         }
         self.update_restrictions();
+    }
+
+    // SPOTIFYGOOD: local "skip to" (tap on an entry of the next tracks)
+    /// Skips to the entry of the next tracks with the given uid
+    ///
+    /// Fails without changing anything if no playable entry with that uid exists. Context and
+    /// autoplay tracks that are skipped over move to the previous tracks (like a series of
+    /// [ConnectState::next_track]). Queued tracks are kept when skipping to a context track, and
+    /// dropped when skipping to a later queued track.
+    pub fn skip_to_uid(&mut self, uid: &str) -> Result<(), Error> {
+        let position = self
+            .next_tracks()
+            .iter()
+            .position(|t| {
+                t.uid == uid && !t.uid.starts_with(IDENTIFIER_DELIMITER) && !t.is_unavailable()
+            })
+            .ok_or_else(|| StateError::CanNotFindTrackInQueue(uid.to_string()))?;
+
+        // when we skip in repeat track, we don't repeat the current track anymore
+        if self.repeat_track() {
+            self.set_repeat_track(false);
+        }
+
+        let mut skipped = self
+            .next_tracks_mut()
+            .drain(..=position)
+            .collect::<Vec<_>>();
+        let new_track = skipped.pop().expect("contains at least the target track");
+        let keep_queue = !new_track.is_queue();
+
+        if let Some(old_track) = self.player_mut().track.take() {
+            // only add songs from our context to our previous tracks
+            if old_track.is_context() || old_track.is_autoplay() {
+                self.push_prev(old_track)
+            }
+        }
+
+        let mut kept_queue = Vec::new();
+        for track in skipped {
+            if track.is_queue() {
+                if keep_queue {
+                    kept_queue.push(track)
+                }
+            } else if track.is_context() || track.is_autoplay() {
+                // also moves delimiters to the prev tracks, like next_track does
+                self.push_prev(track)
+            }
+            // unavailable tracks are dropped
+        }
+        self.next_tracks_mut().splice(0..0, kept_queue);
+
+        self.fill_up_next_tracks()?;
+
+        let update_index = if new_track.is_queue() {
+            None
+        } else if new_track.is_autoplay() {
+            self.set_active_context(ContextType::Autoplay);
+            None
+        } else {
+            new_track.get_context_index().map(|i| i as u32)
+        };
+
+        if let Some(update_index) = update_index {
+            self.update_current_index(|i| i.track = update_index)
+        } else {
+            self.player_mut().index.clear()
+        }
+
+        self.set_track(new_track);
+        self.update_restrictions();
+
+        Ok(())
     }
 }

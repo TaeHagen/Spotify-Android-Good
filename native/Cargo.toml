@@ -10,6 +10,7 @@ rust-version = "1.85"
 [patch.crates-io]
 librespot-core = { path = "vendor/librespot-core" }
 librespot-connect = { path = "vendor/librespot-connect" }
+librespot-playback = { path = "vendor/librespot-playback" }
 
 [profile.release]
 opt-level = 3

@@ -117,6 +117,10 @@ impl ConnectState {
                 self.context = None;
                 self.autoplay_context = None;
 
+                // SPOTIFYGOOD: removed tracks and smart shuffle belong to the old context
+                self.skipped_uids.clear();
+                self.clear_smart_shuffle();
+
                 let player = self.player_mut();
                 player.context_uri.clear();
                 player.context_url.clear();

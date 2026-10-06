@@ -50,7 +50,8 @@ impl ConnectState {
         self.set_repeat_context(false);
     }
 
-    fn validate_shuffle_allowed(&self) -> Result<(), Error> {
+    // SPOTIFYGOOD: pub(super) for smart shuffle
+    pub(super) fn validate_shuffle_allowed(&self) -> Result<(), Error> {
         if let Some(reason) = self
             .player()
             .restrictions

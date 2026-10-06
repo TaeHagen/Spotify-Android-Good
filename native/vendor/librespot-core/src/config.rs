@@ -10,15 +10,25 @@ pub(crate) const IOS_CLIENT_ID: &str = "58bd3c95768941ea9eb4350aaa033eb3";
 // Easily adjust the current platform to mock the behavior on it. If for example
 // android or ios needs to be mocked, the `os_version` has to be set to a valid version.
 // Otherwise, client-token or login5 requests will fail with a generic invalid-credential error.
-/// See [std::env::consts::OS]
-pub const OS: &str = std::env::consts::OS;
+/// The platform librespot presents itself as (upstream: [std::env::consts::OS])
+// SPOTIFYGOOD: always present the Linux desktop identity. Built for target_os=android,
+// librespot would present the Android-app identity (Android client id, client-token
+// platform data, user agent), which Spotify rejects for keymaster-minted credentials.
+// Every platform branch in this crate (client id default, login5, client-token platform
+// data, user agent, AP handshake platform and system_info, spotify_version) matches on
+// this const, so pinning it keeps them coherent. spotify-player's Termux build does the same.
+pub const OS: &str = "linux";
 
 // valid versions for some os:
 // 'android': 30
 // 'ios': 17
 /// See [sysinfo::System::os_version]
 pub fn os_version() -> String {
-    sysinfo::System::os_version().unwrap_or("0".into())
+    // SPOTIFYGOOD: never return an empty/zero version (sysinfo can return None or "" on
+    // Android); fall back to a plausible Linux version for the desktop identity.
+    sysinfo::System::os_version()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "6.1".into())
 }
 
 #[derive(Clone, Debug)]

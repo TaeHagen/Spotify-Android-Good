@@ -106,6 +106,24 @@ impl Default for RequestOptions {
     }
 }
 
+// SPOTIFYGOOD: the fields are private and there was no constructor besides `Default`, so
+// callers outside this crate could not use `request_with_options` without metrics/salt
+// query params or with another base url (e.g. for raw connect-state commands).
+impl RequestOptions {
+    /// Creates request options.
+    ///
+    /// - `metrics`: append `product=0&country=..` to the url
+    /// - `salt`: append a random `salt=..` to the url
+    /// - `base_url`: use this base url instead of the resolved spclient access point
+    pub fn new(metrics: bool, salt: bool, base_url: Option<&'static str>) -> Self {
+        Self {
+            metrics,
+            salt,
+            base_url,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct TransferRequest {
     pub transfer_options: TransferOptions,
