@@ -57,7 +57,14 @@ interface DownloadDao {
     @Query("SELECT COUNT(*) FROM downloads WHERE state IN ('queued','preparing','downloading')")
     fun observePendingCount(): Flow<Int>
 
-    @Query("SELECT COALESCE(SUM(sizeBytes), 0) FROM downloads WHERE state = 'completed'")
+    /**
+     * Bytes of downloaded audio on disk: every row that owns a finished file (also ones marked failed
+     * later, which keep it until removed), each shared file once.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(size), 0) FROM " +
+            "(SELECT MAX(sizeBytes) AS size FROM downloads WHERE path IS NOT NULL GROUP BY COALESCE(LOWER(fileId), path))",
+    )
     fun observeUsedBytes(): Flow<Long>
 
     /** Newest download first (like the Downloads screen). */
@@ -199,6 +206,13 @@ interface DownloadDao {
 
     @Query("UPDATE downloads SET state = 'failed', error = :error, lastValidatedAt = :at WHERE uri IN (:uris) AND state = 'completed'")
     suspend fun markUnavailable(uris: List<String>, error: String, at: Long)
+
+    /** Completed downloads whose file is gone: failed, and no longer counted as stored. */
+    @Query(
+        "UPDATE downloads SET state = 'failed', error = :error, lastValidatedAt = :at, path = NULL, sizeBytes = 0, bytesDone = 0 " +
+            "WHERE uri IN (:uris) AND state = 'completed'",
+    )
+    suspend fun markMissing(uris: List<String>, error: String, at: Long)
 
     @Query("UPDATE downloads SET metadataJson = :metadataJson WHERE uri = :uri AND metadataJson IS NULL")
     suspend fun fillMetadata(uri: String, metadataJson: String)

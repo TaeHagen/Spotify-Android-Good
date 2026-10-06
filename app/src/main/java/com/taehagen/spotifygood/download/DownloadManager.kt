@@ -423,7 +423,7 @@ class DownloadManager(
         }
         val now = System.currentTimeMillis()
         undecryptable.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, appContext.getString(R.string.data_dl_error_key), now) }
-        missing.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, appContext.getString(R.string.data_dl_error_missing_file), now) }
+        missing.chunked(SQL_CHUNK).forEach { dao.markMissing(it, appContext.getString(R.string.data_dl_error_missing_file), now) }
         if (undecryptable.isNotEmpty() || missing.isNotEmpty()) {
             Log.w(TAG, "Skipped ${undecryptable.size} undecryptable and ${missing.size} missing downloads")
         }
