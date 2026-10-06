@@ -32,7 +32,7 @@ class Converters {
 
 @Database(
     entities = [DownloadEntity::class, DownloadCollectionEntity::class, RecentSearchEntity::class, ResponseCacheEntity::class],
-    version = 1,
+    version = 2,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
