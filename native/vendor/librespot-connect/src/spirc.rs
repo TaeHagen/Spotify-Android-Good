@@ -33,6 +33,8 @@ use crate::{
         context::{ContextType, ResetContext},
         provider::IsProvider,
         {ConnectConfig, ConnectState},
+        // SPOTIFYGOOD: queue limit of Spirc::add_to_queue
+        SPOTIFY_MAX_NEXT_TRACKS_SIZE, StateError,
     },
 };
 use futures_util::StreamExt;
@@ -144,6 +146,26 @@ struct SpircTask {
     suggestions_tx: mpsc::UnboundedSender<SuggestionResponse>,
     suggestions_rx: mpsc::UnboundedReceiver<SuggestionResponse>,
     suggestion_fetch: SuggestionFetch,
+    queue_gauge: Arc<QueueGauge>,
+}
+
+// SPOTIFYGOOD: lets Spirc::add_to_queue reject an add right away when the queue is full, the
+// command itself is only handled later by the task
+#[derive(Default)]
+struct QueueGauge {
+    /// queued tracks in the next tracks, as of the last handled event
+    queued: AtomicUsize,
+    /// add_to_queue commands sent but not handled yet
+    pending: AtomicUsize,
+}
+
+impl QueueGauge {
+    fn add_handled(&self, queued: usize) {
+        self.queued.store(queued, Ordering::Release);
+        let _ = self
+            .pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
 }
 
 // SPOTIFYGOOD: the result of a smart shuffle suggestion fetch, sent back into the loop
@@ -267,6 +289,7 @@ pub struct Spirc {
     snapshot_rx: watch::Receiver<ConnectSnapshot>,
     cluster_rx: watch::Receiver<Option<Arc<Cluster>>>,
     errors_rx: broadcast::Receiver<SpircCommandError>,
+    queue_gauge: Arc<QueueGauge>,
 }
 
 impl Spirc {
@@ -353,6 +376,8 @@ impl Spirc {
         let (suggestions_tx, suggestions_rx) = mpsc::unbounded_channel();
 
         let player_events = player.get_player_event_channel();
+        // SPOTIFYGOOD
+        let queue_gauge = Arc::new(QueueGauge::default());
 
         let mut task = SpircTask {
             player,
@@ -398,6 +423,7 @@ impl Spirc {
             suggestions_tx,
             suggestions_rx,
             suggestion_fetch: SuggestionFetch::default(),
+            queue_gauge: queue_gauge.clone(),
         };
 
         let spirc = Spirc {
@@ -406,6 +432,7 @@ impl Spirc {
             snapshot_rx,
             cluster_rx,
             errors_rx,
+            queue_gauge,
         };
 
         let initial_volume = task.connect_state.device_info().volume;
@@ -604,9 +631,24 @@ impl Spirc {
 
     /// Adds the track or episode `uri` to the end of the user queue
     ///
+    /// Fails right away (with [ErrorKind::FailedPrecondition](crate::core::error::ErrorKind))
+    /// when the queued tracks, including the adds that weren't handled yet, already fill the
+    /// next tracks (80 entries). The task checks again when it handles the command and reports
+    /// a full queue as a command error.
+    ///
     /// Does nothing if we are not the active device.
     pub fn add_to_queue(&self, uri: String) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::AddToQueue(uri))?)
+        let gauge = &self.queue_gauge;
+        let in_flight = gauge.pending.fetch_add(1, Ordering::AcqRel);
+        if gauge.queued.load(Ordering::Acquire) + in_flight >= SPOTIFY_MAX_NEXT_TRACKS_SIZE {
+            gauge.pending.fetch_sub(1, Ordering::AcqRel);
+            return Err(StateError::QueueFull(SPOTIFY_MAX_NEXT_TRACKS_SIZE).into());
+        }
+        if let Err(why) = self.commands.send(SpircCommand::AddToQueue(uri)) {
+            gauge.pending.fetch_sub(1, Ordering::AcqRel);
+            return Err(why.into());
+        }
+        Ok(())
     }
 
     /// Removes the entry with the given `uid` from the next tracks
@@ -869,6 +911,9 @@ impl SpircTask {
             // SPOTIFYGOOD: covers every path above without touching each handler
             self.maybe_fetch_suggestions();
             self.publish_snapshot();
+            self.queue_gauge
+                .queued
+                .store(self.connect_state.queued_count(), Ordering::Release);
         }
 
         // SPOTIFYGOOD: the final snapshot is the state when the loop ended (see
@@ -985,7 +1030,13 @@ impl SpircTask {
     // SPOTIFYGOOD: handles a command and reports its outcome (snapshot + error stream)
     async fn dispatch_command(&mut self, cmd: SpircCommand) {
         let name = cmd.name();
-        match self.handle_command(cmd).await {
+        let is_add = matches!(cmd, SpircCommand::AddToQueue(_));
+        let result = self.handle_command(cmd).await;
+        if is_add {
+            self.queue_gauge
+                .add_handled(self.connect_state.queued_count());
+        }
+        match result {
             Ok(()) => self.last_error = None,
             Err(e) => {
                 debug!("could not dispatch command: {e}");
@@ -1521,7 +1572,9 @@ impl SpircTask {
             SetRepeatingTrack(repeat_track) => self.handle_repeat_track(repeat_track.value),
             // SPOTIFYGOOD: preload the new next track after queue changes
             AddToQueue(add_to_queue) => {
-                self.connect_state.add_to_queue(add_to_queue.track, true);
+                // SPOTIFYGOOD: fails (instead of dropping the track) when the queue is full
+                self.connect_state
+                    .add_to_queue(add_to_queue.track, true)?;
                 self.handle_next_tracks_changed();
             }
             SetQueue(set_queue) => {

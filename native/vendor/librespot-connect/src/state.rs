@@ -52,7 +52,8 @@ use thiserror::Error;
 
 // these limitations are essential, otherwise to many tracks will overload the web-player
 const SPOTIFY_MAX_PREV_TRACKS_SIZE: usize = 10;
-const SPOTIFY_MAX_NEXT_TRACKS_SIZE: usize = 80;
+// SPOTIFYGOOD: pub(crate) for the queue limit of Spirc::add_to_queue
+pub(crate) const SPOTIFY_MAX_NEXT_TRACKS_SIZE: usize = 80;
 
 #[derive(Debug, Error)]
 pub(super) enum StateError {
@@ -76,6 +77,9 @@ pub(super) enum StateError {
     // SPOTIFYGOOD: local queue commands
     #[error("no track with uid <{0}> in the next tracks")]
     CanNotFindTrackInQueue(String),
+    // SPOTIFYGOOD: the queued tracks fill the (capped) next tracks
+    #[error("the queue is full ({0} tracks)")]
+    QueueFull(usize),
 }
 
 impl From<StateError> for Error {
@@ -88,7 +92,8 @@ impl From<StateError> for Error {
             | ContextHasNoTracks
             | InvalidTrackUri(_)
             // SPOTIFYGOOD
-            | CanNotFindTrackInQueue(_) => Error::failed_precondition(err),
+            | CanNotFindTrackInQueue(_)
+            | QueueFull(_) => Error::failed_precondition(err),
             CurrentlyDisallowed { .. } | UnsupportedLocalPlayback => Error::unavailable(err),
         }
     }

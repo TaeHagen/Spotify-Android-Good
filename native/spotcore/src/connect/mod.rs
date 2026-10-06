@@ -168,7 +168,7 @@ fn local_control(cmd: &Ctl, activate: bool) -> AppResult<()> {
         Ctl::Shuffle(enabled) => local::sent(spirc.shuffle(*enabled)),
         Ctl::SmartShuffle(enabled) => local::sent(spirc.smart_shuffle(*enabled)),
         Ctl::Repeat(mode) => local::set_repeat(&spirc, *mode),
-        Ctl::QueueAdd(u) => local::sent(spirc.add_to_queue(u.clone())),
+        Ctl::QueueAdd(u) => local::queue_add(&spirc, u),
         Ctl::QueueRemove(uid) => local::sent(spirc.remove_from_queue(uid.clone())),
         Ctl::QueueMove(uid, to) => {
             let raw = hub::local_snapshot()

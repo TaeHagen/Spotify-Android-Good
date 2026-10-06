@@ -176,7 +176,11 @@ impl ConnectState {
                 None,
                 Some(Provider::Queue),
             ) {
-                self.add_to_queue(queued_track, false);
+                // SPOTIFYGOOD: add_to_queue fails once the queue is full
+                if let Err(why) = self.add_to_queue(queued_track, false) {
+                    warn!("transferred queue truncated: {why}");
+                    break;
+                }
             }
         }
 
