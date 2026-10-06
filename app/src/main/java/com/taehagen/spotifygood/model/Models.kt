@@ -232,6 +232,9 @@ data class RootlistEntry(
     val images: List<Image> = emptyList(),
     val owner: PlaylistOwner? = null,
     val children: List<RootlistEntry> = emptyList(),
+    val collaborative: Boolean = false,
+    /** True when the logged-in user may add/remove items (owner or collaborative). */
+    val canEdit: Boolean = false,
 )
 
 @Serializable
