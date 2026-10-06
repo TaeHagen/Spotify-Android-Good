@@ -327,7 +327,7 @@ active** → connect-state command to that device.
 | `player.applySettings` | `EngineSettings` subset (bitrate/normalisation) |
 | `queue.add` | `{"uri":"spotify:track:…"}` |
 | `queue.remove` | `{"uid":"…"}` |
-| `queue.move` | `{"uid":"…","toIndex":0}` |
+| `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
 | `connect.transfer` | `{"deviceId":"…","play":true?}` (self = pull, other = push) |
@@ -354,10 +354,11 @@ active** → connect-state command to that device.
 | `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"}` | paged `{"total","items":[…]}` |
 | `library.contains` | `{"uris":[…]}` | `{"contains":[bool]}` |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
+| — | | Playlist revision conflicts (stale `revision`) fail with `INVALID_ARGUMENT` and a message containing "revision"; clients reload and retry. |
 | `playlist.create` | `{"name","description"?,"public":false}` | `{"uri"}` (also added to rootlist) |
 | `playlist.addItems` | `{"uri","uris":[…],"position":null}` | `{"revision"}` |
 | `playlist.removeItems` | `{"uri","items":[{"uri","index"}],"revision"}` | `{"revision"}` |
-| `playlist.moveItems` | `{"uri","fromIndex","length","toIndex","revision"}` | `{"revision"}` |
+| `playlist.moveItems` | `{"uri","fromIndex","length","toIndex","revision"}` | `{"revision"}` — `toIndex` uses playlist4 MOV semantics: the insert-before position in the list *before* the move (moving item 2 to the end of a 5-item list: from 2, to 5) |
 | `playlist.updateDetails` | `{"uri","name"?,"description"?}` | `{}` |
 | `playlist.delete` | `{"uri"}` | `{}` (removes from rootlist; unfollow) |
 | `playlist.follow` / `playlist.unfollow` | `{"uri"}` | `{}` |
