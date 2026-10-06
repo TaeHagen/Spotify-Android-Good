@@ -26,8 +26,13 @@ import kotlinx.serialization.json.put
  * going through the UI-facing repositories (no caching: downloads always want fresh membership).
  */
 internal class CollectionResolver(private val rpc: NativeRpc, private val json: Json) {
-    /** [metadataJson] is null when the source lists URIs only (Liked Songs). */
-    data class Item(val uri: String, val metadataJson: String?)
+    /**
+     * [metadataJson] is null when the source lists URIs only (Liked Songs). [unavailable]: the catalog
+     * resolved the item and reports it as not playable here (region, explicit filter, relinking
+     * included), so downloading it would fail. Unresolved placeholders (`playable:false` without a
+     * name) are not unavailable: their lookup failed, `download.track` may well succeed.
+     */
+    data class Item(val uri: String, val metadataJson: String?, val unavailable: Boolean = false)
 
     /**
      * [complete]: the source listed every item and nothing failed (item count matches the total it
@@ -167,9 +172,11 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
     private suspend fun fetchEpisodes(uris: List<String>): List<Episode> =
         rpc.callOffMain<EpisodesResult>("catalog.episodes", rpcArgs { putStrings("uris", uris) }).episodes
 
-    private fun trackItem(track: Track) = Item(track.uri, json.encodeToString(Track.serializer(), track))
+    private fun trackItem(track: Track) =
+        Item(track.uri, json.encodeToString(Track.serializer(), track), unavailable = !track.playable && track.name.isNotEmpty())
 
-    private fun episodeItem(episode: Episode) = Item(episode.uri, json.encodeToString(Episode.serializer(), episode))
+    private fun episodeItem(episode: Episode) =
+        Item(episode.uri, json.encodeToString(Episode.serializer(), episode), unavailable = !episode.playable && episode.name.isNotEmpty())
 
     private fun List<Item>.distinctItems(): List<Item> = filter { SpotifyUris.isPlayableItem(it.uri) }.distinctBy { it.uri }
 

@@ -22,6 +22,15 @@ data class DownloadListRow(
     val error: String?,
 )
 
+/** Sync bookkeeping of a downloaded collection (without its member list). */
+data class CollectionSyncRow(
+    val uri: String,
+    val type: String,
+    val lastSyncedAt: Long?,
+    val lastAttemptAt: Long?,
+    val syncFailures: Int,
+)
+
 /** Files referenced by a download row (deletion / garbage collection). */
 data class DownloadFileRow(val uri: String, val path: String?, val imagePath: String?, val individual: Boolean)
 
@@ -221,9 +230,12 @@ interface DownloadCollectionDao {
     @Query("SELECT COUNT(*) FROM download_collections")
     suspend fun count(): Int
 
-    /** Oldest sync time of any downloaded collection (never synced = 0), null without collections. */
-    @Query("SELECT MIN(COALESCE(lastSyncedAt, 0)) FROM download_collections")
-    suspend fun oldestSyncedAt(): Long?
+    @Query("SELECT uri, type, lastSyncedAt, lastAttemptAt, syncFailures FROM download_collections")
+    suspend fun syncStates(): List<CollectionSyncRow>
+
+    /** A sync of [uri] failed: counts towards its retry backoff. */
+    @Query("UPDATE download_collections SET lastAttemptAt = :at, syncFailures = syncFailures + 1 WHERE uri = :uri")
+    suspend fun recordSyncFailure(uri: String, at: Long)
 }
 
 @Dao

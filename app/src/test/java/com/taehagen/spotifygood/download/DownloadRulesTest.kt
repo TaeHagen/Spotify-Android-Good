@@ -143,6 +143,55 @@ class DownloadRulesTest {
     }
 
     @Test
+    fun unplayableMembersAreTrackedAndRevived() {
+        // b and c are greyed out; then b becomes playable and a short lookup does not list c.
+        val first = DownloadRules.updateAvailability(emptySet(), listed = setOf("a", "b", "c"), listedUnavailable = setOf("b", "c"), complete = true)
+        assertEquals(setOf("b", "c"), first.unavailable)
+        assertEquals(emptySet<String>(), first.revived)
+        val second = DownloadRules.updateAvailability(first.unavailable, listed = setOf("a", "b"), listedUnavailable = emptySet(), complete = false)
+        assertEquals(setOf("c"), second.unavailable)
+        assertEquals(setOf("b"), second.revived)
+        val third = DownloadRules.updateAvailability(second.unavailable, listed = setOf("a"), listedUnavailable = emptySet(), complete = true)
+        assertEquals(emptySet<String>(), third.unavailable)
+    }
+
+    @Test
+    fun unplayableMembersDoNotHoldACollectionBack() {
+        val states = mapOf("a" to DownloadState.COMPLETED, "d" to DownloadState.COMPLETED)
+        // b and c are not playable here; d was downloaded before it became unplayable.
+        assertEquals(
+            CollectionDownloadStatus.Complete,
+            DownloadRules.collectionStatus(listOf("a", "b", "c", "d"), states, unavailable = setOf("b", "c", "d")),
+        )
+        assertEquals(
+            CollectionDownloadStatus.InProgress(2, 3, active = false),
+            DownloadRules.collectionStatus(listOf("a", "b", "c", "d"), states, unavailable = setOf("c")),
+        )
+    }
+
+    // ---- sync backoff ---------------------------------------------------------------------------------
+
+    @Test
+    fun aCollectionIsSyncedAgainTwelveHoursAfterItsLastSync() {
+        val hour = 60 * 60_000L
+        assertEquals(12 * hour, DownloadRules.nextSyncAt(lastSyncedAt = null, lastAttemptAt = null, failures = 0))
+        assertEquals(5 * hour + 12 * hour, DownloadRules.nextSyncAt(lastSyncedAt = 5 * hour, lastAttemptAt = 5 * hour, failures = 0))
+    }
+
+    @Test
+    fun aCollectionThatKeepsFailingIsRetriedWithGrowingBackoff() {
+        val hour = 60 * 60_000L
+        val t = 100 * hour
+        // A deleted playlist (NOT_FOUND) never syncs: the next online transitions within the hour skip it.
+        assertEquals(t + hour, DownloadRules.nextSyncAt(lastSyncedAt = null, lastAttemptAt = t, failures = 1))
+        assertEquals(t + 2 * hour, DownloadRules.nextSyncAt(lastSyncedAt = null, lastAttemptAt = t, failures = 2))
+        assertEquals(t + 16 * hour, DownloadRules.nextSyncAt(lastSyncedAt = null, lastAttemptAt = t, failures = 5))
+        assertEquals(t + 24 * hour, DownloadRules.nextSyncAt(lastSyncedAt = null, lastAttemptAt = t, failures = 50))
+        // A failure right after a recent complete sync does not make it due sooner than usual.
+        assertEquals(t + 12 * hour, DownloadRules.nextSyncAt(lastSyncedAt = t, lastAttemptAt = t + hour, failures = 1))
+    }
+
+    @Test
     fun aCompleteResolutionReplacesTheMembership() {
         val update = DownloadRules.updateMembership(listOf("a", "b", "c"), resolved = listOf("b", "d", "b"), complete = true)
         assertEquals(listOf("b", "d"), update.items)

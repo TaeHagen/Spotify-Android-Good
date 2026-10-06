@@ -123,7 +123,9 @@ data class DownloadActivity(
  *   and downloads older than 30 days are re-validated. Items the user removed individually from a
  *   downloaded collection stay removed until the collection is downloaded again. Only a complete
  *   resolution drops items ([CollectionResolver.Resolved.complete]): a failed or short lookup never
- *   deletes downloads.
+ *   deletes downloads. A collection whose sync keeps failing is retried with a growing backoff
+ *   ([DownloadRules.nextSyncAt]). Members the catalog reports as not playable here are kept in the
+ *   membership but not queued, and do not hold the collection status back.
  * * Removal deletes files, rows and the native offline index entries.
  * * The native offline index follows the database through numbered changes ([OfflineIndexSync]):
  *   every commit and removal takes its number under [mutex] with its database write.
@@ -220,9 +222,11 @@ class DownloadManager(
 
     fun collectionStatus(uri: String): Flow<CollectionDownloadStatus> =
         combine(
-            collectionDao.observe(uri).map { entity -> entity?.let { decodeItems(it.itemUrisJson) } }.distinctUntilChanged(),
+            collectionDao.observe(uri)
+                .map { entity -> entity?.let { decodeItems(it.itemUrisJson) to decodeItems(it.unavailableUrisJson).toHashSet() } }
+                .distinctUntilChanged(),
             states,
-        ) { items, states -> DownloadRules.collectionStatus(items, states) }
+        ) { members, states -> DownloadRules.collectionStatus(members?.first, states, members?.second.orEmpty()) }
             .distinctUntilChanged()
             .flowOn(Dispatchers.Default)
 
@@ -255,6 +259,9 @@ class DownloadManager(
                 revision = existing?.revision,
                 addedAt = existing?.addedAt ?: now,
                 lastSyncedAt = existing?.lastSyncedAt,
+                lastAttemptAt = existing?.lastAttemptAt,
+                syncFailures = existing?.syncFailures ?: 0,
+                unavailableUrisJson = existing?.unavailableUrisJson ?: EMPTY_ITEMS,
             )
             applyMembershipLocked(entity, resolved, userInitiated = true).removal
         }
@@ -396,11 +403,15 @@ class DownloadManager(
         sync()
     }
 
-    /** [syncCollections]; false when it could not run because the session did not come online. */
-    internal suspend fun sync(): Boolean {
+    /**
+     * [syncCollections]; false when it could not run because the session did not come online. With
+     * [onlyDue], collections whose next sync ([DownloadRules.nextSyncAt]) is still ahead are skipped.
+     */
+    internal suspend fun sync(onlyDue: Boolean = false): Boolean {
         if (!syncMutex.tryLock()) return true // another sync is running
         try {
             if (settings.settings.value.offlineMode) return true
+            val startedAt = System.currentTimeMillis()
             val all = collectionDao.getAll()
             if (all.isEmpty()) {
                 updateSyncSchedule(false)
@@ -413,6 +424,7 @@ class DownloadManager(
                 val removed = ArrayList<Removal>()
                 for (collection in all) {
                     val type = CollectionType.fromWire(collection.type) ?: continue
+                    if (onlyDue && DownloadRules.nextSyncAt(collection.lastSyncedAt, collection.lastAttemptAt, collection.syncFailures) > startedAt) continue
                     val resolved = try {
                         resolver.resolve(type, collection.uri, collection.revision)
                             ?.let { withMetadata(it, known = decodeItems(collection.itemUrisJson).toHashSet()) }
@@ -420,13 +432,16 @@ class DownloadManager(
                         throw e
                     } catch (e: Exception) {
                         Log.w(TAG, "Sync of ${collection.uri} failed", e)
+                        mutex.withLock { collectionDao.recordSyncFailure(collection.uri, System.currentTimeMillis()) }
                         continue
                     }
                     if (resolved != null && !resolved.complete) Log.w(TAG, "Sync of ${collection.uri} was incomplete: nothing removed")
                     val result = mutex.withLock {
                         val current = collectionDao.get(collection.uri) ?: return@withLock null // removed meanwhile
                         if (resolved == null) {
-                            collectionDao.upsert(current.copy(lastSyncedAt = System.currentTimeMillis())) // unchanged
+                            // Unchanged playlist revision.
+                            val now = System.currentTimeMillis()
+                            collectionDao.upsert(current.copy(lastSyncedAt = now, lastAttemptAt = now, syncFailures = 0))
                             null
                         } else {
                             applyMembershipLocked(current, resolved, userInitiated = false)
@@ -470,6 +485,12 @@ class DownloadManager(
     ): MembershipResult {
         val diff = DownloadRules.updateMembership(decodeItems(entity.itemUrisJson), resolved.items.map { it.uri }, resolved.complete)
         val newItems = diff.items
+        val availability = DownloadRules.updateAvailability(
+            old = decodeItems(entity.unavailableUrisJson).toHashSet(),
+            listed = resolved.items.mapTo(HashSet()) { it.uri },
+            listedUnavailable = resolved.items.filter { it.unavailable }.mapTo(HashSet()) { it.uri },
+            complete = resolved.complete,
+        )
         val others = collectionDao.getAll().filter { it.uri != entity.uri }.map { decodeItems(it.itemUrisJson) }
         val toDelete = if (diff.dropped.isEmpty()) {
             emptyList()
@@ -478,7 +499,14 @@ class DownloadManager(
         }
         runner.cancelItems(toDelete)
         val files = fileRows(toDelete)
-        val toQueue = if (userInitiated) resolved.items else diff.added.toHashSet().let { added -> resolved.items.filter { it.uri in added } }
+        // Not playable here: kept as members, never queued (the download would fail every time).
+        // Members that became playable again are queued like new ones.
+        val toQueue = if (userInitiated) {
+            resolved.items.filter { !it.unavailable }
+        } else {
+            val wanted = diff.added.toHashSet() + availability.revived
+            resolved.items.filter { it.uri in wanted && !it.unavailable }
+        }
         val now = System.currentTimeMillis()
         val quality = settings.settings.value.downloadQuality.kbps
         database.withTransaction {
@@ -488,10 +516,13 @@ class DownloadManager(
                     // Incomplete: try the whole listing again next time (the revision would skip it).
                     revision = if (resolved.complete) resolved.revision ?: entity.revision else entity.revision,
                     lastSyncedAt = if (resolved.complete) now else entity.lastSyncedAt,
+                    lastAttemptAt = now,
+                    syncFailures = if (resolved.complete) 0 else entity.syncFailures + 1,
+                    unavailableUrisJson = json.encodeToString(itemsSerializer, newItems.filter { it in availability.unavailable }),
                 ),
             )
             insertRows(toQueue, quality, individual = false, now = now)
-            if (userInitiated) newItems.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+            if (userInitiated) newItems.filter { it !in availability.unavailable }.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
             deleteRows(toDelete)
         }
         deleteFiles(files)
@@ -592,9 +623,11 @@ class DownloadManager(
 
     private suspend fun syncIfStale() {
         try {
-            val oldest = collectionDao.oldestSyncedAt() ?: return
-            if (System.currentTimeMillis() - oldest < SYNC_STALE_MS) return
-            syncCollections()
+            val now = System.currentTimeMillis()
+            val due = collectionDao.syncStates().any {
+                CollectionType.fromWire(it.type) != null && DownloadRules.nextSyncAt(it.lastSyncedAt, it.lastAttemptAt, it.syncFailures) <= now
+            }
+            if (due) sync(onlyDue = true)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -745,7 +778,6 @@ class DownloadManager(
         private const val METADATA_TIMEOUT_MS = 10_000L
         private const val COLLECTION_METADATA_TIMEOUT_MS = 60_000L
         private const val SYNC_ONLINE_TIMEOUT_MS = 60_000L
-        private const val SYNC_STALE_MS = 12L * 60 * 60 * 1000
         private const val JOB_BACKOFF_MS = 30_000L
         private const val WORK_BACKOFF_S = 30L
         private const val SYNC_BACKOFF_MIN = 15L

@@ -32,6 +32,15 @@ internal object DownloadRules {
     /** Completed downloads are re-validated against the catalog after this long. */
     const val REVALIDATE_AFTER_MS = 30L * 24 * 60 * 60 * 1000
 
+    /** A downloaded collection is synced again (when the session comes online) after this long. */
+    const val SYNC_STALE_MS = 12L * 60 * 60 * 1000
+
+    /** Retry of a collection whose sync failed or was incomplete: 1 h, doubling per failure … */
+    const val SYNC_RETRY_BASE_MS = 60L * 60 * 1000
+
+    /** … up to once a day. */
+    const val SYNC_RETRY_MAX_MS = 24L * 60 * 60 * 1000
+
     private val PENDING = setOf(DownloadState.QUEUED, DownloadState.PREPARING, DownloadState.DOWNLOADING)
 
     /** Codes after which no further download can succeed in this run (account-wide conditions). */
@@ -156,11 +165,16 @@ internal object DownloadRules {
 
     /**
      * Status of a downloaded collection whose items are [items] (null = not downloaded) given the
-     * download state of every known item. Items without a row count towards the total only.
+     * download state of every known item. Items without a row count towards the total only; items
+     * not playable here ([unavailable]) do not count unless they were downloaded.
      */
-    fun collectionStatus(items: List<String>?, states: Map<String, DownloadState>): CollectionDownloadStatus {
+    fun collectionStatus(
+        items: List<String>?,
+        states: Map<String, DownloadState>,
+        unavailable: Set<String> = emptySet(),
+    ): CollectionDownloadStatus {
         if (items == null) return CollectionDownloadStatus.None
-        val distinct = items.distinct()
+        val distinct = items.distinct().filter { it !in unavailable || states[it] == DownloadState.COMPLETED }
         if (distinct.isEmpty()) return CollectionDownloadStatus.Complete
         var done = 0
         var active = false
@@ -175,6 +189,35 @@ internal object DownloadRules {
         } else {
             CollectionDownloadStatus.InProgress(done, distinct.size, active)
         }
+    }
+
+    /** Members not playable here after a resolution, and those that became playable again. */
+    data class Availability(val unavailable: Set<String>, val revived: Set<String>)
+
+    /**
+     * Updates the [old] set of unavailable members with a resolution listing [listed] items, of which
+     * [listedUnavailable] are not playable here. A [complete] resolution decides for every member; an
+     * incomplete one only for the members it lists. [Availability.revived] members were unavailable
+     * and are playable now: they are queued like new members.
+     */
+    fun updateAvailability(old: Set<String>, listed: Set<String>, listedUnavailable: Set<String>, complete: Boolean): Availability {
+        val unavailable = if (complete) listedUnavailable else (old - listed) + listedUnavailable
+        return Availability(unavailable, old.filterTo(HashSet()) { it in listed && it !in listedUnavailable })
+    }
+
+    /**
+     * Earliest time a downloaded collection is synced again when the session comes online:
+     * [SYNC_STALE_MS] after its last complete sync, and after [failures] consecutive failed or
+     * incomplete attempts no sooner than [SYNC_RETRY_BASE_MS] (doubling, ≤ [SYNC_RETRY_MAX_MS]) after
+     * the last one, so a collection that keeps failing (deleted playlist) is not re-fetched at every
+     * reconnect.
+     */
+    fun nextSyncAt(lastSyncedAt: Long?, lastAttemptAt: Long?, failures: Int): Long {
+        val afterSync = (lastSyncedAt ?: 0L) + SYNC_STALE_MS
+        if (failures <= 0 || lastAttemptAt == null) return afterSync
+        var backoff = SYNC_RETRY_BASE_MS
+        repeat((failures - 1).coerceIn(0, 10)) { backoff = (backoff * 2).coerceAtMost(SYNC_RETRY_MAX_MS) }
+        return maxOf(afterSync, lastAttemptAt + backoff)
     }
 
     /** Rough size of [count] items at [kbps] (≈ 4 min each) for the job's network estimate. */

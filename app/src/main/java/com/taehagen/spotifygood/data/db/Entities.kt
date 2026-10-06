@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.data.db
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
@@ -55,7 +56,19 @@ data class DownloadCollectionEntity(
     val itemUrisJson: String = "[]",
     val revision: String? = null,
     val addedAt: Long,
+    /** Last complete sync (or download) of the membership. */
     val lastSyncedAt: Long? = null,
+    /** Last sync attempt, successful or not (spaces out retries with [syncFailures]). */
+    val lastAttemptAt: Long? = null,
+    /** Consecutive failed or incomplete syncs since the last complete one. */
+    @ColumnInfo(defaultValue = "0")
+    val syncFailures: Int = 0,
+    /**
+     * JSON array of member URIs the catalog reports as not playable here (region, explicit filter):
+     * not queued and not counted in the collection status until they become playable.
+     */
+    @ColumnInfo(defaultValue = "'[]'")
+    val unavailableUrisJson: String = "[]",
 )
 
 /** Recent searches: either a free-text query or a tapped result (MediaRef JSON). */
