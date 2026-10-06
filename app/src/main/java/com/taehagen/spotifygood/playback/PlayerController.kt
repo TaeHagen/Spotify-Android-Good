@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.playback
 
 import android.util.Log
+import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.RepeatMode
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
@@ -206,7 +207,13 @@ class PlayerController(
         onPlaybackRequested?.invoke()
         enqueue("catalog.radio", timeoutMs = LOAD_TIMEOUT_MS) {
             val radio = rpc.call<RadioContext>("catalog.radio", buildJsonObject { put("uri", uri) })
-            rpc.callUnit("player.load", loadArgs(PlayRequest(contextUri = radio.contextUri)))
+            // The station is normally a playlist context; the fallback station may be a bare track list.
+            val request = when {
+                radio.contextUri != null -> PlayRequest(contextUri = radio.contextUri)
+                radio.trackUris.isNotEmpty() -> PlayRequest(trackUris = radio.trackUris)
+                else -> throw NativeException(NativeErrorInfo(NativeErrorCode.NOT_FOUND, "Radio station is empty"))
+            }
+            rpc.callUnit("player.load", loadArgs(request))
         }
     }
 
@@ -378,7 +385,7 @@ class PlayerController(
     private fun enabledArgs(enabled: Boolean) = buildJsonObject { put("enabled", enabled) }
 
     @Serializable
-    private data class RadioContext(val contextUri: String)
+    private data class RadioContext(val contextUri: String? = null, val trackUris: List<String> = emptyList())
 
     internal companion object {
         private const val TAG = "PlayerController"

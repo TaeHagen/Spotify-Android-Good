@@ -66,9 +66,6 @@ class CatalogRepository(private val rpc: NativeRpc, private val cache: ResponseC
 
     suspend fun episode(uri: String): Episode? = episodes(listOf(uri)).firstOrNull()
 
-    suspend fun radioContext(seedUri: String): String =
-        rpc.callOffMain<RadioResult>("catalog.radio", rpcArgs { put("uri", seedUri) }).contextUri
-
     suspend fun recentlyPlayed(limit: Int = 50): List<MediaRef> =
         rpc.callOffMain<MediaRefs>("catalog.recentlyPlayed", rpcArgs { put("limit", limit) }).items
 
@@ -104,9 +101,6 @@ internal data class TracksResult(val tracks: List<Track> = emptyList())
 
 @Serializable
 internal data class EpisodesResult(val episodes: List<Episode> = emptyList())
-
-@Serializable
-internal data class RadioResult(val contextUri: String)
 
 @Serializable
 internal data class MediaRefs(val items: List<MediaRef> = emptyList())
