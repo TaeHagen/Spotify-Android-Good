@@ -537,8 +537,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * User selection → `AudioSinkBridge.setPreferredDevice(AudioDeviceInfo?)` (`null` =
   system default; best effort — verify with `routedDevice()`). "More devices…" opens the
   system output switcher via `androidx.mediarouter.app.SystemOutputSwitcherDialogController
-  .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — includes Cast and
-  BT devices not yet connected. Never use `setCommunicationDevice` for media.
+  .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — lists Bluetooth and
+  other system audio outputs not yet connected (the app does not cast). Never use `setCommunicationDevice` for media.
 * Device sheet (one UI for everything, like Spotify's): **This phone** (with current output
   name + icon and local output choices), then **Spotify Connect devices**, then
   "More devices…". Selecting a Connect device → `connect.transfer`.
