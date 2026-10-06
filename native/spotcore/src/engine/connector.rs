@@ -1,0 +1,221 @@
+//! One connection: Session + Spirc construction and teardown (docs/ARCHITECTURE.md §4.2,
+//! research connect.md §13 lifecycle hazards).
+//!
+//! * A `Session` is single use: every attempt builds a new one; a failed or abandoned attempt is
+//!   cleaned up with [`abandon`] (shutdown + dealer close + release from the Player).
+//! * `Spirc::new` is bounded (30 s): DNS / TCP connect inside librespot have no timeout.
+//! * The `Spirc` handle is kept until its task ended ([`teardown`]); the task join is bounded and
+//!   on timeout the task is aborted and the dealer closed by hand (it holds a Session cycle).
+
+use super::{config, player_host, state};
+use crate::error::{AppError, AppResult, ErrorCode};
+use crate::models::{EngineSettings, StoredCredentials};
+use crate::{connect, events, runtime};
+use librespot_connect::Spirc;
+use librespot_core::authentication::Credentials;
+use librespot_core::session::SessionInvalidReason;
+use librespot_core::Session;
+use librespot_playback::mixer::Mixer;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinHandle;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Spirc's shutdown caps disconnect, DELETE and dealer close at 3 s each.
+const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+const DEALER_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// A connected Session with its Spirc.
+pub(crate) struct Live {
+    pub generation: u64,
+    pub session: Session,
+    pub spirc: Arc<Spirc>,
+    pub task: JoinHandle<()>,
+}
+
+/// Creates the Session for an attempt (not connected yet).
+pub(crate) async fn prepare(settings: &EngineSettings) -> AppResult<Session> {
+    let cache = config::build_cache(settings).await?;
+    Ok(Session::new(config::session_config(), Some(cache)))
+}
+
+/// Maps a failed `Spirc::new` (login) to the contract's error codes. AP login errors live in a
+/// private librespot module, so they are recognised by their message (research core.md §2.4).
+pub(crate) fn classify(session: &Session, e: librespot_core::Error) -> AppError {
+    if let Some(err) = premium_error(session) {
+        return err;
+    }
+    let msg = e.to_string();
+    if msg.contains("Login failed with reason") {
+        let code = if msg.contains("Bad credentials") || msg.contains("Could not validate credentials") {
+            ErrorCode::BadCredentials
+        } else if msg.contains("Premium account required") {
+            ErrorCode::PremiumRequired
+        } else if msg.contains("Try another access point") {
+            ErrorCode::Network
+        } else {
+            ErrorCode::Unavailable
+        };
+        return AppError::new(code, msg);
+    }
+    let err = AppError::from(e);
+    match err.code {
+        ErrorCode::BadCredentials | ErrorCode::PremiumRequired => err,
+        // `connect()` failures that aren't login failures are network trouble.
+        ErrorCode::Internal | ErrorCode::Unavailable | ErrorCode::NotFound => AppError::new(ErrorCode::Network, err.message),
+        _ => err,
+    }
+}
+
+/// Login refusals that retrying with the same credentials can't fix.
+pub(crate) fn is_terminal(e: &AppError) -> bool {
+    match e.code {
+        ErrorCode::BadCredentials | ErrorCode::PremiumRequired | ErrorCode::NotLoggedIn => true,
+        ErrorCode::Unavailable => e.message.contains("Login failed with reason"),
+        _ => false,
+    }
+}
+
+/// Error if librespot invalidated the session because the account isn't Premium.
+pub(crate) fn premium_error(session: &Session) -> Option<AppError> {
+    match session.invalid_reason() {
+        Some(SessionInvalidReason::NonPremiumAccount { account_type }) => Some(AppError::new(
+            ErrorCode::PremiumRequired,
+            format!("A Spotify Premium account is required ({account_type})"),
+        )),
+        _ => None,
+    }
+}
+
+/// Connects `session` with `credentials` and starts Spirc. Does not clean up on failure (the
+/// caller keeps the session and calls [`abandon`]).
+pub(crate) async fn connect(
+    session: &Session,
+    credentials: Credentials,
+    settings: &EngineSettings,
+) -> AppResult<Live> {
+    let player = player_host::bind(session, settings).await;
+    let mixer = player_host::mixer_or_default();
+    let connect_config = config::connect_config(settings, mixer.volume());
+    let mixer: Arc<dyn Mixer> = mixer;
+    let fut = Spirc::new(connect_config, session.clone(), credentials, player, mixer);
+    let (spirc, task) = match tokio::time::timeout(CONNECT_TIMEOUT, fut).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(classify(session, e)),
+        Err(_) => return Err(AppError::new(ErrorCode::Network, "Timed out connecting to Spotify")),
+    };
+    if let Some(e) = premium_error(session) {
+        // Keep the handle alive until the task ends (it ends quickly on an invalid session).
+        let spirc = Arc::new(spirc);
+        let task = tokio::spawn(task);
+        teardown_parts(session, &spirc, task).await;
+        return Err(e);
+    }
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let attachment = connect::Attachment {
+        generation,
+        session: session.clone(),
+        state: spirc.subscribe_state(),
+        cluster: spirc.subscribe_cluster(),
+        errors: spirc.subscribe_errors(),
+        spirc: Arc::new(spirc),
+    };
+    let spirc = attachment.spirc.clone();
+    if let Err(e) = spirc.set_autoplay(settings.autoplay) {
+        log::warn!("autoplay setting not applied: {e}");
+    }
+    let task = tokio::spawn(task);
+    connect::attach(attachment);
+    Ok(Live { generation, session: session.clone(), spirc, task })
+}
+
+/// Cleans up a Session whose attempt failed or was abandoned.
+pub(crate) async fn abandon(session: Session) {
+    session.shutdown();
+    if tokio::time::timeout(DEALER_CLOSE_TIMEOUT, session.dealer().close()).await.is_err() {
+        log::warn!("dealer close timed out");
+    }
+    player_host::detach_session();
+}
+
+async fn teardown_parts(session: &Session, spirc: &Arc<Spirc>, mut task: JoinHandle<()>) {
+    if let Err(e) = spirc.shutdown() {
+        log::debug!("spirc already gone: {e}");
+    }
+    if tokio::time::timeout(TASK_JOIN_TIMEOUT, &mut task).await.is_err() {
+        log::warn!("spirc task did not end in time, aborting it");
+        task.abort();
+        if tokio::time::timeout(DEALER_CLOSE_TIMEOUT, session.dealer().close()).await.is_err() {
+            log::warn!("dealer close timed out");
+        }
+    }
+    session.shutdown();
+}
+
+/// Shuts a live connection down. `restore`: remember the local playback for after the
+/// reconnect (otherwise any pending restore is dropped).
+pub(crate) async fn teardown(live: Live, restore: bool) {
+    if restore {
+        connect::prepare_reconnect();
+    } else {
+        connect::clear_restore();
+    }
+    state::set_online(None);
+    connect::detach(live.generation);
+    let Live { session, spirc, task, .. } = live;
+    teardown_parts(&session, &spirc, task).await;
+    // The Spirc task has ended (or was aborted): now the handle may go.
+    drop(spirc);
+    player_host::detach_session();
+    drop(session);
+}
+
+/// Cleans up after the Spirc task ended by itself (lost connection, invalid session).
+pub(crate) async fn teardown_finished(live: Live, restore: bool) {
+    if restore {
+        connect::prepare_reconnect();
+    } else {
+        connect::clear_restore();
+    }
+    state::set_online(None);
+    connect::detach(live.generation);
+    let Live { session, spirc, task, .. } = live;
+    drop(task);
+    session.shutdown();
+    // The task's epilogue normally closed the dealer already; closing twice is a no-op.
+    if tokio::time::timeout(DEALER_CLOSE_TIMEOUT, session.dealer().close()).await.is_err() {
+        log::warn!("dealer close timed out");
+    }
+    drop(spirc);
+    player_host::detach_session();
+}
+
+/// After `Spirc::new`: reads the reusable credentials librespot wrote to the cache, deletes the
+/// plaintext file, and emits a `credentials` event when they are new.
+pub(crate) async fn harvest_credentials(session: &Session, used: Option<&StoredCredentials>) -> Option<StoredCredentials> {
+    let cache = session.cache().cloned();
+    let path = runtime::credentials_dir().join("credentials.json");
+    let from_cache = tokio::task::spawn_blocking(move || {
+        let creds = cache.and_then(|c| c.credentials());
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("could not delete the credentials file: {e}"),
+        }
+        creds
+    })
+    .await
+    .ok()
+    .flatten();
+    let stored = from_cache
+        .as_ref()
+        .and_then(config::from_librespot)
+        .or_else(|| config::from_session(session.username(), session.auth_data()))?;
+    if used != Some(&stored) {
+        events::emit(events::CREDENTIALS, &stored);
+    }
+    Some(stored)
+}

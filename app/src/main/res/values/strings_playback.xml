@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Playback, media session, Android Auto, outputs and Connect presence (owner: playback). -->
+<resources>
+    <!-- Notification channels -->
+    <string name="playback_channel_name">Playback</string>
+    <string name="playback_presence_channel_name">Spotify Connect availability</string>
+    <string name="playback_alerts_channel_name">Playback alerts</string>
+
+    <!-- Media session -->
+    <string name="playback_playing_on">Playing on %1$s</string>
+    <string name="playback_action_like">Add to Liked Songs</string>
+    <string name="playback_action_unlike">Remove from Liked Songs</string>
+    <string name="playback_action_shuffle_on">Turn on shuffle</string>
+    <string name="playback_action_smart_shuffle_on">Turn on smart shuffle</string>
+    <string name="playback_action_shuffle_off">Turn off shuffle</string>
+    <string name="playback_action_repeat_all">Repeat all</string>
+    <string name="playback_action_repeat_one">Repeat current song</string>
+    <string name="playback_action_repeat_off">Turn off repeat</string>
+
+    <!-- Background start failure -->
+    <string name="playback_resume_title">Playback paused</string>
+    <string name="playback_resume_text">Tap to resume</string>
+
+    <!-- Opt-in Connect presence -->
+    <string name="playback_presence_title">Available on Spotify Connect</string>
+    <string name="playback_presence_text">Other devices can play music on this phone</string>
+    <string name="playback_presence_stop">Stop</string>
+
+    <!-- Errors shown in snackbars -->
+    <string name="playback_error_not_active_device">No device is playing. Choose a device to play on.</string>
+    <string name="playback_error_network">Can\'t reach Spotify. Check your connection.</string>
+    <string name="playback_error_premium_required">Spotify Premium is required to play music.</string>
+    <string name="playback_error_refused">Spotify refused playback for this account.</string>
+    <string name="playback_error_unavailable">That isn\'t available right now.</string>
+    <string name="playback_error_not_found">Couldn\'t find that.</string>
+    <string name="playback_error_rate_limited">Too many requests. Try again in a moment.</string>
+    <string name="playback_error_not_logged_in">You\'re not logged in.</string>
+    <string name="playback_error_timeout">The device didn\'t respond. Try again.</string>
+    <string name="playback_error_generic">Something went wrong. Try again.</string>
+
+    <!-- Android Auto browse tree -->
+    <string name="playback_tab_home">Home</string>
+    <string name="playback_tab_library">Your Library</string>
+    <string name="playback_tab_downloads">Downloads</string>
+    <string name="playback_tab_browse">Browse</string>
+    <string name="playback_liked_songs">Liked Songs</string>
+    <string name="playback_playlists">Playlists</string>
+    <string name="playback_albums">Albums</string>
+    <string name="playback_artists">Artists</string>
+    <string name="playback_podcasts">Podcasts</string>
+    <string name="playback_songs">Songs</string>
+    <string name="playback_popular">Popular</string>
+    <string name="playback_top_result">Top result</string>
+    <string name="playback_recently_played">Recently played</string>
+    <string name="playback_recent_searches">Recent searches</string>
+
+    <!-- Local audio outputs -->
+    <string name="playback_output_phone">Phone speaker</string>
+    <string name="playback_output_wired">Wired headphones</string>
+    <string name="playback_output_line">Line out</string>
+    <string name="playback_output_bluetooth">Bluetooth device</string>
+    <string name="playback_output_usb">USB audio</string>
+    <string name="playback_output_hdmi">HDMI</string>
+    <string name="playback_output_hearing_aid">Hearing aid</string>
+    <string name="playback_output_dock">Dock</string>
+    <string name="playback_output_car">Car</string>
+    <string name="playback_output_other">External speaker</string>
+</resources>

@@ -163,13 +163,14 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
     ▲   ◀── session.stop ──┤  ▲  failed (retryable)                                   │
     │                      │  └──────────── Reconnecting(backoff 1s,2s,4s…60s) ◀──────┘
     │                      └─ BAD_CREDENTIALS / PREMIUM_REQUIRED ─▶ Error (no retry)
-    └── session.stop (from any state; graceful, bounded to 5 s)
+    └── session.stop (from any state; graceful, bounded to 10 s)
  Offline mode (settings.offline or no network): Player runs without Spirc; only downloaded
  tracks playable; OfflineController owns the queue; emits the same playback snapshots.
 ```
 
 * `session.start` creates `Session::new(SessionConfig{client_id: KEYMASTER, device_id,
-  tmp_dir: cacheDir/librespot-tmp, autoplay: Some(settings.autoplay) ..}, Some(Cache))`,
+  tmp_dir: cacheDir/librespot-tmp, autoplay: None ..}, Some(Cache))` (autoplay is applied with the patched
+  `spirc.set_autoplay` after `Spirc::new`, so it can change at runtime),
   the `Player` (once; re-bound with `player.set_session` on reconnect), the `AndroidMixer`,
   and `Spirc::new(ConnectConfig{name, device_type: Smartphone, initial_volume:
   <current Android volume>, auto_takeover: false, volume_steps: 64 ..})`, spawns the spirc
@@ -183,7 +184,7 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   while Online (cheap, no network), reacts to `session.setNetworkAvailable`. Backoff
   1→60 s, reset on success; at most one attempt in flight; no attempts while the network
   is known to be down. On reconnect: `Session::new`, `player.set_session`, `Spirc::new`.
-* `session.stop`: `spirc.shutdown()`, await task ≤ 5 s (abort + `dealer().close()` on
+* `session.stop`: `spirc.shutdown()`, await task ≤ 10 s (abort + `dealer().close()` on
   timeout), `session.shutdown()`, drop Spirc/Session; the Player is dropped on a blocking
   thread (its Drop joins the player thread) only on `session.stop {releasePlayer:true}`
   (logout / process trim); otherwise kept for the offline mode.
@@ -244,7 +245,7 @@ queue keeps playing; the next `player.load` goes through Spirc again.
 | `credentials` | `{"username","authType","authData"}` — store encrypted, replaces previous |
 | `playback` | `PlaybackSnapshot` (full snapshot, only on change) |
 | `devices` | `DeviceList` |
-| `queueMetadata` | `{"tracks":[Track|Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri) |
+| `queueMetadata` | `{"tracks":[Track…],"episodes":[Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri) |
 | `download` | `DownloadProgress` |
 | `error` | `{"code","message","context":"playback|connect|session|…"}` user-visible, transient |
 | `log` | not used (logs go to logcat via android_logger, tag `spotcore`) |
@@ -327,7 +328,7 @@ active** → connect-state command to that device.
 | `player.applySettings` | `EngineSettings` subset (bitrate/normalisation) |
 | `queue.add` | `{"uri":"spotify:track:…"}` |
 | `queue.remove` | `{"uid":"…"}` |
-| `queue.move` | `{"uid":"…","toIndex":0}` |
+| `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
 | `connect.transfer` | `{"deviceId":"…","play":true?}` (self = pull, other = push) |
@@ -354,10 +355,11 @@ active** → connect-state command to that device.
 | `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"}` | paged `{"total","items":[…]}` |
 | `library.contains` | `{"uris":[…]}` | `{"contains":[bool]}` |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
+| — | | Playlist revision conflicts (stale `revision`) fail with `INVALID_ARGUMENT` and a message containing "revision"; clients reload and retry. |
 | `playlist.create` | `{"name","description"?,"public":false}` | `{"uri"}` (also added to rootlist) |
 | `playlist.addItems` | `{"uri","uris":[…],"position":null}` | `{"revision"}` |
 | `playlist.removeItems` | `{"uri","items":[{"uri","index"}],"revision"}` | `{"revision"}` |
-| `playlist.moveItems` | `{"uri","fromIndex","length","toIndex","revision"}` | `{"revision"}` |
+| `playlist.moveItems` | `{"uri","fromIndex","length","toIndex","revision"}` | `{"revision"}` — `toIndex` uses playlist4 MOV semantics: the insert-before position in the list *before* the move (moving item 2 to the end of a 5-item list: from 2, to 5) |
 | `playlist.updateDetails` | `{"uri","name"?,"description"?}` | `{}` |
 | `playlist.delete` | `{"uri"}` | `{}` (removes from rootlist; unfollow) |
 | `playlist.follow` / `playlist.unfollow` | `{"uri"}` | `{}` |
@@ -367,8 +369,8 @@ active** → connect-state command to that device.
 | method | args | result |
 |---|---|---|
 | `download.track` | `{"uri","bitrate":160,"dir":"…/offline/audio","imageDir":"…/offline/images"}` | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`) |
-| `offline.setIndex` | `{"tracks":[OfflineTrackRecord]}` | `{}` (replaces the in-memory resolver index) |
-| `offline.add` / `offline.remove` | `{"tracks":[…]}` / `{"uris":[…]}` | `{}` |
+| `offline.setIndex` | `{"tracks":[OfflineTrackRecord]}` | `{}` or `{"rejected":["uri",…]}` (replaces the in-memory resolver index; malformed records are skipped) |
+| `offline.add` / `offline.remove` | `{"tracks":[…]}` / `{"uris":[…]}` | `{}` (`add` may also return `"rejected"`; `remove` never deletes files — Kotlin owns deletion) |
 
 `OfflineTrackRecord`:
 `{"uri","playedUri","fileId","format","keyHex","path","sizeBytes","normalisation":{"trackGainDb","trackPeak","albumGainDb","albumPeak"},"track":Track|"episode":Episode,"imagePath":"…"}`.
@@ -396,7 +398,7 @@ Show         ShowRef + {"description","episodes":[Episode],"total","offset","fol
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
 HomeSection  {"id","title","items":[MediaRef]}
-RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry]}
+RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit"}
 Lyrics       {"syncType":"LINE_SYNCED|UNSYNCED|SYLLABLE_SYNCED","lines":[{"startTimeMs","words"}],
               "provider"?,"colors"?:{"background","text","highlightText"}}
 User         {"username","displayName","images","product","country","explicitFilter"}
@@ -560,7 +562,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
   of another downloaded collection).
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
-  `noBackupFilesDir/offline/images/<imageHex>`. Settings shows usage and "Remove all".
+  `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks start at 2 MiB and adapt between 1 and
+  4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all".
 * Downloads require Premium (they are always Premium here) and are wiped on logout.
 
 ### 9.8 Data layer

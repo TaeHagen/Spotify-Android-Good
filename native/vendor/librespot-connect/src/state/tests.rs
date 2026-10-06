@@ -414,3 +414,29 @@ fn prev_without_track_index_doesnt_underflow() {
     assert_eq!(state.player().index.track, 0);
     assert_eq!(state.current_track(|t| t.uid.clone()), "uid0");
 }
+
+/// compile time check: the engine spawns the task and shares the handle between threads
+#[allow(dead_code)]
+fn spirc_is_send_and_sync(
+    session: Session,
+    player: std::sync::Arc<crate::playback::player::Player>,
+    mixer: std::sync::Arc<dyn crate::playback::mixer::Mixer>,
+) {
+    fn assert_send<T: Send + 'static>(_: T) {}
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<crate::Spirc>();
+    assert_send(async move {
+        let (spirc, task) = crate::Spirc::new(
+            ConnectConfig::default(),
+            session,
+            crate::core::authentication::Credentials::with_access_token(""),
+            player,
+            mixer,
+        )
+        .await
+        .unwrap();
+        task.await;
+        drop(spirc);
+    });
+}

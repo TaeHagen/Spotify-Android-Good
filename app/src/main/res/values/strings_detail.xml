@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Detail pages: album, artist, discography, playlist, show, episode. -->
+<resources>
+    <!-- Common -->
+    <string name="detail_back">Back</string>
+    <string name="detail_more_options">More options</string>
+    <string name="detail_more_options_for">More options for %1$s</string>
+    <string name="detail_shuffle">Shuffle</string>
+    <string name="detail_smart_shuffle">Smart shuffle</string>
+    <string name="detail_state_on">On</string>
+    <string name="detail_state_off">Off</string>
+    <string name="detail_download">Download</string>
+    <string name="detail_remove_download">Remove download</string>
+    <string name="detail_downloading_progress">Downloading, %1$d of %2$d</string>
+    <string name="detail_remove_download_title">Remove from downloads?</string>
+    <string name="detail_remove_download_message">You won’t be able to play this offline anymore.</string>
+    <string name="detail_remove">Remove</string>
+    <string name="detail_cancel">Cancel</string>
+    <string name="detail_download_removed">Removed from downloads</string>
+    <string name="detail_download_failed">Couldn’t update downloads</string>
+    <string name="detail_save_to_library">Save to Your Library</string>
+    <string name="detail_remove_from_library">Remove from Your Library</string>
+    <string name="detail_added_to_library">Added to Your Library</string>
+    <string name="detail_removed_from_library">Removed from Your Library</string>
+    <string name="detail_library_failed">Couldn’t update Your Library</string>
+    <string name="detail_follow">Follow</string>
+    <string name="detail_following">Following</string>
+    <string name="detail_error_generic">Couldn’t load this page.</string>
+    <string name="detail_error_offline">You’re offline. Connect to the internet to load this page.</string>
+    <string name="detail_error_not_found">This page isn’t available.</string>
+    <string name="detail_unavailable">This isn’t available right now</string>
+    <string name="detail_unavailable_offline">Not available offline. Download it to listen without a connection.</string>
+    <string name="detail_show_more">Show more</string>
+    <string name="detail_show_less">Show less</string>
+    <string name="detail_see_more">See more</string>
+    <string name="detail_retry">Retry</string>
+    <string name="detail_duration_hr_min">%1$d hr %2$d min</string>
+    <string name="detail_duration_min_sec">%1$d min %2$d sec</string>
+    <string name="detail_duration_min">%1$d min</string>
+    <string name="detail_duration_sec">%1$d sec</string>
+    <string name="detail_separator">%1$s • %2$s</string>
+    <string name="detail_separator_plain">" • "</string>
+    <string name="detail_count_and_duration">%1$s, %2$s</string>
+    <string name="detail_share">Share</string>
+    <string name="detail_share_failed">No app available to share</string>
+    <string name="detail_load_more_failed">Couldn’t load more</string>
+
+    <!-- Album -->
+    <string name="detail_type_album">Album</string>
+    <string name="detail_type_single">Single</string>
+    <string name="detail_type_ep">EP</string>
+    <string name="detail_type_compilation">Compilation</string>
+    <string name="detail_disc">Disc %1$d</string>
+    <string name="detail_more_by">More by %1$s</string>
+    <string name="detail_label">Label: %1$s</string>
+
+    <!-- Artist -->
+    <string name="detail_popular">Popular</string>
+    <string name="detail_albums">Albums</string>
+    <string name="detail_singles_eps">Singles and EPs</string>
+    <string name="detail_compilations">Compilations</string>
+    <string name="detail_appears_on">Appears on</string>
+    <string name="detail_fans_also_like">Fans also like</string>
+    <string name="detail_about">About</string>
+    <string name="detail_start_radio">Start artist radio</string>
+    <string name="detail_grid_view">Show as grid</string>
+    <string name="detail_list_view">Show as list</string>
+    <string name="detail_discography_empty">No releases yet</string>
+
+    <!-- Playlist -->
+    <string name="detail_owner_collaborative">%1$s • Collaborative</string>
+    <string name="detail_open_profile">Open profile</string>
+    <string name="detail_save_playlist">Save to Your Library</string>
+    <string name="detail_remove_playlist">Remove from Your Library</string>
+    <string name="detail_edit_playlist">Edit playlist</string>
+    <string name="detail_done">Done</string>
+    <string name="detail_edit_details">Edit details</string>
+    <string name="detail_name">Name</string>
+    <string name="detail_description">Description</string>
+    <string name="detail_save">Save</string>
+    <string name="detail_name_required">Give your playlist a name</string>
+    <string name="detail_add_songs">Add songs</string>
+    <string name="detail_delete_playlist">Delete playlist</string>
+    <string name="detail_delete_playlist_title">Delete playlist?</string>
+    <string name="detail_delete_playlist_message">“%1$s” will be deleted from Your Library.</string>
+    <string name="detail_delete">Delete</string>
+    <string name="detail_playlist_deleted">Playlist deleted</string>
+    <string name="detail_playlist_delete_failed">Couldn’t delete the playlist</string>
+    <string name="detail_move_up">Move up</string>
+    <string name="detail_move_down">Move down</string>
+    <string name="detail_reorder">Drag to reorder %1$s</string>
+    <string name="detail_remove_from_playlist">Remove %1$s from playlist</string>
+    <string name="detail_find_in_playlist">Find in playlist</string>
+    <string name="detail_clear_search">Clear search</string>
+    <string name="detail_no_matches">Couldn’t find “%1$s”</string>
+    <string name="detail_no_matches_message">Try searching again using a different spelling or keyword.</string>
+    <string name="detail_playlist_empty">This playlist is empty</string>
+    <string name="detail_playlist_empty_owned">Find songs to add to your playlist.</string>
+    <string name="detail_add_to_this_playlist">Add %1$s to this playlist</string>
+    <string name="detail_already_in_playlist">%1$s is in this playlist</string>
+    <string name="detail_search_songs">Search for songs</string>
+    <string name="detail_search_songs_hint">Search for songs to add to this playlist.</string>
+    <string name="detail_search_no_results">No songs found for “%1$s”</string>
+    <string name="detail_search_failed">Search failed. Check your connection and try again.</string>
+    <string name="detail_playlist_conflict">This playlist changed on another device. Showing the latest version.</string>
+    <string name="detail_playlist_update_failed">Couldn’t update the playlist</string>
+    <string name="detail_playlist_update_offline">You’re offline. The playlist couldn’t be changed.</string>
+
+    <!-- Show / episode -->
+    <string name="detail_all_episodes">All episodes</string>
+    <string name="detail_sort_newest">Newest</string>
+    <string name="detail_sort_oldest">Oldest</string>
+    <string name="detail_sort_episodes">Sort episodes</string>
+    <string name="detail_no_episodes">No episodes yet</string>
+    <string name="detail_save_episode">Save to Your Episodes</string>
+    <string name="detail_remove_episode">Remove from Your Episodes</string>
+    <string name="detail_saved_episode">Saved to Your Episodes</string>
+    <string name="detail_removed_episode">Removed from Your Episodes</string>
+    <string name="detail_time_left">%1$s left</string>
+    <string name="detail_played">Played</string>
+    <string name="detail_open_show">Open show</string>
+    <string name="detail_download_episode">Download episode</string>
+    <string name="detail_remove_episode_download">Remove downloaded episode</string>
+    <string name="detail_downloading_episode">Downloading episode</string>
+    <string name="detail_episode_download_failed">Download failed. Tap to retry.</string>
+</resources>

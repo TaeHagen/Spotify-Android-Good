@@ -3,6 +3,8 @@ package com.taehagen.spotifygood.nativebridge
 import android.util.Log
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -37,8 +39,11 @@ class NativeRpc(val json: Json) {
             }
         }
 
-    suspend inline fun <reified T> call(method: String, args: JsonObject = EMPTY): T =
-        json.decodeFromJsonElement(callRaw(method, args))
+    /** Typed call; the result is decoded on [Dispatchers.Default] (pages can be large). */
+    suspend inline fun <reified T> call(method: String, args: JsonObject = EMPTY): T {
+        val element = callRaw(method, args)
+        return withContext(Dispatchers.Default) { json.decodeFromJsonElement<T>(element) }
+    }
 
     /** Call whose result is ignored (still waits for completion and surfaces errors). */
     suspend fun callUnit(method: String, args: JsonObject = EMPTY) {

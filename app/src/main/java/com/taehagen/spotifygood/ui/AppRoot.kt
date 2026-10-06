@@ -1,0 +1,291 @@
+package com.taehagen.spotifygood.ui
+
+import android.provider.MediaStore
+import android.util.Log
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
+import com.taehagen.spotifygood.AppGraph
+import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.data.SearchType
+import com.taehagen.spotifygood.engine.EngineState
+import com.taehagen.spotifygood.model.MediaRef
+import com.taehagen.spotifygood.model.MediaType
+import com.taehagen.spotifygood.model.PlaybackSource
+import com.taehagen.spotifygood.model.SearchResults
+import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.ui.screens.login.LoginScreen
+import com.taehagen.spotifygood.ui.screens.status.PremiumRequiredScreen
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+
+/** How the PLAYBACK_REFUSED condition is presented. */
+enum class PlaybackRefusal { NONE, SCREEN, BANNER }
+
+/** Which top-level surface the app shows. */
+private enum class RootScreen { LOGIN, PREMIUM_REQUIRED, MAIN }
+
+/** Voice search request ("Play X on SpotifyGood", MEDIA_PLAY_FROM_SEARCH). */
+data class MediaSearchRequest(
+    val query: String?,
+    val focus: String? = null,
+    val artist: String? = null,
+    val album: String? = null,
+    val title: String? = null,
+    val playlist: String? = null,
+)
+
+/**
+ * Activity-scoped shell state: splash readiness, login/premium gating, the PLAYBACK_REFUSED
+ * condition, deep links waiting for the main scaffold and voice-search playback.
+ */
+class ShellViewModel(private val graph: AppGraph) : ViewModel() {
+    private val _ready = MutableStateFlow(false)
+    /** False while the login state is still unknown (keeps the splash screen up). */
+    val ready: StateFlow<Boolean> = _ready.asStateFlow()
+
+    val engineState: StateFlow<EngineState> = graph.engine.state
+    val isLoggedIn: StateFlow<Boolean> = graph.engine.isLoggedIn
+
+    private val refusedEvent = MutableStateFlow(false)
+    private val refusedDismissed = MutableStateFlow(false)
+
+    val playbackRefusal: StateFlow<PlaybackRefusal> =
+        combine(refusedEvent, graph.engine.state, refusedDismissed) { event, state, dismissed ->
+            val refused = event || state.error?.code == NativeErrorCode.PLAYBACK_REFUSED
+            when {
+                !refused -> PlaybackRefusal.NONE
+                dismissed -> PlaybackRefusal.BANNER
+                else -> PlaybackRefusal.SCREEN
+            }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, PlaybackRefusal.NONE)
+
+    private val links = Channel<String>(Channel.UNLIMITED)
+    /** Deep links (spotify: URIs / open.spotify.com) to open once the main UI is up. */
+    val pendingLinks: Flow<String> = links.receiveAsFlow()
+
+    private val messageChannel = Channel<String>(Channel.BUFFERED)
+    /** Snackbar messages produced outside the navigator (intents, voice search). */
+    val messages: Flow<String> = messageChannel.receiveAsFlow()
+
+    init {
+        viewModelScope.launch { resolveInitialLoginState() }
+        viewModelScope.launch {
+            graph.events.errors.collect { error ->
+                if (error.code == NativeErrorCode.PLAYBACK_REFUSED) {
+                    refusedEvent.value = true
+                    refusedDismissed.value = false
+                }
+            }
+        }
+        viewModelScope.launch {
+            graph.engine.isLoggedIn.collect { loggedIn ->
+                if (!loggedIn) {
+                    refusedEvent.value = false
+                    refusedDismissed.value = false
+                }
+            }
+        }
+        viewModelScope.launch {
+            // Audible local playback proves the account is not refused (any more).
+            graph.playback.snapshot.collect { snapshot ->
+                if (snapshot.isPlaying && snapshot.source == PlaybackSource.LOCAL && snapshot.lastError == null) {
+                    refusedEvent.value = false
+                    if (graph.engine.state.value.error?.code == NativeErrorCode.PLAYBACK_REFUSED) graph.engine.clearError()
+                }
+            }
+        }
+    }
+
+    /**
+     * The engine reads stored credentials asynchronously; keep the splash until it knows whether
+     * we are logged in (bounded so a slow keystore never blocks startup).
+     */
+    private suspend fun resolveInitialLoginState() {
+        withTimeoutOrNull(SPLASH_MAX_MS) { graph.engine.awaitReady() }
+        _ready.value = true
+    }
+
+    fun openLink(uri: String) {
+        links.trySend(uri)
+    }
+
+    fun showMessage(message: String) {
+        messageChannel.trySend(message)
+    }
+
+    fun dismissRefusal() {
+        refusedDismissed.value = true
+    }
+
+    fun showRefusalDetails() {
+        refusedDismissed.value = false
+    }
+
+    /** PLAYBACK_REFUSED "Try again": drop the sticky error, reconnect if needed and resume. */
+    fun retryPlayback() {
+        refusedEvent.value = false
+        refusedDismissed.value = false
+        graph.engine.clearError()
+        graph.engine.retry()
+        graph.player.resume()
+    }
+
+    /** PREMIUM_REQUIRED "Try again" (e.g. after upgrading the account). */
+    fun retryAccount() {
+        graph.engine.clearError()
+        graph.engine.retry()
+    }
+
+    /** Logs out and wipes account data (survives this ViewModel). */
+    fun logout() {
+        graph.appScope.launch {
+            try {
+                graph.logout()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Log.e(TAG, "Logout failed", t)
+            }
+        }
+    }
+
+    /** MEDIA_PLAY_FROM_SEARCH: search and play the best match (empty query resumes playback). */
+    fun playFromSearch(request: MediaSearchRequest) {
+        viewModelScope.launch {
+            if (!graph.engine.isLoggedIn.value) {
+                showMessage(graph.app.getString(R.string.shell_msg_login_first))
+                return@launch
+            }
+            graph.engine.awaitOnline(ONLINE_TIMEOUT_MS)
+            val type = when (request.focus) {
+                MediaStore.Audio.Artists.ENTRY_CONTENT_TYPE -> SearchType.ARTIST
+                MediaStore.Audio.Albums.ENTRY_CONTENT_TYPE -> SearchType.ALBUM
+                PLAYLIST_ENTRY_CONTENT_TYPE -> SearchType.PLAYLIST
+                MediaStore.Audio.Media.ENTRY_CONTENT_TYPE -> SearchType.TRACK
+                else -> null
+            }
+            val query = when (type) {
+                SearchType.ARTIST -> request.artist ?: request.query
+                SearchType.ALBUM -> request.album ?: request.query
+                SearchType.PLAYLIST -> request.playlist ?: request.query
+                SearchType.TRACK -> listOfNotNull(request.title, request.artist).joinToString(" ").ifBlank { request.query }
+                else -> request.query
+            }?.trim()
+            if (query.isNullOrEmpty()) {
+                graph.player.resume()
+                return@launch
+            }
+            val results = try {
+                graph.search.search(query, if (type != null) setOf(type) else SearchType.entries.toSet(), limit = 10)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Log.w(TAG, "Voice search failed", t)
+                showMessage(graph.app.getString(R.string.shell_msg_voice_search_failed))
+                return@launch
+            }
+            if (!playBestMatch(results, type)) {
+                showMessage(graph.app.getString(R.string.shell_msg_no_results, query))
+            }
+        }
+    }
+
+    private fun playBestMatch(results: SearchResults, type: SearchType?): Boolean {
+        val player = graph.player
+        fun playTrack(track: Track) {
+            val album = track.album?.uri
+            if (album != null) player.playContext(album, startUri = track.uri) else player.playTracks(listOf(track.uri))
+        }
+        fun playRef(ref: MediaRef) {
+            when (ref.type) {
+                MediaType.TRACK -> results.tracks.firstOrNull { it.uri == ref.uri }?.let(::playTrack)
+                    ?: player.playTracks(listOf(ref.uri))
+                MediaType.EPISODE -> player.playTracks(listOf(ref.uri))
+                else -> player.playContext(ref.uri)
+            }
+        }
+        when (type) {
+            SearchType.ARTIST -> results.artists.firstOrNull()?.let { player.playContext(it.uri); return true }
+            SearchType.ALBUM -> results.albums.firstOrNull()?.let { player.playContext(it.uri); return true }
+            SearchType.PLAYLIST -> results.playlists.firstOrNull()?.let { player.playContext(it.uri); return true }
+            SearchType.TRACK -> results.tracks.firstOrNull { it.playable }?.let { playTrack(it); return true }
+            else -> {
+                results.topResult?.let { playRef(it); return true }
+                results.tracks.firstOrNull { it.playable }?.let { playTrack(it); return true }
+                results.artists.firstOrNull()?.let { player.playContext(it.uri); return true }
+                results.albums.firstOrNull()?.let { player.playContext(it.uri); return true }
+                results.playlists.firstOrNull()?.let { player.playContext(it.uri); return true }
+            }
+        }
+        return false
+    }
+
+    private companion object {
+        const val TAG = "ShellViewModel"
+        const val SPLASH_MAX_MS = 2_000L
+        const val ONLINE_TIMEOUT_MS = 15_000L
+
+        /** MediaStore.Audio.Playlists.ENTRY_CONTENT_TYPE (deprecated constant, still sent by assistants). */
+        const val PLAYLIST_ENTRY_CONTENT_TYPE = "vnd.android.cursor.item/playlist"
+    }
+}
+
+/**
+ * Root of the UI: login when signed out, the Premium explanation when the account cannot
+ * stream, otherwise the main scaffold (which overlays the PLAYBACK_REFUSED explanation).
+ */
+@Composable
+fun AppRoot(modifier: Modifier = Modifier) {
+    val shell = appViewModel { ShellViewModel(it) }
+    val ready by shell.ready.collectAsStateWithLifecycle()
+    val loggedIn by shell.isLoggedIn.collectAsStateWithLifecycle()
+    val engine by shell.engineState.collectAsStateWithLifecycle()
+
+    Surface(modifier = modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        if (!ready) return@Surface // The splash screen is still on top.
+        val premiumRequired = engine.error?.code == NativeErrorCode.PREMIUM_REQUIRED || engine.user?.isPremium == false
+        val screen = when {
+            !loggedIn -> RootScreen.LOGIN
+            premiumRequired -> RootScreen.PREMIUM_REQUIRED
+            else -> RootScreen.MAIN
+        }
+        AnimatedContent(
+            targetState = screen,
+            transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(200)) },
+            label = "root",
+        ) { target ->
+            when (target) {
+                RootScreen.LOGIN -> LoginScreen()
+                RootScreen.PREMIUM_REQUIRED -> PremiumRequiredScreen(
+                    onLogout = shell::logout,
+                    onRetry = shell::retryAccount,
+                    accountName = engine.user?.let { it.displayName ?: it.username },
+                )
+                RootScreen.MAIN -> MainScaffold(shell)
+            }
+        }
+    }
+}

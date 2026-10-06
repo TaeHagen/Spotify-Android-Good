@@ -1,13 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Base window theme; Compose draws everything (edge-to-edge). -->
+    <!--
+      Base window theme; Compose draws everything edge-to-edge (MainActivity calls
+      enableEdgeToEdge and SpotifyGoodTheme keeps the system-bar icon colors in sync with the
+      resolved app theme). The dark window background avoids a white flash before first frame.
+    -->
     <style name="Theme.SpotifyGood" parent="android:Theme.Material.NoActionBar">
         <item name="android:windowBackground">@color/background</item>
+        <item name="android:colorBackground">@color/background</item>
+        <item name="android:colorAccent">@color/brand</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar">false</item>
     </style>
 
+    <!-- Launch theme: kept on screen until the engine knows whether we are logged in. -->
     <style name="Theme.SpotifyGood.Splash" parent="Theme.SplashScreen">
         <item name="windowSplashScreenBackground">@color/background</item>
         <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
