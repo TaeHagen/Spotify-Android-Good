@@ -80,7 +80,6 @@ import com.taehagen.spotifygood.ui.screens.album.DetailScaffold
 import com.taehagen.spotifygood.ui.screens.album.ExpandableText
 import com.taehagen.spotifygood.ui.screens.album.FollowButton
 import com.taehagen.spotifygood.ui.screens.album.LoadStateContent
-import com.taehagen.spotifygood.ui.screens.album.MessageEffect
 import com.taehagen.spotifygood.ui.screens.album.MoreButton
 import com.taehagen.spotifygood.ui.screens.album.ShuffleButton
 import com.taehagen.spotifygood.ui.screens.album.dataOrNull
@@ -99,7 +98,6 @@ fun ArtistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier 
     val navigator = LocalAppNavigator.current
     val listState = rememberLazyListState()
     val showTitle by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 } }
-    MessageEffect(viewModel.messages)
 
     DetailScaffold(
         title = state.load.dataOrNull()?.artist?.name.orEmpty(),
@@ -342,7 +340,6 @@ fun ArtistDiscographyScreen(uri: String, group: String, contentPadding: PaddingV
     val state by viewModel.state.collectAsStateWithLifecycle()
     val navigator = LocalAppNavigator.current
     var grid by rememberSaveable { mutableStateOf(false) }
-    MessageEffect(viewModel.messages)
 
     DetailScaffold(
         title = state.load.dataOrNull()?.artistName.orEmpty(),

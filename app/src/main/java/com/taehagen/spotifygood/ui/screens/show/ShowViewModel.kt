@@ -321,27 +321,14 @@ internal class EpisodeViewModel(graph: AppGraph, private val uri: String) : Deta
     }
 
     fun download() {
-        viewModelScope.launch {
-            try {
-                graph.downloads.downloadItems(listOf(uri))
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                message(R.string.detail_download_failed)
-            }
+        launchWrite(successRes = null, failureRes = R.string.detail_download_failed) {
+            graph.downloads.downloadItems(listOf(uri))
         }
     }
 
     fun removeDownload() {
-        viewModelScope.launch {
-            try {
-                graph.downloads.removeItems(listOf(uri))
-                message(R.string.detail_download_removed)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                message(R.string.detail_download_failed)
-            }
+        launchWrite(R.string.detail_download_removed, R.string.detail_download_failed) {
+            graph.downloads.removeItems(listOf(uri))
         }
     }
 }

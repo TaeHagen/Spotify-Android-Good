@@ -152,7 +152,7 @@ async fn downloaded_files_play_offline_through_the_index() {
     let index = Arc::new(OfflineIndex::new());
     let (entries, rejected) = build_entries(vec![ogg_record.clone(), mp3_record.clone()]);
     assert!(rejected.is_empty());
-    index.replace(entries);
+    index.replace(entries, None);
 
     // Any network access by the Player would fail the load with NetworkError.
     let frames = Arc::new(AtomicU64::new(0));
@@ -191,7 +191,7 @@ async fn downloaded_files_play_offline_through_the_index() {
     wrong.uri = "spotify:track:0000000000000000000007".into();
     wrong.played_uri = None;
     wrong.key_hex = "00".repeat(16);
-    index.add(build_entries(vec![wrong.clone()]).0);
+    index.add(build_entries(vec![wrong.clone()]).0, None);
     player.load(SpotifyUri::from_uri(&wrong.uri).expect("uri"), true, 0);
     let reason = loop {
         match next_event(&mut events, "unavailable").await {

@@ -13,6 +13,7 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.taehagen.spotifygood.playback.PlaybackService
 import com.taehagen.spotifygood.ui.AppRoot
 import com.taehagen.spotifygood.ui.MediaSearchRequest
 import com.taehagen.spotifygood.ui.ShellViewModel
@@ -21,8 +22,8 @@ import com.taehagen.spotifygood.ui.theme.SpotifyGoodTheme
 
 /**
  * Single activity hosting the Compose UI (owned by the UI shell): edge-to-edge, splash screen,
- * notification permission request, deep links (`spotify:`, open.spotify.com) and the
- * `spotifygood://auth` login redirect.
+ * notification permission request, deep links (`spotify:`, open.spotify.com), the
+ * `spotifygood://auth` login redirect and media notification taps (open Now Playing).
  */
 class MainActivity : ComponentActivity() {
     private val graph: AppGraph get() = (application as App).graph
@@ -60,6 +61,13 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent?) {
         intent ?: return
+        // Media notification, lock-screen player or SysUI media card tap (the session activity). The
+        // launch intent's action is MAIN, so this is independent of the action switch below.
+        if (intent.getBooleanExtra(PlaybackService.EXTRA_OPEN_PLAYER, false)) {
+            // Consumed: later handling of the same intent object must not open the player again.
+            intent.removeExtra(PlaybackService.EXTRA_OPEN_PLAYER)
+            shell.openPlayer()
+        }
         when (intent.action) {
             Intent.ACTION_VIEW -> {
                 val data = intent.data ?: return

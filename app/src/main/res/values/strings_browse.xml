@@ -146,6 +146,7 @@
     <string name="browse_downloads_storage">%1$s used</string>
     <string name="browse_downloads_active">Now downloading: %1$s</string>
     <string name="browse_downloads_retry_failed">Retry failed downloads</string>
+    <string name="browse_downloads_resume">Resume</string>
     <string name="browse_downloads_remove_all">Remove all downloads</string>
     <string name="browse_downloads_remove_all_title">Remove all downloads?</string>
     <string name="browse_downloads_remove_all_message">All downloaded music and podcasts will be deleted from this device.</string>

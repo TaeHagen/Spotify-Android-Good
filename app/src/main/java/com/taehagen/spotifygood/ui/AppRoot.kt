@@ -2,6 +2,7 @@ package com.taehagen.spotifygood.ui
 
 import android.provider.MediaStore
 import android.util.Log
+import androidx.activity.compose.LocalActivity
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -11,11 +12,16 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.SearchType
@@ -26,6 +32,7 @@ import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.SearchResults
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import com.taehagen.spotifygood.ui.screens.login.LoginScreen
 import com.taehagen.spotifygood.ui.screens.status.PremiumRequiredScreen
 import kotlinx.coroutines.CancellationException
@@ -59,7 +66,8 @@ data class MediaSearchRequest(
 
 /**
  * Activity-scoped shell state: splash readiness, login/premium gating, the PLAYBACK_REFUSED
- * condition, deep links waiting for the main scaffold and voice-search playback.
+ * condition, deep links and "open Now Playing" requests waiting for the main scaffold and
+ * voice-search playback.
  */
 class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     private val _ready = MutableStateFlow(false)
@@ -85,6 +93,12 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     private val links = Channel<String>(Channel.UNLIMITED)
     /** Deep links (spotify: URIs / open.spotify.com) to open once the main UI is up. */
     val pendingLinks: Flow<String> = links.receiveAsFlow()
+
+    private val openPlayerRequests = Channel<Unit>(Channel.CONFLATED)
+    /** Requests to show Now Playing (media notification / lock-screen taps), also from before login. */
+    val pendingOpenPlayer: Flow<Unit> = openPlayerRequests.receiveAsFlow()
+
+    private val mainSessions = MainSessionStore()
 
     private val messageChannel = Channel<String>(Channel.BUFFERED)
     /** Snackbar messages produced outside the navigator (intents, voice search). */
@@ -128,12 +142,31 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
         _ready.value = true
     }
 
+    /** ViewModel store owner of the signed-in UI; see [MainSessionStore]. */
+    fun mainSessionOwner(): ViewModelStoreOwner = mainSessions.acquire()
+
+    /** The signed-in UI left the composition for good: clears all of its ViewModels. */
+    fun releaseMainSession(owner: ViewModelStoreOwner) {
+        mainSessions.release(owner)
+        // Results of the old session's writes are not for whoever signs in next.
+        BackgroundMessages.clear()
+    }
+
+    override fun onCleared() {
+        mainSessions.clear()
+    }
+
     fun openLink(uri: String) {
         links.trySend(uri)
     }
 
     fun showMessage(message: String) {
         messageChannel.trySend(message)
+    }
+
+    /** Opens Now Playing once the main scaffold is up (and has something to show). */
+    fun openPlayer() {
+        openPlayerRequests.trySend(Unit)
     }
 
     fun dismissRefusal() {
@@ -175,7 +208,14 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     /** MEDIA_PLAY_FROM_SEARCH: search and play the best match (empty query resumes playback). */
     fun playFromSearch(request: MediaSearchRequest) {
         viewModelScope.launch {
-            if (!graph.engine.isLoggedIn.value) {
+            // A cold start ("Play X on SpotifyGood" with no process) gets here before the engine has
+            // read the stored credentials: wait for that instead of answering "log in first".
+            val loggedIn = awaitLoginState(
+                isLoggedIn = { graph.engine.isLoggedIn.value },
+                awaitReady = graph.engine::awaitReady,
+                timeoutMs = LOGIN_WAIT_MS,
+            )
+            if (!loggedIn) {
                 showMessage(graph.app.getString(R.string.shell_msg_login_first))
                 return@launch
             }
@@ -246,6 +286,8 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     private companion object {
         const val TAG = "ShellViewModel"
         const val SPLASH_MAX_MS = 2_000L
+        /** Upper bound for the credential load before voice search gives up (slow keystore). */
+        const val LOGIN_WAIT_MS = 10_000L
         const val ONLINE_TIMEOUT_MS = 15_000L
 
         /** MediaStore.Audio.Playlists.ENTRY_CONTENT_TYPE (deprecated constant, still sent by assistants). */
@@ -284,8 +326,27 @@ fun AppRoot(modifier: Modifier = Modifier) {
                     onRetry = shell::retryAccount,
                     accountName = engine.user?.let { it.displayName ?: it.username },
                 )
-                RootScreen.MAIN -> MainScaffold(shell)
+                RootScreen.MAIN -> MainSessionScope(shell) { MainScaffold(shell) }
             }
         }
     }
+}
+
+/**
+ * Scopes every ViewModel of the signed-in UI (navigation entries, player surfaces, sheets) to a
+ * store owned by [shell]: kept across configuration changes, cleared once this content leaves the
+ * composition for good, i.e. after the fade-out to the login or Premium screen, or when the
+ * activity finishes. A NavController never clears its entries when its host is just disposed.
+ */
+@Composable
+private fun MainSessionScope(shell: ShellViewModel, content: @Composable () -> Unit) {
+    val owner = remember(shell) { shell.mainSessionOwner() }
+    val activity = LocalActivity.current
+    DisposableEffect(owner) {
+        onDispose {
+            // A configuration change recomposes this content with the same (retained) session.
+            if (activity?.isChangingConfigurations != true) shell.releaseMainSession(owner)
+        }
+    }
+    CompositionLocalProvider(LocalViewModelStoreOwner provides owner, content = content)
 }

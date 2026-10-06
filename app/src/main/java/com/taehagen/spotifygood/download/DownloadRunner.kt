@@ -2,13 +2,14 @@ package com.taehagen.spotifygood.download
 
 import android.app.Notification
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.SystemClock
 import android.text.format.Formatter
 import android.util.Log
 import androidx.room.withTransaction
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.auth.CredentialStore
-import com.taehagen.spotifygood.data.callUnitOffMain
 import com.taehagen.spotifygood.data.callWith
 import com.taehagen.spotifygood.data.db.AppDatabase
 import com.taehagen.spotifygood.data.db.DownloadEntity
@@ -45,9 +46,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 /** How a download run ended; the host (job / worker) maps it to its reschedule semantics. */
@@ -55,10 +59,13 @@ internal enum class RunOutcome {
     /** The queue is drained. */
     FINISHED,
 
-    /** Work remains but cannot proceed now (offline, backoff): reschedule with system backoff. */
+    /**
+     * Work remains but cannot proceed now (offline, backoff, storage full, metered network not
+     * allowed): reschedule with system backoff (the host's constraints include storage not low).
+     */
     RESCHEDULE,
 
-    /** Stopped for a reason the user must resolve (cancel, storage, account): do not reschedule. */
+    /** Stopped for a reason the user must resolve (cancel, account, offline mode): do not reschedule. */
     STOPPED,
 }
 
@@ -89,9 +96,13 @@ internal class KeyCache {
  *
  * A run holds the `DOWNLOAD` engine holder, waits ≤ 60 s for the session, then for each item: checks
  * free storage, calls `download.track` (coroutine cancellation cancels the native task; `.part`
- * files are kept and resumed natively), mirrors `download` events into the database (≥ 500 ms apart)
- * and the notification, stores the record with its key encrypted, and registers it with
- * `offline.add`. Failures are retried with exponential backoff up to [DownloadRules.MAX_ATTEMPTS].
+ * files are kept and resumed natively, and the row records the file it writes via `download.fileId`
+ * so garbage collection keeps that `.part` while the row exists), mirrors `download` events into the
+ * database (≥ 500 ms apart) and the notification, stores the record with its key encrypted, and
+ * registers it with `offline.add` (numbered with the commit, see [OfflineIndexSync]). Failures are
+ * retried with exponential backoff up to [DownloadRules.MAX_ATTEMPTS]; a rate limit, or repeated
+ * connectivity failures while online, pause the whole queue ([QueueBreaker]: every pending row is
+ * held back, so the loop waits inline for a short pause and reschedules for a long one).
  *
  * Lock order: [runLock] before [commitLock] (the manager's mutation lock).
  */
@@ -107,6 +118,7 @@ internal class DownloadRunner(
     private val notifications: DownloadNotifications,
     private val keys: KeyCache,
     private val commitLock: Mutex,
+    private val index: OfflineIndexSync,
 ) {
     private val dao = database.downloads()
     private val json: Json = rpc.json
@@ -117,6 +129,9 @@ internal class DownloadRunner(
     @Volatile private var current: CurrentItem? = null
     @Volatile private var session: Deferred<RunOutcome>? = null
     @Volatile private var cancelRequested = false
+
+    /** Kept across runs (runLock orders them), so pauses keep growing while a condition lasts. */
+    private val breaker = QueueBreaker()
 
     private val _activity = MutableStateFlow(DownloadActivity())
     val activity: StateFlow<DownloadActivity> = _activity.asStateFlow()
@@ -158,6 +173,15 @@ internal class DownloadRunner(
         withTimeoutOrNull(STOP_TIMEOUT_MS) { active.cancelAndJoin() }
     }
 
+    /**
+     * [stop], then waits (bounded) until the run released the queue, so that a host scheduled next
+     * does not find the queue still taken and finish at once.
+     */
+    suspend fun stopAndAwaitIdle() {
+        stop()
+        withTimeoutOrNull(STOP_TIMEOUT_MS) { runLock.withLock {} }
+    }
+
     /** Deletes orphaned files when nothing is running or pending (after removals). */
     suspend fun collectGarbageIfIdle() {
         if (!runLock.tryLock()) return
@@ -187,12 +211,17 @@ internal class DownloadRunner(
     }
 
     private suspend fun sessionBody(host: DownloadHost): RunOutcome {
+        dao.resetInterrupted()
+        // Everything pending is held back (backoff, queue pause) for longer than a run waits: do not
+        // bring the engine up only to find that out.
+        val paused = pausedForMs(System.currentTimeMillis())
+        if (paused != null && paused > MAX_INLINE_WAIT_MS) return RunOutcome.RESCHEDULE
+        if (meteredNotAllowed()) return RunOutcome.RESCHEDULE
         val holder = engine.acquire(HolderType.DOWNLOAD)
         val receiver = notifications.registerCancelReceiver(::requestCancel)
         val stats = RunStats()
         _activity.value = DownloadActivity(running = true)
         try {
-            dao.resetInterrupted()
             host.updateNotification(notifications.progress(null, 0, 0, 0f))
             if (settings.settings.value.offlineMode) return RunOutcome.STOPPED // resumed when offline mode ends
             if (!engine.awaitOnline(ONLINE_TIMEOUT_MS)) {
@@ -212,6 +241,12 @@ internal class DownloadRunner(
                     delay(wait.coerceAtLeast(MIN_WAIT_MS))
                     continue
                 }
+                if (meteredNotAllowed()) {
+                    // The host's network constraint is stale (it predates the setting): never use
+                    // mobile data against the setting; the manager re-creates the work.
+                    Log.i(TAG, "On a metered network with mobile data downloads off: rescheduling")
+                    return RunOutcome.RESCHEDULE
+                }
                 val free = withContext(Dispatchers.IO) { storage.freeBytes() }
                 if (free < DownloadRules.MIN_FREE_BYTES) {
                     val message = context.getString(
@@ -220,7 +255,9 @@ internal class DownloadRunner(
                     )
                     stats.stopMessage = message
                     notifications.showStopped(message)
-                    return RunOutcome.STOPPED
+                    // Resumed by the host once storage is no longer low (its constraint), or when the
+                    // user comes back to the app / retries.
+                    return RunOutcome.RESCHEDULE
                 }
                 when (val result = processItem(item, host, stats)) {
                     ItemResult.Done -> Unit
@@ -246,6 +283,20 @@ internal class DownloadRunner(
                 _activity.value = DownloadActivity(lastError = stats.stopMessage)
             }
         }
+    }
+
+    /** Mobile data downloads are off and the default network is metered (no network: false). */
+    private fun meteredNotAllowed(): Boolean {
+        if (settings.settings.value.downloadOverCellular) return false
+        val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return false
+        val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork) ?: return false
+        return !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+    }
+
+    /** How long until a pending item may run; null when one may run now or nothing is pending. */
+    private suspend fun pausedForMs(now: Long): Long? {
+        if (dao.nextRunnable(now) != null) return null
+        return dao.earliestRetryAt()?.let { it - now }
     }
 
     private class RunStats {
@@ -296,31 +347,61 @@ internal class DownloadRunner(
                 },
             )
             progress.cancelAndJoin()
-            commit(item, record, quality)
-            stats.completed++
-            stats.transferredBytes += record.sizeBytes
-            host.reportTransferred(stats.transferredBytes)
+            if (commit(item, record, quality)) {
+                breaker.onSuccess()
+                stats.completed++
+                stats.transferredBytes += record.sizeBytes
+                host.reportTransferred(stats.transferredBytes)
+            }
             ItemResult.Done
         } catch (e: CancellationException) {
             progress.cancel()
             // Back to the queue untouched (attempts unchanged); the native side keeps the .part file.
-            withContext(NonCancellable) { dao.requeue(item.uri) }
+            withContext(NonCancellable) {
+                dao.requeue(item.uri)
+                withTimeoutOrNull(FILE_ID_CANCEL_TIMEOUT_MS) { recordFileId(item.uri) }
+            }
             throw e
         } catch (e: Exception) {
             progress.cancelAndJoin()
             val error = e as? NativeException
                 ?: NativeException(NativeErrorInfo(NativeErrorCode.INTERNAL, e.message ?: e.javaClass.simpleName))
             if (e !is NativeException) Log.w(TAG, "Download of ${item.uri} failed", e)
+            recordFileId(item.uri)
             handleFailure(item, error, stats)
+        }
+    }
+
+    /**
+     * Stores which file the download of [uri] writes (`download.fileId`), so garbage collection keeps
+     * its `.part` while the row exists, also once it failed or was cancelled. Best effort.
+     */
+    private suspend fun recordFileId(uri: String) {
+        try {
+            val result = withTimeoutOrNull(NATIVE_CALL_TIMEOUT_MS) {
+                withContext(Dispatchers.Default) { rpc.callRaw("download.fileId", rpcArgs { put("uri", uri) }) }
+            } ?: return
+            val fileId = result.jsonObject["fileId"]?.jsonPrimitive?.contentOrNull ?: return
+            dao.setFileId(uri, fileId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not record the file of $uri", e)
         }
     }
 
     private suspend fun trackProgress(uri: String, title: String?, total: Int, host: DownloadHost, stats: RunStats) {
         var lastDbWrite = 0L
         var lastUiUpdate = 0L
+        var fileRecorded = false
         events.downloads.collect { p ->
             if (p.uri != uri) return@collect
             if (p.state != DownloadState.PREPARING && p.state != DownloadState.DOWNLOADING) return@collect
+            if (p.state == DownloadState.DOWNLOADING && !fileRecorded) {
+                // Bytes are about to land in a .part: from now on it must survive a killed process.
+                fileRecorded = true
+                recordFileId(uri)
+            }
             val now = SystemClock.elapsedRealtime()
             if (now - lastDbWrite >= DB_THROTTLE_MS) {
                 lastDbWrite = now
@@ -349,17 +430,31 @@ internal class DownloadRunner(
         }
     }
 
-    /** Persists a finished download (key encrypted) unless the item was removed meanwhile. */
-    private suspend fun commit(item: DownloadEntity, record: OfflineTrackRecord, quality: Int) {
+    private sealed interface Commit {
+        /** Stored as change [seq] of the offline index. */
+        class Kept(val seq: Long) : Commit
+        data object Removed : Commit
+        data object FileGone : Commit
+    }
+
+    /**
+     * Persists a finished download (key encrypted) unless the item was removed meanwhile; returns
+     * whether it did.
+     */
+    private suspend fun commit(item: DownloadEntity, record: OfflineTrackRecord, quality: Int): Boolean {
         val keyHex = record.keyHex.lowercase()
         val encryptedKey = withContext(Dispatchers.IO) { credentialStore.encrypt(Hex.decode(keyHex)) }
         val recordJson = json.encodeToString(OfflineTrackRecord.serializer(), record.copy(keyHex = ""))
         val metadataJson = record.track?.let { json.encodeToString(Track.serializer(), it) }
             ?: record.episode?.let { json.encodeToString(Episode.serializer(), it) }
         val now = System.currentTimeMillis()
-        val kept = commitLock.withLock {
-            database.withTransaction {
-                val row = dao.get(item.uri) ?: return@withTransaction false
+        val outcome = commitLock.withLock {
+            // Under the lock, like removals: a file download.track reused from another download
+            // (relinking) is deleted when that download is removed before this row names the file.
+            val present = withContext(Dispatchers.IO) { File(record.path).isFile }
+            val result = database.withTransaction {
+                val row = dao.get(item.uri) ?: return@withTransaction Commit.Removed
+                if (!present) return@withTransaction Commit.FileGone
                 dao.upsert(
                     row.copy(
                         state = DownloadState.COMPLETED,
@@ -379,33 +474,35 @@ internal class DownloadRunner(
                         retryAt = null,
                     ),
                 )
-                true
+                Commit.Kept(index.next())
             }
+            // Removed while downloading: drop the file unless another download uses it (images and
+            // partial files are collected once the queue is idle).
+            if (result == Commit.Removed && dao.countFileUsers(record.fileId) == 0) {
+                withContext(Dispatchers.IO) { storage.deleteAudio(record.path) }
+            }
+            result
         }
-        if (!kept) {
-            // Removed while downloading: drop the file (images are collected once the queue is idle).
-            withContext(Dispatchers.IO) { storage.deleteAudio(record.path) }
-            return
+        val seq = when (outcome) {
+            is Commit.Kept -> outcome.seq
+            Commit.Removed -> return false
+            Commit.FileGone -> {
+                Log.w(TAG, "The file of ${item.uri} was removed with another download; downloading it again")
+                dao.requeue(item.uri)
+                return false
+            }
         }
         keys[item.uri] = keyHex
-        try {
-            withTimeoutOrNull(NATIVE_CALL_TIMEOUT_MS) {
-                rpc.callUnitOffMain(
-                    "offline.add",
-                    rpcArgs { put("tracks", json.encodeToJsonElement(ListSerializer(OfflineTrackRecord.serializer()), listOf(record.copy(keyHex = keyHex)))) },
-                )
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // The full index is pushed again (offline.setIndex) at the next engine start.
-            Log.w(TAG, "offline.add failed for ${item.uri}", e)
-        }
+        index.add(listOf(record.copy(keyHex = keyHex)), seq)
+        return true
     }
 
     private suspend fun handleFailure(item: DownloadEntity, e: NativeException, stats: RunStats): ItemResult {
         val message = describe(e)
-        return when (val action = DownloadRules.onFailure(e.code, item.attempts, engine.isOnline.value, e.info.retryAfterMs)) {
+        val online = engine.isOnline.value
+        val now = System.currentTimeMillis()
+        val pauseMs = breaker.onFailure(e.code, online, e.info.retryAfterMs)
+        val result = when (val action = DownloadRules.onFailure(e.code, item.attempts, online, e.info.retryAfterMs)) {
             DownloadRules.FailureAction.StopRun -> {
                 dao.markFailed(item.uri, item.attempts + 1, message)
                 stats.failed++
@@ -426,7 +523,20 @@ internal class DownloadRunner(
                 stats.failed++
                 ItemResult.Done
             }
+            DownloadRules.FailureAction.Throttled -> {
+                // Not an attempt: the item waits with the rest of the queue.
+                val until = now + (pauseMs ?: DownloadRules.rateLimitPauseMs(e.info.retryAfterMs, 1))
+                dao.scheduleRetry(item.uri, item.attempts, until, message)
+                ItemResult.Done
+            }
         }
+        if (pauseMs != null && result !is ItemResult.StopRun) {
+            // Hold every pending row back: the loop then waits (inline or rescheduled) instead of
+            // starting the next item against a service that is refusing them all.
+            Log.i(TAG, "Pausing the download queue for $pauseMs ms (${e.code})")
+            dao.deferPending(now + pauseMs)
+        }
+        return result
     }
 
     private fun describe(e: NativeException): String = when (e.code) {
@@ -445,11 +555,13 @@ internal class DownloadRunner(
             ?: runCatching { json.decodeFromString(Episode.serializer(), metadataJson).name }.getOrNull()
     }
 
-    /** Must hold [runLock]. */
+    /** Must hold [runLock] (no download in flight). */
     private suspend fun collectGarbage() {
         withContext(NonCancellable + Dispatchers.IO) {
             commitLock.withLock {
-                if (dao.pendingCount() == 0) storage.collectGarbage(dao.allPaths(), dao.allImagePaths())
+                if (dao.pendingCount() == 0) {
+                    storage.collectGarbage(dao.allPaths(), dao.allFileIds(), dao.unfinishedFileIds(), dao.allImagePaths())
+                }
             }
         }
     }
@@ -462,6 +574,7 @@ internal class DownloadRunner(
         const val DB_THROTTLE_MS = 500L
         const val UI_THROTTLE_MS = 1_000L
         const val NATIVE_CALL_TIMEOUT_MS = 10_000L
+        const val FILE_ID_CANCEL_TIMEOUT_MS = 2_000L
         const val STOP_TIMEOUT_MS = 5_000L
         const val MAX_NETWORK_WAITS = 5
     }
