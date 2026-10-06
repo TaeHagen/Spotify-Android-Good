@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Strings owned by the data / download layer (data/**, download/**). -->
+<resources>
+    <!-- Notification channel (created by the app initializer; fallback here). -->
+    <string name="data_dl_channel_name">Downloads</string>
+    <string name="data_dl_channel_description">Progress of music and podcasts being downloaded for offline listening</string>
+
+    <!-- Ongoing download notification -->
+    <string name="data_dl_notif_title">Downloading for offline listening</string>
+    <string name="data_dl_notif_preparing">Preparing downloads…</string>
+    <string name="data_dl_notif_progress">%1$d of %2$d</string>
+    <string name="data_dl_notif_cancel">Cancel</string>
+
+    <!-- Completion / failure notification -->
+    <plurals name="data_dl_done_title">
+        <item quantity="one">%d download complete</item>
+        <item quantity="other">%d downloads complete</item>
+    </plurals>
+    <plurals name="data_dl_done_failed">
+        <item quantity="one">%d download failed</item>
+        <item quantity="other">%d downloads failed</item>
+    </plurals>
+    <string name="data_dl_stopped_title">Downloads paused</string>
+
+    <!-- Reasons (stored with failed items and shown in notifications) -->
+    <string name="data_dl_error_storage">Not enough storage space. Free up at least %1$s to keep downloading.</string>
+    <string name="data_dl_error_premium">Downloading requires Spotify Premium.</string>
+    <string name="data_dl_error_refused">Spotify refused to provide audio for this account.</string>
+    <string name="data_dl_error_login">Log in again to continue downloading.</string>
+    <string name="data_dl_error_unavailable">Not available on Spotify.</string>
+    <string name="data_dl_error_network">Network error. Will retry.</string>
+    <string name="data_dl_error_rate_limited">Spotify is limiting requests. Will retry.</string>
+    <string name="data_dl_error_generic">Download failed.</string>
+    <string name="data_dl_error_unplayable">No longer available on Spotify.</string>
+    <string name="data_dl_error_key">Re-download required: this download can no longer be decrypted.</string>
+    <string name="data_dl_error_missing_file">The downloaded file is missing. Download it again.</string>
+</resources>

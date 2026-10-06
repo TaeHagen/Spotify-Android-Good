@@ -29,6 +29,10 @@ data class DownloadEntity(
     val lastValidatedAt: Long? = null,
     val attempts: Int = 0,
     val error: String? = null,
+    /** True when the item was downloaded on its own (not only as part of a downloaded collection). */
+    val individual: Boolean = false,
+    /** Earliest time (epoch ms) of the next attempt after a transient failure (exponential backoff). */
+    val retryAt: Long? = null,
 ) {
     override fun equals(other: Any?) = other is DownloadEntity && other.uri == uri && other.state == state &&
         other.bytesDone == bytesDone && other.completedAt == completedAt && other.error == error
