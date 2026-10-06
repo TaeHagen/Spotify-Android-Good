@@ -17,12 +17,12 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoMode
-import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Smartphone
+import androidx.compose.material.icons.rounded.SpeakerGroup
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -312,7 +312,8 @@ private fun DevicesList(
             DeviceListItem(
                 title = stringResource(R.string.player_devices_more),
                 subtitle = stringResource(R.string.player_devices_more_description),
-                icon = Icons.Rounded.Cast,
+                // The system output switcher: no Cast support (no Cast SDK), so no Cast icon either.
+                icon = Icons.Rounded.SpeakerGroup,
                 highlighted = false,
                 busy = false,
                 enabled = true,
@@ -324,8 +325,8 @@ private fun DevicesList(
             item(key = "connect:empty") {
                 EmptyState(
                     title = stringResource(R.string.player_devices_none),
-                    message = stringResource(R.string.player_devices_tip_account) + "\n" +
-                        stringResource(R.string.player_devices_tip_network),
+                    // Only devices signed in to the account are listed (no local network discovery).
+                    message = stringResource(R.string.player_devices_tip_account),
                     icon = Icons.Rounded.Devices,
                     modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
                 )
