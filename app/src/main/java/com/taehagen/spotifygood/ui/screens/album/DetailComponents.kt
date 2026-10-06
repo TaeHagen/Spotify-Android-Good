@@ -65,7 +65,6 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalLayoutDirection
-import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
@@ -86,9 +85,6 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.lifecycle.repeatOnLifecycle
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.model.AlbumRef
@@ -101,7 +97,6 @@ import com.taehagen.spotifygood.ui.components.Artwork
 import com.taehagen.spotifygood.ui.components.ErrorState
 import com.taehagen.spotifygood.ui.components.LoadingState
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.Locale
 
@@ -236,21 +231,6 @@ internal fun <T> LoadStateContent(
             ErrorState(message = stringResource(message), onRetry = onRetry)
         }
         is LoadState.Ready -> content(state.data)
-    }
-}
-
-/** Shows ViewModel messages through the app navigator (snackbar host) while started. */
-@Composable
-internal fun MessageEffect(messages: Flow<UiMessage>) {
-    val navigator = LocalAppNavigator.current
-    val resources = LocalResources.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    LaunchedEffect(messages, lifecycleOwner, resources) {
-        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            messages.collect { message ->
-                navigator.showMessage(resources.getString(message.res, *message.args.toTypedArray()))
-            }
-        }
     }
 }
 

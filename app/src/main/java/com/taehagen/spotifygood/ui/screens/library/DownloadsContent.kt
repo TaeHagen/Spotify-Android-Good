@@ -443,14 +443,18 @@ private fun StorageHeader(state: DownloadsUiState, onRetryFailed: () -> Unit) {
                     modifier = Modifier.padding(start = if (activity.running) 8.dp else 0.dp),
                 )
             }
-            if (!activity.running) {
-                activity.lastError?.let { reason ->
+            val reason = activity.lastError
+            if (reason != null && canResumeDownloads(activity, content.pendingCount)) {
+                // The last run stopped early with items still waiting: let the user restart it
+                // (retryFailed also re-queues failed items and always schedules a run).
+                Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         text = reason,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.padding(top = 4.dp),
+                        modifier = Modifier.weight(1f),
                     )
+                    TextButton(onClick = onRetryFailed) { Text(stringResource(R.string.browse_downloads_resume)) }
                 }
             }
             content.active?.let { active ->

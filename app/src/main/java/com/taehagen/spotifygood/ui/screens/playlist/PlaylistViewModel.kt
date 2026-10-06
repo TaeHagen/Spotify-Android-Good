@@ -59,6 +59,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 
 /** A loaded playlist item with a stable list key. */
 @Immutable
@@ -127,6 +128,16 @@ internal sealed interface PlaylistEvent {
     data object Deleted : PlaylistEvent
 }
 
+/**
+ * Per-playlist edit locks, process-wide: queued edits outlive their page (app scope), and a page
+ * reopened meanwhile must queue its edits behind them instead of interleaving.
+ */
+private object PlaylistEditLocks {
+    private val locks = ConcurrentHashMap<String, Mutex>()
+
+    fun forUri(uri: String): Mutex = locks.computeIfAbsent(uri) { Mutex() }
+}
+
 @OptIn(FlowPreview::class)
 internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : DetailViewModel(graph, uri) {
 
@@ -144,10 +155,15 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     // Mutations run one at a time, each with the latest known revision. Local (optimistic) state
     // wins while mutations are pending; a failure bumps [generation] so queued mutations computed
     // on the stale optimistic list are dropped, and the server state is reloaded.
-    private val mutationMutex = Mutex()
+    // They run in the app scope (on the main thread, like the rest of this class): the user saw
+    // them applied, so leaving the page must not cancel the queued ones. The lock is per playlist,
+    // shared with a reopened page of the same playlist.
+    private val mutationMutex = PlaylistEditLocks.forUri(uri)
     private var pendingMutations = 0
     private var generation = 0
     private var dragging = false
+    /** The page is gone; queued mutations still run, but nothing needs refreshing. */
+    @Volatile private var cleared = false
     private var pageJob: Job? = null
     private var loadAllJob: Job? = null
 
@@ -429,15 +445,10 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     }
 
     fun delete() {
-        viewModelScope.launch {
-            try {
-                graph.playlists.delete(uri)
-                eventChannel.send(PlaylistEvent.Deleted)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                message(R.string.detail_playlist_delete_failed)
-            }
+        launchWrite(R.string.detail_playlist_deleted, R.string.detail_playlist_delete_failed) {
+            graph.playlists.delete(uri)
+            // Leaves the page if it is still showing.
+            eventChannel.trySend(PlaylistEvent.Deleted)
         }
     }
 
@@ -462,7 +473,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         data.value = LoadState.Ready(mutation.optimistic)
         pendingMutations++
         val queuedGeneration = generation
-        viewModelScope.launch {
+        graph.appScope.launch(Dispatchers.Main.immediate) {
             mutationMutex.withLock {
                 if (queuedGeneration != generation) {
                     pendingMutations--
@@ -485,9 +496,15 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
                 if (failure != null) message(mutationFailureMessage(failure))
                 // With pending edits a refresh would only fetch the revision we already have; the
                 // rows are refreshed once the queue drains (or right away after a failure).
-                if (failure != null || revision == null || pendingMutations == 0) refreshLoaded(force = failure != null)
+                val refresh = failure != null || revision == null || pendingMutations == 0
+                if (refresh && !cleared) refreshLoaded(force = failure != null)
             }
         }
+    }
+
+    override fun onCleared() {
+        cleared = true
+        super.onCleared()
     }
 
     /**
