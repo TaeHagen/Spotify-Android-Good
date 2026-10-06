@@ -21,6 +21,10 @@ use librespot_playback::player::{Player, PlayerEventChannel};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+/// Longest wait for a dropped Player (part of the `session.stop` / `logout` bound).
+pub(crate) const PLAYER_DROP_TIMEOUT: Duration = Duration::from_millis(1500);
 
 struct Host {
     player: Arc<Player>,
@@ -64,10 +68,16 @@ pub(crate) fn offline_session() -> Session {
     Session::new(config::session_config(), None)
 }
 
+/// Drops a Player that is no longer in `HOST`, waiting at most [`PLAYER_DROP_TIMEOUT`]: its
+/// `Drop` joins the player thread, which joins the loader threads (bounded in the vendored
+/// player, see PATCHES.md). A drop that takes longer finishes in the background; a new Player
+/// can be created meanwhile (the old one was stopped first, so it no longer writes audio).
 async fn drop_player(player: Arc<Player>) {
     player.stop();
-    if let Err(e) = tokio::task::spawn_blocking(move || drop(player)).await {
-        log::warn!("dropping the player failed: {e}");
+    match tokio::time::timeout(PLAYER_DROP_TIMEOUT, tokio::task::spawn_blocking(move || drop(player))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("dropping the player failed: {e}"),
+        Err(_) => log::warn!("the player is still shutting down, continuing without waiting"),
     }
 }
 

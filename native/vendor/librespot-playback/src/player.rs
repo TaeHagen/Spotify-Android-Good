@@ -71,6 +71,16 @@ const AUDIO_KEY_RETRY_DELAY: Duration = Duration::from_secs(1);
 // runtime nothing drives I/O or timers while the player thread is blocked in `Sink::write`.
 const PLAYER_RUNTIME_WORKER_THREADS: usize = 1;
 
+// SPOTIFYGOOD: bounded player shutdown. Stock `PlayerInternal::drop` joins every loader thread
+// (superseded loads included) and the runtime drop waits for its blocking tasks (hyper's
+// getaddrinfo). Loaders have no network timeout, so a stalled request kept `Player::drop`
+// (and the engine's stop/logout) waiting for minutes. Loaders still running after
+// `LOADER_JOIN_TIMEOUT` are detached (their results are discarded anyway); the runtime is shut
+// down with `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT`, which also cancels the I/O of detached loaders.
+const LOADER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+const LOADER_JOIN_POLL: Duration = Duration::from_millis(10);
+const PLAYER_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+
 pub type PlayerResult = Result<(), Error>;
 
 // SPOTIFYGOOD: why a track could not be loaded, carried by `PlayerEvent::Unavailable`.
@@ -605,6 +615,9 @@ impl Player {
                 .build()
                 .expect("Failed to create Tokio runtime");
             runtime.block_on(internal);
+            // SPOTIFYGOOD: bounded (see PLAYER_RUNTIME_SHUTDOWN_TIMEOUT); a plain drop waits for
+            // every blocking task without a limit.
+            runtime.shutdown_timeout(PLAYER_RUNTIME_SHUTDOWN_TIMEOUT);
 
             debug!("PlayerInternal thread finished.");
         })
@@ -2791,8 +2804,17 @@ impl Drop for PlayerInternal {
                 .collect()
         };
 
+        // SPOTIFYGOOD: join for at most LOADER_JOIN_TIMEOUT in total, then detach the rest.
+        let deadline = Instant::now() + LOADER_JOIN_TIMEOUT;
         for handle in handles {
-            let _ = handle.join();
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(LOADER_JOIN_POLL);
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                warn!("Loader thread still running at player shutdown, detaching it");
+            }
         }
     }
 }

@@ -97,11 +97,12 @@ arm), which needed no change.
 | `src/lib.rs` | `pub mod offline;` |
 | `src/config.rs` | `PlayerConfig::offline_source` (+ default `None`); `NormalisationSettings` + helpers. |
 | `player.rs` imports | `process::exit` removed; `FutureExt` instead of `TryFutureExt`; new imports. |
-| `player.rs` consts | `AUDIO_KEY_RETRIES = 3`, `AUDIO_KEY_RETRY_DELAY = 1 s`, `PLAYER_RUNTIME_WORKER_THREADS = 1`. |
+| `player.rs` consts | `AUDIO_KEY_RETRIES = 3`, `AUDIO_KEY_RETRY_DELAY = 1 s`, `PLAYER_RUNTIME_WORKER_THREADS = 1`, `LOADER_JOIN_TIMEOUT = 1 s`, `LOADER_JOIN_POLL = 10 ms`, `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT = 250 ms`. |
 | `UnavailableReason`, `KeyFailure`, `classify_audio_key_error` | New. Classification: `is_permanent_denial` → abort; session invalid / `SessionError::NotConnected` → no retry; everything else → retry. |
 | `PlayerCommand` | `SetOfflineSource`, `SetBitrate`, `SetNormalisation`, `SetGapless` (+ `Debug` arms). |
 | `PlayerEvent::Unavailable` | `reason` field. |
-| `Player::new` | `thread::Builder` named `lrs-player`; runtime `new_multi_thread().worker_threads(1).thread_name("lrs-player-rt")`. |
+| `Player::new` | `thread::Builder` named `lrs-player`; runtime `new_multi_thread().worker_threads(1).thread_name("lrs-player-rt")`, ended with `shutdown_timeout(PLAYER_RUNTIME_SHUTDOWN_TIMEOUT)` instead of a plain drop (which waits for every blocking task, e.g. a hanging getaddrinfo). |
+| `impl Drop for PlayerInternal` | Joins the loader threads for at most `LOADER_JOIN_TIMEOUT` in total, then detaches the rest (stock joined every one without a limit; loaders have no network timeout, so a stalled request blocked `Player::drop` for minutes). |
 | `Player::set_*` | New methods. |
 | `PlayerPreload::Loading`, `PlayerState::Loading` | loader output `Result<_, UnavailableReason>` instead of `Result<_, ()>`. |
 | `PlayerTrackLoader::load_track` / `load_remote_track` / `load_local_track` | Return `Result<PlayerLoadedTrackData, UnavailableReason>`. Offline hook. Key retry. No cache deletion after a key failure. Local files: `duration.as_secs().max(1)` (stock divides by zero for files < 1 s). |
@@ -149,6 +150,10 @@ arm), which needed no change.
   * Transient exhaustion → the file is still tried without decryption (some files are not
     encrypted). If that fails → `Unavailable(KeyTemporarilyDenied)`. A cached file is never
     deleted after a key failure.
+* **Bounded drop.** `Player::drop` returns within about `LOADER_JOIN_TIMEOUT` +
+  `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT` plus the current packet. Loaders still running then are
+  detached; the runtime shutdown cancels their I/O, so they end soon after with their result
+  discarded. The engine still bounds its own wait (`player_host::PLAYER_DROP_TIMEOUT`).
 * **Process safety.** Sink `start()`/`stop()` errors no longer exit the process. A failed start
   produces `Playing` then `Paused`. Watch `Player::is_invalid()` for a dead player thread.
 * **Threads.** `lrs-player` (decoding and all Sink calls), `lrs-player-rt` (1 tokio worker:
