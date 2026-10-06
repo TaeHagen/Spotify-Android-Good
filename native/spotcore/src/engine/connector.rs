@@ -10,7 +10,7 @@
 use super::{config, player_host, state};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{EngineSettings, StoredCredentials};
-use crate::{connect, events, runtime};
+use crate::{connect, events};
 use librespot_connect::Spirc;
 use librespot_core::authentication::Credentials;
 use librespot_core::session::SessionInvalidReason;
@@ -193,27 +193,11 @@ pub(crate) async fn teardown_finished(live: Live, restore: bool) {
     player_host::detach_session();
 }
 
-/// After `Spirc::new`: reads the reusable credentials librespot wrote to the cache, deletes the
-/// plaintext file, and emits a `credentials` event when they are new.
-pub(crate) async fn harvest_credentials(session: &Session, used: Option<&StoredCredentials>) -> Option<StoredCredentials> {
-    let cache = session.cache().cloned();
-    let path = runtime::credentials_dir().join("credentials.json");
-    let from_cache = tokio::task::spawn_blocking(move || {
-        let creds = cache.and_then(|c| c.credentials());
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => log::warn!("could not delete the credentials file: {e}"),
-        }
-        creds
-    })
-    .await
-    .ok()
-    .flatten();
-    let stored = from_cache
-        .as_ref()
-        .and_then(config::from_librespot)
-        .or_else(|| config::from_session(session.username(), session.auth_data()))?;
+/// After `Spirc::new`: the reusable credentials of the connected session (`Session::connect`
+/// sets its username and auth data from the APWelcome), and a `credentials` event when they
+/// are new. Nothing is read from or written to disk (the Cache has no credentials location).
+pub(crate) fn harvest_credentials(session: &Session, used: Option<&StoredCredentials>) -> Option<StoredCredentials> {
+    let stored = config::from_session(session.username(), session.auth_data())?;
     if used != Some(&stored) {
         events::emit(events::CREDENTIALS, &stored);
     }

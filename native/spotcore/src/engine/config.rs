@@ -84,18 +84,32 @@ pub(crate) fn connect_config(settings: &EngineSettings, initial_volume: u16) -> 
     }
 }
 
-/// Streaming cache only (downloads live elsewhere); credentials go to the no-backup dir and are
-/// deleted right after librespot wrote them. Blocking (directory scan) → `spawn_blocking`.
+/// Streaming cache only (downloads live elsewhere). No credentials location: librespot would
+/// write the reusable credentials there in plaintext on every login; they are taken from the
+/// Session instead (`connector::harvest_credentials`) and Kotlin stores them encrypted.
+/// Blocking (directory scan) → `spawn_blocking`.
 pub(crate) async fn build_cache(settings: &EngineSettings) -> AppResult<Cache> {
     let limit_mb = settings.streaming_cache_mb;
     tokio::task::spawn_blocking(move || -> AppResult<Cache> {
+        remove_legacy_credentials_file();
         std::fs::create_dir_all(runtime::librespot_tmp_dir())?;
         let audio = (limit_mb > 0).then(runtime::streaming_cache_dir);
         let limit = (limit_mb > 0).then(|| limit_mb.saturating_mul(MIB));
-        Cache::new(Some(runtime::credentials_dir()), None, audio, limit).map_err(AppError::from)
+        Cache::new(None, None, audio, limit).map_err(AppError::from)
     })
     .await
     .map_err(|e| AppError::internal(format!("cache setup: {e}")))?
+}
+
+/// Deletes the plaintext `credentials.json` older builds let librespot write (and could leave
+/// behind after a failed attempt). Blocking.
+fn remove_legacy_credentials_file() {
+    let path = runtime::credentials_dir().join("credentials.json");
+    match std::fs::remove_file(&path) {
+        Ok(()) => log::info!("deleted a leftover plaintext credentials file"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("could not delete the leftover credentials file: {e}"),
+    }
 }
 
 pub(crate) fn to_librespot(c: &StoredCredentials) -> AppResult<Credentials> {
@@ -116,7 +130,8 @@ pub(crate) fn from_librespot(c: &Credentials) -> Option<StoredCredentials> {
     Some(StoredCredentials { username, auth_type: c.auth_type.value(), auth_data: BASE64.encode(&c.auth_data) })
 }
 
-/// Reusable credentials from a connected session (fallback when the cache file is missing).
+/// Reusable credentials of a connected session (`Session::connect` stores the APWelcome reusable
+/// credentials, which are always `AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS`).
 pub(crate) fn from_session(username: String, auth_data: Vec<u8>) -> Option<StoredCredentials> {
     from_librespot(&Credentials {
         username: Some(username),

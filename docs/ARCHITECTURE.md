@@ -180,9 +180,10 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   task, subscribes to `subscribe_state()`, `subscribe_cluster()`, `subscribe_errors()`.
 * Credentials: first login uses `Credentials::with_access_token(oauthToken)`; afterwards
   always the stored reusable credentials (JSON, `{"username","authType","authData"}`)
-  passed in by Kotlin. When librespot produces new reusable credentials (read from the
-  Cache `credentials.json` after connect, then that file is deleted), Rust emits a
-  `credentials` event; Kotlin stores them encrypted.
+  passed in by Kotlin. When librespot produces new reusable credentials (taken from the
+  Session after connect; the librespot `Cache` has no credentials location, so they are never
+  written to disk in plaintext, and a `credentials.json` left by an older build is deleted),
+  Rust emits a `credentials` event; Kotlin stores them encrypted.
 * Reconnect supervisor: awaits the spirc task end / polls `session.is_invalid()` every 5 s
   while Online (cheap, no network), reacts to `session.setNetworkAvailable`. Backoff
   1→60 s, reset on success; at most one attempt in flight; no attempts while the network

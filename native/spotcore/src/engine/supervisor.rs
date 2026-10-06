@@ -351,7 +351,7 @@ impl Supervisor {
 
     async fn online(&mut self, mut live: Live) -> Phase {
         let used = shared().credentials.lock().clone();
-        if let Some(stored) = connector::harvest_credentials(&live.session, used.as_ref()).await {
+        if let Some(stored) = connector::harvest_credentials(&live.session, used.as_ref()) {
             *shared().credentials.lock() = Some(stored);
         }
         let mut declared = false;
