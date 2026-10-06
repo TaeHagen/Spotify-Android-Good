@@ -674,7 +674,8 @@ impl Default for EngineSettings {
             normalize_pregain: NormalizePregain::Normal,
             autoplay: true,
             gapless: true,
-            device_name: "Android".into(),
+            // Empty: `engine::config::device_name` falls back to the nativeInit device name.
+            device_name: String::new(),
             streaming_cache_mb: 1024,
             offline: false,
         }

@@ -67,9 +67,15 @@ pub(crate) fn player_config(settings: &EngineSettings) -> PlayerConfig {
     config
 }
 
+/// The Connect / zeroconf device name: the setting, else the `nativeInit` device name (the
+/// phone model, from Kotlin), else "Android".
 pub(crate) fn device_name(settings: &EngineSettings) -> String {
-    let name = settings.device_name.trim();
-    if name.is_empty() { DEFAULT_DEVICE_NAME.to_string() } else { name.to_string() }
+    let init_name = runtime::is_initialized().then(|| runtime::config().device_name.trim()).unwrap_or_default();
+    [settings.device_name.trim(), init_name]
+        .into_iter()
+        .find(|name| !name.is_empty())
+        .unwrap_or(DEFAULT_DEVICE_NAME)
+        .to_string()
 }
 
 pub(crate) fn connect_config(settings: &EngineSettings, initial_volume: u16) -> ConnectConfig {

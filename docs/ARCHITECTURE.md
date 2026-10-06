@@ -93,7 +93,8 @@ object NativeBridge {
 
 * `nativeInit` — once per process (from `App.onCreate`). Creates the tokio runtime,
   stores global refs and installs the logger. No network. `configJson`:
-  `{"filesDir","cacheDir","noBackupDir","deviceId","deviceName","logLevel"}`.
+  `{"filesDir","cacheDir","noBackupDir","deviceId","deviceName","logLevel"}`. `deviceName` (the
+  phone model) is the Connect / zeroconf name when `EngineSettings.deviceName` is empty.
 * `nativeCall` — never blocks. Result delivered later via
   `NativeCallbacks.onResult(requestId, ok, json)`. `requestId == 0` means
   fire-and-forget. `argsJson` is a JSON object (`{}` when no args).
@@ -333,7 +334,7 @@ active** → connect-state command to that device.
 | `session.setNetworkAvailable` | `{"available":true,"metered":false}` | `{}` |
 | `session.updateSettings` | `EngineSettings` | `{}` |
 | `session.logout` | `{}` | `{}` (forgets the account, stops, deletes the caches; runs to the end even if cancelled) |
-| `session.zeroconfLogin` | `{"timeoutMs":180000}` | `{"credentials":{…}}` when another Spotify app hands over credentials (libmdns discovery; Kotlin holds a MulticastLock meanwhile) |
+| `session.zeroconfLogin` | `{"timeoutMs":180000,"deviceName":"…"}` | `{"credentials":{…}}` when another Spotify app hands over credentials (libmdns discovery; Kotlin holds a MulticastLock meanwhile). `deviceName` is advertised (the setting, else the phone model); without it the Connect name below is used |
 | `session.token` | `{}` | `{"accessToken","expiresAtMs"}` login5 token (for Kotlin-side HTTP such as artwork never needs it; reserved) |
 | `session.setOAuthToken` | `{"accessToken","expiresAtMs"}` | `{}` (lets pathfinder fall back to the OAuth token) |
 

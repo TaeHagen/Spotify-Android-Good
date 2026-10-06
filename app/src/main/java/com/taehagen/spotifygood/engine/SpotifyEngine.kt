@@ -285,13 +285,26 @@ class SpotifyEngine(
         }
     }
 
+    /**
+     * The name zeroconf advertises (and the login screen tells the user to pick): the device-name
+     * setting, else the device model, the same rule as the Connect name.
+     */
+    fun zeroconfDeviceName(): String = settings.settings.value.deviceName.trim().ifBlank { deviceName }
+
     /** Login by letting another Spotify app on the LAN hand over credentials (Spotify Connect zeroconf). */
     suspend fun loginWithZeroconf(timeoutMs: Long = 180_000) {
         ready.await()
         ensureNativeAvailable()
+        val name = settings.awaitLoaded().deviceName.trim().ifBlank { deviceName }
         val result = try {
             withTimeout(timeoutMs + ZEROCONF_GRACE_MS) {
-                rpc.call<ZeroconfResult>("session.zeroconfLogin", buildJsonObject { put("timeoutMs", timeoutMs) })
+                rpc.call<ZeroconfResult>(
+                    "session.zeroconfLogin",
+                    buildJsonObject {
+                        put("timeoutMs", timeoutMs)
+                        put("deviceName", name)
+                    },
+                )
             }
         } catch (e: TimeoutCancellationException) {
             throw NativeException(NativeErrorInfo(NativeErrorCode.NETWORK, "No Spotify app handed over a login"))
