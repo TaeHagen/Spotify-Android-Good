@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.ui.screens.player
 
+import android.os.SystemClock
 import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -93,8 +94,19 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
     /** Finer position for synced lyrics. */
     val lyricsPosition: Flow<Long> = playback.positionTicker(LYRICS_TICK_MS)
 
-    /** A once-per-second tick for the sleep timer countdown (only while the sheet is visible). */
-    val clock: Flow<Long> = playback.positionTicker(CLOCK_TICK_MS)
+    /**
+     * A once-per-second tick for the sleep timer countdown, only while collected (the sheet is
+     * visible) and a timed sleep timer runs. Independent of playback: the timer keeps counting
+     * down while paused. "End of track" shows no countdown, so it does not tick.
+     */
+    val clock: Flow<Long> = sleepTimer.state.transformLatest { state ->
+        if (state is SleepTimerState.Running) {
+            while (true) {
+                emit(SystemClock.elapsedRealtime())
+                delay(CLOCK_TICK_MS)
+            }
+        }
+    }
 
     fun positionNow(): Long = playback.positionMs()
 
