@@ -1,5 +1,7 @@
 package com.taehagen.spotifygood.ui
 
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
 import kotlinx.coroutines.withTimeoutOrNull
 
 // Pure helpers of the UI shell (no Android framework calls; covered by JVM unit tests).
@@ -16,4 +18,35 @@ internal suspend fun awaitLoginState(
 ): Boolean {
     if (isLoggedIn()) return true
     return withTimeoutOrNull(timeoutMs) { awaitReady() } != null && isLoggedIn()
+}
+
+/**
+ * ViewModel stores of the signed-in UI (the main scaffold's navigation entries, player surfaces and
+ * sheets). Held by the activity-scoped shell, so a session survives configuration changes; a
+ * session is [release]d when the signed-in UI is left for good (logout, Premium gate, activity
+ * finishing), which clears all its ViewModels. Without this the NavController's entries live in the
+ * activity's store, and disposing the scaffold without popping them leaves every ViewModel of the
+ * old session running (collectors, refetches) until the activity finishes. Main thread only.
+ */
+internal class MainSessionStore {
+    private class Session : ViewModelStoreOwner {
+        override val viewModelStore = ViewModelStore()
+    }
+
+    private var current: Session? = null
+
+    /** The current session (a new one once the previous one was released). */
+    fun acquire(): ViewModelStoreOwner = current ?: Session().also { current = it }
+
+    /** Clears every ViewModel of [session]; the next [acquire] starts a new session. */
+    fun release(session: ViewModelStoreOwner) {
+        if (current === session) current = null
+        session.viewModelStore.clear()
+    }
+
+    /** The shell itself is cleared (activity finished). */
+    fun clear() {
+        current?.viewModelStore?.clear()
+        current = null
+    }
 }
