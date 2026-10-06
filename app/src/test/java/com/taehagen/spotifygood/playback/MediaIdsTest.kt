@@ -34,6 +34,16 @@ class MediaIdsTest {
     }
 
     @Test
+    fun likedSongsFolderIsPlayableWithItsContextUri() {
+        val liked = "spotify:user:someone:collection"
+        val id = LibraryTree.likedMediaId(liked)
+        assertEquals(LoadPlan(contextUri = liked), MediaIds.plan(listOf(id), 0) { error("unused") })
+        // While the user is unknown the folder keeps the browse-only id (not playable).
+        assertEquals(LibraryTree.LIKED, LibraryTree.likedMediaId(null))
+        assertNull(MediaIds.plan(listOf(LibraryTree.LIKED), 0) { error("unused") })
+    }
+
+    @Test
     fun planPlaysTrackInsideItsContext() {
         val plan = MediaIds.plan(listOf(MediaIds.inContext(playlist, t2)), 0) { error("unused") }
         assertEquals(LoadPlan(contextUri = playlist, startUri = t2), plan)

@@ -307,7 +307,10 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
     private fun likedFolder(): MediaItem {
         val uri = likedContextUri()
         return MediaItem.Builder()
-            .setMediaId(LIKED)
+            // Playable ("Play" on the folder) only works with the context uri as the media id:
+            // MediaIds/SpotifyPlayer cannot load "library:liked". Browsing/lookup of the context
+            // uri lands on the Liked Songs branches as well.
+            .setMediaId(likedMediaId(uri))
             .setMediaMetadata(
                 MediaMetadata.Builder()
                     .setTitle(context.getString(R.string.playback_liked_songs))
@@ -499,6 +502,13 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         const val ALBUMS = "library:albums"
         const val ARTISTS = "library:artists"
         const val PODCASTS = "library:podcasts"
+
+        /**
+         * Media id of the Liked Songs folder: its context uri when the user is known (so the folder
+         * is playable), otherwise [LIKED] (browsable only). [LIKED] keeps working for browsers that
+         * cached it.
+         */
+        fun likedMediaId(likedContextUri: String?): String = likedContextUri ?: LIKED
 
         private const val MAX_TABS = 4
         private const val MAX_ITEMS = 100
