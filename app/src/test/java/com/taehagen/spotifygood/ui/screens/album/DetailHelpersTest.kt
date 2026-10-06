@@ -176,6 +176,20 @@ class ReorderMathTest {
     }
 
     @Test
+    fun insertBeforeMatchesTheContract() {
+        // docs/ARCHITECTURE.md §6.3: moving item 2 to the end of a 5-item list is from 2, to 5.
+        assertEquals(5, insertBeforeIndex(2, 4))
+        assertEquals(listOf("a", "b", "d", "e", "c"), list.movedBefore(2, 5))
+        // Drag / "move down" one row: insert before target + 1; "move up": before the target.
+        assertEquals(4, insertBeforeIndex(2, 3))
+        assertEquals(listOf("a", "b", "d", "c", "e"), list.movedBefore(2, insertBeforeIndex(2, 3)))
+        assertEquals(1, insertBeforeIndex(2, 1))
+        assertEquals(listOf("a", "c", "b", "d", "e"), list.movedBefore(2, insertBeforeIndex(2, 1)))
+        assertEquals(0, insertBeforeIndex(4, 0))
+        assertEquals(listOf("e", "a", "b", "c", "d"), list.movedBefore(4, insertBeforeIndex(4, 0)))
+    }
+
+    @Test
     fun indexAfterMoveTracksEveryElement() {
         for (from in list.indices) {
             for (to in list.indices) {
