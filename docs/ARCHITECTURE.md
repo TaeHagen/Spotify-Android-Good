@@ -133,8 +133,11 @@ Error results and error events use
 `NOT_LOGGED_IN, NOT_CONNECTED, BAD_CREDENTIALS, PREMIUM_REQUIRED, NETWORK, NOT_FOUND,
 RATE_LIMITED, INVALID_ARGUMENT, UNAVAILABLE, NOT_ACTIVE_DEVICE, PLAYBACK_REFUSED, CANCELLED,
 INTERNAL`. `PLAYBACK_REFUSED` = Spotify permanently refused audio keys for this account
-(librespot #1649; AesKeyError 0x0001). The engine stops after 3 consecutive refusals instead
-of skipping through the queue, and the app shows a dedicated explanation screen.
+(librespot #1649; AesKeyError 0x0001). The engine stops after 3 consecutive refused loads
+instead of skipping through the queue, and the app shows a dedicated explanation screen. Only
+loads count: a refused preload never stops the playing track. 3 loads failing transiently
+(audio key timeout or rate limit, network) also stop playback, with `RATE_LIMITED`
+(`retryAfterMs` 60000) or `NETWORK`. A track plays or a new `player.load` resets the count.
 Kotlin maps them to `NativeException(code, message)`.
 
 ### 3.4 JSON conventions

@@ -42,7 +42,7 @@ pub(crate) struct HubState {
     pub last_active: Option<LastActive>,
     /// A reconnect with a pending restore is in progress (frozen playback state).
     pub reconnect: Option<restore::Frozen>,
-    /// `lastError` override after Spotify refused audio keys.
+    /// `lastError` override after the load brake stopped playback (see `player_events`).
     pub refused_error: Option<String>,
 }
 

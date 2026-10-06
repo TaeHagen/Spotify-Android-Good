@@ -16,7 +16,8 @@ use crate::{
     model::{AudioOutputKind, LoadRequest, PlayingTrack, SpircPlayStatus},
     playback::{
         mixer::Mixer,
-        player::{Player, PlayerEvent, PlayerEventChannel},
+        // SPOTIFYGOOD: + UnavailableReason
+        player::{Player, PlayerEvent, PlayerEventChannel, UnavailableReason},
     },
     protocol::{
         autoplay_context_request::AutoplayContextRequest,
@@ -1282,10 +1283,30 @@ impl SpircTask {
                 self.handle_preload_next_track();
                 return Ok(());
             }
-            PlayerEvent::Unavailable { track_id, .. } => {
-                self.handle_unavailable(&track_id)?;
-                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()? {
+            // SPOTIFYGOOD: transient failures (audio key timeout or rate limit, network) no longer
+            // mark the track unavailable for the rest of the session. A failed preload only
+            // preloads the track after it when the failure was specific to that track: after a
+            // key denial or a transient failure the next preload most likely fails the same way,
+            // and the chain walked the whole queue (one key request each) while a track played.
+            // The next track is then loaded (and a failure handled like any other) when the
+            // current one ends.
+            PlayerEvent::Unavailable {
+                track_id, reason, ..
+            } => {
+                let transient = matches!(
+                    reason,
+                    UnavailableReason::KeyTemporarilyDenied | UnavailableReason::NetworkError
+                );
+                let is_current =
+                    self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()?;
+                if !transient {
+                    self.connect_state.mark_unavailable(&track_id)?;
+                }
+                if is_current {
+                    self.handle_preload_next_track();
                     self.handle_next(None)?
+                } else if !transient && reason != UnavailableReason::KeyDenied {
+                    self.handle_preload_next_track();
                 }
             }
             _ => return Ok(()),
@@ -2358,13 +2379,8 @@ impl SpircTask {
         }
     }
 
-    // Mark unavailable tracks so we can skip them later
-    fn handle_unavailable(&mut self, track_id: &SpotifyUri) -> Result<(), Error> {
-        self.connect_state.mark_unavailable(track_id)?;
-        self.handle_preload_next_track();
-
-        Ok(())
-    }
+    // SPOTIFYGOOD: handle_unavailable (mark + preload the next track) is inlined into the
+    // PlayerEvent::Unavailable handling, which now depends on the reason
 
     fn add_autoplay_resolving_when_required(&mut self) {
         let require_load_new = !self
