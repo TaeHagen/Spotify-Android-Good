@@ -345,18 +345,18 @@ active** → connect-state command to that device.
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
 | `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` | `SearchResults` |
-| `catalog.home` | `{}` | `{"sections":[HomeSection]}` |
+| `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection]}` |
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
-| `catalog.radio` | `{"uri"}` | `{"contextUri":"spotify:playlist:…"}` (inspiredby-mix) |
+| `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
 | `catalog.recentlyPlayed` | `{"limit":50}` | `{"items":[MediaRef]}` |
 | `catalog.user` | `{"username"?}` | `User` (me when omitted) |
 | `library.playlists` | `{}` | `{"items":[RootlistEntry]}` (rootlist, folders preserved) |
-| `library.tracks` | `{"offset":0,"limit":100}` | `{"total","items":[{"addedAt","track":Track}]}` (Liked Songs) |
+| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}]}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` |
 | `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"}` | paged `{"total","items":[…]}` |
 | `library.contains` | `{"uris":[…]}` | `{"contains":[bool]}` |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
 | — | | Playlist revision conflicts (stale `revision`) fail with `INVALID_ARGUMENT` and a message containing "revision"; clients reload and retry. |
-| `playlist.create` | `{"name","description"?,"public":false}` | `{"uri"}` (also added to rootlist) |
+| `playlist.create` | `{"name","description"?,"public":false,"uris"?:[…]}` | `{"uri","revision"}` (also added to the top of the rootlist) |
 | `playlist.addItems` | `{"uri","uris":[…],"position":null}` | `{"revision"}` |
 | `playlist.removeItems` | `{"uri","items":[{"uri","index"}],"revision"}` | `{"revision"}` |
 | `playlist.moveItems` | `{"uri","fromIndex","length","toIndex","revision"}` | `{"revision"}` — `toIndex` uses playlist4 MOV semantics: the insert-before position in the list *before* the move (moving item 2 to the end of a 5-item list: from 2, to 5) |
@@ -393,6 +393,9 @@ Artist       {"uri","name","images","headerImages"?,"biography"?,"topTracks":[Tr
 PlaylistRef  {"uri","name","description"?,"images","owner":{"username","displayName"?},"totalTracks"?}
 Playlist     PlaylistRef + {"collaborative","isOwnedByMe","canEdit","revision","offset","total",
               "items":[{"uid"?,"addedAt"?,"addedBy"?,"track"?:Track,"episode"?:Episode}],"following"?:bool}
+             (items never drop out, so indexes stay aligned for edits: local files and unresolved
+              items keep their slot as a `track`/`episode` with `playable:false`; local files have
+              empty `artists`)
 ShowRef      {"uri","name","publisher"?,"images"}
 Show         ShowRef + {"description","episodes":[Episode],"total","offset","following"?}
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef}
