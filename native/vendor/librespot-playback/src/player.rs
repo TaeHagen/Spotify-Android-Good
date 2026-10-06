@@ -7,7 +7,8 @@ use std::{
     mem,
     pin::Pin,
     // SPOTIFYGOOD: `process::exit` removed. No code path may end the host (Android app) process.
-    sync::Mutex,
+    // `MutexGuard` / `PoisonError` for `lock_load_handles()`.
+    sync::{Mutex, MutexGuard, PoisonError},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -56,7 +57,9 @@ pub const PCM_AT_0DBFS: f64 = 1.0;
 // otherwise expect in Vorbis comments. This packet isn't well-formed and players may balk at it.
 const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 
-const LOAD_HANDLES_POISON_MSG: &str = "load handles mutex should not be poisoned";
+// SPOTIFYGOOD: `LOAD_HANDLES_POISON_MSG` removed. `load_handles` is locked with
+// `lock_load_handles()`, which ignores poisoning: a panic elsewhere must never turn into a
+// second panic in `PlayerInternal::drop` (a double panic aborts the host process).
 
 // SPOTIFYGOOD: audio-key retry policy for transient failures (librespot #1649 / PR #1763).
 const AUDIO_KEY_RETRIES: u32 = 3;
@@ -2713,24 +2716,32 @@ impl PlayerInternal {
         // SPOTIFYGOOD: hold the lock while spawning and inserting. Otherwise a fast loader
         // (e.g. an offline file) could remove its entry before it was inserted, leaving an
         // un-joined handle in the map until the player is dropped.
-        let mut load_handles = self.load_handles.lock().expect(LOAD_HANDLES_POISON_MSG);
+        let mut load_handles = lock_load_handles(&self.load_handles);
 
         // SPOTIFYGOOD: named thread; the result (including the failure reason) is always sent.
-        let load_handle = thread::Builder::new()
+        // A failed spawn (EAGAIN: thread limit or memory pressure) must not panic while the
+        // guard is held: that poisoned the mutex and the unwind's `PlayerInternal::drop` then
+        // panicked again, aborting the process. The closure (and `result_tx` with it) is
+        // dropped, so the load ends as `Unavailable(Other)` below.
+        let spawned = thread::Builder::new()
             .name("lrs-loader".to_string())
             .spawn(move || {
                 let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
                 let _ = result_tx.send(data);
 
-                let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
-                load_handles.remove(&thread::current().id());
-            })
-            .expect("Failed to spawn loader thread");
+                lock_load_handles(&load_handles_clone).remove(&thread::current().id());
+            });
 
-        load_handles.insert(load_handle.thread().id(), load_handle);
+        match spawned {
+            Ok(load_handle) => {
+                load_handles.insert(load_handle.thread().id(), load_handle);
+            }
+            Err(e) => error!("Failed to spawn loader thread: {e}"),
+        }
         drop(load_handles);
 
-        // SPOTIFYGOOD: a dropped sender (the loader thread panicked) is reported as `Other`.
+        // SPOTIFYGOOD: a dropped sender (the loader thread panicked or could not be spawned) is
+        // reported as `Other`.
         result_rx.map(|result| result.unwrap_or(Err(UnavailableReason::Other)))
     }
 
@@ -2757,13 +2768,22 @@ impl PlayerInternal {
     }
 }
 
+// SPOTIFYGOOD: locks `load_handles` even if a thread panicked while holding it. The map stays
+// consistent (single insert / remove / drain operations), so the poison flag carries no
+// information here, and panicking on it in `Drop` would abort the process.
+type LoadHandles = HashMap<thread::ThreadId, thread::JoinHandle<()>>;
+
+fn lock_load_handles(handles: &Mutex<LoadHandles>) -> MutexGuard<'_, LoadHandles> {
+    handles.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl Drop for PlayerInternal {
     fn drop(&mut self) {
         debug!("drop PlayerInternal[{}]", self.player_id);
 
         let handles: Vec<thread::JoinHandle<()>> = {
             // waiting for the thread while holding the mutex would result in a deadlock
-            let mut load_handles = self.load_handles.lock().expect(LOAD_HANDLES_POISON_MSG);
+            let mut load_handles = lock_load_handles(&self.load_handles); // SPOTIFYGOOD
 
             load_handles
                 .drain()
