@@ -3,9 +3,11 @@
 //! Lookup order per uri: the catalog cache (`catalog::metadata::cached_*`), our own LRU of
 //! fetched items, the offline index (downloads carry their metadata), and finally the partial
 //! metadata of the playing `AudioItem` (`PlayerEvent::TrackChanged`). Missing items of the
-//! window (current + next 30 + prev 10) are fetched in batches with `catalog::metadata::tracks` /
-//! `episodes` (debounced, one batch in flight); results are emitted as `queueMetadata` and the
-//! snapshot is republished. Uris the catalog does not return are not retried for a while.
+//! window (current + next 50, the Media3 queue window + prev 10) are fetched in batches with
+//! `catalog::metadata::tracks` / `episodes` (debounced, one batch in flight); results are emitted
+//! as `queueMetadata` and the snapshot is republished. Uris a successful response omits are not
+//! retried for 5 minutes; after a failed or timed out request they are retried after 20 s, or as
+//! soon as the session is online again.
 //! Context names come from the context metadata, a built-in table, or librespot-metadata
 //! (album / artist / show / playlist), cached in a small LRU.
 
@@ -23,7 +25,7 @@ use std::num::NonZeroUsize;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-const WINDOW_NEXT: usize = 30;
+const WINDOW_NEXT: usize = 50;
 const WINDOW_PREV: usize = 10;
 const FETCHED_CAPACITY: usize = 512;
 const ITEM_CAPACITY: usize = 16;
@@ -33,6 +35,8 @@ const BATCH: usize = 100;
 const DEBOUNCE: Duration = Duration::from_millis(150);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Backoff after a failed request (network error, timeout).
+const RETRY_AFTER_ERROR: Duration = Duration::from_secs(20);
 const CONTEXT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
@@ -57,7 +61,8 @@ pub(crate) struct ItemInfo {
 struct MetaState {
     fetched: LruCache<String, Entry>,
     items: LruCache<String, ItemInfo>,
-    failed: LruCache<String, Instant>,
+    /// Uris not to request again for a while: when, and for how long.
+    failed: LruCache<String, (Instant, Duration)>,
     pending: VecDeque<String>,
     in_flight: bool,
     contexts: LruCache<String, (Option<String>, Instant)>,
@@ -266,7 +271,7 @@ fn request(uris: Vec<String>) {
             if st.pending.contains(&u) || st.fetched.contains(&u) {
                 continue;
             }
-            if st.failed.peek(&u).is_some_and(|at| at.elapsed() < RETRY_AFTER) {
+            if st.failed.peek(&u).is_some_and(|(at, backoff)| at.elapsed() < *backoff) {
                 continue;
             }
             st.pending.push_back(u);
@@ -287,26 +292,52 @@ fn request(uris: Vec<String>) {
     }
 }
 
-async fn fetch_batch(session: &Session, batch: &[String]) -> (Vec<Track>, Vec<Episode>) {
+/// The result of one kind of a batch: the returned items, or `Err` if the request failed.
+type Fetched<T> = Result<Vec<T>, ()>;
+
+async fn fetch_batch(session: &Session, batch: &[String]) -> (Fetched<Track>, Fetched<Episode>) {
     let tracks: Vec<String> = batch.iter().filter(|u| uri::is_track(u)).cloned().collect();
     let episodes: Vec<String> = batch.iter().filter(|u| uri::is_episode(u)).cloned().collect();
-    let mut got_tracks = Vec::new();
-    let mut got_episodes = Vec::new();
+    let mut got_tracks = Ok(Vec::new());
+    let mut got_episodes = Ok(Vec::new());
     if !tracks.is_empty() {
-        match tokio::time::timeout(FETCH_TIMEOUT, catalog::metadata::tracks(session, &tracks)).await {
-            Ok(Ok(v)) => got_tracks = v,
-            Ok(Err(e)) => log::debug!("track metadata failed: {e}"),
-            Err(_) => log::debug!("track metadata timed out"),
-        }
+        got_tracks = match tokio::time::timeout(FETCH_TIMEOUT, catalog::metadata::tracks(session, &tracks)).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => {
+                log::debug!("track metadata failed: {e}");
+                Err(())
+            }
+            Err(_) => {
+                log::debug!("track metadata timed out");
+                Err(())
+            }
+        };
     }
     if !episodes.is_empty() {
-        match tokio::time::timeout(FETCH_TIMEOUT, catalog::metadata::episodes(session, &episodes)).await {
-            Ok(Ok(v)) => got_episodes = v,
-            Ok(Err(e)) => log::debug!("episode metadata failed: {e}"),
-            Err(_) => log::debug!("episode metadata timed out"),
-        }
+        got_episodes = match tokio::time::timeout(FETCH_TIMEOUT, catalog::metadata::episodes(session, &episodes)).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => {
+                log::debug!("episode metadata failed: {e}");
+                Err(())
+            }
+            Err(_) => {
+                log::debug!("episode metadata timed out");
+                Err(())
+            }
+        };
     }
     (got_tracks, got_episodes)
+}
+
+/// How long not to request `u` again after a batch: omitted from a successful response (the
+/// catalog doesn't know it) for long, after a failed request briefly.
+fn backoff_for(u: &str, tracks_ok: bool, episodes_ok: bool) -> Duration {
+    let ok = if uri::is_episode(u) { episodes_ok } else { tracks_ok };
+    if ok {
+        RETRY_AFTER
+    } else {
+        RETRY_AFTER_ERROR
+    }
 }
 
 async fn fetch_loop() {
@@ -330,6 +361,8 @@ async fn fetch_loop() {
         };
         let (tracks, episodes) = fetch_batch(&session, &batch).await;
         drop(session);
+        let (tracks_ok, episodes_ok) = (tracks.is_ok(), episodes.is_ok());
+        let (tracks, episodes) = (tracks.unwrap_or_default(), episodes.unwrap_or_default());
         {
             let mut st = META.lock();
             let mut found: HashSet<&str> = HashSet::new();
@@ -341,8 +374,9 @@ async fn fetch_loop() {
                 found.insert(e.uri.as_str());
                 st.fetched.put(e.uri.clone(), Entry::Episode(e.clone()));
             }
+            let now = Instant::now();
             for u in batch.iter().filter(|u| !found.contains(u.as_str())) {
-                st.failed.put(u.clone(), Instant::now());
+                st.failed.put(u.clone(), (now, backoff_for(u, tracks_ok, episodes_ok)));
             }
         }
         if !tracks.is_empty() || !episodes.is_empty() {
@@ -448,6 +482,16 @@ async fn resolve_context_name(session: &Session, u: &str) -> Result<Option<Strin
     Ok(name.filter(|n| !n.is_empty()))
 }
 
+/// The session is online (again): items whose request failed meanwhile are fetched right away.
+pub(crate) fn on_online() {
+    let mut st = META.lock();
+    let transient: Vec<String> =
+        st.failed.iter().filter(|(_, (_, backoff))| *backoff < RETRY_AFTER).map(|(u, _)| u.clone()).collect();
+    for u in transient {
+        st.failed.pop(&u);
+    }
+}
+
 /// Forgets everything (logout).
 pub(crate) fn clear() {
     let mut st = META.lock();
@@ -479,6 +523,17 @@ mod tests {
             explicit: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn failed_requests_back_off_briefly() {
+        // a successful response that omits a uri: the catalog doesn't know it
+        assert_eq!(backoff_for("spotify:track:x", true, false), RETRY_AFTER);
+        assert_eq!(backoff_for("spotify:episode:x", false, true), RETRY_AFTER);
+        // the request failed (offline, timeout): retried soon
+        assert_eq!(backoff_for("spotify:track:x", false, true), RETRY_AFTER_ERROR);
+        assert_eq!(backoff_for("spotify:episode:x", true, false), RETRY_AFTER_ERROR);
+        assert!(RETRY_AFTER_ERROR < RETRY_AFTER);
     }
 
     #[test]

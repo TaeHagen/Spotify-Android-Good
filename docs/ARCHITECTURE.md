@@ -252,7 +252,7 @@ queue keeps playing; the next `player.load` goes through Spirc again.
 | `credentials` | `{"username","authType","authData"}` — store encrypted, replaces previous |
 | `playback` | `PlaybackSnapshot` (full snapshot, only on change) |
 | `devices` | `DeviceList` |
-| `queueMetadata` | `{"tracks":[Track…],"episodes":[Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri) |
+| `queueMetadata` | `{"tracks":[Track…],"episodes":[Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri). Filled / fetched for the current track, the next 50 (the Media3 queue window) and the last 10 prev |
 | `download` | `DownloadProgress` |
 | `error` | `{"code","message","context":"playback|connect|session|…"}` user-visible, transient |
 | `log` | not used (logs go to logcat via android_logger, tag `spotcore`) |

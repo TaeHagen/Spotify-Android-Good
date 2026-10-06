@@ -370,6 +370,9 @@ pub(crate) fn clear_restore() {
 
 /// The engine's session state changed (online / offline …): recompute what is shown.
 pub(crate) fn on_engine_state_changed() {
+    if engine::is_online() {
+        metadata::on_online();
+    }
     hub::publish();
     hub::publish_devices();
 }
