@@ -37,6 +37,7 @@ import androidx.compose.material.icons.rounded.Album
 import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Person
@@ -118,6 +119,8 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
     val indicator by viewModel.indicator.collectAsStateWithLifecycle()
     val remoteVolumeSupported by viewModel.remoteVolumeSupported.collectAsStateWithLifecycle()
     val lyricsPreview by viewModel.lyricsPreview.collectAsStateWithLifecycle()
+    // Ungated by the preview setting: decides whether the lyrics button can open anything.
+    val lyricsState by viewModel.lyrics.collectAsStateWithLifecycle()
     val sleepTimer by viewModel.sleepTimerState.collectAsStateWithLifecycle()
     val navigator = LocalAppNavigator.current
     val context = LocalContext.current
@@ -202,6 +205,7 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
                     indicator = indicator,
                     remoteVolumeSupported = remoteVolumeSupported,
                     lyrics = (lyricsPreview as? LyricsState.Loaded)?.lyrics,
+                    lyricsUnavailable = lyricsState == LyricsState.Unavailable,
                     lyricsFallbackColor = artworkColor,
                     sleepTimer = sleepTimer,
                     viewModel = viewModel,
@@ -240,6 +244,7 @@ private fun NowPlayingBody(
     indicator: DeviceIndicator,
     remoteVolumeSupported: Boolean,
     lyrics: Lyrics?,
+    lyricsUnavailable: Boolean,
     lyricsFallbackColor: State<Color>,
     sleepTimer: SleepTimerState,
     viewModel: PlayerViewModel,
@@ -328,6 +333,10 @@ private fun NowPlayingBody(
             indicator = indicator,
             showDeviceName = !isRemote,
             onDevices = navigator::openDevices,
+            // Always reachable (the preview card can be turned off or missing after a failed
+            // load; the full screen offers Retry). Disabled once Spotify has none for the track.
+            lyricsButton = if (track.isEpisode) null else !lyricsUnavailable,
+            onLyrics = navigator::openLyrics,
             onShare = onShare,
             onQueue = navigator::openQueue,
         )
@@ -850,6 +859,9 @@ private fun BottomActions(
     indicator: DeviceIndicator,
     showDeviceName: Boolean,
     onDevices: () -> Unit,
+    /** null: no lyrics button (podcast episodes); otherwise whether it is enabled. */
+    lyricsButton: Boolean?,
+    onLyrics: () -> Unit,
     onShare: () -> Unit,
     onQueue: () -> Unit,
 ) {
@@ -889,6 +901,11 @@ private fun BottomActions(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
+            }
+        }
+        if (lyricsButton != null) {
+            IconButton(onClick = onLyrics, enabled = lyricsButton) {
+                Icon(Icons.Rounded.Lyrics, contentDescription = stringResource(R.string.player_open_lyrics))
             }
         }
         IconButton(onClick = onShare) {
