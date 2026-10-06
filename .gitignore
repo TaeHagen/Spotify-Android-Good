@@ -18,3 +18,6 @@ build/
 /native/target/
 # Generated JNI libs (built by the cargoBuild task)
 /app/src/main/jniLibs/
+
+# Claude Code agent worktrees
+.claude/
