@@ -2,17 +2,25 @@ package com.taehagen.spotifygood.ui.screens.player
 
 import androidx.compose.runtime.Immutable
 import com.taehagen.spotifygood.model.AlbumRef
+import com.taehagen.spotifygood.model.ArtistRef
+import com.taehagen.spotifygood.model.ContextType
 import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.DeviceType
 import com.taehagen.spotifygood.model.Episode
+import com.taehagen.spotifygood.model.Image
 import com.taehagen.spotifygood.model.LyricsLine
+import com.taehagen.spotifygood.model.PlaybackContext
+import com.taehagen.spotifygood.model.PlaybackRestrictions
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
+import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.PlaybackTrack
+import com.taehagen.spotifygood.model.ShowRef
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.model.TrackProvider
 import com.taehagen.spotifygood.playback.AudioOutput
 import com.taehagen.spotifygood.playback.OutputKind
+import com.taehagen.spotifygood.playback.ResumeState
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -45,6 +53,83 @@ internal fun formatPlaybackTime(ms: Long): String {
 /** Duration of the snapshot's current item, preferring the engine's value. */
 internal fun PlaybackSnapshot.effectiveDurationMs(): Long =
     if (durationMs > 0) durationMs else track?.durationMs ?: 0L
+
+// ---------------------------------------------------------------------------------------------
+// Last session placeholder (cold start)
+// ---------------------------------------------------------------------------------------------
+
+/** Only play/pause works on the resume placeholder (play loads the saved session). */
+private val PLACEHOLDER_RESTRICTIONS = PlaybackRestrictions(
+    canSkipPrev = false,
+    canSkipNext = false,
+    canSeek = false,
+    canToggleShuffle = false,
+    canToggleRepeat = false,
+    canPause = true,
+)
+
+/** Context type of a Spotify context URI, for snapshots that are not built by the engine. */
+internal fun contextTypeOf(uri: String): ContextType = when {
+    uri.endsWith(":collection") -> ContextType.COLLECTION
+    uri.startsWith("spotify:playlist:") || uri.contains(":playlist:") -> ContextType.PLAYLIST
+    uri.startsWith("spotify:album:") -> ContextType.ALBUM
+    uri.startsWith("spotify:artist:") -> ContextType.ARTIST
+    uri.startsWith("spotify:show:") -> ContextType.SHOW
+    uri.startsWith("spotify:station:") -> ContextType.STATION
+    uri.startsWith("spotify:search:") -> ContextType.SEARCH
+    else -> ContextType.UNKNOWN
+}
+
+/**
+ * The last local session as a paused snapshot, shown by the mini player and Now Playing while
+ * nothing is loaded (cold start, or the engine stopped after idling), like Spotify does. Its
+ * artist/album/show refs carry only names (blank URIs: no page to open), and only play/pause is
+ * possible: play resumes, i.e. loads, exactly this saved session.
+ */
+internal fun ResumeState.toPlaceholderSnapshot(): PlaybackSnapshot {
+    val images = artworkUrl?.takeIf { it.isNotBlank() }?.let { listOf(Image(it)) }.orEmpty()
+    val track = if (isEpisode) {
+        PlaybackTrack(
+            uri = trackUri,
+            name = title,
+            durationMs = durationMs,
+            isEpisode = true,
+            show = ShowRef(uri = "", name = album ?: artist.orEmpty(), images = images),
+        )
+    } else {
+        PlaybackTrack(
+            uri = trackUri,
+            name = title,
+            artists = artist?.takeIf { it.isNotBlank() }?.let { listOf(ArtistRef(uri = "", name = it)) }.orEmpty(),
+            album = if (album != null || images.isNotEmpty()) AlbumRef(uri = "", name = album.orEmpty(), images = images) else null,
+            durationMs = durationMs,
+        )
+    }
+    val duration = durationMs?.coerceAtLeast(0) ?: 0
+    return PlaybackSnapshot(
+        source = PlaybackSource.NONE,
+        status = PlaybackStatus.PAUSED,
+        positionMs = if (duration > 0) positionMs.coerceIn(0, duration) else positionMs.coerceAtLeast(0),
+        durationMs = duration,
+        context = contextUri?.takeIf { it.isNotBlank() && it != trackUri }?.let { PlaybackContext(uri = it, type = contextTypeOf(it)) },
+        track = track,
+        restrictions = PLACEHOLDER_RESTRICTIONS,
+    )
+}
+
+/** Whether the resume placeholder may stand in for [real]: nothing is loaded and no remote device plays. */
+internal fun wantsResumePlaceholder(real: PlaybackSnapshot): Boolean =
+    real.track == null && real.source != PlaybackSource.REMOTE
+
+/**
+ * What the player surfaces show: the engine's snapshot, or the resume [placeholder] while the
+ * engine has nothing loaded; LOADING while [resuming] (play was tapped, the session is loading).
+ */
+internal fun displaySnapshot(real: PlaybackSnapshot, placeholder: PlaybackSnapshot?, resuming: Boolean): PlaybackSnapshot = when {
+    placeholder == null || !wantsResumePlaceholder(real) -> real
+    resuming -> placeholder.copy(status = PlaybackStatus.LOADING)
+    else -> placeholder
+}
 
 // ---------------------------------------------------------------------------------------------
 // Skip back / forward (podcast episodes)

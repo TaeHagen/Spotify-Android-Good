@@ -547,7 +547,7 @@ private fun NowPlayingMenu(
         }
         DropdownMenu(expanded = expanded, onDismissRequest = dismiss) {
             if (pickArtist) {
-                track.artists.forEach { artist ->
+                track.artists.filter { it.uri.isNotBlank() }.forEach { artist ->
                     DropdownMenuItem(
                         text = { Text(artist.name) },
                         leadingIcon = { Icon(Icons.Rounded.Person, contentDescription = null) },
@@ -597,7 +597,8 @@ private fun MainMenuItems(
             onAddToPlaylist()
         },
     )
-    val album = track.album
+    // Refs may carry only a name (the last-session placeholder): nothing to go to then.
+    val album = track.album?.takeIf { it.uri.isNotBlank() }
     if (!track.isEpisode && album != null) {
         DropdownMenuItem(
             text = { Text(stringResource(R.string.player_go_to_album)) },
@@ -608,21 +609,22 @@ private fun MainMenuItems(
             },
         )
     }
-    if (!track.isEpisode && track.artists.isNotEmpty()) {
+    val artistPages = track.artists.filter { it.uri.isNotBlank() }
+    if (!track.isEpisode && artistPages.isNotEmpty()) {
         DropdownMenuItem(
             text = { Text(stringResource(R.string.player_go_to_artist)) },
             leadingIcon = { Icon(Icons.Rounded.Person, contentDescription = null) },
             onClick = {
-                if (track.artists.size == 1) {
+                if (artistPages.size == 1) {
                     dismiss()
-                    onOpenUri(track.artists.first().uri)
+                    onOpenUri(artistPages.first().uri)
                 } else {
                     onPickArtist()
                 }
             },
         )
     }
-    val show = track.show
+    val show = track.show?.takeIf { it.uri.isNotBlank() }
     if (track.isEpisode && show != null) {
         DropdownMenuItem(
             text = { Text(stringResource(R.string.player_go_to_podcast)) },
@@ -731,7 +733,8 @@ private fun TitleRow(
     onToggleLike: () -> Unit,
     onOpenUri: (String) -> Unit,
 ) {
-    val titleTarget = if (track.isEpisode) track.show?.uri else track.album?.uri
+    // Refs may carry only a name (the last-session placeholder): no link then.
+    val titleTarget = (if (track.isEpisode) track.show?.uri else track.album?.uri)?.takeIf { it.isNotBlank() }
     val openAlbumLabel = stringResource(if (track.isEpisode) R.string.player_go_to_podcast else R.string.player_open_album)
     val currentOpen by rememberUpdatedState(onOpenUri)
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -757,15 +760,19 @@ private fun TitleRow(
             )
             val subtitle = remember(track.uri, track.artists, track.show, track.isEpisode) {
                 buildAnnotatedString {
-                    if (track.isEpisode) {
-                        val show = track.show
-                        if (show != null) {
-                            withLink(LinkAnnotation.Clickable(show.uri, linkStyle) { currentOpen(show.uri) }) { append(show.name) }
+                    fun appendLinked(uri: String, name: String) {
+                        if (uri.isBlank()) {
+                            append(name)
+                        } else {
+                            withLink(LinkAnnotation.Clickable(uri, linkStyle) { currentOpen(uri) }) { append(name) }
                         }
+                    }
+                    if (track.isEpisode) {
+                        track.show?.let { show -> appendLinked(show.uri, show.name) }
                     } else {
                         track.artists.forEachIndexed { index, artist ->
                             if (index > 0) append(", ")
-                            withLink(LinkAnnotation.Clickable(artist.uri, linkStyle) { currentOpen(artist.uri) }) { append(artist.name) }
+                            appendLinked(artist.uri, artist.name)
                         }
                     }
                 }

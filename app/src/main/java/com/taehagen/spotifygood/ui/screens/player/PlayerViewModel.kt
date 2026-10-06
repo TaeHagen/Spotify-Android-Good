@@ -13,6 +13,7 @@ import com.taehagen.spotifygood.playback.SleepTimerState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -24,22 +25,28 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 internal const val POSITION_TICK_MS = 500L
 internal const val LYRICS_TICK_MS = 200L
 internal const val CLOCK_TICK_MS = 1_000L
 private const val STOP_TIMEOUT_MS = 5_000L
 private const val PENDING_EDIT_TIMEOUT_MS = 4_000L
+/** Longest the placeholder shows LOADING after play (PlayerController's load timeout). */
+private const val RESUME_FEEDBACK_MS = 30_000L
 
 /** Lyrics of the current track. */
 @Immutable
@@ -86,14 +93,53 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
     private val sleepTimer = graph.sleepTimer
     private val outputs = graph.outputs
     private val devices = graph.devices
+    private val resumeStore = graph.resumeStore
 
-    val snapshot: StateFlow<PlaybackSnapshot> = playback.snapshot
+    /**
+     * The last local session (ResumeStore) as a paused placeholder, while the engine has nothing
+     * loaded: after a cold start, or once the engine stopped after idling. Re-read whenever the
+     * snapshot loses its track; null once a real track arrives or after logout (the store is
+     * cleared then too). The engine's snapshot itself is never touched (service, sleep timer…).
+     */
+    private val resumePlaceholder: StateFlow<PlaybackSnapshot?> = combine(
+        playback.snapshot.map(::wantsResumePlaceholder).distinctUntilChanged(),
+        graph.engine.isLoggedIn,
+    ) { wanted, loggedIn -> wanted && loggedIn }
+        .distinctUntilChanged()
+        .transformLatest { wanted -> emit(if (wanted) resumeStore.read()?.toPlaceholderSnapshot() else null) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), null)
+
+    /** Play was tapped on the placeholder; LOADING until the session shows up (or fails). */
+    private val resuming = MutableStateFlow(false)
+    private var resumeJob: Job? = null
+
+    /** What the player surfaces show: the engine's snapshot, or the last-session placeholder. */
+    val snapshot: StateFlow<PlaybackSnapshot> = combine(playback.snapshot, resumePlaceholder, resuming, ::displaySnapshot)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), playback.snapshot.value)
+
+    /** True while the mini player has something to show (a loaded item or the placeholder). */
+    val hasContent: StateFlow<Boolean> = snapshot
+        .map { it.track != null }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), playback.snapshot.value.track != null)
+
+    /** The placeholder while it is shown (the engine has nothing loaded). */
+    private fun shownPlaceholder(): PlaybackSnapshot? =
+        resumePlaceholder.value?.takeIf { wantsResumePlaceholder(playback.snapshot.value) }
+
+    private val shownPlaceholderFlow: Flow<PlaybackSnapshot?> =
+        combine(playback.snapshot, resumePlaceholder) { real, placeholder -> placeholder?.takeIf { wantsResumePlaceholder(real) } }
+            .distinctUntilChanged()
+
+    private fun ticker(periodMs: Long): Flow<Long> = shownPlaceholderFlow.flatMapLatest { placeholder ->
+        if (placeholder != null) flowOf(placeholder.positionMs) else playback.positionTicker(periodMs)
+    }
 
     /** Position for seek bars / progress lines (collect with lifecycle). */
-    val position: Flow<Long> = playback.positionTicker(POSITION_TICK_MS)
+    val position: Flow<Long> = ticker(POSITION_TICK_MS)
 
     /** Finer position for synced lyrics. */
-    val lyricsPosition: Flow<Long> = playback.positionTicker(LYRICS_TICK_MS)
+    val lyricsPosition: Flow<Long> = ticker(LYRICS_TICK_MS)
 
     /**
      * A once-per-second tick for the sleep timer countdown, only while collected (the sheet is
@@ -109,7 +155,7 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
         }
     }
 
-    fun positionNow(): Long = playback.positionMs()
+    fun positionNow(): Long = shownPlaceholder()?.positionMs ?: playback.positionMs()
 
     private val currentUri: Flow<String?> = snapshot.map { it.track?.uri }.distinctUntilChanged()
 
@@ -216,11 +262,37 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
 
     // --------------------------------------------------------------------------------------- commands
 
-    fun togglePlayPause() = player.togglePlayPause()
+    fun togglePlayPause() {
+        if (shownPlaceholder() != null) resumeLastSession() else player.togglePlayPause()
+    }
+
+    /**
+     * Play on the last-session placeholder. With no active device PlayerController loads exactly the
+     * saved session (the placeholder's content); shows LOADING until a track arrives or it failed.
+     */
+    private fun resumeLastSession() {
+        if (resumeJob?.isActive == true) return
+        resumeJob = viewModelScope.launch {
+            resuming.value = true
+            try {
+                withTimeoutOrNull(RESUME_FEEDBACK_MS) {
+                    merge(
+                        playback.snapshot.filter { !wantsResumePlaceholder(it) }.map { },
+                        player.errors.map { },
+                    ).first()
+                }
+            } finally {
+                resuming.value = false
+            }
+        }
+        // After the watcher subscribed (immediate dispatcher), so a fast failure is not missed.
+        player.resume()
+    }
     fun next() = player.next()
     fun previous() = player.previous()
     fun seekTo(positionMs: Long) {
         pendingSeek = null
+        if (shownPlaceholder() != null) return // nothing loaded yet (seeking is disabled there)
         player.seekTo(positionMs.coerceAtLeast(0))
     }
 

@@ -95,6 +95,7 @@ import com.taehagen.spotifygood.ui.screens.player.MiniPlayer
 import com.taehagen.spotifygood.ui.screens.player.NowPlayingScreen
 import com.taehagen.spotifygood.ui.screens.player.QueueScreen
 import com.taehagen.spotifygood.ui.screens.player.SleepTimerSheet
+import com.taehagen.spotifygood.ui.screens.player.rememberPlayerHasContent
 import com.taehagen.spotifygood.ui.screens.status.PlaybackRefusedBanner
 import com.taehagen.spotifygood.ui.screens.status.PlaybackRefusedScreen
 import com.taehagen.spotifygood.ui.theme.LocalSystemBarsController
@@ -123,9 +124,8 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
 
     val backStack by navController.currentBackStack.collectAsStateWithLifecycle()
     val currentTab = remember(backStack) { MainNavigator.tabOf(backStack) }
-    val hasTrackState = remember(graph) {
-        graph.playback.currentTrack.map { it != null }.distinctUntilChanged()
-    }.collectAsStateWithLifecycle(initialValue = graph.playback.currentTrack.value != null)
+    // A loaded item, or the last session (cold start) that the mini player offers to resume.
+    val hasTrackState = rememberPlayerHasContent()
     val hasTrack by hasTrackState
     val networkAvailable by graph.engine.isNetworkAvailable.collectAsStateWithLifecycle()
     val offlineMode by remember(graph) {

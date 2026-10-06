@@ -3,16 +3,19 @@ package com.taehagen.spotifygood.ui.screens.player
 import com.taehagen.spotifygood.model.ActiveDeviceRef
 import com.taehagen.spotifygood.model.ArtistRef
 import com.taehagen.spotifygood.model.ConnectDevice
+import com.taehagen.spotifygood.model.ContextType
 import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.DeviceType
 import com.taehagen.spotifygood.model.LyricsLine
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
+import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.model.ShowRef
 import com.taehagen.spotifygood.model.TrackProvider
 import com.taehagen.spotifygood.playback.AudioOutput
 import com.taehagen.spotifygood.playback.OutputKind
+import com.taehagen.spotifygood.playback.ResumeState
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -50,6 +53,91 @@ class TimeFormatTest {
         assertEquals(180_000, PlaybackSnapshot(track = track, durationMs = 180_000).effectiveDurationMs())
         assertEquals(200_000, PlaybackSnapshot(track = track, durationMs = 0).effectiveDurationMs())
         assertEquals(0, PlaybackSnapshot().effectiveDurationMs())
+    }
+}
+
+class ResumePlaceholderTest {
+    private fun state(
+        isEpisode: Boolean = false,
+        contextUri: String? = "spotify:album:a",
+        durationMs: Long? = 200_000,
+        positionMs: Long = 42_000,
+    ) = ResumeState(
+        contextUri = contextUri,
+        trackUri = if (isEpisode) "spotify:episode:e" else "spotify:track:t",
+        positionMs = positionMs,
+        title = "Song",
+        artist = if (isEpisode) "The Show" else "Artist A, Artist B",
+        album = if (isEpisode) "The Show" else "Album",
+        artworkUrl = "https://i.scdn.co/image/x",
+        durationMs = durationMs,
+        isEpisode = isEpisode,
+    )
+
+    @Test
+    fun aSavedTrackBecomesAPausedSnapshotThatCanOnlyBePlayed() {
+        val snapshot = state().toPlaceholderSnapshot()
+        val track = snapshot.track!!
+        assertEquals("spotify:track:t", track.uri)
+        assertEquals("Song", track.name)
+        assertEquals("Artist A, Artist B", track.artistLine)
+        assertEquals("Album", track.album?.name)
+        assertEquals("https://i.scdn.co/image/x", track.imageUrl)
+        // Name-only refs: there is no page to open for them.
+        assertTrue(track.album!!.uri.isEmpty() && track.artists.all { it.uri.isEmpty() })
+        assertEquals(PlaybackStatus.PAUSED, snapshot.status)
+        assertEquals(PlaybackSource.NONE, snapshot.source)
+        assertEquals(42_000, snapshot.positionAt())
+        assertEquals(200_000, snapshot.effectiveDurationMs())
+        assertEquals(ContextType.ALBUM, snapshot.context?.type)
+        with(snapshot.restrictions) {
+            assertTrue(canPause)
+            assertFalse(canSeek || canSkipNext || canSkipPrev || canToggleShuffle || canToggleRepeat)
+        }
+    }
+
+    @Test
+    fun aSavedEpisodeShowsItsShow() {
+        val track = state(isEpisode = true, contextUri = "spotify:show:s").toPlaceholderSnapshot().track!!
+        assertTrue(track.isEpisode)
+        assertEquals("The Show", track.artistLine)
+        assertEquals("https://i.scdn.co/image/x", track.imageUrl)
+        assertNull(track.album)
+    }
+
+    @Test
+    fun positionIsKeptInsideTheDurationAndATrackContextIsDropped() {
+        val snapshot = state(contextUri = "spotify:track:t", durationMs = 100_000, positionMs = 150_000).toPlaceholderSnapshot()
+        assertEquals(100_000, snapshot.positionAt())
+        assertNull(snapshot.context)
+    }
+
+    @Test
+    fun theEngineSnapshotWinsAsSoonAsItHasATrack() {
+        val placeholder = state().toPlaceholderSnapshot()
+        val playing = PlaybackSnapshot(
+            source = PlaybackSource.LOCAL,
+            status = PlaybackStatus.PLAYING,
+            track = PlaybackTrack(uri = "spotify:track:other"),
+        )
+        assertEquals(playing, displaySnapshot(playing, placeholder, resuming = false))
+        assertEquals(placeholder, displaySnapshot(PlaybackSnapshot.EMPTY, placeholder, resuming = false))
+        assertEquals(PlaybackStatus.LOADING, displaySnapshot(PlaybackSnapshot.EMPTY, placeholder, resuming = true).status)
+        assertEquals(PlaybackSnapshot.EMPTY, displaySnapshot(PlaybackSnapshot.EMPTY, null, resuming = false))
+        // A remote device is active (even without a track): play would go there, not resume this.
+        val remote = PlaybackSnapshot(source = PlaybackSource.REMOTE)
+        assertFalse(wantsResumePlaceholder(remote))
+        assertEquals(remote, displaySnapshot(remote, placeholder, resuming = false))
+    }
+
+    @Test
+    fun contextTypesFromUris() {
+        assertEquals(ContextType.PLAYLIST, contextTypeOf("spotify:playlist:p"))
+        assertEquals(ContextType.PLAYLIST, contextTypeOf("spotify:user:u:playlist:p"))
+        assertEquals(ContextType.COLLECTION, contextTypeOf("spotify:user:u:collection"))
+        assertEquals(ContextType.ARTIST, contextTypeOf("spotify:artist:a"))
+        assertEquals(ContextType.SHOW, contextTypeOf("spotify:show:s"))
+        assertEquals(ContextType.UNKNOWN, contextTypeOf("spotify:user:u:collection:your-episodes"))
     }
 }
 

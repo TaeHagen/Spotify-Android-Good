@@ -267,14 +267,16 @@ private fun TrackActions(t: MediaActionTarget.TrackTarget, s: ActionScope) {
         }
     }
     ItemDownloadAction(track.uri, download, s)
-    track.album?.let { album ->
+    // Refs may carry only a name (the last-session placeholder): nothing to open then.
+    track.album?.takeIf { it.uri.isNotBlank() }?.let { album ->
         SheetAction(Icons.Rounded.Album, stringResource(R.string.shell_action_go_to_album)) { s.go(Route.Album(album.uri)) }
     }
-    if (track.artists.isNotEmpty()) {
+    val artistPages = track.artists.filter { it.uri.isNotBlank() }
+    if (artistPages.isNotEmpty()) {
         SheetAction(
             Icons.Rounded.Person,
-            stringResource(if (track.artists.size > 1) R.string.shell_action_go_to_artists else R.string.shell_action_go_to_artist),
-        ) { s.goToArtists(track.artists) }
+            stringResource(if (artistPages.size > 1) R.string.shell_action_go_to_artists else R.string.shell_action_go_to_artist),
+        ) { s.goToArtists(artistPages) }
     }
     SheetAction(Icons.Rounded.Radio, stringResource(R.string.shell_action_start_radio)) { s.radio(track.uri) }
     SheetAction(Icons.Rounded.Share, stringResource(R.string.shell_action_share)) { s.share(track.uri, track.name) }
@@ -304,7 +306,7 @@ private fun EpisodeActions(t: MediaActionTarget.EpisodeTarget, s: ActionScope) {
         s.runner.setSaved(episode.uri, !saved, R.string.shell_msg_saved_episode, R.string.shell_msg_removed_episode)
     }
     ItemDownloadAction(episode.uri, download, s)
-    episode.show?.let { show ->
+    episode.show?.takeIf { it.uri.isNotBlank() }?.let { show ->
         SheetAction(Icons.Rounded.Podcasts, stringResource(R.string.shell_action_go_to_show)) { s.go(Route.Show(show.uri)) }
     }
     SheetAction(Icons.Rounded.Info, stringResource(R.string.shell_action_view_episode)) { s.go(Route.Episode(episode.uri)) }
