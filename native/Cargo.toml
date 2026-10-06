@@ -8,6 +8,7 @@ rust-version = "1.85"
 
 # Patched librespot crates, see vendor/README.md.
 [patch.crates-io]
+librespot-core = { path = "vendor/librespot-core" }
 librespot-connect = { path = "vendor/librespot-connect" }
 
 [profile.release]
