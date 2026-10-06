@@ -50,7 +50,7 @@ pub(crate) fn classify(session: &Session, e: librespot_core::Error) -> AppError 
     }
     let msg = e.to_string();
     if msg.contains("Login failed with reason") {
-        let code = if msg.contains("Bad credentials") || msg.contains("Could not validate credentials") {
+        let code = if crate::error::is_rejected_credentials(&msg) {
             ErrorCode::BadCredentials
         } else if msg.contains("Premium account required") {
             ErrorCode::PremiumRequired
@@ -218,4 +218,36 @@ pub(crate) async fn harvest_credentials(session: &Session, used: Option<&StoredC
         events::emit(events::CREDENTIALS, &stored);
     }
     Some(stored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use librespot_core::{Error, SessionConfig};
+
+    #[tokio::test]
+    async fn only_ap_refusals_are_terminal() {
+        let session = Session::new(SessionConfig::default(), None);
+
+        // An HTTP 401 (client-token / login5 / spclient) or a proxy 407 during Spirc::new.
+        let http = classify(&session, Error::unauthenticated("Upstream responded with status code 401"));
+        assert_eq!(http.code, ErrorCode::Network);
+        assert!(!is_terminal(&http), "retried with backoff, never BAD_CREDENTIALS");
+
+        let refused = classify(&session, Error::permission_denied("Login failed with reason: Bad credentials"));
+        assert_eq!(refused.code, ErrorCode::BadCredentials);
+        assert!(is_terminal(&refused));
+
+        let premium = classify(&session, Error::permission_denied("Login failed with reason: Premium account required"));
+        assert_eq!(premium.code, ErrorCode::PremiumRequired);
+        assert!(is_terminal(&premium));
+
+        let ap = classify(&session, Error::permission_denied("Login failed with reason: Try another access point"));
+        assert_eq!(ap.code, ErrorCode::Network);
+        assert!(!is_terminal(&ap));
+
+        let io = classify(&session, Error::unavailable("connection reset"));
+        assert_eq!(io.code, ErrorCode::Network);
+        assert!(!is_terminal(&io));
+    }
 }

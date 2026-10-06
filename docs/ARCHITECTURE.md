@@ -132,7 +132,10 @@ Error results and error events use
 `{"code":"…","message":"…","retryAfterMs":<optional>}` with `code` one of
 `NOT_LOGGED_IN, NOT_CONNECTED, BAD_CREDENTIALS, PREMIUM_REQUIRED, NETWORK, NOT_FOUND,
 RATE_LIMITED, INVALID_ARGUMENT, UNAVAILABLE, NOT_ACTIVE_DEVICE, PLAYBACK_REFUSED, CANCELLED,
-INTERNAL`. `PLAYBACK_REFUSED` = Spotify permanently refused audio keys for this account
+INTERNAL`. `BAD_CREDENTIALS` = the access point refused the login credentials (AP
+`LoginFailed` "Bad credentials" / "Could not validate credentials"); Kotlin then deletes the
+stored credentials. An HTTP 401/407/511 (rejected bearer token, proxy authentication) is
+`NETWORK` and retried. `PLAYBACK_REFUSED` = Spotify permanently refused audio keys for this account
 (librespot #1649; AesKeyError 0x0001). The engine stops after 3 consecutive refusals instead
 of skipping through the queue, and the app shows a dedicated explanation screen.
 Kotlin maps them to `NativeException(code, message)`.
