@@ -20,13 +20,10 @@ internal fun AppGraph.offlineFlow(): Flow<Boolean> =
 internal fun AppGraph.nowPlayingFlow(): Flow<NowPlaying> =
     playback.snapshot.map { it.toNowPlaying() }.distinctUntilChanged()
 
-/**
- * Downloaded collections, newest first. DownloadManager has no list API for collections yet, so
- * this reads the (public) Room table it maintains.
- */
+/** Downloaded collections, newest first. */
 internal fun AppGraph.downloadedCollectionsFlow(): Flow<List<DownloadedCollection>> =
-    database.collections().observeAll()
-        .map { list -> list.map { it.toDownloadedCollection(json) } }
+    downloads.collections
+        .map { list -> list.map { it.toDownloadedCollection() } }
         .distinctUntilChanged()
         .flowOn(Dispatchers.Default)
 

@@ -28,8 +28,6 @@
     <string name="detail_error_generic">Couldn’t load this page.</string>
     <string name="detail_error_offline">You’re offline. Connect to the internet to load this page.</string>
     <string name="detail_error_not_found">This page isn’t available.</string>
-    <string name="detail_unavailable">This isn’t available right now</string>
-    <string name="detail_unavailable_offline">Not available offline. Download it to listen without a connection.</string>
     <string name="detail_show_more">Show more</string>
     <string name="detail_show_less">Show less</string>
     <string name="detail_see_more">See more</string>

@@ -51,7 +51,8 @@ interface DownloadDao {
     @Query("SELECT COALESCE(SUM(sizeBytes), 0) FROM downloads WHERE state = 'completed'")
     fun observeUsedBytes(): Flow<Long>
 
-    @Query("SELECT uri FROM downloads WHERE state = 'completed'")
+    /** Newest download first (like the Downloads screen). */
+    @Query("SELECT uri FROM downloads WHERE state = 'completed' ORDER BY addedAt DESC")
     fun observeCompletedUris(): Flow<List<String>>
 
     @Upsert

@@ -16,7 +16,6 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -87,8 +86,6 @@ private fun AlbumList(
     onRemoveDownload: () -> Unit,
 ) {
     val album = content.album
-    val unavailable = stringResource(R.string.detail_unavailable)
-    val unavailableOffline = stringResource(R.string.detail_unavailable_offline)
     LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
         item(key = "header", contentType = "header") {
             AlbumHeader(
@@ -116,14 +113,7 @@ private fun AlbumList(
                 val showActions = { navigator.showActions(MediaActionTarget.TrackTarget(track, contextUri = uri)) }
                 TrackRow(
                     track = track,
-                    onClick = {
-                        when {
-                            playable -> onPlayTrack(track)
-                            state.offline -> navigator.showMessage(unavailableOffline)
-                            else -> navigator.showMessage(unavailable)
-                        }
-                    },
-                    modifier = Modifier.alpha(if (playable) 1f else DisabledRowAlpha),
+                    onClick = { onPlayTrack(track) },
                     isCurrent = state.playback.isCurrent(track.uri),
                     isPlaying = state.playback.isPlayingItem(track.uri),
                     showArtwork = false,
@@ -132,6 +122,8 @@ private fun AlbumList(
                     downloadState = downloadState,
                     onMoreClick = showActions,
                     onLongClick = showActions,
+                    // Unplayable (or not downloaded while offline): dimmed, actions still in the overflow.
+                    enabled = playable,
                 )
             }
         }

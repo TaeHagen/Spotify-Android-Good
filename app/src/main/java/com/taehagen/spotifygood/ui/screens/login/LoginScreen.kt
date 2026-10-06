@@ -94,15 +94,12 @@ import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.ui.appViewModel
 import com.taehagen.spotifygood.ui.components.friendlyErrorMessage
 import com.taehagen.spotifygood.ui.theme.AppColors
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.File
 
 /** Login flows (docs/ARCHITECTURE.md §9.3); thin wrapper around [com.taehagen.spotifygood.auth.AuthRepository]. */
 class LoginViewModel(private val graph: AppGraph) : ViewModel() {
@@ -121,10 +118,7 @@ class LoginViewModel(private val graph: AppGraph) : ViewModel() {
         // A device code persisted before process death: resume polling instead of showing options.
         if (state.value == LoginState.Idle) {
             viewModelScope.launch {
-                val pending = withContext(Dispatchers.IO) {
-                    File(graph.app.noBackupFilesDir, PENDING_DEVICE_LOGIN_FILE).exists()
-                }
-                if (pending && state.value == LoginState.Idle) graph.auth.startDeviceLogin()
+                if (graph.auth.hasPendingDeviceLogin() && state.value == LoginState.Idle) graph.auth.startDeviceLogin()
             }
         }
     }
@@ -142,11 +136,6 @@ class LoginViewModel(private val graph: AppGraph) : ViewModel() {
             is LoginState.AwaitingApproval, LoginState.WaitingForBrowser, LoginState.WaitingForDevice -> graph.auth.cancel()
             else -> Unit
         }
-    }
-
-    private companion object {
-        /** Mirrors AuthRepository's private PENDING_DEVICE_LOGIN_FILE (see report: contract request). */
-        const val PENDING_DEVICE_LOGIN_FILE = "device_login.bin"
     }
 }
 

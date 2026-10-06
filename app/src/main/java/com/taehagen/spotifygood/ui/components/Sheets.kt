@@ -669,15 +669,18 @@ private sealed interface PickerEntry {
 }
 
 /**
- * Flattens the rootlist into folder headers + playlists the user can add to. The rootlist does
- * not say whether a playlist is collaborative, so "editable" = owned by the current user (or
- * owner unknown); the server rejects anything else and the error is shown.
+ * Flattens the rootlist into folder headers + playlists the user can add to: those marked
+ * [RootlistEntry.canEdit], plus collaborative ones. While the engine reports canEdit for none of
+ * them (not populated yet), playlists owned by the current user (or with an unknown owner) stand
+ * in; the server rejects anything else and the error is shown.
  */
 private fun buildPickerEntries(rootlist: Rootlist?, me: String?): List<PickerEntry> {
     if (rootlist == null) return emptyList()
     val seen = HashSet<String>()
-    fun editable(e: RootlistEntry): Boolean =
+    val canEditKnown = rootlist.flatPlaylists().any { it.canEdit }
+    fun owned(e: RootlistEntry): Boolean =
         me == null || e.owner == null || e.owner.username.equals(me, ignoreCase = true)
+    fun editable(e: RootlistEntry): Boolean = e.canEdit || e.collaborative || (!canEditKnown && owned(e))
 
     fun walk(entries: List<RootlistEntry>, depth: Int, path: String): List<PickerEntry> = buildList {
         entries.forEachIndexed { i, e ->

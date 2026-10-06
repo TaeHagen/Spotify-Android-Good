@@ -343,6 +343,7 @@ private fun TopResults(
                                 onClick = { ref?.let(onOpen) ?: navigator.navigate(Route.Episode(episode.uri)) },
                                 isCurrent = state.nowPlaying.isCurrent(episode.uri),
                                 isPlaying = state.nowPlaying.isPlaying,
+                                onLongClick = { navigator.showActions(MediaActionTarget.EpisodeTarget(episode)) },
                                 onMoreClick = { navigator.showActions(MediaActionTarget.EpisodeTarget(episode)) },
                             )
                         }

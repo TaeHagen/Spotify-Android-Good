@@ -569,10 +569,8 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
                     ),
                     icon = Icons.Rounded.Equalizer,
                     enabled = equalizerAvailable,
-                    onClick = {
-                        openEqualizerSession(context, vm.audioSessionId)
-                        runCatching { equalizerLauncher.launch(equalizerIntent) }
-                    },
+                    // The playback layer opens / closes the effect session with local audio.
+                    onClick = { runCatching { equalizerLauncher.launch(equalizerIntent) } },
                 )
             }
 
@@ -646,19 +644,6 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
         )
         SettingsDialog.Licenses -> LicensesDialog(onDismiss = { dialog = null })
         null -> Unit
-    }
-}
-
-/** Lets audio-effect apps attach to our (stable) session before their panel opens. */
-private fun openEqualizerSession(context: Context, sessionId: Int) {
-    runCatching {
-        context.sendBroadcast(
-            Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION).apply {
-                putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId)
-                putExtra(AudioEffect.EXTRA_PACKAGE_NAME, context.packageName)
-                putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC)
-            },
-        )
     }
 }
 

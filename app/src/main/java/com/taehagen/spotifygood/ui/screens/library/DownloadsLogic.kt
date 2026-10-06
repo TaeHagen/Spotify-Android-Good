@@ -48,12 +48,15 @@ data class DownloadsContent(
 
 /**
  * Groups [items] (in download order) and [collections] (newest first) into screen sections.
- * [metadata] decodes an item's Track/Episode (memoised by the caller).
+ * [metadata] decodes an item's Track/Episode (memoised by the caller). [activeUri] is the item the
+ * downloader works on ([com.taehagen.spotifygood.download.DownloadActivity.currentUri]); without
+ * it the first DOWNLOADING row counts as active.
  */
 fun buildDownloadsContent(
     items: List<DownloadItem>,
     collections: List<DownloadedCollection>,
     metadata: (DownloadItem) -> DownloadMetadata?,
+    activeUri: String? = null,
 ): DownloadsContent {
     val inCollections = HashSet<String>()
     collections.forEach { inCollections.addAll(it.itemUris) }
@@ -74,7 +77,12 @@ fun buildDownloadsContent(
             DownloadState.QUEUED, DownloadState.PREPARING, DownloadState.DOWNLOADING -> pending++
             DownloadState.CANCELLED -> Unit
         }
-        val needsEntry = item.uri !in inCollections || (item.state == DownloadState.DOWNLOADING && active == null)
+        val isActive = active == null && if (activeUri != null) {
+            item.uri == activeUri && item.state in PENDING_STATES
+        } else {
+            item.state == DownloadState.DOWNLOADING
+        }
+        val needsEntry = item.uri !in inCollections || isActive
         if (!needsEntry) continue
         val meta = metadata(item)
         val entry = DownloadEntry(
@@ -86,7 +94,7 @@ fun buildDownloadsContent(
             track = (meta as? DownloadMetadata.OfTrack)?.track,
             episode = (meta as? DownloadMetadata.OfEpisode)?.episode,
         )
-        if (item.state == DownloadState.DOWNLOADING && active == null) active = entry
+        if (isActive) active = entry
         if (item.uri in inCollections || item.state == DownloadState.CANCELLED) continue
         if (entry.isEpisode) episodes += entry else songs += entry
     }
@@ -105,6 +113,8 @@ fun buildDownloadsContent(
         completed = completedUris,
     )
 }
+
+private val PENDING_STATES = setOf(DownloadState.QUEUED, DownloadState.PREPARING, DownloadState.DOWNLOADING)
 
 /** URIs to play for a downloaded collection: everything online, only completed items offline. */
 fun DownloadedCollection.playableUris(completed: Set<String>, offline: Boolean): List<String> =

@@ -111,6 +111,15 @@ class AuthRepository(
         }
     }
 
+    /**
+     * True when a device code persisted before process death can still be resumed (not about to
+     * expire): the login screen then calls [startDeviceLogin] instead of showing the options.
+     */
+    suspend fun hasPendingDeviceLogin(): Boolean = withContext(Dispatchers.IO) {
+        val pending = pendingStore.load() ?: return@withContext false
+        pending.expiresAtMs - System.currentTimeMillis() > MIN_REMAINING_MS
+    }
+
     /** Opens the device-code approval page in a Custom Tab (call after [startDeviceLogin]). */
     fun openApprovalPage(activity: Activity) {
         val awaiting = _state.value as? LoginState.AwaitingApproval ?: return

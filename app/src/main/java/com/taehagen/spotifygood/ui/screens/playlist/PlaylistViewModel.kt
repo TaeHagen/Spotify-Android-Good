@@ -360,8 +360,9 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     /** Moves the item at [from] to final position [to] (both absolute indices). */
     fun moveItem(from: Int, to: Int) = mutate { playlist ->
         if (from == to || from !in playlist.rows.indices || to !in playlist.rows.indices) return@mutate null
+        val itemUri = playlist.rows[from].item.uri
         Mutation(optimistic = playlist.copy(rows = playlist.rows.moved(from, to))) { revision ->
-            graph.playlists.moveItem(uri, from, insertBeforeIndex(from, to), revision)
+            graph.playlists.moveItem(uri, from, insertBeforeIndex(from, to), revision, itemUri)
         }
     }
 
@@ -381,8 +382,10 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         dragging = false
         if (from == to || from < 0 || to < 0) return
         mutate { playlist ->
+            // The rows were already reordered while dragging: the moved item is at [to] now.
+            val itemUri = playlist.rows.getOrNull(to)?.item?.uri
             Mutation(optimistic = playlist) { revision ->
-                graph.playlists.moveItem(uri, from, insertBeforeIndex(from, to), revision)
+                graph.playlists.moveItem(uri, from, insertBeforeIndex(from, to), revision, itemUri)
             }
         }
     }
@@ -421,6 +424,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
                 name = newName.takeIf { nameChanged },
                 description = newDescription.takeIf { descriptionChanged },
             )
+            null // details are not revisioned
         }
     }
 
@@ -441,7 +445,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         addQuery.value = query
     }
 
-    private class Mutation(val optimistic: PlaylistData, val apply: suspend (revision: String?) -> Unit)
+    /** [apply] runs against the latest known revision and returns the new one (null if unknown). */
+    private class Mutation(val optimistic: PlaylistData, val apply: suspend (revision: String?) -> String?)
 
     private class CoreState(
         val load: LoadState<PlaylistData>,
@@ -464,8 +469,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
                     return@withLock
                 }
                 var failure: Exception? = null
+                var revision: String? = null
                 try {
-                    mutation.apply(data.value.dataOrNull()?.revision)
+                    revision = mutation.apply(data.value.dataOrNull()?.revision)
+                    // Kept for the next queued mutation (no extra fetch, no stale overwrite).
+                    if (revision != null) data.value.dataOrNull()?.let { data.value = LoadState.Ready(it.copy(revision = revision)) }
                 } catch (e: CancellationException) {
                     pendingMutations--
                     throw e
@@ -475,7 +483,9 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
                 }
                 pendingMutations--
                 if (failure != null) message(mutationFailureMessage(failure))
-                refreshLoaded(force = failure != null)
+                // With pending edits a refresh would only fetch the revision we already have; the
+                // rows are refreshed once the queue drains (or right away after a failure).
+                if (failure != null || revision == null || pendingMutations == 0) refreshLoaded(force = failure != null)
             }
         }
     }

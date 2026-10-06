@@ -43,7 +43,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.stringResource
@@ -70,7 +69,6 @@ import com.taehagen.spotifygood.ui.screens.album.AddedButton
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadButton
 import com.taehagen.spotifygood.ui.screens.album.DetailActionRow
 import com.taehagen.spotifygood.ui.screens.album.DetailScaffold
-import com.taehagen.spotifygood.ui.screens.album.DisabledRowAlpha
 import com.taehagen.spotifygood.ui.screens.album.ExpandableText
 import com.taehagen.spotifygood.ui.screens.album.HeaderMetaText
 import com.taehagen.spotifygood.ui.screens.album.LoadMoreEffect
@@ -268,8 +266,6 @@ private fun PlaylistList(
         edgeBottom = contentPadding.calculateBottomPadding() +
             WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding(),
     )
-    val unavailable = stringResource(R.string.detail_unavailable)
-    val unavailableOffline = stringResource(R.string.detail_unavailable_offline)
 
     LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
         item(key = "header", contentType = "header") {
@@ -323,8 +319,6 @@ private fun PlaylistList(
                     state = state,
                     navigator = navigator,
                     onPlay = actions.onPlayItem,
-                    unavailable = unavailable,
-                    unavailableOffline = unavailableOffline,
                     modifier = Modifier.animateItem(),
                 )
             }
@@ -467,8 +461,6 @@ private fun PlaylistItemRow(
     state: PlaylistUiState,
     navigator: AppNavigator,
     onPlay: (VisibleRow) -> Unit,
-    unavailable: String,
-    unavailableOffline: String,
     modifier: Modifier = Modifier,
 ) {
     val item = visible.row.item
@@ -476,16 +468,10 @@ private fun PlaylistItemRow(
     val episode = item.episode
     val itemUri = item.uri ?: return
     val downloadState = state.rowDownloads[itemUri]
+    // Unplayable (or not downloaded while offline): dimmed, actions still in the overflow.
     val playable = (track?.playable ?: episode?.playable ?: false) &&
         (!state.offline || downloadState == DownloadState.COMPLETED)
-    val onClick = {
-        when {
-            playable -> onPlay(visible)
-            state.offline -> navigator.showMessage(unavailableOffline)
-            else -> navigator.showMessage(unavailable)
-        }
-    }
-    val rowModifier = modifier.alpha(if (playable) 1f else DisabledRowAlpha)
+    val onClick = { onPlay(visible) }
     when {
         track != null -> {
             val showActions = {
@@ -502,23 +488,29 @@ private fun PlaylistItemRow(
             TrackRow(
                 track = track,
                 onClick = onClick,
-                modifier = rowModifier,
+                modifier = modifier,
                 isCurrent = state.playback.isCurrent(itemUri),
                 isPlaying = state.playback.isPlayingItem(itemUri),
                 showArtwork = true,
                 downloadState = downloadState,
                 onMoreClick = showActions,
                 onLongClick = showActions,
+                enabled = playable,
             )
         }
-        episode != null -> EpisodeRow(
-            episode = episode,
-            onClick = onClick,
-            modifier = rowModifier,
-            isCurrent = state.playback.isCurrent(itemUri),
-            isPlaying = state.playback.isPlayingItem(itemUri),
-            downloadState = downloadState,
-            onMoreClick = { navigator.showActions(MediaActionTarget.EpisodeTarget(episode)) },
-        )
+        episode != null -> {
+            val showActions = { navigator.showActions(MediaActionTarget.EpisodeTarget(episode)) }
+            EpisodeRow(
+                episode = episode,
+                onClick = onClick,
+                modifier = modifier,
+                isCurrent = state.playback.isCurrent(itemUri),
+                isPlaying = state.playback.isPlayingItem(itemUri),
+                downloadState = downloadState,
+                onLongClick = showActions,
+                enabled = playable,
+                onMoreClick = showActions,
+            )
+        }
     }
 }

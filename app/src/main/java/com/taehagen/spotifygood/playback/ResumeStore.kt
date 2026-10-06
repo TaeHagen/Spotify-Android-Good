@@ -27,10 +27,25 @@ data class ResumeState(
     val durationMs: Long?,
     val isEpisode: Boolean,
 ) {
+    /** The context to resume in; null when there is none or it is just the track itself. */
+    private val resumeContext: String?
+        get() = contextUri?.takeIf { it != trackUri && !MediaIds.isItemUri(it) }
+
     /** Media id understood by the session player (see [MediaIds]). */
     val mediaId: String
-        get() = contextUri?.takeIf { it != trackUri && !MediaIds.isItemUri(it) }
-            ?.let { MediaIds.inContext(it, trackUri) } ?: trackUri
+        get() = resumeContext?.let { MediaIds.inContext(it, trackUri) } ?: trackUri
+
+    /** `player.load` request that starts this session again (e.g. when no Connect device is active). */
+    fun toPlayRequest(): PlayRequest {
+        val context = resumeContext
+        return PlayRequest(
+            contextUri = context,
+            trackUris = if (context == null) listOf(trackUri) else null,
+            startUri = trackUri,
+            positionMs = positionMs,
+            play = true,
+        )
+    }
 
     companion object {
         /** Resume state of a local snapshot at [positionMs]; null if nothing is loaded. */
@@ -51,7 +66,11 @@ data class ResumeState(
     }
 }
 
-/** DataStore-backed [ResumeState] (one small preferences file; all I/O off the main thread). */
+/**
+ * DataStore-backed [ResumeState] (one small preferences file; all I/O off the main thread). The
+ * DataStore itself is a process singleton (extension delegate); the app shares one
+ * [com.taehagen.spotifygood.AppGraph.resumeStore].
+ */
 class ResumeStore(context: Context) {
     private val store = context.applicationContext.resumeDataStore
 

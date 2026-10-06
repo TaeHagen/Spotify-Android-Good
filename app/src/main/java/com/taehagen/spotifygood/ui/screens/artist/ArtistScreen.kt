@@ -46,7 +46,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
@@ -78,7 +77,6 @@ import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
 import com.taehagen.spotifygood.ui.screens.album.DetailActionRow
 import com.taehagen.spotifygood.ui.screens.album.DetailScaffold
-import com.taehagen.spotifygood.ui.screens.album.DisabledRowAlpha
 import com.taehagen.spotifygood.ui.screens.album.ExpandableText
 import com.taehagen.spotifygood.ui.screens.album.FollowButton
 import com.taehagen.spotifygood.ui.screens.album.LoadStateContent
@@ -145,8 +143,6 @@ private fun ArtistList(
     val artist = content.artist
     var popularExpanded by rememberSaveable { mutableStateOf(false) }
     val popular = if (popularExpanded) content.topTracks else content.topTracks.take(ArtistViewModel.COLLAPSED_TOP_TRACKS)
-    val unavailable = stringResource(R.string.detail_unavailable)
-    val unavailableOffline = stringResource(R.string.detail_unavailable_offline)
 
     LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
         item(key = "hero", contentType = "hero") {
@@ -185,14 +181,7 @@ private fun ArtistList(
                 val showActions = { navigator.showActions(MediaActionTarget.TrackTarget(track, contextUri = uri)) }
                 TrackRow(
                     track = track,
-                    onClick = {
-                        when {
-                            playable -> onPlayTrack(track)
-                            state.offline -> navigator.showMessage(unavailableOffline)
-                            else -> navigator.showMessage(unavailable)
-                        }
-                    },
-                    modifier = Modifier.alpha(if (playable) 1f else DisabledRowAlpha),
+                    onClick = { onPlayTrack(track) },
                     isCurrent = state.playback.isCurrent(track.uri),
                     isPlaying = state.playback.isPlayingItem(track.uri),
                     showArtwork = true,
@@ -201,6 +190,8 @@ private fun ArtistList(
                     downloadState = downloadState,
                     onMoreClick = showActions,
                     onLongClick = showActions,
+                    // Unplayable (or not downloaded while offline): dimmed, actions still in the overflow.
+                    enabled = playable,
                 )
             }
             if (content.topTracks.size > ArtistViewModel.COLLAPSED_TOP_TRACKS) {

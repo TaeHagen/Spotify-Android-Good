@@ -319,6 +319,7 @@ private fun DownloadsList(
                     isCurrent = state.nowPlaying.isCurrent(entry.uri),
                     isPlaying = state.nowPlaying.isPlaying,
                     downloadState = entry.state,
+                    onLongClick = { onEntryMore(entry) },
                     onMoreClick = { onEntryMore(entry) },
                 )
             }
@@ -430,15 +431,27 @@ private fun StorageHeader(state: DownloadsUiState, onRetryFailed: () -> Unit) {
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        val activity = state.activity
         if (content.pendingCount > 0) {
             Spacer(Modifier.height(12.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                // Spinner only while the downloader runs (not while it waits for Wi-Fi / the system).
+                if (activity.running) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                 Text(
                     text = pluralStringResource(R.plurals.browse_downloads_pending, content.pendingCount, content.pendingCount),
                     style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(start = 8.dp),
+                    modifier = Modifier.padding(start = if (activity.running) 8.dp else 0.dp),
                 )
+            }
+            if (!activity.running) {
+                activity.lastError?.let { reason ->
+                    Text(
+                        text = reason,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
             }
             content.active?.let { active ->
                 val name = active.track?.name ?: active.episode?.name
@@ -452,7 +465,8 @@ private fun StorageHeader(state: DownloadsUiState, onRetryFailed: () -> Unit) {
                         modifier = Modifier.padding(top = 4.dp),
                     )
                 }
-                val progress = active.progress
+                // The downloader's bytes and the database row are both throttled: show the newer one.
+                val progress = listOfNotNull(activity.progress?.takeIf { activity.currentUri == active.uri }, active.progress).maxOrNull()
                 if (progress != null) {
                     LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth().padding(top = 6.dp))
                 } else {

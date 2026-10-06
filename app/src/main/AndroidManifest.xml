@@ -114,8 +114,9 @@
             </intent-filter>
         </service>
 
+        <!-- Media3's MediaButtonReceiver; starts nothing while logged out -->
         <receiver
-            android:name="androidx.media3.session.MediaButtonReceiver"
+            android:name=".playback.PlaybackButtonReceiver"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MEDIA_BUTTON" />

@@ -24,7 +24,8 @@ data class QueueMetadataEvent(val tracks: List<Track> = emptyList(), val episode
 
 /**
  * Fan-out of native events (docs/ARCHITECTURE.md §5). State-like events are exposed as
- * [StateFlow]s (latest value wins), the rest as [SharedFlow]s with a bounded buffer.
+ * [StateFlow]s (latest value wins, replayed to new collectors), the rest as [SharedFlow]s with a
+ * bounded buffer; `credentials` replays its latest value and `queueMetadata` its last few events.
  */
 class NativeEvents(private val json: Json) {
     private val _session = MutableStateFlow(SessionEvent())
@@ -39,7 +40,13 @@ class NativeEvents(private val json: Json) {
     private val _credentials = MutableSharedFlow<StoredCredentials>(replay = 1, extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     val credentials: SharedFlow<StoredCredentials> = _credentials.asSharedFlow()
 
-    private val _queueMetadata = MutableSharedFlow<QueueMetadataEvent>(extraBufferCapacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    // The engine sends metadata for a URI only once; replay keeps early events (before
+    // PlaybackRepository subscribes, it is created lazily) from being lost.
+    private val _queueMetadata = MutableSharedFlow<QueueMetadataEvent>(
+        replay = QUEUE_METADATA_REPLAY,
+        extraBufferCapacity = 8,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
     val queueMetadata: SharedFlow<QueueMetadataEvent> = _queueMetadata.asSharedFlow()
 
     private val _downloads = MutableSharedFlow<DownloadProgress>(extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
@@ -72,10 +79,12 @@ class NativeEvents(private val json: Json) {
         _playback.value = PlaybackSnapshot.EMPTY
         _devices.value = DeviceList()
         _credentials.resetReplayCache()
+        _queueMetadata.resetReplayCache()
     }
 
     private companion object {
         const val TAG = "NativeEvents"
+        const val QUEUE_METADATA_REPLAY = 8
     }
 }
 

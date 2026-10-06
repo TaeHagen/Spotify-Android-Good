@@ -71,6 +71,11 @@ enum class CollectionType(val wire: String) {
 
 data class CollectionRef(val uri: String, val type: CollectionType, val name: String, val imageUrl: String?)
 
+/** A downloaded collection: what it is, its item URIs (collection order) and when it was downloaded. */
+data class DownloadedCollection(val ref: CollectionRef, val itemUris: List<String>, val addedAt: Long) {
+    val itemCount: Int get() = itemUris.size
+}
+
 sealed interface CollectionDownloadStatus {
     data object None : CollectionDownloadStatus
     /** [done] of [total] items downloaded; [active] while work is pending. */
@@ -99,7 +104,10 @@ data class DownloadActivity(
     val remaining: Int = 0,
     /** Why the last run stopped early (storage, account …); null when it did not. */
     val lastError: String? = null,
-)
+) {
+    /** 0..1 for [currentUri] while its size is known. */
+    val progress: Float? get() = if (totalBytes > 0) (bytes.toFloat() / totalBytes).coerceIn(0f, 1f) else null
+}
 
 /**
  * Offline downloads (docs/ARCHITECTURE.md §9.7).
@@ -129,7 +137,7 @@ class DownloadManager(
 ) {
     private val appContext = context.applicationContext
     private val dao = database.downloads()
-    private val collections = database.collections()
+    private val collectionDao = database.collections()
     private val json = rpc.json
     private val itemsSerializer = ListSerializer(String.serializer())
 
@@ -148,9 +156,9 @@ class DownloadManager(
     /** Network policy (`downloadOverCellular`) of what this process scheduled last; null = nothing. */
     @Volatile private var scheduledCellular: Boolean? = null
 
-    /** URIs of completed downloads (hot). */
+    /** URIs of completed downloads (hot), iterating newest download first (Android Auto queue order). */
     val downloadedUris: StateFlow<Set<String>> = dao.observeCompletedUris()
-        .map<List<String>, Set<String>> { it.toHashSet() }
+        .map<List<String>, Set<String>> { LinkedHashSet(it) }
         .flowOn(Dispatchers.Default)
         .stateIn(scope, SharingStarted.Eagerly, emptySet())
 
@@ -168,6 +176,13 @@ class DownloadManager(
     val usedBytes: Flow<Long> = dao.observeUsedBytes()
     val pendingCount: Flow<Int> = dao.observePendingCount()
 
+    /** Downloaded collections, newest first (one shared database observer). */
+    val collections: Flow<List<DownloadedCollection>> = collectionDao.observeAll()
+        .map { list -> list.map { it.toDownloadedCollection() } }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .shareIn(scope, SharingStarted.WhileSubscribed(STATES_STOP_TIMEOUT_MS, replayExpirationMillis = 0), replay = 1)
+
     /** Live state of the downloader (current item, bytes, last stop reason). */
     val activity: StateFlow<DownloadActivity> get() = runner.activity
 
@@ -176,7 +191,7 @@ class DownloadManager(
             try {
                 // Resume after process death / reboot (a non-persisted job does not survive a reboot).
                 if (dao.pendingCount() > 0) scheduleExecution()
-                updateSyncSchedule(collections.count() > 0)
+                updateSyncSchedule(collectionDao.count() > 0)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -201,14 +216,14 @@ class DownloadManager(
 
     fun collectionStatus(uri: String): Flow<CollectionDownloadStatus> =
         combine(
-            collections.observe(uri).map { entity -> entity?.let { decodeItems(it.itemUrisJson) } }.distinctUntilChanged(),
+            collectionDao.observe(uri).map { entity -> entity?.let { decodeItems(it.itemUrisJson) } }.distinctUntilChanged(),
             states,
         ) { items, states -> DownloadRules.collectionStatus(items, states) }
             .distinctUntilChanged()
             .flowOn(Dispatchers.Default)
 
     /** True while [uri] is a downloaded collection (toggle state on album/playlist screens). */
-    fun isCollectionDownloaded(uri: String): Flow<Boolean> = collections.observe(uri).map { it != null }.distinctUntilChanged()
+    fun isCollectionDownloaded(uri: String): Flow<Boolean> = collectionDao.observe(uri).map { it != null }.distinctUntilChanged()
 
     /**
      * Downloads a playlist / album / Liked Songs / show (newest [CollectionResolver.MAX_SHOW_EPISODES]
@@ -219,7 +234,7 @@ class DownloadManager(
     suspend fun downloadCollection(ref: CollectionRef) {
         val resolved = requireNotNull(resolver.resolve(ref.type, ref.uri))
         val removed = mutex.withLock {
-            val existing = collections.get(ref.uri)
+            val existing = collectionDao.get(ref.uri)
             val now = System.currentTimeMillis()
             val entity = DownloadCollectionEntity(
                 uri = ref.uri,
@@ -241,20 +256,20 @@ class DownloadManager(
     /** Stops keeping [uri] offline; deletes its items unless another download still needs them. */
     suspend fun removeCollection(uri: String) {
         val removed = mutex.withLock {
-            val entity = collections.get(uri) ?: return
-            val others = collections.getAll().filter { it.uri != uri }.map { decodeItems(it.itemUrisJson) }
+            val entity = collectionDao.get(uri) ?: return
+            val others = collectionDao.getAll().filter { it.uri != uri }.map { decodeItems(it.itemUrisJson) }
             val toDelete = DownloadRules.itemsToDelete(decodeItems(entity.itemUrisJson), others, dao.individualUris().toHashSet())
             runner.cancelItems(toDelete)
             val files = fileRows(toDelete)
             database.withTransaction {
-                collections.delete(uri)
+                collectionDao.delete(uri)
                 deleteRows(toDelete)
             }
             deleteFiles(files)
             toDelete
         }
         afterRemoval(removed)
-        if (collections.count() == 0) updateSyncSchedule(false)
+        if (collectionDao.count() == 0) updateSyncSchedule(false)
     }
 
     /** Downloads single tracks / episodes (kept until removed, independent of collections). */
@@ -308,7 +323,7 @@ class DownloadManager(
             val all = dao.allUris()
             database.withTransaction {
                 dao.deleteAll()
-                collections.deleteAll()
+                collectionDao.deleteAll()
             }
             withContext(Dispatchers.IO) { storage.deleteAll() }
             keys.clear()
@@ -371,7 +386,7 @@ class DownloadManager(
         if (!syncMutex.tryLock()) return true // another sync is running
         try {
             if (settings.settings.value.offlineMode) return true
-            val all = collections.getAll()
+            val all = collectionDao.getAll()
             if (all.isEmpty()) {
                 updateSyncSchedule(false)
                 return true
@@ -392,9 +407,9 @@ class DownloadManager(
                         continue
                     }
                     val result = mutex.withLock {
-                        val current = collections.get(collection.uri) ?: return@withLock null // removed meanwhile
+                        val current = collectionDao.get(collection.uri) ?: return@withLock null // removed meanwhile
                         if (resolved == null) {
-                            collections.upsert(current.copy(lastSyncedAt = System.currentTimeMillis())) // unchanged
+                            collectionDao.upsert(current.copy(lastSyncedAt = System.currentTimeMillis())) // unchanged
                             null
                         } else {
                             applyMembershipLocked(current, resolved, userInitiated = false)
@@ -417,7 +432,7 @@ class DownloadManager(
 
     // ---- hooks for the job / workers --------------------------------------------------------------
 
-    internal suspend fun hasCollections(): Boolean = collections.count() > 0
+    internal suspend fun hasCollections(): Boolean = collectionDao.count() > 0
 
     // ---- membership ----------------------------------------------------------------------------------
 
@@ -435,7 +450,7 @@ class DownloadManager(
     ): MembershipResult {
         val newItems = resolved.items.map { it.uri }
         val diff = DownloadRules.diff(decodeItems(entity.itemUrisJson), newItems)
-        val others = collections.getAll().filter { it.uri != entity.uri }.map { decodeItems(it.itemUrisJson) }
+        val others = collectionDao.getAll().filter { it.uri != entity.uri }.map { decodeItems(it.itemUrisJson) }
         val toDelete = if (diff.dropped.isEmpty()) {
             emptyList()
         } else {
@@ -447,7 +462,7 @@ class DownloadManager(
         val now = System.currentTimeMillis()
         val quality = settings.settings.value.downloadQuality.kbps
         database.withTransaction {
-            collections.upsert(
+            collectionDao.upsert(
                 entity.copy(
                     itemUrisJson = json.encodeToString(itemsSerializer, newItems),
                     revision = resolved.revision ?: entity.revision,
@@ -542,7 +557,7 @@ class DownloadManager(
 
     private suspend fun syncIfStale() {
         try {
-            val oldest = collections.oldestSyncedAt() ?: return
+            val oldest = collectionDao.oldestSyncedAt() ?: return
             if (System.currentTimeMillis() - oldest < SYNC_STALE_MS) return
             syncCollections()
         } catch (e: CancellationException) {
@@ -561,6 +576,13 @@ class DownloadManager(
             null
         }
     }
+
+    private fun DownloadCollectionEntity.toDownloadedCollection() = DownloadedCollection(
+        // Unknown types (rows from a newer app version) stay listed, and removable, as playlists.
+        ref = CollectionRef(uri, CollectionType.fromWire(type) ?: CollectionType.PLAYLIST, name, imageUrl),
+        itemUris = decodeItems(itemUrisJson),
+        addedAt = addedAt,
+    )
 
     private fun decodeItems(itemUrisJson: String): List<String> =
         try {

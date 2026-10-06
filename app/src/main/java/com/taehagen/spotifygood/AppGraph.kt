@@ -22,6 +22,7 @@ import com.taehagen.spotifygood.playback.OutputRouteManager
 import com.taehagen.spotifygood.playback.PlaybackRepository
 import com.taehagen.spotifygood.playback.PlaybackServiceConnector
 import com.taehagen.spotifygood.playback.PlayerController
+import com.taehagen.spotifygood.playback.ResumeStore
 import com.taehagen.spotifygood.playback.SleepTimer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -69,7 +70,9 @@ class AppGraph(val app: Application) {
     val auth: AuthRepository by lazy { AuthRepository(app, appScope, engine, credentialStore, httpClient) }
 
     val playback: PlaybackRepository by lazy { PlaybackRepository(appScope, events) }
-    val player: PlayerController by lazy { PlayerController(appScope, rpc, playback) }
+    /** Last local session (playback resumption, cold-start play); one DataStore per process. */
+    val resumeStore: ResumeStore by lazy { ResumeStore(app) }
+    val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore) }
     val devices: DevicesRepository by lazy { DevicesRepository(appScope, rpc, events) }
     val outputs: OutputRouteManager by lazy {
         OutputRouteManager(app, appScope, audioSink, rpc).also { manager ->
@@ -89,7 +92,7 @@ class AppGraph(val app: Application) {
     val search: SearchRepository by lazy { SearchRepository(rpc, database.recentSearches()) }
     val home: HomeRepository by lazy { HomeRepository(rpc, responseCache) }
     val lyrics: LyricsRepository by lazy { LyricsRepository(rpc) }
-    val playlists: PlaylistEditor by lazy { PlaylistEditor(rpc, library) }
+    val playlists: PlaylistEditor by lazy { PlaylistEditor(rpc, library, catalog) }
 
     val downloads: DownloadManager by lazy {
         DownloadManager(app, appScope, database, rpc, events, engine, settings, credentialStore)
@@ -102,6 +105,8 @@ class AppGraph(val app: Application) {
     suspend fun logout() {
         engine.logout()
         downloads.removeAll()
+        // The playback service clears it too, but only while it runs.
+        resumeStore.clear()
         responseCache.clear()
         kotlinx.coroutines.withContext(Dispatchers.IO) { database.clearAllTables() }
         events.reset()

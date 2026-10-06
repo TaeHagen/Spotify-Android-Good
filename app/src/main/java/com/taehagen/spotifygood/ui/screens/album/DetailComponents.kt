@@ -108,7 +108,6 @@ import java.util.Locale
 // Composables shared by the detail pages. Built on the shared ui.components where they exist.
 
 internal val DetailTopBarHeight: Dp = 64.dp
-internal const val DisabledRowAlpha = 0.38f
 
 /** Height covered by the overlay top bar (status bar + bar). */
 @Composable

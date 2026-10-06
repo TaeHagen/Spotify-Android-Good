@@ -1,9 +1,9 @@
 package com.taehagen.spotifygood.ui.screens.library
 
 import androidx.compose.runtime.Immutable
-import com.taehagen.spotifygood.data.db.DownloadCollectionEntity
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.download.CollectionType
+import com.taehagen.spotifygood.download.DownloadedCollection as StoredCollection
 import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.ArtistRef
 import com.taehagen.spotifygood.model.DownloadState
@@ -160,15 +160,13 @@ data class DownloadedCollection(
     fun toMediaRef(): MediaRef = MediaRef(mediaType, uri, name, null, imageUrl?.let { listOf(Image(it)) }.orEmpty())
 }
 
-fun collectionTypeOf(wire: String): CollectionType =
-    CollectionType.entries.firstOrNull { it.wire == wire } ?: CollectionType.PLAYLIST
-
-fun DownloadCollectionEntity.toDownloadedCollection(json: Json): DownloadedCollection = DownloadedCollection(
-    uri = uri,
-    type = collectionTypeOf(type),
-    name = name,
-    imageUrl = imageUrl,
-    itemUris = runCatching { json.decodeFromString<List<String>>(itemUrisJson) }.getOrDefault(emptyList()),
+/** Row model of a collection reported by [com.taehagen.spotifygood.download.DownloadManager.collections]. */
+fun StoredCollection.toDownloadedCollection(): DownloadedCollection = DownloadedCollection(
+    uri = ref.uri,
+    type = ref.type,
+    name = ref.name,
+    imageUrl = ref.imageUrl,
+    itemUris = itemUris,
     addedAt = addedAt,
 )
 

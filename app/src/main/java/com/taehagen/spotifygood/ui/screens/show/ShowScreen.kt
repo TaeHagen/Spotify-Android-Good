@@ -40,7 +40,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -65,7 +64,6 @@ import com.taehagen.spotifygood.ui.screens.album.AddedButton
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadButton
 import com.taehagen.spotifygood.ui.screens.album.DetailActionRow
 import com.taehagen.spotifygood.ui.screens.album.DetailScaffold
-import com.taehagen.spotifygood.ui.screens.album.DisabledRowAlpha
 import com.taehagen.spotifygood.ui.screens.album.ExpandableText
 import com.taehagen.spotifygood.ui.screens.album.FollowButton
 import com.taehagen.spotifygood.ui.screens.album.HeaderMetaText
@@ -141,8 +139,6 @@ private fun ShowList(
     onRetryPage: () -> Unit,
 ) {
     val show = header.show
-    val unavailable = stringResource(R.string.detail_unavailable)
-    val unavailableOffline = stringResource(R.string.detail_unavailable_offline)
     LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
         item(key = "header", contentType = "header") {
             DetailHeader(
@@ -203,20 +199,17 @@ private fun ShowList(
         items(state.list.episodes, key = { it.uri }, contentType = { "episode" }) { episode ->
             val downloadState = state.rowDownloads[episode.uri]
             val playable = episode.playable && (!state.offline || downloadState == DownloadState.COMPLETED)
+            val showActions = { navigator.showActions(MediaActionTarget.EpisodeTarget(episode)) }
             EpisodeRow(
                 episode = episode,
-                onClick = {
-                    when {
-                        playable -> onPlayEpisode(episode)
-                        state.offline -> navigator.showMessage(unavailableOffline)
-                        else -> navigator.showMessage(unavailable)
-                    }
-                },
-                modifier = Modifier.alpha(if (playable) 1f else DisabledRowAlpha),
+                onClick = { onPlayEpisode(episode) },
                 isCurrent = state.playback.isCurrent(episode.uri),
                 isPlaying = state.playback.isPlayingItem(episode.uri),
                 downloadState = downloadState,
-                onMoreClick = { navigator.showActions(MediaActionTarget.EpisodeTarget(episode)) },
+                onLongClick = showActions,
+                // Unplayable (or not downloaded while offline): dimmed, actions still in the overflow.
+                enabled = playable,
+                onMoreClick = showActions,
             )
         }
         item(key = "footer", contentType = "footer") {
