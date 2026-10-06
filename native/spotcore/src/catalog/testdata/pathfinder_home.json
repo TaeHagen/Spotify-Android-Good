@@ -1,0 +1,96 @@
+{
+  "data": {
+    "home": {
+      "__typename": "HomeV2",
+      "greeting": {"transformedLabel": "Good evening"},
+      "homeChips": [{"id": "0JQ5DAnM3wGh0gz1MXnu89", "label": {"transformedLabel": "Music"}}],
+      "sectionContainer": {
+        "sections": {
+          "totalCount": 4,
+          "items": [
+            {
+              "uri": "spotify:section:0JQ5DAqbMKFHOzuVTgTizF",
+              "data": {
+                "__typename": "HomeGenericSectionData",
+                "title": {"transformedLabel": "Made For Alice", "isPersonalizedTitle": true},
+                "subtitle": {"transformedLabel": ""}
+              },
+              "sectionItems": {
+                "totalCount": 3,
+                "items": [
+                  {
+                    "uri": "spotify:playlist:37i9dQZEVXcJZyENOWUFo7",
+                    "content": {
+                      "__typename": "PlaylistResponseWrapper",
+                      "data": {
+                        "__typename": "Playlist",
+                        "uri": "spotify:playlist:37i9dQZEVXcJZyENOWUFo7",
+                        "name": "Discover Weekly",
+                        "description": "Your weekly mixtape of fresh music.",
+                        "format": "discover-weekly",
+                        "images": {"items": [{"sources": [{"url": "https://pickasso.spotifycdn.com/image/ab67c0de0000deef/dt/v1/img/dw/cover/en", "width": null, "height": null}]}]},
+                        "ownerV2": {"data": {"__typename": "User", "name": "Spotify"}}
+                      }
+                    }
+                  },
+                  {
+                    "uri": "spotify:album:6XhjNHCyCDyyGJRM5mg40G",
+                    "content": {
+                      "__typename": "AlbumResponseWrapper",
+                      "data": {
+                        "__typename": "Album",
+                        "uri": "spotify:album:6XhjNHCyCDyyGJRM5mg40G",
+                        "name": "Whenever You Need Somebody",
+                        "artists": {"items": [{"uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt", "profile": {"name": "Rick Astley"}}]},
+                        "coverArt": {"sources": [{"url": "https://i.scdn.co/image/ab67616d00001e0215ebbedaacef61af244262a8", "width": 300, "height": 300}]},
+                        "albumType": "ALBUM"
+                      }
+                    }
+                  },
+                  {
+                    "uri": "spotify:concert:abc",
+                    "content": {"__typename": "UnknownTypeWrapper", "data": {"__typename": "Concert", "uri": "spotify:concert:abc"}}
+                  }
+                ]
+              }
+            },
+            {
+              "uri": "spotify:section:0JQ5DAnM3wGh0gz1MXnu3B",
+              "data": {"__typename": "HomeShortsSectionData"},
+              "sectionItems": {
+                "items": [
+                  {
+                    "uri": "spotify:user:alice:collection",
+                    "content": {"__typename": "LibraryPseudoPlaylistResponseWrapper", "data": {"__typename": "PseudoPlaylist", "uri": "spotify:user:alice:collection", "name": "Liked Songs", "count": 321, "image": {"sources": [{"url": "https://misc.scdn.co/liked-songs/liked-songs-300.png", "width": 300, "height": 300}]}}}
+                  }
+                ]
+              }
+            },
+            {
+              "uri": "spotify:section:empty",
+              "data": {"__typename": "HomeGenericSectionData", "title": {"transformedLabel": "Nothing"}},
+              "sectionItems": {"items": []}
+            },
+            {
+              "uri": "spotify:section:0JQ5DAnM3wGh0gz1MXnu4h",
+              "data": {"__typename": "HomeGenericSectionData", "title": {"text": "Popular podcasts"}},
+              "sectionItems": {
+                "items": [
+                  {
+                    "uri": "spotify:show:5CfCWKI5pZ28U0uOzXkDHe",
+                    "content": {"__typename": "PodcastOrAudiobookResponseWrapper", "data": {"__typename": "Podcast", "uri": "spotify:show:5CfCWKI5pZ28U0uOzXkDHe", "name": "The Rick Show", "publisher": {"name": "Rick Talks"}, "coverArt": {"sources": [{"url": "https://i.scdn.co/image/ab6765630000ba8a0000000000000000000000bb", "width": 300}]}}}
+                  },
+                  {
+                    "uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt",
+                    "content": {"__typename": "ArtistResponseWrapper", "data": {"__typename": "Artist", "uri": "spotify:artist:0gxyHStUsqpMadRV0Di1Qt", "profile": {"name": "Rick Astley"}, "visuals": {"avatarImage": {"sources": [{"url": "https://i.scdn.co/image/r", "width": 320}]}}}}
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "extensions": {}
+}

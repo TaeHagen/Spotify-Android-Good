@@ -341,6 +341,11 @@ pub struct RootlistEntry {
     pub owner: Option<PlaylistOwner>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<RootlistEntry>,
+    #[serde(default)]
+    pub collaborative: bool,
+    /// True when the logged-in user may add/remove items (owner or collaborative).
+    #[serde(default)]
+    pub can_edit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
