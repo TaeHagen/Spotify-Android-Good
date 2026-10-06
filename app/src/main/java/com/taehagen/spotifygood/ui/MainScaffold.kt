@@ -59,6 +59,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -105,6 +106,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * The signed-in app: adaptive navigation (bottom bar / rail), the navigation host, the docked
@@ -120,9 +122,10 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
 
     val backStack by navController.currentBackStack.collectAsStateWithLifecycle()
     val currentTab = remember(backStack) { MainNavigator.tabOf(backStack) }
-    val hasTrack by remember(graph) {
+    val hasTrackState = remember(graph) {
         graph.playback.currentTrack.map { it != null }.distinctUntilChanged()
     }.collectAsStateWithLifecycle(initialValue = graph.playback.currentTrack.value != null)
+    val hasTrack by hasTrackState
     val networkAvailable by graph.engine.isNetworkAvailable.collectAsStateWithLifecycle()
     val offlineMode by remember(graph) {
         graph.settings.settings.map { it.offlineMode }.distinctUntilChanged()
@@ -138,6 +141,18 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
         navController.currentBackStack.first { it.isNotEmpty() }
         shell.pendingLinks.collect { uri ->
             if (!navigator.openUri(uri)) navigator.showMessage(unsupportedLink)
+        }
+    }
+
+    // Media notification / lock-screen player taps (PlaybackService.EXTRA_OPEN_PLAYER).
+    LaunchedEffect(navigator) {
+        shell.pendingOpenPlayer.collect {
+            // Right after a cold start the player may need a moment to have something to show; a
+            // stale tap after playback ended opens nothing.
+            val hasContent = withTimeoutOrNull(OPEN_PLAYER_WAIT_MS) {
+                snapshotFlow { hasTrackState.value }.first { it }
+            } ?: false
+            if (hasContent) navigator.openNowPlaying()
         }
     }
 
@@ -469,5 +484,6 @@ private fun NotificationPermissionRequest() {
 }
 
 private const val DUPLICATE_WINDOW_MS = 3_000L
+private const val OPEN_PLAYER_WAIT_MS = 3_000L
 private const val PREFS = "shell"
 private const val KEY_NOTIFICATION_ASKS = "notification_permission_asks"

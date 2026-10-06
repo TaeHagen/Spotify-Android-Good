@@ -59,7 +59,8 @@ data class MediaSearchRequest(
 
 /**
  * Activity-scoped shell state: splash readiness, login/premium gating, the PLAYBACK_REFUSED
- * condition, deep links waiting for the main scaffold and voice-search playback.
+ * condition, deep links and "open Now Playing" requests waiting for the main scaffold and
+ * voice-search playback.
  */
 class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     private val _ready = MutableStateFlow(false)
@@ -85,6 +86,10 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     private val links = Channel<String>(Channel.UNLIMITED)
     /** Deep links (spotify: URIs / open.spotify.com) to open once the main UI is up. */
     val pendingLinks: Flow<String> = links.receiveAsFlow()
+
+    private val openPlayerRequests = Channel<Unit>(Channel.CONFLATED)
+    /** Requests to show Now Playing (media notification / lock-screen taps), also from before login. */
+    val pendingOpenPlayer: Flow<Unit> = openPlayerRequests.receiveAsFlow()
 
     private val messageChannel = Channel<String>(Channel.BUFFERED)
     /** Snackbar messages produced outside the navigator (intents, voice search). */
@@ -134,6 +139,11 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
 
     fun showMessage(message: String) {
         messageChannel.trySend(message)
+    }
+
+    /** Opens Now Playing once the main scaffold is up (and has something to show). */
+    fun openPlayer() {
+        openPlayerRequests.trySend(Unit)
     }
 
     fun dismissRefusal() {
