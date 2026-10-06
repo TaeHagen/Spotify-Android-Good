@@ -570,7 +570,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   queued items one at a time with `download.track` (cancellation propagates to
   `nativeCancel`), stores records (encrypted key), updates `offline.add`, retries failures
   with backoff (max 3), stops gracefully on `onStopped`/timeout (Android 15 6 h limit),
-  re-enqueues itself if work remains.
+  re-enqueues itself if work remains. "Not enough storage" reschedules (the hosts require
+  storage not low) instead of stopping for good.
+* Scheduling: turning "Download using mobile data" off or on stops a running run (its item
+  resumes from the `.part`) and re-creates the job / worker with the new network constraint;
+  pending work whose constraint does not match the setting is re-created too, and the runner
+  never downloads on a metered network while mobile data is off. User actions, app start,
+  coming online and returning to the app re-create work that waits out a retry backoff (never
+  an executing job or running worker).
 * Queue-wide pauses (`QueueBreaker`): `RATE_LIMITED` requeues the item without counting an
   attempt and pauses the whole queue for the server's `retryAfterMs` (else 1 min, doubling);
   three consecutive connectivity failures while the session is online (CDN unreachable) pause
@@ -578,10 +585,19 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   waits inline (≤ 2 min) or reschedules; a completed download resets the breaker.
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
-  of another downloaded collection).
+  of another downloaded collection). Liked Songs are listed with `library.tracks
+  {urisOnly:true}`; new rows get metadata from `catalog.tracks`. Only a *complete* resolution
+  removes items (item count matches the source's total, not empty): an empty or short one only
+  adds, and is retried. A collection whose sync fails or is incomplete is retried after 1 h,
+  doubling up to 24 h (`lastAttemptAt`, `syncFailures`), instead of at every reconnect.
+  Members the catalog resolves as not playable here (`playable:false` with a name) stay members
+  but are not queued and do not count in the collection status (`unavailableUrisJson`); they
+  are queued once they become playable.
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
   `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks start at 2 MiB and adapt between 1 and
-  4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all".
+  4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all";
+  usage counts every row that still owns a finished file (also ones marked failed later), each
+  shared file once.
 * Files are shared: the downloader reuses a verified `<fileId>`, so several rows (relinking, the
   same recording in two releases) can use one file. Removal deletes a completed file only when no
   remaining row has it as its `path` or `fileId`. Unfinished rows record the file their download
