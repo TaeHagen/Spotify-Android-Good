@@ -5,6 +5,7 @@ import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -47,10 +48,73 @@ class DownloadRulesTest {
         assertEquals(FailureAction.Retry(1, 5_000L), DownloadRules.onFailure(NativeErrorCode.NETWORK, 0, online = true))
         assertEquals(FailureAction.Retry(2, 20_000L), DownloadRules.onFailure(NativeErrorCode.INTERNAL, 1, online = true))
         assertEquals(FailureAction.Fail(3), DownloadRules.onFailure(NativeErrorCode.INTERNAL, 2, online = true))
+    }
+
+    @Test
+    fun rateLimitsAreNeverCountedAsAttempts() {
+        // Even on the last attempt and with a server delay: the item waits with the queue.
         assertEquals(
-            FailureAction.Retry(1, 30_000L),
+            FailureAction.Throttled,
             DownloadRules.onFailure(NativeErrorCode.RATE_LIMITED, 0, online = true, retryAfterMs = 30_000L),
         )
+        assertEquals(FailureAction.Throttled, DownloadRules.onFailure(NativeErrorCode.RATE_LIMITED, 2, online = true))
+    }
+
+    // ---- queue-wide pauses -----------------------------------------------------------------------------
+
+    @Test
+    fun aRateLimitPausesTheQueueForTheServerDelay() {
+        val breaker = QueueBreaker()
+        assertEquals(120_000L, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 120_000L))
+        // Longer than the per-item backoff cap: a server delay is honoured up to the queue cap.
+        assertEquals(20 * 60_000L, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 20 * 60_000L))
+        assertEquals(DownloadRules.MAX_QUEUE_PAUSE_MS, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 5 * 3_600_000L))
+        assertEquals(DownloadRules.BASE_BACKOFF_MS, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 0L))
+    }
+
+    @Test
+    fun rateLimitsWithoutADelayPauseLongerEachTimeUntilADownloadSucceeds() {
+        val breaker = QueueBreaker()
+        assertEquals(60_000L, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = null))
+        assertEquals(120_000L, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = null))
+        assertEquals(240_000L, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = null))
+        repeat(10) { breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = null) }
+        assertEquals(DownloadRules.MAX_QUEUE_PAUSE_MS, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = null))
+        breaker.onSuccess()
+        assertEquals(60_000L, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = null))
+    }
+
+    @Test
+    fun repeatedConnectivityFailuresWhileOnlinePauseTheQueue() {
+        val breaker = QueueBreaker()
+        // The CDN is unreachable while the session is online: three items in a row trip the breaker.
+        assertNull(breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
+        assertNull(breaker.onFailure(NativeErrorCode.NOT_CONNECTED, online = true, retryAfterMs = null))
+        assertEquals(60_000L, breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
+        // It keeps failing after the pause: the next trips pause longer.
+        repeat(2) { assertNull(breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null)) }
+        assertEquals(240_000L, breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
+        repeat(2) { breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null) }
+        assertEquals(960_000L, breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
+        repeat(2) { breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null) }
+        assertEquals(DownloadRules.MAX_QUEUE_PAUSE_MS, breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
+        breaker.onSuccess()
+        repeat(2) { assertNull(breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null)) }
+        assertEquals(60_000L, breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
+    }
+
+    @Test
+    fun otherFailuresAndOfflineFailuresDoNotTripTheBreaker() {
+        val breaker = QueueBreaker()
+        assertNull(breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
+        assertNull(breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
+        // An item-specific failure means the service answered: the run of failures is broken.
+        assertNull(breaker.onFailure(NativeErrorCode.UNAVAILABLE, online = true, retryAfterMs = null))
+        assertNull(breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
+        assertNull(breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
+        // The device went offline: the run waits for the network, the breaker stays put.
+        repeat(5) { assertNull(breaker.onFailure(NativeErrorCode.NETWORK, online = false, retryAfterMs = null)) }
+        assertEquals(60_000L, breaker.onFailure(NativeErrorCode.NETWORK, online = true, retryAfterMs = null))
     }
 
     @Test

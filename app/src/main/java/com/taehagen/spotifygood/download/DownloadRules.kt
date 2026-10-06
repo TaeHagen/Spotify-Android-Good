@@ -14,6 +14,18 @@ internal object DownloadRules {
     const val BASE_BACKOFF_MS = 5_000L
     const val MAX_BACKOFF_MS = 5 * 60_000L
 
+    /** First queue pause after a rate limit without a server delay (doubles per consecutive limit). */
+    const val RATE_LIMIT_PAUSE_MS = 60_000L
+
+    /** Consecutive connectivity failures while online after which the whole queue pauses. */
+    const val CONNECTIVITY_TRIP = 3
+
+    /** First queue pause after [CONNECTIVITY_TRIP] connectivity failures (×4 per further trip). */
+    const val CONNECTIVITY_PAUSE_MS = 60_000L
+
+    /** Longest queue pause. */
+    const val MAX_QUEUE_PAUSE_MS = 30 * 60_000L
+
     /** Stop downloading when less than this is free on the data partition. */
     const val MIN_FREE_BYTES = 200L * 1024 * 1024
 
@@ -59,6 +71,12 @@ internal object DownloadRules {
         data class Retry(val attempts: Int, val delayMs: Long) : FailureAction
 
         data class Fail(val attempts: Int) : FailureAction
+
+        /**
+         * The service is rate limiting: back to the queue without counting an attempt; the whole
+         * queue pauses ([QueueBreaker]) rather than every item trying again.
+         */
+        data object Throttled : FailureAction
     }
 
     /** Decides what to do with an item that failed with [code] after [previousAttempts] earlier failures. */
@@ -66,12 +84,35 @@ internal object DownloadRules {
         val attempts = previousAttempts + 1
         return when {
             code in STOP_RUN -> FailureAction.StopRun
+            code == NativeErrorCode.RATE_LIMITED -> FailureAction.Throttled
             code in CONNECTIVITY && !online -> FailureAction.WaitForNetwork
             code in PERMANENT -> FailureAction.Fail(attempts)
             attempts >= MAX_ATTEMPTS -> FailureAction.Fail(attempts)
             else -> FailureAction.Retry(attempts, backoffMs(attempts, retryAfterMs))
         }
     }
+
+    /**
+     * Queue pause after the [consecutive]-th rate limit in a row (1-based): the server's
+     * [retryAfterMs] when it gave one (at least [BASE_BACKOFF_MS]), else [RATE_LIMIT_PAUSE_MS]
+     * doubling per consecutive limit; at most [MAX_QUEUE_PAUSE_MS].
+     */
+    fun rateLimitPauseMs(retryAfterMs: Long?, consecutive: Int): Long {
+        val pause = retryAfterMs?.coerceAtLeast(BASE_BACKOFF_MS) ?: grow(RATE_LIMIT_PAUSE_MS, 2, consecutive)
+        return pause.coerceAtMost(MAX_QUEUE_PAUSE_MS)
+    }
+
+    /** Queue pause after the [trips]-th connectivity trip in a row (1-based): 1, 4, 16 min …, ≤ 30 min. */
+    fun connectivityPauseMs(trips: Int): Long = grow(CONNECTIVITY_PAUSE_MS, 4, trips).coerceAtMost(MAX_QUEUE_PAUSE_MS)
+
+    private fun grow(base: Long, factor: Long, n: Int): Long {
+        var value = base
+        repeat((n - 1).coerceIn(0, 10)) { value = (value * factor).coerceAtMost(MAX_QUEUE_PAUSE_MS) }
+        return value
+    }
+
+    /** Codes that say something about connectivity (for [QueueBreaker]). */
+    fun isConnectivity(code: String) = code in CONNECTIVITY
 
     /**
      * Which of [candidates] may be deleted: those not part of any of [keptCollections] (item lists of
@@ -172,6 +213,45 @@ internal object DownloadRules {
             val lower = name.lowercase()
             if (lower.endsWith(PART_SUFFIX)) lower.removeSuffix(PART_SUFFIX) !in parts else lower !in files
         }
+    }
+}
+
+/**
+ * Run-wide view of failures (docs/ARCHITECTURE.md §9.7), so that a condition of the whole service
+ * pauses the whole queue instead of every item spending its attempts on it:
+ * * a rate limit pauses at once ([DownloadRules.rateLimitPauseMs]);
+ * * connectivity failures while the session is online (CDN unreachable while the AP works) pause
+ *   after [DownloadRules.CONNECTIVITY_TRIP] consecutive items ([DownloadRules.connectivityPauseMs]);
+ *   each failure still counts as an attempt of its item.
+ *
+ * A completed download resets it; another kind of failure resets the connectivity count (the service
+ * answered). Pauses grow while the condition persists. Not thread-safe: used by one run at a time.
+ */
+internal class QueueBreaker {
+    private var rateLimits = 0
+    private var connectivityFailures = 0
+    private var connectivityTrips = 0
+
+    fun onSuccess() {
+        rateLimits = 0
+        connectivityFailures = 0
+        connectivityTrips = 0
+    }
+
+    /** How long to pause the whole queue after an item failed with [code]; null = go on. */
+    fun onFailure(code: String, online: Boolean, retryAfterMs: Long?): Long? {
+        if (code == NativeErrorCode.RATE_LIMITED) {
+            connectivityFailures = 0
+            return DownloadRules.rateLimitPauseMs(retryAfterMs, ++rateLimits)
+        }
+        if (!DownloadRules.isConnectivity(code)) {
+            connectivityFailures = 0
+            return null
+        }
+        if (!online) return null // the device is offline: the run waits for the network instead
+        if (++connectivityFailures < DownloadRules.CONNECTIVITY_TRIP) return null
+        connectivityFailures = 0
+        return DownloadRules.connectivityPauseMs(++connectivityTrips)
     }
 }
 

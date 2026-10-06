@@ -95,7 +95,9 @@ internal class KeyCache {
  * so garbage collection keeps that `.part` while the row exists), mirrors `download` events into the
  * database (≥ 500 ms apart) and the notification, stores the record with its key encrypted, and
  * registers it with `offline.add` (numbered with the commit, see [OfflineIndexSync]). Failures are
- * retried with exponential backoff up to [DownloadRules.MAX_ATTEMPTS].
+ * retried with exponential backoff up to [DownloadRules.MAX_ATTEMPTS]; a rate limit, or repeated
+ * connectivity failures while online, pause the whole queue ([QueueBreaker]: every pending row is
+ * held back, so the loop waits inline for a short pause and reschedules for a long one).
  *
  * Lock order: [runLock] before [commitLock] (the manager's mutation lock).
  */
@@ -122,6 +124,9 @@ internal class DownloadRunner(
     @Volatile private var current: CurrentItem? = null
     @Volatile private var session: Deferred<RunOutcome>? = null
     @Volatile private var cancelRequested = false
+
+    /** Kept across runs (runLock orders them), so pauses keep growing while a condition lasts. */
+    private val breaker = QueueBreaker()
 
     private val _activity = MutableStateFlow(DownloadActivity())
     val activity: StateFlow<DownloadActivity> = _activity.asStateFlow()
@@ -192,12 +197,16 @@ internal class DownloadRunner(
     }
 
     private suspend fun sessionBody(host: DownloadHost): RunOutcome {
+        dao.resetInterrupted()
+        // Everything pending is held back (backoff, queue pause) for longer than a run waits: do not
+        // bring the engine up only to find that out.
+        val paused = pausedForMs(System.currentTimeMillis())
+        if (paused != null && paused > MAX_INLINE_WAIT_MS) return RunOutcome.RESCHEDULE
         val holder = engine.acquire(HolderType.DOWNLOAD)
         val receiver = notifications.registerCancelReceiver(::requestCancel)
         val stats = RunStats()
         _activity.value = DownloadActivity(running = true)
         try {
-            dao.resetInterrupted()
             host.updateNotification(notifications.progress(null, 0, 0, 0f))
             if (settings.settings.value.offlineMode) return RunOutcome.STOPPED // resumed when offline mode ends
             if (!engine.awaitOnline(ONLINE_TIMEOUT_MS)) {
@@ -253,6 +262,12 @@ internal class DownloadRunner(
         }
     }
 
+    /** How long until a pending item may run; null when one may run now or nothing is pending. */
+    private suspend fun pausedForMs(now: Long): Long? {
+        if (dao.nextRunnable(now) != null) return null
+        return dao.earliestRetryAt()?.let { it - now }
+    }
+
     private class RunStats {
         var completed = 0
         var failed = 0
@@ -302,6 +317,7 @@ internal class DownloadRunner(
             )
             progress.cancelAndJoin()
             if (commit(item, record, quality)) {
+                breaker.onSuccess()
                 stats.completed++
                 stats.transferredBytes += record.sizeBytes
                 host.reportTransferred(stats.transferredBytes)
@@ -452,7 +468,10 @@ internal class DownloadRunner(
 
     private suspend fun handleFailure(item: DownloadEntity, e: NativeException, stats: RunStats): ItemResult {
         val message = describe(e)
-        return when (val action = DownloadRules.onFailure(e.code, item.attempts, engine.isOnline.value, e.info.retryAfterMs)) {
+        val online = engine.isOnline.value
+        val now = System.currentTimeMillis()
+        val pauseMs = breaker.onFailure(e.code, online, e.info.retryAfterMs)
+        val result = when (val action = DownloadRules.onFailure(e.code, item.attempts, online, e.info.retryAfterMs)) {
             DownloadRules.FailureAction.StopRun -> {
                 dao.markFailed(item.uri, item.attempts + 1, message)
                 stats.failed++
@@ -473,7 +492,20 @@ internal class DownloadRunner(
                 stats.failed++
                 ItemResult.Done
             }
+            DownloadRules.FailureAction.Throttled -> {
+                // Not an attempt: the item waits with the rest of the queue.
+                val until = now + (pauseMs ?: DownloadRules.rateLimitPauseMs(e.info.retryAfterMs, 1))
+                dao.scheduleRetry(item.uri, item.attempts, until, message)
+                ItemResult.Done
+            }
         }
+        if (pauseMs != null && result !is ItemResult.StopRun) {
+            // Hold every pending row back: the loop then waits (inline or rescheduled) instead of
+            // starting the next item against a service that is refusing them all.
+            Log.i(TAG, "Pausing the download queue for $pauseMs ms (${e.code})")
+            dao.deferPending(now + pauseMs)
+        }
+        return result
     }
 
     private fun describe(e: NativeException): String = when (e.code) {

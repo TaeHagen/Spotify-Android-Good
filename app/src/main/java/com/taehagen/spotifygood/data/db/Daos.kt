@@ -121,6 +121,13 @@ interface DownloadDao {
     @Query("UPDATE downloads SET state = 'failed', attempts = :attempts, retryAt = NULL, error = :error WHERE uri = :uri")
     suspend fun markFailed(uri: String, attempts: Int, error: String?)
 
+    /** Holds every pending item back until [until] (the whole queue pauses: rate limit, CDN outage). */
+    @Query(
+        "UPDATE downloads SET retryAt = :until WHERE state IN ('queued','preparing','downloading') " +
+            "AND (retryAt IS NULL OR retryAt < :until)",
+    )
+    suspend fun deferPending(until: Long): Int
+
     @Query("UPDATE downloads SET state = 'failed', retryAt = NULL, error = :error WHERE state IN ('queued','preparing','downloading')")
     suspend fun failAllPending(error: String?)
 
