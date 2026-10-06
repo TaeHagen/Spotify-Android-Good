@@ -281,7 +281,8 @@ async fn via_searchview(session: &Session, query: &str, offset: u32, limit: u32)
 
 async fn via_context(session: &Session, query: &str, offset: u32, limit: u32) -> AppResult<SearchResults> {
     let uri = format!("spotify:search:{}", encode_search_query(query));
-    let items = context::resolve(session, &uri, (offset + limit) as usize, 3).await?;
+    // A failed follow-up page only shortens the hit list.
+    let items = context::resolve_prefix(session, &uri, (offset + limit) as usize, 3).await?.items;
     let uris: Vec<String> = items
         .into_iter()
         .filter_map(|i| parse_kind(&i.uri, UriKind::Track))
