@@ -561,8 +561,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
   of another downloaded collection).
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
-  `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks adapt between 512 KiB and
-  4 MiB (≈4 s of transfer each); the first chunk validates the key. Settings shows usage and "Remove all".
+  `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks start at 2 MiB and adapt between 1 and
+  4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all".
 * Downloads require Premium (they are always Premium here) and are wiped on logout.
 
 ### 9.8 Data layer
