@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.playback
 
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
@@ -15,6 +16,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.C
 import androidx.media3.common.HeartRating
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Rating
 import androidx.media3.session.CacheBitmapLoader
 import androidx.media3.session.CommandButton
@@ -110,12 +112,7 @@ class PlaybackService : MediaLibraryService() {
             downloadedUris = { graph.downloads.downloadedUris.value.toList() },
         )
 
-        val provider = DefaultMediaNotificationProvider.Builder(this)
-            .setChannelId(Notifications.CHANNEL_PLAYBACK)
-            .setChannelName(R.string.playback_channel_name)
-            .setNotificationId(Notifications.ID_PLAYBACK)
-            .build()
-            .apply { setSmallIcon(R.drawable.ic_notification) }
+        val provider = PlaybackNotificationProvider(this).apply { setSmallIcon(R.drawable.ic_notification) }
         setMediaNotificationProvider(PresenceAwareNotificationProvider(provider))
 
         session = MediaLibrarySession.Builder(this, player, LibraryCallback())
@@ -401,6 +398,22 @@ class PlaybackService : MediaLibraryService() {
         } catch (e: SecurityException) {
             Log.w(TAG, "Foreground refused", e)
         }
+    }
+
+    /**
+     * Media3's notification, whose text also says "Playing on <device>" for remote playback
+     * (docs §8): the default provider shows only title and artist, and the device line is the
+     * metadata subtitle. On API 30+ the artist already carries it (see [SpotifyPlayer]); it is never
+     * added twice.
+     */
+    private class PlaybackNotificationProvider(private val context: Context) : DefaultMediaNotificationProvider(
+        context,
+        { Notifications.ID_PLAYBACK },
+        Notifications.CHANNEL_PLAYBACK,
+        R.string.playback_channel_name,
+    ) {
+        override fun getNotificationContentText(metadata: MediaMetadata): CharSequence? =
+            DeviceLine.join(context, super.getNotificationContentText(metadata), metadata.subtitle)
     }
 
     /** Drops late (artwork) updates of the media notification while presence owns the foreground. */

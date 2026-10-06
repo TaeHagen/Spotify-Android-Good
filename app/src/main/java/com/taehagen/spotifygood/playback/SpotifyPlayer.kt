@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.playback
 
 import android.content.Context
+import android.os.Build
 import android.os.Bundle
 import android.os.Looper
 import androidx.media3.common.AudioAttributes
@@ -195,12 +196,18 @@ internal class SpotifyPlayer(
         } else {
             null
         }
+        val artist = t.artistLine.ifBlank { null }
+        val deviceLine = key.remoteDevice?.let { context.getString(R.string.playback_playing_on, it) }
         val metadata = MediaMetadata.Builder()
             .setTitle(t.name)
-            .setArtist(t.artistLine.ifBlank { null })
+            // SysUI media controls (API 30+: QS / lock screen player) and Wear show only title and
+            // artist, so the "Playing on <device>" line goes into the artist there (docs §8). Older
+            // releases render our notification, whose content text adds the subtitle instead
+            // (the notification provider of PlaybackService), keeping the artist clean.
+            .setArtist(if (Build.VERSION.SDK_INT >= DeviceLine.IN_ARTIST_SDK) DeviceLine.join(context, artist, deviceLine) else artist)
             .setAlbumTitle(t.album?.name ?: t.show?.name)
             .setArtworkUri(artworkUri(context, t.imageUrl))
-            .setSubtitle(key.remoteDevice?.let { context.getString(R.string.playback_playing_on, it) })
+            .setSubtitle(deviceLine)
             .setDurationMs(key.durationMs.takeIf { it > 0 })
             .setIsBrowsable(false)
             .setIsPlayable(true)

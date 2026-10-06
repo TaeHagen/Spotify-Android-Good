@@ -8,6 +8,8 @@
 
     <!-- Media session -->
     <string name="playback_playing_on">Playing on %1$s</string>
+    <!-- Artist line of a track playing on another Connect device: "<artists> • Playing on <device>". -->
+    <string name="playback_artist_on_device">%1$s • %2$s</string>
     <string name="playback_action_like">Add to Liked Songs</string>
     <string name="playback_action_unlike">Remove from Liked Songs</string>
     <string name="playback_action_shuffle_on">Turn on shuffle</string>
