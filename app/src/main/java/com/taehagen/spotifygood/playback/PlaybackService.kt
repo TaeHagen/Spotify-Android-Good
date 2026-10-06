@@ -249,6 +249,8 @@ class PlaybackService : MediaLibraryService() {
                     smartShuffleAvailable = s.isSmartShuffleAvailable,
                     canShuffle = s.restrictions.canToggleShuffle,
                     repeat = s.repeat,
+                    isEpisode = s.track?.isEpisode == true,
+                    canSeek = s.restrictions.canSeek,
                 )
             }.distinctUntilChanged().collect { state ->
                 buttons = PlaybackSessionCommands.buttons(this@PlaybackService, state)

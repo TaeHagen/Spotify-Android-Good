@@ -18,6 +18,8 @@
     <string name="playback_action_repeat_all">Repeat all</string>
     <string name="playback_action_repeat_one">Repeat current song</string>
     <string name="playback_action_repeat_off">Turn off repeat</string>
+    <string name="playback_action_seek_back">Back 15 seconds</string>
+    <string name="playback_action_seek_forward">Forward 15 seconds</string>
 
     <!-- Background start failure -->
     <string name="playback_resume_title">Playback paused</string>

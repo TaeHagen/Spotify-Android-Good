@@ -93,6 +93,8 @@ internal class SpotifyPlayer(
         val w = QueueWindow.build(s)
         queueWindow = w
         val hasItem = !w.isEmpty
+        // Podcasts skip back / forward 15 s (notification, Auto, Wear), like Now Playing.
+        val episodeSkips = hasItem && w.current?.track?.isEpisode == true && s.restrictions.canSeek
         val remote = s.source == PlaybackSource.REMOTE
         val remoteName = if (remote) s.activeDevice?.name else null
         val remoteVolumeSupported = remote && s.activeDevice?.let { active ->
@@ -117,6 +119,8 @@ internal class SpotifyPlayer(
             .addIf(COMMAND_SEEK_TO_MEDIA_ITEM, hasItem)
             .addIf(COMMAND_SEEK_TO_DEFAULT_POSITION, hasItem)
             .addIf(COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM, hasItem && r.canSeek)
+            .addIf(COMMAND_SEEK_BACK, episodeSkips)
+            .addIf(COMMAND_SEEK_FORWARD, episodeSkips)
             .addIf(COMMAND_SEEK_TO_NEXT, hasItem && r.canSkipNext)
             .addIf(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM, hasItem && r.canSkipNext)
             .addIf(COMMAND_SEEK_TO_PREVIOUS, hasItem && r.canSkipPrev)
@@ -133,6 +137,8 @@ internal class SpotifyPlayer(
             .setPlaylist(buildItems(w, s, remoteName))
             .setAudioAttributes(AUDIO_ATTRIBUTES)
             .setAudioSessionId(audioSessionId)
+            .setSeekBackIncrementMs(EPISODE_SKIP_MS)
+            .setSeekForwardIncrementMs(EPISODE_SKIP_MS)
             .setShuffleModeEnabled(s.shuffle || s.smartShuffle)
             .setRepeatMode(
                 when (s.repeat) {
@@ -397,19 +403,21 @@ internal class SpotifyPlayer(
         }
     }
 
-    private companion object {
-        const val SETTLE_MS = 2_000L
-        const val LOAD_SETTLE_MS = 8_000L
-        const val RESTART_THRESHOLD_MS = 3_000L
-        const val VOLUME_STEP_PERCENT = 5
-        const val DEFAULT_UNMUTE_PERCENT = 50
+    internal companion object {
+        /** Skip back / forward of podcast episodes (the Now Playing ±15 s buttons). */
+        const val EPISODE_SKIP_MS = 15_000L
+        private const val SETTLE_MS = 2_000L
+        private const val LOAD_SETTLE_MS = 8_000L
+        private const val RESTART_THRESHOLD_MS = 3_000L
+        private const val VOLUME_STEP_PERCENT = 5
+        private const val DEFAULT_UNMUTE_PERCENT = 50
 
-        val AUDIO_ATTRIBUTES: AudioAttributes = AudioAttributes.Builder()
+        private val AUDIO_ATTRIBUTES: AudioAttributes = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
 
-        val REMOTE_DEVICE_INFO: DeviceInfo = DeviceInfo.Builder(DeviceInfo.PLAYBACK_TYPE_REMOTE)
+        private val REMOTE_DEVICE_INFO: DeviceInfo = DeviceInfo.Builder(DeviceInfo.PLAYBACK_TYPE_REMOTE)
             .setMinVolume(0)
             .setMaxVolume(100)
             .build()
