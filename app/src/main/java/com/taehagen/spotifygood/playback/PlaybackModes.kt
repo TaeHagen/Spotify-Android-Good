@@ -17,11 +17,13 @@ val PlaybackSnapshot.shuffleMode: ShuffleMode
     }
 
 /**
- * Smart shuffle is implemented by the local Spirc only (remote devices report `UNAVAILABLE`) and
- * only makes sense for playlist-like contexts (docs §7).
+ * Smart shuffle is implemented by the local Spirc only and only makes sense for playlist-like
+ * contexts (docs §7). Remote devices and the offline queue (`offline:true` snapshots, docs §4.6,
+ * which also covers the connecting window while it still owns the Player) report `UNAVAILABLE`,
+ * so the shuffle button must skip it there or it could never get back to "off".
  */
 val PlaybackSnapshot.isSmartShuffleAvailable: Boolean
-    get() = source == PlaybackSource.LOCAL &&
+    get() = source == PlaybackSource.LOCAL && !offline &&
         (context?.type == ContextType.PLAYLIST || context?.type == ContextType.COLLECTION)
 
 /** Pure state machines of the shuffle / repeat buttons (shared by the UI, notification and Auto). */
