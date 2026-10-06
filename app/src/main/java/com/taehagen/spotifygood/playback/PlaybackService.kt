@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
@@ -92,7 +94,14 @@ class PlaybackService : MediaLibraryService() {
     /** Media3 currently keeps the service foreground with the media notification. */
     private var mediaForeground = false
     private var buttons: List<CommandButton> = emptyList()
-    private var resumeAlertPosted = false
+    /**
+     * The media foreground was refused while mirroring a remote device: until that changes (or the
+     * app is visible again) the mirroring notification is posted without asking for the foreground.
+     */
+    private var remoteForegroundRefused = false
+    private val main = Handler(Looper.getMainLooper())
+    /** A background start for local audio must reach the foreground in time (startForegroundService). */
+    private val foregroundDeadline = Runnable { onForegroundDeadline() }
     private val searchCache = ConcurrentHashMap<String, List<MediaItem>>()
     /** uri → downloaded cover path of completed downloads (offline artwork). */
     @Volatile private var downloadedImages: Map<String, String> = emptyMap()
@@ -148,10 +157,17 @@ class PlaybackService : MediaLibraryService() {
                 if (presence.disable()) afterPresenceDisabled()
             }
             ACTION_RESUME -> {
-                cancelResumeAlert()
+                ResumeAlert.cancel(this)
                 // Through the session player, so Media3 goes foreground right away (the tap's
                 // temporary allowlist is short) instead of waiting for the engine's snapshot.
                 if (player.mediaItemCount > 0) player.play() else graph.player.resume()
+            }
+            ACTION_LOCAL_PLAYBACK -> {
+                // Started with startForegroundService for audio that began in the background (a
+                // remote "play on this phone"): Media3 goes foreground once the session player
+                // reports playing; startForeground is mandatory either way.
+                main.removeCallbacks(foregroundDeadline)
+                if (!mediaForeground && !presence.isForeground) main.postDelayed(foregroundDeadline, FOREGROUND_DEADLINE_MS)
             }
         }
         super.onStartCommand(intent, flags, startId)
@@ -169,19 +185,25 @@ class PlaybackService : MediaLibraryService() {
         session: MediaSession,
         startInForegroundRequired: Boolean,
     ): ListenableFuture<Void?> {
-        val idle = !startInForegroundRequired || session.player.currentTimeline.isEmpty
+        // Mirroring a remote device whose media foreground was refused: keep the controls as a
+        // normal notification instead of failing (and being told so) on every state change.
+        val foregroundRequired = startInForegroundRequired &&
+            !(remoteForegroundRefused && graph.playback.snapshot.value.source == PlaybackSource.REMOTE)
+        val idle = !foregroundRequired || session.player.currentTimeline.isEmpty
         if (presence.isEnabled && idle && (presence.isForeground || presence.showForeground())) {
             mediaForeground = false
             return Futures.immediateFuture(null)
         }
-        val future = super.onUpdateNotificationAsync(session, startInForegroundRequired)
+        val future = super.onUpdateNotificationAsync(session, foregroundRequired)
         future.addListener(
             {
                 val succeeded = runCatching { future.get() }.isSuccess
                 if (!succeeded) return@addListener
-                mediaForeground = startInForegroundRequired
-                if (startInForegroundRequired) {
+                mediaForeground = foregroundRequired
+                if (foregroundRequired) {
                     presence.onMediaForeground()
+                    main.removeCallbacks(foregroundDeadline)
+                    coordinator.onServiceForeground()
                 } else if (presence.isEnabled) {
                     // Media3 just left the foreground although presence is on: take it back.
                     presence.showForeground()
@@ -200,6 +222,7 @@ class PlaybackService : MediaLibraryService() {
 
     override fun onDestroy() {
         isRunning = false
+        main.removeCallbacks(foregroundDeadline)
         coordinator.closeEffectSession()
         presence.release()
         clearListener()
@@ -223,7 +246,18 @@ class PlaybackService : MediaLibraryService() {
             ).collect { player.refresh() }
         }
         lifecycleScope.launch {
-            playback.isPlaying.filter { it }.collect { if (resumeAlertPosted) cancelResumeAlert() }
+            playback.isPlaying.filter { it }.collect { if (ResumeAlert.isPosted) ResumeAlert.cancel(this@PlaybackService) }
+        }
+        lifecycleScope.launch {
+            // A refused remote-mirroring foreground is retried once the situation changed.
+            combine(playback.snapshot.map { it.source }.distinctUntilChanged(), coordinator.appVisible) { source, visible ->
+                source != PlaybackSource.REMOTE || visible
+            }.filter { it }.collect {
+                if (remoteForegroundRefused) {
+                    remoteForegroundRefused = false
+                    triggerNotificationUpdate()
+                }
+            }
         }
         lifecycleScope.launch {
             graph.downloads.items
@@ -342,50 +376,32 @@ class PlaybackService : MediaLibraryService() {
 
     /** Media3 could not start the foreground service from the background (API 31+). */
     private fun onForegroundStartNotAllowed() {
+        val s = graph.playback.snapshot.value
+        if (s.source != PlaybackSource.LOCAL) {
+            // Mirroring another device: nothing plays here, so nothing to pause (a pause would go
+            // to that device). Show its controls as a normal notification instead.
+            Log.i(TAG, "Foreground start refused while mirroring ${s.source}; posting the notification without it")
+            remoteForegroundRefused = true
+            session?.let { onUpdateNotificationAsync(it, false) }
+            return
+        }
         Log.w(TAG, "Foreground service start not allowed; asking the user to resume")
-        // Keep Connect and the session consistent: we cannot play without a foreground service.
-        graph.player.pause()
-        postResumeAlert()
+        // Local audio never plays without the media foreground service: pause (Connect sees it).
+        coordinator.refuseBackgroundPlayback()
     }
 
-    private fun postResumeAlert() {
-        val notifications = NotificationManagerCompat.from(this)
-        if (!notifications.areNotificationsEnabled()) return
-        if (notifications.getNotificationChannelCompat(Notifications.CHANNEL_ALERTS) == null) {
-            notifications.createNotificationChannel(
-                NotificationChannelCompat.Builder(Notifications.CHANNEL_ALERTS, NotificationManagerCompat.IMPORTANCE_DEFAULT)
-                    .setName(getString(R.string.playback_alerts_channel_name))
-                    .build(),
-            )
+    /**
+     * A background [ACTION_LOCAL_PLAYBACK] start did not reach the media foreground in time (e.g.
+     * playback was paused meanwhile, so Media3 did not ask for it): satisfy the
+     * `startForegroundService` contract, and stop local audio that would play without it.
+     */
+    private fun onForegroundDeadline() {
+        if (mediaForeground || presence.isForeground) return
+        satisfyForegroundContract()
+        if (coordinator.isPlayingLocally()) {
+            Log.w(TAG, "Media foreground not reached in time; pausing local playback")
+            coordinator.refuseBackgroundPlayback()
         }
-        val resume = PendingIntent.getService(
-            this,
-            REQUEST_RESUME,
-            Intent(this, PlaybackService::class.java).setAction(ACTION_RESUME),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val track = graph.playback.snapshot.value.track
-        val notification = NotificationCompat.Builder(this, Notifications.CHANNEL_ALERTS)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(track?.name ?: getString(R.string.playback_resume_title))
-            .setContentText(getString(R.string.playback_resume_text))
-            .setContentIntent(resume)
-            .addAction(R.drawable.pb_ic_play, getString(R.string.playback_resume_text), resume)
-            .setAutoCancel(true)
-            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .build()
-        try {
-            notifications.notify(Notifications.ID_RESUME_ALERT, notification)
-            resumeAlertPosted = true
-        } catch (e: SecurityException) {
-            Log.w(TAG, "Cannot post the resume notification", e)
-        }
-    }
-
-    private fun cancelResumeAlert() {
-        resumeAlertPosted = false
-        NotificationManagerCompat.from(this).cancel(Notifications.ID_RESUME_ALERT)
     }
 
     /**
@@ -667,11 +683,17 @@ class PlaybackService : MediaLibraryService() {
         const val ACTION_STOP_PRESENCE = "com.taehagen.spotifygood.playback.STOP_PRESENCE"
         /** "Tap to resume" after a refused background start. */
         const val ACTION_RESUME = "com.taehagen.spotifygood.playback.RESUME"
+        /**
+         * Sent with `startForegroundService` by [PlaybackCoordinator] when local audio starts
+         * while the app is in the background and the service is not running.
+         */
+        const val ACTION_LOCAL_PLAYBACK = "com.taehagen.spotifygood.playback.LOCAL_PLAYBACK"
         /** Boolean extra on the session activity intent: open the Now Playing screen. */
         const val EXTRA_OPEN_PLAYER = "com.taehagen.spotifygood.extra.OPEN_PLAYER"
 
         private const val REQUEST_SESSION = 1
-        private const val REQUEST_RESUME = 2
+        /** Well inside the system's startForeground deadline (5–10 s). */
+        private const val FOREGROUND_DEADLINE_MS = 3_000L
         private const val RESUME_SAVE_INTERVAL_MS = 15_000L
         private const val LOGIN_WAIT_MS = 3_000L
         private const val MAX_CACHED_SEARCHES = 8
