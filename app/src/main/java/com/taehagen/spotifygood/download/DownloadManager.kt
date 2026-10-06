@@ -156,9 +156,9 @@ class DownloadManager(
     /** Network policy (`downloadOverCellular`) of what this process scheduled last; null = nothing. */
     @Volatile private var scheduledCellular: Boolean? = null
 
-    /** URIs of completed downloads (hot). */
+    /** URIs of completed downloads (hot), iterating newest download first (Android Auto queue order). */
     val downloadedUris: StateFlow<Set<String>> = dao.observeCompletedUris()
-        .map<List<String>, Set<String>> { it.toHashSet() }
+        .map<List<String>, Set<String>> { LinkedHashSet(it) }
         .flowOn(Dispatchers.Default)
         .stateIn(scope, SharingStarted.Eagerly, emptySet())
 

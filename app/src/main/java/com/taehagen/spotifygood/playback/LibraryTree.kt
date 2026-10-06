@@ -131,9 +131,10 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         return graph.library.likedTracks(0, MAX_ITEMS).items.map { saved -> trackItem(saved.track, likedUri) }
     }
 
+    /** Newest download first, the order [com.taehagen.spotifygood.download.DownloadManager.downloadedUris] plays them in. */
     private suspend fun downloads(): List<MediaItem> {
         val items = withTimeoutOrNull(LOOKUP_TIMEOUT_MS) { graph.downloads.items.first() }.orEmpty()
-        return items.filter { it.state == DownloadState.COMPLETED }.mapNotNull { item ->
+        return items.asReversed().filter { it.state == DownloadState.COMPLETED }.mapNotNull { item ->
             val json = item.metadataJson ?: return@mapNotNull null
             val image = item.imagePath?.let { artworkUri(context, it) }
             val extras = Bundle().apply { putLong(MediaConstants.EXTRAS_KEY_DOWNLOAD_STATUS, MediaConstants.EXTRAS_VALUE_STATUS_DOWNLOADED) }
