@@ -175,7 +175,14 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     /** MEDIA_PLAY_FROM_SEARCH: search and play the best match (empty query resumes playback). */
     fun playFromSearch(request: MediaSearchRequest) {
         viewModelScope.launch {
-            if (!graph.engine.isLoggedIn.value) {
+            // A cold start ("Play X on SpotifyGood" with no process) gets here before the engine has
+            // read the stored credentials: wait for that instead of answering "log in first".
+            val loggedIn = awaitLoginState(
+                isLoggedIn = { graph.engine.isLoggedIn.value },
+                awaitReady = graph.engine::awaitReady,
+                timeoutMs = LOGIN_WAIT_MS,
+            )
+            if (!loggedIn) {
                 showMessage(graph.app.getString(R.string.shell_msg_login_first))
                 return@launch
             }
@@ -246,6 +253,8 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     private companion object {
         const val TAG = "ShellViewModel"
         const val SPLASH_MAX_MS = 2_000L
+        /** Upper bound for the credential load before voice search gives up (slow keystore). */
+        const val LOGIN_WAIT_MS = 10_000L
         const val ONLINE_TIMEOUT_MS = 15_000L
 
         /** MediaStore.Audio.Playlists.ENTRY_CONTENT_TYPE (deprecated constant, still sent by assistants). */
