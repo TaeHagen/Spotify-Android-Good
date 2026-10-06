@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shared strings. Feature strings live in strings_<area>.xml, one file per owner. -->
+<resources>
+    <string name="app_name">SpotifyGood</string>
+</resources>

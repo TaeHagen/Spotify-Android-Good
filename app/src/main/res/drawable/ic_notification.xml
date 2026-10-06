@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Monochrome status-bar icon: equalizer bars. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path android:fillColor="#FFFFFFFF" android:pathData="M4,13h3v8h-3z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M10.5,3h3v18h-3z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M17,8h3v13h-3z" />
+</vector>

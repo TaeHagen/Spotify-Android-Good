@@ -77,6 +77,8 @@ kotlin {
         freeCompilerArgs.addAll(
             "-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi",
             "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
+            "-opt-in=androidx.media3.common.util.UnstableApi",
+            "-opt-in=androidx.compose.foundation.ExperimentalFoundationApi",
         )
     }
 }
@@ -172,6 +174,7 @@ dependencies {
     implementation(libs.androidx.compose.foundation)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.material.icons.extended)
+    implementation(libs.androidx.compose.material3.navigation.suite)
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     implementation(libs.androidx.core.ktx)

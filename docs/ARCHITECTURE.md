@@ -131,7 +131,10 @@ class AudioSinkBridge {                      // called ONLY on the librespot pla
 Error results and error events use
 `{"code":"…","message":"…","retryAfterMs":<optional>}` with `code` one of
 `NOT_LOGGED_IN, NOT_CONNECTED, BAD_CREDENTIALS, PREMIUM_REQUIRED, NETWORK, NOT_FOUND,
-RATE_LIMITED, INVALID_ARGUMENT, UNAVAILABLE, NOT_ACTIVE_DEVICE, CANCELLED, INTERNAL`.
+RATE_LIMITED, INVALID_ARGUMENT, UNAVAILABLE, NOT_ACTIVE_DEVICE, PLAYBACK_REFUSED, CANCELLED,
+INTERNAL`. `PLAYBACK_REFUSED` = Spotify permanently refused audio keys for this account
+(librespot #1649; AesKeyError 0x0001). The engine stops after 3 consecutive refusals instead
+of skipping through the queue, and the app shows a dedicated explanation screen.
 Kotlin maps them to `NativeException(code, message)`.
 
 ### 3.4 JSON conventions
@@ -302,6 +305,8 @@ active** → connect-state command to that device.
 | `session.updateSettings` | `EngineSettings` | `{}` |
 | `session.logout` | `{}` | `{}` (stops, clears caches/credentials file) |
 | `session.zeroconfLogin` | `{"timeoutMs":180000}` | `{"credentials":{…}}` when another Spotify app hands over credentials (libmdns discovery; Kotlin holds a MulticastLock meanwhile) |
+| `session.token` | `{}` | `{"accessToken","expiresAtMs"}` login5 token (for Kotlin-side HTTP such as artwork never needs it; reserved) |
+| `session.setOAuthToken` | `{"accessToken","expiresAtMs"}` | `{}` (lets pathfinder fall back to the OAuth token) |
 
 `EngineSettings`: `{"bitrate":96|160|320,"normalize":true,"normalizePregain":"quiet|normal|loud",
 "autoplay":true,"gapless":true,"deviceName":"…","streamingCacheMb":1024,"offline":false}`.
@@ -449,7 +454,16 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 
 ### 9.3 Auth
 
-* OAuth Authorization Code + PKCE with the desktop client id
+* **Primary: OAuth device authorization grant** (RFC 8628) with the desktop client id
+  `65b708073fc0480ea92a077233ca87bd` and the desktop scope list:
+  `POST https://accounts.spotify.com/oauth2/device/authorize` → `{device_code, user_code,
+  verification_uri, verification_uri_complete, expires_in, interval}`; open
+  `verification_uri_complete` in a Custom Tab (explicit browser package) and also show the
+  code (for approving from another device); poll `POST https://accounts.spotify.com/api/token`
+  (`grant_type=urn:ietf:params:oauth:grant-type:device_code`, honour `interval`/`slow_down`,
+  stop on `expired_token`/`access_denied`) only while the login screen is alive. The device
+  code is persisted (≤ expiry) so polling resumes after process death. No local server.
+* **Fallback:** OAuth Authorization Code + PKCE with the desktop client id
   `65b708073fc0480ea92a077233ca87bd`, redirect `http://127.0.0.1:5588/login` (fallback
   port 8898), desktop scope list, `state` verified. `LoopbackServer` binds 127.0.0.1 only,
   loops until `/login`, 5 min timeout, replies with a 302 to `spotifygood://auth` plus an
@@ -506,9 +520,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `OnRoutingChangedListener`, and listens with `AudioDeviceCallback` (registered only
   while the engine runs).
 * User selection → `AudioSinkBridge.setPreferredDevice(AudioDeviceInfo?)` (`null` =
-  system default). "More devices…" opens the system output switcher
-  (`MediaRouter.showSystemOutputSwitcher` / platform media output panel) — includes Cast
-  and BT devices not yet connected.
+  system default; best effort — verify with `routedDevice()`). "More devices…" opens the
+  system output switcher via `androidx.mediarouter.app.SystemOutputSwitcherDialogController
+  .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — includes Cast and
+  BT devices not yet connected. Never use `setCommunicationDevice` for media.
 * Device sheet (one UI for everything, like Spotify's): **This phone** (with current output
   name + icon and local output choices), then **Spotify Connect devices**, then
   "More devices…". Selecting a Connect device → `connect.transfer`.
@@ -531,6 +546,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   persists `DownloadEntity` (state QUEUED) and `DownloadCollectionEntity` (collection URI,
   auto-sync); enqueues unique work `downloads` (KEEP) with constraints (network CONNECTED
   or UNMETERED per setting, storage not low). Removal deletes files + rows.
+* Execution: **API 34+ → user-initiated data transfer job** (`JobScheduler`, `DownloadJobService`,
+  `setUserInitiated(true)`, scheduled while the app is visible — survives the Android 15 dataSync
+  limit and the Android 16 job quota); **API < 34 → WorkManager** worker below. Both delegate to
+  the same `DownloadRunner`. Periodic collection sync is plain constrained WorkManager.
 * `DownloadWorker : CoroutineWorker` → `setForeground` (dataSync, progress notification,
   Cancel action), acquires the `DOWNLOAD` holder, waits for Online (≤ 60 s), then downloads
   queued items one at a time with `download.track` (cancellation propagates to
@@ -545,6 +564,29 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Downloads require Premium (they are always Premium here) and are wiped on logout.
 
 ### 9.8 Data layer
+
+Native catalog strategy (Rust `catalog/`):
+* **spclient** (stable, preferred): extended-metadata batches (tracks, albums, artists, shows,
+  episodes), `playlist/v2` (playlists, rootlist, changes), context-resolve (Liked Songs
+  `spotify:user:<u>:collection`, artist/album contexts), `collection/v2` paging/write/contains
+  (library sets: `collection` tracks+albums, `artist`, `show`, `listenlater`; protos compiled
+  from `librespot-protocol/proto/collection2v2.proto` in `spotcore/build.rs`),
+  `recently-played/v3`, `user-profile-view/v3`, `radio-apollo/v3` and `inspiredby-mix/v2`,
+  `color-lyrics/v2` (lenient JSON parsing).
+* **pathfinder** GraphQL (`https://api-partner.spotify.com/pathfinder/v2/query`, persisted
+  queries) for search (`searchDesktop`) and the home feed (`home`). Operation hashes rot, so
+  they are discovered at runtime: fetch `https://open.spotify.com/` once, extract the web
+  player bundle URLs, regex out `"<operationName>","query","<sha256>"` pairs, cache them on
+  disk (`filesDir/pathfinder.json`, refreshed weekly or on `PersistedQueryNotFound`); shipped
+  defaults are only a starting point. Token: login5 first; on 401/403 the OAuth access token
+  from login (if still valid); otherwise the call fails over to the fallbacks below.
+* **Fallbacks**: search → spclient `searchview/km/v4/search/<q>` (JSON) → context-resolve
+  `spotify:search:<q>` (tracks only). Home → assembled locally from recently played,
+  rootlist playlists (incl. followed Made-For-You mixes), followed artists and radio
+  stations seeded from recent tracks.
+* The public Web API is never used by default.
+
+
 
 Repositories call the native catalog RPCs and expose `suspend` functions / `Flow`s.
 `ResponseCache` (Room table `response_cache`: key, json, fetchedAt) stores the last
