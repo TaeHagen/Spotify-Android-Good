@@ -209,16 +209,22 @@ fn install_logger(level: Option<&str>) {
     };
     #[cfg(target_os = "android")]
     {
+        let level = filter.as_str().to_lowercase();
+        // librespot logs URLs that carry tokens or signatures:
+        // * request URLs with tokens at trace/debug level (`http_client`, `dealer`);
+        // * signed CDN URLs (`verify=…`, `__token__=…~hmac=…`) at WARN level: audio's
+        //   "Fetching {url} failed …, trying next" on every CDN failover (`fetch`), and core's
+        //   expiry-parse warnings (`cdn_url`). Those modules only log at ERROR here; the rest of
+        //   `fetch` (`fetch::receive`, no URLs) keeps the normal level.
+        let directives = format!(
+            "{level},librespot_core::http_client=info,librespot_core::dealer=info,librespot_core::cdn_url=error,\
+             librespot_audio::fetch=error,librespot_audio::fetch::receive={level},hyper=warn,rustls=warn,h2=warn"
+        );
         android_logger::init_once(
             android_logger::Config::default()
                 .with_tag("spotcore")
                 .with_max_level(filter)
-                // librespot logs request URLs with tokens at trace/debug level in a few places.
-                .with_filter(
-                    android_logger::FilterBuilder::new()
-                        .parse(&format!("{},librespot_core::http_client=info,librespot_core::dealer=info,hyper=warn,rustls=warn,h2=warn", filter.as_str().to_lowercase()))
-                        .build(),
-                ),
+                .with_filter(android_logger::FilterBuilder::new().parse(&directives).build()),
         );
     }
     #[cfg(not(target_os = "android"))]
