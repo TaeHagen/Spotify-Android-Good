@@ -28,14 +28,20 @@ class NativeRpc(val json: Json) {
         suspendCancellableCoroutine { cont ->
             val id = nextId.getAndIncrement()
             pending[id] = cont
-            cont.invokeOnCancellation {
-                if (pending.remove(id) != null) runCatching { NativeBridge.nativeCancel(id) }
-            }
             try {
                 NativeBridge.nativeCall(id, method, args.toString())
             } catch (t: Throwable) {
                 pending.remove(id)
                 cont.resumeWithException(t)
+                return@suspendCancellableCoroutine
+            }
+            // Registered only now that the native task exists: a cancellation that happened
+            // before or during nativeCall runs this handler right away and still reaches the
+            // native task (registered first, a nativeCancel could arrive before it existed and
+            // the task would run unowned). A result that already arrived removed the id, so
+            // the handler then does nothing.
+            cont.invokeOnCancellation {
+                if (pending.remove(id) != null) runCatching { NativeBridge.nativeCancel(id) }
             }
         }
 
