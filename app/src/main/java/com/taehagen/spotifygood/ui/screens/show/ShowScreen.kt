@@ -70,7 +70,6 @@ import com.taehagen.spotifygood.ui.screens.album.HeaderMetaText
 import com.taehagen.spotifygood.ui.screens.album.LoadMoreEffect
 import com.taehagen.spotifygood.ui.screens.album.LoadState
 import com.taehagen.spotifygood.ui.screens.album.LoadStateContent
-import com.taehagen.spotifygood.ui.screens.album.MessageEffect
 import com.taehagen.spotifygood.ui.screens.album.MoreButton
 import com.taehagen.spotifygood.ui.screens.album.PagingFooter
 import com.taehagen.spotifygood.ui.screens.album.RemoveDownloadDialog
@@ -90,7 +89,6 @@ fun ShowScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier = 
     val navigator = LocalAppNavigator.current
     val listState = rememberLazyListState()
     val showTitle by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 } }
-    MessageEffect(viewModel.messages)
     LoadMoreEffect(
         listState = listState,
         enabled = state.load is LoadState.Ready && !state.list.endReached && !state.list.failed,
@@ -235,7 +233,6 @@ fun EpisodeScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier
     val navigator = LocalAppNavigator.current
     val listState = rememberLazyListState()
     val showTitle by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 } }
-    MessageEffect(viewModel.messages)
 
     DetailScaffold(
         title = state.load.dataOrNull()?.episode?.name.orEmpty(),

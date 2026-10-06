@@ -77,6 +77,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.compose.rememberNavController
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import com.taehagen.spotifygood.ui.components.OfflineBanner
 import com.taehagen.spotifygood.ui.components.friendlyErrorMessage
 import com.taehagen.spotifygood.ui.components.rememberAppGraph
@@ -163,6 +164,8 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
         merge(
             navigator.messages,
             shell.messages,
+            // Results of writes that outlive their page (detail pages run them in the app scope).
+            BackgroundMessages.messages,
             graph.player.errors,
             graph.events.errors
                 .filter { it.code != NativeErrorCode.PLAYBACK_REFUSED && it.code != NativeErrorCode.CANCELLED }

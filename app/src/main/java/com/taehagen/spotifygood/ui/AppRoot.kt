@@ -32,6 +32,7 @@ import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.SearchResults
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import com.taehagen.spotifygood.ui.screens.login.LoginScreen
 import com.taehagen.spotifygood.ui.screens.status.PremiumRequiredScreen
 import kotlinx.coroutines.CancellationException
@@ -147,6 +148,8 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     /** The signed-in UI left the composition for good: clears all of its ViewModels. */
     fun releaseMainSession(owner: ViewModelStoreOwner) {
         mainSessions.release(owner)
+        // Results of the old session's writes are not for whoever signs in next.
+        BackgroundMessages.clear()
     }
 
     override fun onCleared() {
