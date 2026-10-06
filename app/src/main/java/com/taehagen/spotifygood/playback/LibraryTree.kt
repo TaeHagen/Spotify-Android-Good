@@ -239,14 +239,15 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
     /** The last locally played item (for "recent" roots of non-SysUI browsers). */
     private suspend fun recentItem(): MediaItem? = graph.resumeStore.read()?.let(::resumeItem)
 
-    fun resumeItem(state: ResumeState): MediaItem = MediaItem.Builder()
+    /** [downloadedImage]: path of the downloaded cover of the track, preferred (works offline). */
+    fun resumeItem(state: ResumeState, downloadedImage: String? = null): MediaItem = MediaItem.Builder()
         .setMediaId(state.mediaId)
         .setMediaMetadata(
             MediaMetadata.Builder()
                 .setTitle(state.title)
                 .setArtist(state.artist)
                 .setAlbumTitle(state.album)
-                .setArtworkUri(artworkUri(context, state.artworkUrl))
+                .setArtworkUri(artworkUri(context, downloadedImage) ?: artworkUri(context, state.artworkUrl))
                 .setDurationMs(state.durationMs)
                 .setIsBrowsable(false)
                 .setIsPlayable(true)

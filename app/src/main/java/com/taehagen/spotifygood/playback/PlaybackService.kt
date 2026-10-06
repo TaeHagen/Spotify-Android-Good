@@ -41,6 +41,7 @@ import com.taehagen.spotifygood.Notifications
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.engine.EngineHolder
 import com.taehagen.spotifygood.engine.HolderType
+import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.PlaybackSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -53,6 +54,7 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
@@ -92,6 +94,8 @@ class PlaybackService : MediaLibraryService() {
     private var buttons: List<CommandButton> = emptyList()
     private var resumeAlertPosted = false
     private val searchCache = ConcurrentHashMap<String, List<MediaItem>>()
+    /** uri → downloaded cover path of completed downloads (offline artwork). */
+    @Volatile private var downloadedImages: Map<String, String> = emptyMap()
 
     override fun onCreate() {
         super.onCreate()
@@ -110,6 +114,7 @@ class PlaybackService : MediaLibraryService() {
             volume = coordinator.volumeSync,
             audioSessionId = graph.audioSink.audioSessionId,
             downloadedUris = { graph.downloads.downloadedUris.value.toList() },
+            downloadedImage = { uri -> downloadedImages[uri] },
         )
 
         val provider = PlaybackNotificationProvider(this).apply { setSmallIcon(R.drawable.ic_notification) }
@@ -219,6 +224,21 @@ class PlaybackService : MediaLibraryService() {
         }
         lifecycleScope.launch {
             playback.isPlaying.filter { it }.collect { if (resumeAlertPosted) cancelResumeAlert() }
+        }
+        lifecycleScope.launch {
+            graph.downloads.items
+                .map { items ->
+                    items.asSequence()
+                        .filter { it.state == DownloadState.COMPLETED && it.imagePath != null }
+                        .associate { it.uri to it.imagePath!! }
+                }
+                .distinctUntilChanged()
+                .flowOn(Dispatchers.Default)
+                .catch { Log.w(TAG, "Downloaded artwork unavailable", it) }
+                .collect { images ->
+                    downloadedImages = images
+                    player.refresh()
+                }
         }
         lifecycleScope.launch {
             combine(playback.snapshot, likedState()) { s, liked ->
@@ -587,7 +607,7 @@ class PlaybackService : MediaLibraryService() {
                 if (query.isBlank()) {
                     val last = resumeStore.read()
                         ?: return@future MediaItemsWithStartPosition(emptyList(), C.INDEX_UNSET, C.TIME_UNSET)
-                    MediaItemsWithStartPosition(listOf(tree.resumeItem(last)), 0, last.positionMs)
+                    MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
                 } else {
                     val item = runCatching { tree.resolveVoiceQuery(query, first.requestMetadata.extras) }
                         .onFailure { if (it is CancellationException) throw it }
@@ -613,7 +633,7 @@ class PlaybackService : MediaLibraryService() {
                 if (isForPlayback) satisfyForegroundContract()
                 throw UnsupportedOperationException("Nothing to resume")
             }
-            MediaItemsWithStartPosition(listOf(tree.resumeItem(last)), 0, last.positionMs)
+            MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
         }
     }
 

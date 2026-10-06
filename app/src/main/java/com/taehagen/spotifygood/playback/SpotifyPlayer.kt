@@ -57,6 +57,8 @@ internal class SpotifyPlayer(
     private val volume: VolumeSync,
     private val audioSessionId: Int,
     private val downloadedUris: () -> List<String>,
+    /** Absolute path of the downloaded cover of a track / episode uri (offline artwork), if any. */
+    private val downloadedImage: (String) -> String? = { null },
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
 
     private val context = context.applicationContext
@@ -77,6 +79,8 @@ internal class SpotifyPlayer(
         val remoteDevice: String?,
         val durationMs: Long,
         val seekable: Boolean,
+        /** Downloaded cover, preferred over the CDN url (part of the key: downloads come and go). */
+        val imagePath: String?,
     )
 
     private class CachedItem(val key: ItemKey, val data: MediaItemData)
@@ -190,6 +194,7 @@ internal class SpotifyPlayer(
                 remoteDevice = remoteName.takeIf { isCurrent },
                 durationMs = durationMs,
                 seekable = s.restrictions.canSeek,
+                imagePath = downloadedImage(entry.track.uri),
             )
             val cached = itemCache[entry.uid]?.takeIf { it.key == key } ?: CachedItem(key, itemData(entry.uid, key))
             cache[entry.uid] = cached
@@ -216,7 +221,9 @@ internal class SpotifyPlayer(
             // (the notification provider of PlaybackService), keeping the artist clean.
             .setArtist(if (Build.VERSION.SDK_INT >= DeviceLine.IN_ARTIST_SDK) DeviceLine.join(context, artist, deviceLine) else artist)
             .setAlbumTitle(t.album?.name ?: t.show?.name)
-            .setArtworkUri(artworkUri(context, t.imageUrl))
+            // The downloaded cover works offline (notification, lock screen, Auto) and is the one
+            // the download stored; the CDN url (best(300)) usually names a different image file.
+            .setArtworkUri(artworkUri(context, key.imagePath) ?: artworkUri(context, t.imageUrl))
             .setSubtitle(deviceLine)
             .setDurationMs(key.durationMs.takeIf { it > 0 })
             .setIsBrowsable(false)
