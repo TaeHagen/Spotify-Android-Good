@@ -313,14 +313,12 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
     if offline::is_active() {
         // The offline queue has no Connect state to transfer: hand its tracks over as a play
         // command, then stop locally.
-        if let Some(snap) = offline::snapshot(hub::this_device_ref(), 0) {
-            let mut uris: Vec<String> = snap.track.iter().map(|t| t.uri.clone()).collect();
-            uris.extend(snap.next_tracks.iter().take(50).map(|t| t.uri.clone()));
+        if let Some((uris, position_ms)) = offline::handover(50) {
             if !uris.is_empty() {
                 let load = LoadArgs {
                     track_uris: Some(uris),
                     start_index: Some(0),
-                    position_ms: snap.position_ms,
+                    position_ms,
                     play: args.play,
                     ..Default::default()
                 };

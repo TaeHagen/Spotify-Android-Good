@@ -24,6 +24,12 @@ pub(crate) fn snapshot(device: ActiveDeviceRef, volume: u16) -> Option<PlaybackS
     q.active.then(|| q.snapshot(device, volume))
 }
 
+/// The current and up to `max_next` next items, and the current position, while active.
+pub(crate) fn handover(max_next: usize) -> Option<(Vec<String>, u64)> {
+    let q = QUEUE.lock();
+    q.active.then(|| q.handover(now_ms(), max_next))
+}
+
 /// Another controller (Spirc) took the Player over: forget the queue without touching the Player.
 pub(crate) fn deactivate() {
     let mut q = QUEUE.lock();

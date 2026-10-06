@@ -585,6 +585,14 @@ impl OfflineQueue {
             .collect()
     }
 
+    /// What to hand over to another device: the current item followed by up to `max_next` next
+    /// items, and the position at `now_ms` (the snapshot only carries the last anchor).
+    pub fn handover(&self, now_ms: i64, max_next: usize) -> (Vec<String>, u64) {
+        let mut uris: Vec<String> = self.current_uri().map(str::to_string).into_iter().collect();
+        uris.extend(self.next_tracks().into_iter().take(max_next).map(|t| t.uri));
+        (uris, self.position_at(now_ms))
+    }
+
     /// The snapshot (bare tracks; metadata is filled by the caller). Positions are reported as
     /// the last anchor (position + timestamp), so the JSON only changes when the state does.
     pub fn snapshot(&self, device: ActiveDeviceRef, volume: u16) -> PlaybackSnapshot {
@@ -872,6 +880,11 @@ mod tests {
         assert_eq!(q.position_at(100_000), 5000);
         assert_eq!(q.play(7000), Some(Action::Play));
         assert_eq!(q.position_at(8000), 6000);
+        // a transfer hands over the extrapolated position, not the last anchor
+        let (items, position) = q.handover(68_000, 50);
+        assert_eq!(items, vec!["spotify:track:0", "spotify:track:1"]);
+        assert_eq!(position, 60_000, "clamped to the duration");
+        assert_eq!(q.handover(30_000, 0), (vec!["spotify:track:0".to_string()], 28_000));
         let s = q.snapshot(dev(), 123);
         assert!(s.offline);
         assert_eq!(s.source, PlaybackSource::Local);
