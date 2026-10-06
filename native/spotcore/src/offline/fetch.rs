@@ -15,11 +15,15 @@
 //! * Chunks adapt to the measured throughput (≈ [`Policy::target_chunk_time`] each, between
 //!   [`Policy::min_chunk`] and [`Policy::max_chunk`], 1–4 MiB): few requests against
 //!   librespot's 300-per-30-s client rate limiter.
-//! * Errors: 403/404/410 → re-resolve the CDN URLs (bounded); 5xx/408/stalls/network → rotate
-//!   to the next URL with exponential backoff; 429 → backoff (honouring `Retry-After` when
-//!   known); 416 or an inconsistent response → forget the size and retry. A run of
+//! * Errors: 403/404/410 → re-resolve the CDN URLs and move to the next one (another host may
+//!   serve what this one refuses; bounded); 5xx/408/stalls/network → rotate to the next URL with
+//!   exponential backoff; 416 or an inconsistent response → forget the size and retry. A run of
 //!   [`Policy::max_failures`] consecutive failures without progress fails the download; the
 //!   `.part` is kept for the next attempt.
+//! * 429: waiting is the server's call. A requested pause up to [`Policy::backoff_max`] is
+//!   waited out exactly (at most [`Policy::rate_limit_retries`] times); a longer one, or a 429
+//!   without any delay after that, fails the download at once with `RATE_LIMITED` and the full
+//!   `retryAfterMs`, so Kotlin pauses the whole queue instead of every item retrying.
 
 use super::disk;
 use super::format;
@@ -55,6 +59,8 @@ pub struct Policy {
     pub max_failures: u32,
     /// CDN URL re-resolves (403/404/410) per download.
     pub max_refreshes: u32,
+    /// Retries after a `429` per download before the pause is left to the queue.
+    pub rate_limit_retries: u32,
     pub backoff_base: Duration,
     pub backoff_max: Duration,
     /// Sanity limit for the size reported by the CDN.
@@ -73,6 +79,7 @@ impl Default for Policy {
             write_batch: 256 * 1024,
             max_failures: 6,
             max_refreshes: 4,
+            rate_limit_retries: 1,
             backoff_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             max_file_size: 2048 * MIB,
@@ -99,6 +106,8 @@ impl Policy {
 struct State {
     failures: u32,
     refreshes: u32,
+    /// `429` answers so far.
+    rate_limits: u32,
     url_index: usize,
     need_refresh: bool,
     /// File size from the responses so far; `None` = not known (yet, or any more).
@@ -118,6 +127,9 @@ impl State {
                     return Err(AppError::unavailable(format!("The CDN keeps refusing this file ({err})")));
                 }
                 self.need_refresh = true;
+                // Storage-resolve lists the hosts in much the same order every time: without
+                // moving on, every attempt would ask the host that refused.
+                self.url_index += 1;
                 if self.refreshes > 1 {
                     delay = Some(policy.backoff(self.refreshes - 1));
                 }
@@ -130,7 +142,14 @@ impl State {
             }
             FetchError::Status { code: 429, retry_after } => {
                 self.failures += 1;
-                delay = Some(retry_after.unwrap_or_else(|| policy.backoff(self.failures)).min(policy.backoff_max * 2));
+                self.rate_limits += 1;
+                let long = retry_after.is_some_and(|wait| wait > policy.backoff_max);
+                if long || self.rate_limits > policy.rate_limit_retries {
+                    // Hand the pause to the queue (RATE_LIMITED with the server's delay).
+                    self.last_error = Some(err);
+                    return Err(self.give_up());
+                }
+                delay = Some(retry_after.unwrap_or_else(|| policy.backoff(self.failures)));
             }
             FetchError::RateLimited => {
                 self.failures += 1;
@@ -217,7 +236,8 @@ pub async fn download_part<T: Transport>(
     let mut may_restart = have > 0;
     let mut chunk_len = policy.initial_chunk.max(1);
     let mut rate: Option<f64> = None;
-    let mut st = State { failures: 0, refreshes: 0, url_index: 0, need_refresh: false, total: None, last_error: None };
+    let mut st =
+        State { failures: 0, refreshes: 0, rate_limits: 0, url_index: 0, need_refresh: false, total: None, last_error: None };
 
     loop {
         if !verified && (have >= header_len || st.total.is_some_and(|t| have == t && have > 0)) {
@@ -628,6 +648,8 @@ pub(crate) mod tests {
         let calls = cdn.calls.lock().clone();
         assert_eq!(calls.iter().filter(|c| **c == Call::Urls(true)).count(), 2, "403 and 410 re-resolve");
         let opens = cdn.opens();
+        assert_eq!((opens[0].0.as_str(), opens[1].0.as_str()), (cdn.urls[0].as_str(), cdn.urls[1].as_str()), "403 moves on");
+        let opens = cdn.opens();
         let urls: Vec<_> = opens.iter().map(|o| o.0.clone()).collect();
         assert!(urls.contains(&cdn.urls[0]) && urls.contains(&cdn.urls[1]), "rotates URLs");
         assert!(
@@ -703,11 +725,14 @@ pub(crate) mod tests {
             progress.failed(&err);
         }
         {
+            // A 429 without a delay is retried once, then left to the queue.
             let limited = MockCdn::new(data.clone());
             limited.open_failures.lock().extend(std::iter::repeat_n(FetchError::Status { code: 429, retry_after: None }, 10));
             let mut progress = Progress::new("u", recorder().0);
             let err = download_part(&limited, &part, OGG, Some(KEY), &policy, &mut progress).await.expect_err("gives up");
             assert_eq!(err.code, ErrorCode::RateLimited);
+            assert_eq!(err.retry_after_ms, None);
+            assert_eq!(limited.opens().len() as u32, policy.rate_limit_retries + 1);
             progress.failed(&err);
         }
         {
@@ -738,6 +763,69 @@ pub(crate) mod tests {
             assert_eq!(stalling.opens().len() as u32, policy.max_failures + 1);
             progress.failed(&err);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn rate_limits_honour_the_server_delay() {
+        let dir = scratch_dir("fetch-429");
+        let part = dir.join("f.part");
+        let data = encrypted_ogg(100 * 1024);
+        let policy = Policy { backoff_max: Duration::from_millis(200), ..fast_policy() };
+        {
+            // A short delay is waited out exactly, then the download goes on.
+            let cdn = MockCdn::new(data.clone());
+            cdn.open_failures.lock().push_back(FetchError::Status { code: 429, retry_after: Some(Duration::from_millis(60)) });
+            let started = Instant::now();
+            let mut progress = Progress::new("u", recorder().0);
+            download_part(&cdn, &part, OGG, Some(KEY), &policy, &mut progress).await.expect("recovers");
+            assert!(started.elapsed() >= Duration::from_millis(60), "waited for the server");
+            assert_eq!(part_bytes(&part), Some(data.clone()));
+            progress.completed(0);
+        }
+        std::fs::remove_file(&part).expect("reset");
+        {
+            // A delay longer than one download should wait fails at once and carries the delay.
+            let cdn = MockCdn::new(data.clone());
+            cdn.open_failures.lock().push_back(FetchError::Status { code: 429, retry_after: Some(Duration::from_secs(120)) });
+            let started = Instant::now();
+            let mut progress = Progress::new("u", recorder().0);
+            let err = download_part(&cdn, &part, OGG, Some(KEY), &policy, &mut progress).await.expect_err("rate limited");
+            assert!(started.elapsed() < Duration::from_secs(5), "did not sleep");
+            assert_eq!(err.code, ErrorCode::RateLimited);
+            assert_eq!(err.retry_after_ms, Some(120_000), "not truncated");
+            assert_eq!(cdn.opens().len(), 1, "no further request inside the window");
+            progress.failed(&err);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn refusals_move_to_the_next_host() {
+        let dir = scratch_dir("fetch-403");
+        let part = dir.join("f.part");
+        let cdn = MockCdn::new(encrypted_ogg(100 * 1024));
+        cdn.open_failures.lock().push_back(FetchError::Status { code: 404, retry_after: None });
+        let mut progress = Progress::new("u", recorder().0);
+        download_part(&cdn, &part, OGG, Some(KEY), &fast_policy(), &mut progress).await.expect("served by the other host");
+        let opens = cdn.opens();
+        assert_eq!(opens[0].0, cdn.urls[0]);
+        assert_eq!(opens[1].0, cdn.urls[1], "re-resolved and moved on");
+        assert_eq!(opens[1].1, 0);
+        progress.completed(0);
+
+        // Refused everywhere: every host is asked, the attempts stay bounded.
+        let refusing = MockCdn::new(cdn.data.clone());
+        refusing.open_failures.lock().extend(std::iter::repeat_n(FetchError::Status { code: 403, retry_after: None }, 10));
+        std::fs::remove_file(&part).expect("reset");
+        let policy = fast_policy();
+        let mut progress = Progress::new("u", recorder().0);
+        let err = download_part(&refusing, &part, OGG, Some(KEY), &policy, &mut progress).await.expect_err("refused");
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        let hosts: std::collections::HashSet<_> = refusing.opens().into_iter().map(|o| o.0).collect();
+        assert_eq!(hosts.len(), refusing.urls.len());
+        assert_eq!(refusing.opens().len() as u32, policy.max_refreshes + 1);
+        progress.failed(&err);
         let _ = std::fs::remove_dir_all(dir);
     }
 

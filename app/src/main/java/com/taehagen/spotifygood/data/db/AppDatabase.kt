@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.data.db
 
 import android.content.Context
+import androidx.room.AutoMigration
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
@@ -32,8 +33,10 @@ class Converters {
 
 @Database(
     entities = [DownloadEntity::class, DownloadCollectionEntity::class, RecentSearchEntity::class, ResponseCacheEntity::class],
-    version = 2,
+    version = 3,
     exportSchema = true,
+    // 3: download_collections gained lastAttemptAt, syncFailures and unavailableUrisJson.
+    autoMigrations = [AutoMigration(from = 2, to = 3)],
 )
 @TypeConverters(Converters::class)
 abstract class AppDatabase : RoomDatabase() {
