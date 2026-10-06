@@ -327,7 +327,7 @@ active** → connect-state command to that device.
 | `player.applySettings` | `EngineSettings` subset (bitrate/normalisation) |
 | `queue.add` | `{"uri":"spotify:track:…"}` |
 | `queue.remove` | `{"uid":"…"}` |
-| `queue.move` | `{"uid":"…","toIndex":0}` |
+| `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
 | `connect.transfer` | `{"deviceId":"…","play":true?}` (self = pull, other = push) |
