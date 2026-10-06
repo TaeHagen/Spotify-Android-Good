@@ -210,6 +210,7 @@ enum PlayerCommand {
     SetOfflineSource(Option<OfflineSourceRef>),
     SetBitrate(Bitrate),
     SetNormalisation(NormalisationSettings),
+    SetGapless(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -753,6 +754,12 @@ impl Player {
     // and the current track's gain factor is recomputed from its normalisation data.
     pub fn set_normalisation(&self, settings: NormalisationSettings) {
         self.command(PlayerCommand::SetNormalisation(settings));
+    }
+
+    // SPOTIFYGOOD: change gapless playback at runtime. `config.gapless` is only read when a load
+    // starts (`handle_command_load`), so it applies from the next track change on.
+    pub fn set_gapless(&self, gapless: bool) {
+        self.command(PlayerCommand::SetGapless(gapless));
     }
 }
 
@@ -2628,12 +2635,15 @@ impl PlayerInternal {
             }
 
             // SPOTIFYGOOD: runtime settings. `load_track` clones `self.config` for every new
-            // loader, so the source and bitrate apply to loads and preloads started from now on.
+            // loader, so the source and bitrate apply to loads and preloads started from now on;
+            // `gapless` is read by `handle_command_load`, so it applies from the next load.
             PlayerCommand::SetOfflineSource(source) => self.config.offline_source = source,
 
             PlayerCommand::SetBitrate(bitrate) => self.config.bitrate = bitrate,
 
             PlayerCommand::SetNormalisation(settings) => self.handle_set_normalisation(settings),
+
+            PlayerCommand::SetGapless(gapless) => self.config.gapless = gapless,
 
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => {
                 self.send_event(PlayerEvent::FilterExplicitContentChanged { filter });
@@ -2858,6 +2868,9 @@ impl fmt::Debug for PlayerCommand {
                 .debug_tuple("SetNormalisation")
                 .field(&settings)
                 .finish(),
+            PlayerCommand::SetGapless(gapless) => {
+                f.debug_tuple("SetGapless").field(&gapless).finish()
+            }
         }
     }
 }

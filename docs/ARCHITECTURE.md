@@ -195,11 +195,12 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
 
 ### 4.3 Playback configuration
 
-`PlayerConfig { bitrate: from settings (96/160/320), gapless: true, normalisation:
+`PlayerConfig { bitrate: from settings (96/160/320), gapless: settings.gapless, normalisation:
 settings.normalize, normalisation_type: Auto, normalisation_pregain_db: settings
 (quiet −5, normal 0, loud +5), position_update_interval: None, ditherer: None, .. }`.
-Changing the bitrate/normalisation requires `player.applySettings`, which recreates the
-Player only while nothing is playing (otherwise applied at the next idle point).
+Changes (`player.applySettings` or `session.updateSettings`) are applied to the running Player
+through the patched runtime setters, without recreating it: bitrate and gapless from the next
+load (track change), normalisation from the next audio packet.
 
 ### 4.4 Audio output
 

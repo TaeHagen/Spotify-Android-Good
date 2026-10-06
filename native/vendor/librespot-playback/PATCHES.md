@@ -21,8 +21,8 @@ below. `Cargo.lock`, `Cargo.toml.orig` and `.cargo_vcs_info.json` were removed, 
    Android that kills the app.
 3. **Audio-key refusals (librespot #1649 / PR #1763).** Transient key failures are retried. A
    permanent denial aborts the load, and the reason reaches the app.
-4. **Runtime settings.** Downloads, bitrate and normalisation can change without recreating the
-   Player (and with it the Sink / AudioTrack and the Spirc binding).
+4. **Runtime settings.** Downloads, bitrate, normalisation and gapless can change without
+   recreating the Player (and with it the Sink / AudioTrack and the Spirc binding).
 5. **Resources.** Named threads, a 1-worker player runtime instead of one worker per CPU core,
    and a fix for a leaked loader-thread handle.
 
@@ -65,6 +65,7 @@ impl Player {
     pub fn set_offline_source(&self, source: Option<OfflineSourceRef>);
     pub fn set_bitrate(&self, bitrate: Bitrate);
     pub fn set_normalisation(&self, settings: NormalisationSettings);
+    pub fn set_gapless(&self, gapless: bool);
 }
 pub enum PlayerEvent {
     // ...
@@ -98,7 +99,7 @@ arm), which needed no change.
 | `player.rs` imports | `process::exit` removed; `FutureExt` instead of `TryFutureExt`; new imports. |
 | `player.rs` consts | `AUDIO_KEY_RETRIES = 3`, `AUDIO_KEY_RETRY_DELAY = 1 s`, `PLAYER_RUNTIME_WORKER_THREADS = 1`. |
 | `UnavailableReason`, `KeyFailure`, `classify_audio_key_error` | New. Classification: `is_permanent_denial` → abort; session invalid / `SessionError::NotConnected` → no retry; everything else → retry. |
-| `PlayerCommand` | `SetOfflineSource`, `SetBitrate`, `SetNormalisation` (+ `Debug` arms). |
+| `PlayerCommand` | `SetOfflineSource`, `SetBitrate`, `SetNormalisation`, `SetGapless` (+ `Debug` arms). |
 | `PlayerEvent::Unavailable` | `reason` field. |
 | `Player::new` | `thread::Builder` named `lrs-player`; runtime `new_multi_thread().worker_threads(1).thread_name("lrs-player-rt")`. |
 | `Player::set_*` | New methods. |
@@ -133,6 +134,9 @@ arm), which needed no change.
     keep what they were loaded with.
   * `set_bitrate` only affects streamed tracks. To switch the current track, `stop()` and
     `load(uri, playing, position)`.
+  * `set_gapless` updates `config.gapless`, which `handle_command_load` reads: it applies from
+    the next load (track change). Commands are processed in order, so a load sent after the
+    command sees the new value.
 * **`set_normalisation`** applies from the next packet: the config and knee factor are updated,
   and the current track's gain is recomputed from its normalisation data. `normalisation_type:
   Auto` still follows `set_auto_normalise_as_album`.

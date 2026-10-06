@@ -129,7 +129,8 @@ pub(crate) async fn release() {
     }
 }
 
-/// Applies bitrate / normalisation to the running Player (no re-creation needed).
+/// Applies bitrate / normalisation / gapless to the running Player through its runtime setters
+/// (no re-creation needed). A Player created later is built from the new settings.
 pub(crate) fn apply_settings(old: &EngineSettings, new: &EngineSettings) {
     let Some(p) = player() else { return };
     if config::bitrate(old.bitrate) != config::bitrate(new.bitrate) {
@@ -139,7 +140,7 @@ pub(crate) fn apply_settings(old: &EngineSettings, new: &EngineSettings) {
         p.set_normalisation(config::normalisation(new));
     }
     if old.gapless != new.gapless {
-        log::info!("gapless change applies when the player is recreated");
+        p.set_gapless(new.gapless);
     }
 }
 
