@@ -124,6 +124,11 @@ pub struct ConnectSnapshot {
     pub session_id: String,
     /// The last failed command (`"<command>: <message>"`), cleared by the next successful one
     pub last_error: Option<String>,
+    /// Set on the final snapshot, published when the spirc task ends (shutdown or lost
+    /// connection). It describes the state when the task stopped handling events, before it
+    /// disconnected: the disconnect itself (stopped, inactive) is not reflected. The task then
+    /// no longer controls the player.
+    pub ending: bool,
 }
 
 /// A command that failed to be handled, see [Spirc::subscribe_errors](crate::Spirc::subscribe_errors)

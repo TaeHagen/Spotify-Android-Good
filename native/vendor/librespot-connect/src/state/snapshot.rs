@@ -108,6 +108,7 @@ impl ConnectState {
             volume: self.device_info().volume.min(u16::MAX.into()) as u16,
             session_id: player.session_id.clone(),
             last_error,
+            ending: false,
         }
     }
 

@@ -565,6 +565,14 @@ impl Spirc {
 
     // SPOTIFYGOOD: everything below in this impl is an addition
 
+    /// Whether the spirc task still handles commands
+    ///
+    /// False once the task ended (by itself, for example after the connection was lost, or
+    /// after [Spirc::shutdown]), or while it is shutting down. Commands then fail to send.
+    pub fn is_running(&self) -> bool {
+        !self.commands.is_closed()
+    }
+
     /// Subscribes to snapshots of the local connect state
     ///
     /// The receiver always holds the latest snapshot (no backlog), use
@@ -863,6 +871,16 @@ impl SpircTask {
             self.publish_snapshot();
         }
 
+        // SPOTIFYGOOD: the final snapshot is the state when the loop ended (see
+        // ConnectSnapshot::ending), the disconnect below only describes the teardown (stopped,
+        // inactive) and would hide what was playing when the connection was lost
+        let mut final_snapshot = self.connect_state.snapshot(
+            self.snapshot_status(),
+            1000 * self.session.time_delta(),
+            self.last_error.clone(),
+        );
+        final_snapshot.ending = true;
+
         // SPOTIFYGOOD: every network call of the epilogue is bounded, so that the task ends
         // even while offline
         if !self.shutdown && self.connect_state.is_active() {
@@ -893,8 +911,8 @@ impl SpircTask {
             error!("timeout while closing the dealer")
         }
 
-        // SPOTIFYGOOD: the final state
-        self.publish_snapshot();
+        // SPOTIFYGOOD: the final state, always sent (it differs by `ending`)
+        self.snapshot_tx.send_replace(final_snapshot);
     }
 
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {

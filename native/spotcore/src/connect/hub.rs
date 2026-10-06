@@ -19,7 +19,7 @@ use librespot_core::Session;
 use librespot_protocol::connect::Cluster;
 use parking_lot::Mutex;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{broadcast, watch, Notify};
 
 /// A placeholder of the last local playback is shown while reconnecting, for at most this long.
@@ -39,11 +39,20 @@ pub(crate) struct HubState {
     /// Last `player.setAudioOutput` (re-applied to every new Spirc).
     pub audio_output: Option<AudioOutputInfo>,
     /// Last snapshot while this device was active (reconnect restore point).
-    pub last_active: Option<(ConnectSnapshot, Instant)>,
+    pub last_active: Option<LastActive>,
     /// A reconnect with a pending restore is in progress (frozen playback state).
     pub reconnect: Option<restore::Frozen>,
     /// `lastError` override after Spotify refused audio keys.
     pub refused_error: Option<String>,
+}
+
+/// The reconnect restore point while the attached Spirc is not active (anymore).
+#[derive(Debug, Clone)]
+pub(crate) struct LastActive {
+    pub snap: ConnectSnapshot,
+    /// Local epoch ms at which the device stopped being active (`None`: it still is). The
+    /// position is extrapolated up to this point only.
+    pub ended_at_ms: Option<i64>,
 }
 
 pub(crate) static HUB: LazyLock<Mutex<HubState>> = LazyLock::new(|| Mutex::new(HubState::default()));
@@ -188,21 +197,15 @@ async fn observe(
 }
 
 fn on_snapshot(generation: u64, snap: ConnectSnapshot, session: &Session) {
-    let became_active;
-    {
+    let became_active = {
         let mut hub = HUB.lock();
         if hub.link.as_ref().map(|l| l.generation) != Some(generation) {
             return;
         }
-        let was_active = hub.snapshot.as_ref().is_some_and(|s| s.is_active);
-        became_active = snap.is_active && !was_active;
-        if snap.is_active && snap.track.is_some() {
-            hub.last_active = Some((snap.clone(), Instant::now()));
-        } else if !snap.is_active && hub.reconnect.is_none() && !session.is_invalid() {
-            // Deliberately inactive (another device took over, user stop): nothing to restore.
-            hub.last_active = None;
-        }
-        hub.snapshot = Some(snap.clone());
+        apply_snapshot(&mut hub, snap.clone(), session.is_invalid(), super::now_ms())
+    };
+    if snap.ending {
+        log::debug!("spirc {generation} ended (active: {}, {:?})", snap.is_active, snap.status);
     }
     if became_active {
         // Spirc owns the Player now.
@@ -210,6 +213,26 @@ fn on_snapshot(generation: u64, snap: ConnectSnapshot, session: &Session) {
     }
     player_events::check_exhausted(&snap);
     publish();
+}
+
+/// Records a snapshot of the attached Spirc; returns whether this device became active.
+/// `session_invalid`: the session is gone, so an inactive snapshot is not a deliberate stop.
+pub(crate) fn apply_snapshot(hub: &mut HubState, snap: ConnectSnapshot, session_invalid: bool, now_ms: i64) -> bool {
+    let was_active = hub.snapshot.as_ref().is_some_and(|s| s.is_active);
+    let became_active = snap.is_active && !was_active;
+    if snap.is_active && snap.track.is_some() {
+        hub.last_active = Some(LastActive { snap: snap.clone(), ended_at_ms: None });
+    } else if !snap.is_active {
+        if hub.reconnect.is_none() && !session_invalid {
+            // Deliberately inactive (another device took over, user stop): nothing to restore.
+            hub.last_active = None;
+        } else if let Some(last) = hub.last_active.as_mut() {
+            // Spirc stops the Player when it becomes inactive.
+            last.ended_at_ms.get_or_insert(now_ms);
+        }
+    }
+    hub.snapshot = Some(snap);
+    became_active
 }
 
 fn on_cluster(generation: u64, cluster: Arc<Cluster>) {

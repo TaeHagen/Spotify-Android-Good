@@ -125,6 +125,9 @@ pub(crate) async fn load(args: &LoadArgs) -> AppResult<()> {
     if uris.is_empty() {
         return Err(AppError::unavailable("Not available offline"));
     }
+    // Offline playback started during an outage replaces the reconnect restore point (callers
+    // through `connect::load` already dropped it).
+    super::restore::clear();
     engine::player_host::ensure_player_for_offline().await?;
     let spec = LoadSpec {
         context_uri: args.context_uri.clone(),

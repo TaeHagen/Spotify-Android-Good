@@ -437,6 +437,13 @@ For a remote active device, smart shuffle is not supported (the command reports
   control the remote device; the notification says "Playing on <device>".
 * **Audio output reporting**: Kotlin reports the current local output (speaker /
   Bluetooth "<name>" / wired / USB / car) with `player.setAudioOutput`.
+* **Reconnect restore**: when the engine rebuilds Session + Spirc (network switch, lost AP
+  connection), the last local playback is frozen and shown paused; a Spirc that ended by
+  itself has its Player paused at that point. Once the new Spirc is online and its first
+  cluster shows no other active device, the device activates and reloads context, track,
+  position, options and user queue (playing again if the gap was < 120 s). An explicit
+  `player.load` (local, remote or offline) or running offline playback replaces the restore
+  point; a dropped restore point stops the paused track nobody owns anymore.
 
 ## 9. Android app
 

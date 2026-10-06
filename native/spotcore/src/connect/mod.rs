@@ -122,7 +122,10 @@ fn spirc() -> AppResult<std::sync::Arc<librespot_connect::Spirc>> {
 async fn load(args: LoadArgs) -> AppResult<Value> {
     player_events::on_user_load();
     let downloaded = !engine::is_online() && offline::has_downloaded(&args);
-    match decide(CommandKind::Load, downloaded)? {
+    let target = decide(CommandKind::Load, downloaded)?;
+    // An explicit load replaces whatever a reconnect would have restored.
+    restore::clear();
+    match target {
         Target::Local { activate } => {
             let spirc = spirc()?;
             let request = local::load_request(&args)?;
