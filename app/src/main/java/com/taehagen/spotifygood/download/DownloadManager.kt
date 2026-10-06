@@ -499,13 +499,19 @@ class DownloadManager(
 
     private suspend fun fileRows(uris: List<String>): List<DownloadFileRow> = uris.chunked(SQL_CHUNK).flatMap { dao.fileRows(it) }
 
-    /** Deletes the audio of [rows] and their images unless a remaining download still uses them. */
+    /**
+     * Must hold [mutex], after [rows] were deleted. Deletes their audio and images unless a remaining
+     * download still uses them (two downloads can share one file: relinking, the same recording in
+     * two releases). Partial files are left to garbage collection, which knows whether an unfinished
+     * download still resumes them.
+     */
     private suspend fun deleteFiles(rows: List<DownloadFileRow>) {
         if (rows.isEmpty()) return
+        val audio = DownloadRules.audioToDelete(rows.map { it.path }, dao.allPaths(), dao.allFileIds())
         val remainingImages = dao.allImagePaths().toHashSet()
         withContext(Dispatchers.IO) {
+            audio.forEach(storage::deleteAudio)
             rows.forEach { row ->
-                storage.deleteAudio(row.path)
                 if (row.imagePath != null && row.imagePath !in remainingImages) storage.deleteImage(row.imagePath)
             }
         }

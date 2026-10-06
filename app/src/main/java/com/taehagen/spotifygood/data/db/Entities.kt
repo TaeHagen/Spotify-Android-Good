@@ -12,6 +12,10 @@ data class DownloadEntity(
     val state: DownloadState,
     /** Kbps requested (96/160/320). */
     val quality: Int,
+    /**
+     * Hex id of the audio file: the completed file, or (unfinished rows) the one the last attempt
+     * chose, whose `.part` is kept for a resume.
+     */
     val fileId: String? = null,
     val format: String? = null,
     /** Audio key encrypted with [com.taehagen.spotifygood.auth.CredentialStore.encrypt]. */

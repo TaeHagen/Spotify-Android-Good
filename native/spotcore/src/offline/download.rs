@@ -19,7 +19,8 @@
 //!
 //! The record is returned, not registered: Kotlin persists it and calls `offline.add`.
 //! Aborting the call leaves the `.part` for a later resume and emits `cancelled`, never
-//! `completed`. Only one download per file id runs at a time.
+//! `completed`. Only one download per file id runs at a time. The chosen file id is remembered
+//! per URI (`download.fileId`), so Kotlin can keep the `.part` of a failed download.
 
 use super::convert::{self, check_availability};
 use super::disk;
@@ -46,6 +47,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -58,6 +60,8 @@ const MAX_COVER_BYTES: usize = 10 * 1024 * 1024;
 /// How long a download waits for the session's country (CountryCode / ProductInfo).
 const COUNTRY_TIMEOUT: Duration = Duration::from_secs(10);
 const COUNTRY_POLL: Duration = Duration::from_millis(250);
+/// URIs whose chosen file is remembered for `download.fileId`.
+const CHOSEN_FILES: usize = 512;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +82,34 @@ pub async fn handle(args: Value) -> AppResult<Value> {
     let args: DownloadArgs = rpc::parse_args(args)?;
     let record = download_track(args).await?;
     rpc::to_value(&record)
+}
+
+#[derive(Debug, Deserialize)]
+struct FileIdArgs {
+    uri: String,
+}
+
+/// `download.fileId {uri}` → `{"fileId"}`, omitted when no download of `uri` chose a file in
+/// this process.
+pub fn handle_file_id(args: Value) -> AppResult<Value> {
+    let args: FileIdArgs = rpc::parse_args(args)?;
+    Ok(match chosen_file(args.uri.trim()) {
+        Some(hex) => serde_json::json!({ "fileId": hex }),
+        None => serde_json::json!({}),
+    })
+}
+
+static CHOSEN: LazyLock<Mutex<lru::LruCache<String, String>>> =
+    LazyLock::new(|| Mutex::new(lru::LruCache::new(NonZeroUsize::new(CHOSEN_FILES).unwrap_or(NonZeroUsize::MIN))));
+
+/// Remembers that downloading `uri` writes `<fileId>(.part)`.
+fn remember_file(uri: &str, file_hex: &str) {
+    CHOSEN.lock().put(uri.to_owned(), file_hex.to_owned());
+}
+
+/// The file the last download of `uri` chose (lower-case hex), if any.
+pub fn chosen_file(uri: &str) -> Option<String> {
+    CHOSEN.lock().get(uri).cloned()
 }
 
 /// The session's country: the CountryCode packet, else the `country` user attribute.
@@ -149,6 +181,7 @@ async fn run(uri_str: &str, args: &DownloadArgs, progress: &mut Progress) -> App
 
     let prepared = prepare(&session, &uri, uri_str, args.bitrate, country).await?;
     let file_hex = file_id_hex(&prepared.file_id);
+    remember_file(uri_str, &file_hex);
     let _file_lock = lock_file(&file_hex).await;
 
     let dir = PathBuf::from(args.dir.trim());
@@ -450,6 +483,16 @@ mod tests {
         )
         .await;
         assert!(ended.is_none() && started.elapsed() < Duration::from_secs(5), "stops when the session ends");
+    }
+
+    #[test]
+    fn remembers_the_chosen_file_per_uri() {
+        let rpc = |uri: &str| handle_file_id(serde_json::json!({ "uri": uri })).expect("fileId");
+        assert_eq!(rpc("spotify:track:0000000000000000000077"), serde_json::json!({}));
+        remember_file("spotify:track:0000000000000000000077", &"ab".repeat(20));
+        remember_file("spotify:track:0000000000000000000077", &"cd".repeat(20));
+        assert_eq!(rpc(" spotify:track:0000000000000000000077 "), serde_json::json!({ "fileId": "cd".repeat(20) }), "the latest choice");
+        assert!(handle_file_id(serde_json::json!({})).is_err());
     }
 
     #[test]

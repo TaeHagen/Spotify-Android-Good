@@ -152,6 +152,22 @@ interface DownloadDao {
     @Query("SELECT path FROM downloads WHERE path IS NOT NULL")
     suspend fun allPaths(): List<String>
 
+    /** Files (hex ids) of all rows: completed ones and the ones unfinished downloads are writing. */
+    @Query("SELECT DISTINCT fileId FROM downloads WHERE fileId IS NOT NULL")
+    suspend fun allFileIds(): List<String>
+
+    /** Files whose `.part` an unfinished row (pending, failed, cancelled) may resume. */
+    @Query("SELECT DISTINCT fileId FROM downloads WHERE fileId IS NOT NULL AND state != 'completed'")
+    suspend fun unfinishedFileIds(): List<String>
+
+    /** Rows using the file [fileId] (several downloads can share one file). */
+    @Query("SELECT COUNT(*) FROM downloads WHERE fileId = :fileId COLLATE NOCASE")
+    suspend fun countFileUsers(fileId: String): Int
+
+    /** Records the file an unfinished download writes, so its `.part` survives garbage collection. */
+    @Query("UPDATE downloads SET fileId = :fileId WHERE uri = :uri AND state != 'completed'")
+    suspend fun setFileId(uri: String, fileId: String)
+
     @Query("SELECT DISTINCT imagePath FROM downloads WHERE imagePath IS NOT NULL")
     suspend fun allImagePaths(): List<String>
 

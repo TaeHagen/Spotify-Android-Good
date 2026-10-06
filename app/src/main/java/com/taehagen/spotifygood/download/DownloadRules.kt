@@ -2,10 +2,11 @@ package com.taehagen.spotifygood.download
 
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import java.io.File
 
 /**
  * Pure download policy (no Android, no I/O) so it can be unit tested: shared membership, removal,
- * collection status, retry/backoff and sizing rules.
+ * shared files, collection status, retry/backoff and sizing rules.
  */
 internal object DownloadRules {
     /** An item is marked FAILED after this many failed attempts. */
@@ -125,6 +126,53 @@ internal object DownloadRules {
     fun estimateBytes(count: Int, kbps: Int): Long = count.toLong() * kbps * 1000 / 8 * AVERAGE_DURATION_S
 
     private const val AVERAGE_DURATION_S = 240L
+
+    // ---- files ---------------------------------------------------------------------------------------
+    //
+    // Audio lives in `<audioDir>/<fileId>` (+ `.part` while unfinished). Several rows can use one file
+    // (relinking, the same recording in two releases): the native downloader reuses a verified file,
+    // so a file belongs to every row whose path or fileId names it. Matching is by lower-case file
+    // name, so path aliases (`/data/user/0` vs `/data/data`) do not matter.
+
+    private const val PART_SUFFIX = ".part"
+
+    private fun fileName(path: String) = File(path).name.lowercase()
+
+    /**
+     * Of the completed files of removed rows ([removedPaths]), those no remaining row uses: none has
+     * them as its path ([remainingPaths]) or file ([remainingFileIds], also rows still downloading it).
+     */
+    fun audioToDelete(
+        removedPaths: Collection<String?>,
+        remainingPaths: Collection<String>,
+        remainingFileIds: Collection<String>,
+    ): List<String> {
+        val used = HashSet<String>()
+        remainingPaths.mapTo(used, ::fileName)
+        remainingFileIds.mapTo(used) { it.lowercase() }
+        return removedPaths.filterNotNull().filter { it.isNotEmpty() && fileName(it) !in used }.distinct()
+    }
+
+    /**
+     * Names in the audio directory garbage collection deletes: completed files no row uses ([paths],
+     * [fileIds]) and `.part` files no unfinished row is downloading ([unfinishedFileIds], any state:
+     * failed and cancelled rows resume them when retried).
+     */
+    fun audioGarbage(
+        names: Collection<String>,
+        paths: Collection<String>,
+        fileIds: Collection<String>,
+        unfinishedFileIds: Collection<String>,
+    ): List<String> {
+        val files = HashSet<String>()
+        paths.mapTo(files, ::fileName)
+        fileIds.mapTo(files) { it.lowercase() }
+        val parts = unfinishedFileIds.mapTo(HashSet()) { it.lowercase() }
+        return names.filter { name ->
+            val lower = name.lowercase()
+            if (lower.endsWith(PART_SUFFIX)) lower.removeSuffix(PART_SUFFIX) !in parts else lower !in files
+        }
+    }
 }
 
 /** Lower-case hex codec for audio keys. */

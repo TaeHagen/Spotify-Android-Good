@@ -7,6 +7,9 @@
 //! RPCs:
 //! * `download.track {uri, bitrate, dir, imageDir}` → `OfflineTrackRecord` (see [`download`]).
 //!   The record is *not* registered; Kotlin persists it and then calls `offline.add`.
+//! * `download.fileId {uri}` → `{"fileId"}` (omitted when unknown): the file the last
+//!   `download.track` of `uri` in this process chose, also when it failed or was cancelled, so
+//!   Kotlin knows which `<fileId>.part` belongs to an unfinished download.
 //! * `offline.setIndex {tracks:[OfflineTrackRecord], seq?}` replaces the index;
 //!   `offline.add {tracks, seq?}` adds/replaces by `uri`; `offline.remove {uris, seq?}`
 //!   unregisters by `uri` (only: a record reachable through its `playedUri` is not removed).
@@ -16,8 +19,8 @@
 //!   as `{"rejected":[uri…]}` (omitted when none).
 //!
 //! **Files are owned by Kotlin**: `offline.remove` and `offline.setIndex` never delete anything.
-//! `DownloadManager` deletes `<dir>/<fileId>` and `<dir>/<fileId>.part` (and unreferenced
-//! covers) when the user removes a download or logs out.
+//! `DownloadManager` deletes `<dir>/<fileId>` when no remaining download uses it, and collects
+//! `.part` files and covers no download refers to; everything goes when the user logs out.
 //!
 //! Record format (`OfflineTrackRecord`): `fileId` 40 hex chars; `keyHex` 32 hex chars (empty =
 //! unencrypted); `format` = `format!("{:?}", AudioFileFormat)` e.g. `"OGG_VORBIS_320"`, `"MP3_96"`
@@ -71,6 +74,7 @@ pub fn source() -> OfflineSourceRef {
 pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
     match method {
         "download.track" => download::handle(args).await,
+        "download.fileId" => download::handle_file_id(args),
         "offline.setIndex" => register(args, true).await,
         "offline.add" => register(args, false).await,
         "offline.remove" => remove(args),

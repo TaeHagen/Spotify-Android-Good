@@ -47,7 +47,11 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 /** How a download run ended; the host (job / worker) maps it to its reschedule semantics. */
@@ -89,9 +93,11 @@ internal class KeyCache {
  *
  * A run holds the `DOWNLOAD` engine holder, waits ≤ 60 s for the session, then for each item: checks
  * free storage, calls `download.track` (coroutine cancellation cancels the native task; `.part`
- * files are kept and resumed natively), mirrors `download` events into the database (≥ 500 ms apart)
- * and the notification, stores the record with its key encrypted, and registers it with
- * `offline.add`. Failures are retried with exponential backoff up to [DownloadRules.MAX_ATTEMPTS].
+ * files are kept and resumed natively, and the row records the file it writes via `download.fileId`
+ * so garbage collection keeps that `.part` while the row exists), mirrors `download` events into the
+ * database (≥ 500 ms apart) and the notification, stores the record with its key encrypted, and
+ * registers it with `offline.add`. Failures are retried with exponential backoff up to
+ * [DownloadRules.MAX_ATTEMPTS].
  *
  * Lock order: [runLock] before [commitLock] (the manager's mutation lock).
  */
@@ -296,31 +302,60 @@ internal class DownloadRunner(
                 },
             )
             progress.cancelAndJoin()
-            commit(item, record, quality)
-            stats.completed++
-            stats.transferredBytes += record.sizeBytes
-            host.reportTransferred(stats.transferredBytes)
+            if (commit(item, record, quality)) {
+                stats.completed++
+                stats.transferredBytes += record.sizeBytes
+                host.reportTransferred(stats.transferredBytes)
+            }
             ItemResult.Done
         } catch (e: CancellationException) {
             progress.cancel()
             // Back to the queue untouched (attempts unchanged); the native side keeps the .part file.
-            withContext(NonCancellable) { dao.requeue(item.uri) }
+            withContext(NonCancellable) {
+                dao.requeue(item.uri)
+                withTimeoutOrNull(FILE_ID_CANCEL_TIMEOUT_MS) { recordFileId(item.uri) }
+            }
             throw e
         } catch (e: Exception) {
             progress.cancelAndJoin()
             val error = e as? NativeException
                 ?: NativeException(NativeErrorInfo(NativeErrorCode.INTERNAL, e.message ?: e.javaClass.simpleName))
             if (e !is NativeException) Log.w(TAG, "Download of ${item.uri} failed", e)
+            recordFileId(item.uri)
             handleFailure(item, error, stats)
+        }
+    }
+
+    /**
+     * Stores which file the download of [uri] writes (`download.fileId`), so garbage collection keeps
+     * its `.part` while the row exists, also once it failed or was cancelled. Best effort.
+     */
+    private suspend fun recordFileId(uri: String) {
+        try {
+            val result = withTimeoutOrNull(NATIVE_CALL_TIMEOUT_MS) {
+                withContext(Dispatchers.Default) { rpc.callRaw("download.fileId", rpcArgs { put("uri", uri) }) }
+            } ?: return
+            val fileId = result.jsonObject["fileId"]?.jsonPrimitive?.contentOrNull ?: return
+            dao.setFileId(uri, fileId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not record the file of $uri", e)
         }
     }
 
     private suspend fun trackProgress(uri: String, title: String?, total: Int, host: DownloadHost, stats: RunStats) {
         var lastDbWrite = 0L
         var lastUiUpdate = 0L
+        var fileRecorded = false
         events.downloads.collect { p ->
             if (p.uri != uri) return@collect
             if (p.state != DownloadState.PREPARING && p.state != DownloadState.DOWNLOADING) return@collect
+            if (p.state == DownloadState.DOWNLOADING && !fileRecorded) {
+                // Bytes are about to land in a .part: from now on it must survive a killed process.
+                fileRecorded = true
+                recordFileId(uri)
+            }
             val now = SystemClock.elapsedRealtime()
             if (now - lastDbWrite >= DB_THROTTLE_MS) {
                 lastDbWrite = now
@@ -349,17 +384,26 @@ internal class DownloadRunner(
         }
     }
 
-    /** Persists a finished download (key encrypted) unless the item was removed meanwhile. */
-    private suspend fun commit(item: DownloadEntity, record: OfflineTrackRecord, quality: Int) {
+    private enum class Commit { KEPT, REMOVED, FILE_GONE }
+
+    /**
+     * Persists a finished download (key encrypted) unless the item was removed meanwhile; returns
+     * whether it did.
+     */
+    private suspend fun commit(item: DownloadEntity, record: OfflineTrackRecord, quality: Int): Boolean {
         val keyHex = record.keyHex.lowercase()
         val encryptedKey = withContext(Dispatchers.IO) { credentialStore.encrypt(Hex.decode(keyHex)) }
         val recordJson = json.encodeToString(OfflineTrackRecord.serializer(), record.copy(keyHex = ""))
         val metadataJson = record.track?.let { json.encodeToString(Track.serializer(), it) }
             ?: record.episode?.let { json.encodeToString(Episode.serializer(), it) }
         val now = System.currentTimeMillis()
-        val kept = commitLock.withLock {
-            database.withTransaction {
-                val row = dao.get(item.uri) ?: return@withTransaction false
+        val outcome = commitLock.withLock {
+            // Under the lock, like removals: a file download.track reused from another download
+            // (relinking) is deleted when that download is removed before this row names the file.
+            val present = withContext(Dispatchers.IO) { File(record.path).isFile }
+            val result = database.withTransaction {
+                val row = dao.get(item.uri) ?: return@withTransaction Commit.REMOVED
+                if (!present) return@withTransaction Commit.FILE_GONE
                 dao.upsert(
                     row.copy(
                         state = DownloadState.COMPLETED,
@@ -379,13 +423,23 @@ internal class DownloadRunner(
                         retryAt = null,
                     ),
                 )
-                true
+                Commit.KEPT
             }
+            // Removed while downloading: drop the file unless another download uses it (images and
+            // partial files are collected once the queue is idle).
+            if (result == Commit.REMOVED && dao.countFileUsers(record.fileId) == 0) {
+                withContext(Dispatchers.IO) { storage.deleteAudio(record.path) }
+            }
+            result
         }
-        if (!kept) {
-            // Removed while downloading: drop the file (images are collected once the queue is idle).
-            withContext(Dispatchers.IO) { storage.deleteAudio(record.path) }
-            return
+        when (outcome) {
+            Commit.KEPT -> Unit
+            Commit.REMOVED -> return false
+            Commit.FILE_GONE -> {
+                Log.w(TAG, "The file of ${item.uri} was removed with another download; downloading it again")
+                dao.requeue(item.uri)
+                return false
+            }
         }
         keys[item.uri] = keyHex
         try {
@@ -401,6 +455,7 @@ internal class DownloadRunner(
             // The full index is pushed again (offline.setIndex) at the next engine start.
             Log.w(TAG, "offline.add failed for ${item.uri}", e)
         }
+        return true
     }
 
     private suspend fun handleFailure(item: DownloadEntity, e: NativeException, stats: RunStats): ItemResult {
@@ -445,11 +500,13 @@ internal class DownloadRunner(
             ?: runCatching { json.decodeFromString(Episode.serializer(), metadataJson).name }.getOrNull()
     }
 
-    /** Must hold [runLock]. */
+    /** Must hold [runLock] (no download in flight). */
     private suspend fun collectGarbage() {
         withContext(NonCancellable + Dispatchers.IO) {
             commitLock.withLock {
-                if (dao.pendingCount() == 0) storage.collectGarbage(dao.allPaths(), dao.allImagePaths())
+                if (dao.pendingCount() == 0) {
+                    storage.collectGarbage(dao.allPaths(), dao.allFileIds(), dao.unfinishedFileIds(), dao.allImagePaths())
+                }
             }
         }
     }
@@ -462,6 +519,7 @@ internal class DownloadRunner(
         const val DB_THROTTLE_MS = 500L
         const val UI_THROTTLE_MS = 1_000L
         const val NATIVE_CALL_TIMEOUT_MS = 10_000L
+        const val FILE_ID_CANCEL_TIMEOUT_MS = 2_000L
         const val STOP_TIMEOUT_MS = 5_000L
         const val MAX_NETWORK_WAITS = 5
     }
