@@ -17,6 +17,9 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
@@ -127,6 +130,9 @@ import kotlinx.coroutines.delay
 
 private const val DISABLED_ALPHA = 0.38f
 
+/** Space below the status bar kept free for the transparent back-button bar of detail pages. */
+private val OVERLAID_TOP_BAR_SPACE = 48.dp
+
 /** Cover art / artist image with placeholder, crossfade and Coil caching. */
 @Composable
 fun Artwork(
@@ -192,10 +198,13 @@ fun TrackRow(
     isSuggestion: Boolean = false,
     onMoreClick: (() -> Unit)? = null,
     onLongClick: (() -> Unit)? = null,
+    /** False: dimmed and not clickable (kept before [trailing] so trailing-lambda calls still work). */
+    enabled: Boolean = true,
     trailing: (@Composable () -> Unit)? = null,
 ) {
     val colors = MaterialTheme.colorScheme
     val titleColor = if (isCurrent) colors.primary else colors.onSurface
+    val dimmed = !enabled || !track.playable
     val subtitle = subtitleOverride ?: remember(track.artists) { track.artists.joinToString { it.name } }
     val nowPlayingLabel = stringResource(R.string.shell_state_now_playing)
     val unavailableLabel = stringResource(R.string.shell_state_unavailable)
@@ -204,6 +213,7 @@ fun TrackRow(
         modifier = modifier
             .fillMaxWidth()
             .combinedClickable(
+                enabled = enabled,
                 onClick = { if (track.playable) onClick() },
                 onLongClick = onLongClick ?: onMoreClick,
                 onLongClickLabel = if (onLongClick != null || onMoreClick != null) moreLabel else null,
@@ -221,7 +231,7 @@ fun TrackRow(
         Row(
             modifier = Modifier
                 .weight(1f)
-                .alpha(if (track.playable) 1f else DISABLED_ALPHA),
+                .alpha(if (dimmed) DISABLED_ALPHA else 1f),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             when {
@@ -296,9 +306,12 @@ fun TrackRow(
                 }
             }
         }
-        trailing?.invoke()
+        // Trailing slot sits at the END of the row (queue remove / drag handle / suggestion actions).
+        if (trailing != null) {
+            Box(Modifier.alpha(if (enabled) 1f else DISABLED_ALPHA), contentAlignment = Alignment.Center) { trailing() }
+        }
         if (onMoreClick != null) {
-            IconButton(onClick = onMoreClick) {
+            IconButton(onClick = onMoreClick, enabled = enabled) {
                 Icon(Icons.Rounded.MoreVert, contentDescription = moreLabel, tint = colors.onSurfaceVariant)
             }
         }
@@ -314,6 +327,9 @@ fun EpisodeRow(
     isCurrent: Boolean = false,
     isPlaying: Boolean = false,
     downloadState: DownloadState? = null,
+    onLongClick: (() -> Unit)? = null,
+    /** False: dimmed and not clickable. Both new parameters precede [onMoreClick] for trailing-lambda calls. */
+    enabled: Boolean = true,
     onMoreClick: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
@@ -338,15 +354,16 @@ fun EpisodeRow(
         modifier = modifier
             .fillMaxWidth()
             .combinedClickable(
+                enabled = enabled,
                 onClick = { if (episode.playable) onClick() },
-                onLongClick = onMoreClick,
-                onLongClickLabel = if (onMoreClick != null) moreLabel else null,
+                onLongClick = onLongClick ?: onMoreClick,
+                onLongClickLabel = if (onLongClick != null || onMoreClick != null) moreLabel else null,
             )
             .semantics { if (isCurrent) stateDescription = nowPlayingLabel }
             .padding(start = 16.dp, end = if (onMoreClick != null) 4.dp else 16.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.Top,
     ) {
-        Row(Modifier.weight(1f).alpha(if (episode.playable) 1f else DISABLED_ALPHA)) {
+        Row(Modifier.weight(1f).alpha(if (enabled && episode.playable) 1f else DISABLED_ALPHA)) {
             Artwork(
                 url = episode.images.best(160) ?: episode.show?.images?.best(160),
                 contentDescription = null,
@@ -404,7 +421,7 @@ fun EpisodeRow(
             }
         }
         if (onMoreClick != null) {
-            IconButton(onClick = onMoreClick) {
+            IconButton(onClick = onMoreClick, enabled = enabled) {
                 Icon(Icons.Rounded.MoreVert, contentDescription = moreLabel, tint = colors.onSurfaceVariant)
             }
         }
@@ -801,8 +818,10 @@ fun OfflineBanner(modifier: Modifier = Modifier) {
  * title, subtitle lines, palette gradient background, and an action row (play/shuffle/download/
  * like/more) supplied by the caller.
  *
- * The gradient also extends above the header so a transparent top bar over it blends in; pair
- * with [DetailTopBar] to show the title in the bar once the header scrolls away.
+ * Edge-to-edge: place it as the first item of a full-window list. The gradient is drawn behind
+ * the status bar (and beyond, for overscroll) while the content is padded by the status-bar inset
+ * plus room for a transparent overlaid top bar; pair with [DetailTopBar] to show the title in the
+ * bar once the header scrolls away.
  */
 @Composable
 fun DetailHeader(
@@ -840,8 +859,11 @@ fun DetailHeader(
                     size = Size(size.width, size.height + extra),
                 )
             }
+            // Edge-to-edge: the gradient (drawn above) fills the status-bar area; the content is
+            // pushed below the status bar and the transparent back-button bar screens overlay.
+            .windowInsetsPadding(WindowInsets.statusBars)
             .padding(horizontal = 16.dp)
-            .padding(top = 16.dp, bottom = 8.dp),
+            .padding(top = OVERLAID_TOP_BAR_SPACE, bottom = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         val shape = if (circularImage) CircleShape else RoundedCornerShape(6.dp)
