@@ -98,7 +98,11 @@ object NativeBridge {
   `NativeCallbacks.onResult(requestId, ok, json)`. `requestId == 0` means
   fire-and-forget. `argsJson` is a JSON object (`{}` when no args).
 * `nativeCancel` — aborts the tokio task of an in-flight call. A cancelled call delivers
-  `onResult(id, false, {"code":"CANCELLED","message":"…"})`.
+  `onResult(id, false, {"code":"CANCELLED","message":"…"})`. Exception: engine lifecycle work
+  always runs to the end (`session.stop`, `session.logout`, and the configuration step of
+  `session.start`, which runs in its own task); cancelling those only stops the wait. Kotlin
+  registers its cancellation handler after `nativeCall` returned, so a call cancelled before
+  it was dispatched is still cancelled natively.
 
 ### 3.2 Rust → Kotlin
 
@@ -180,7 +184,12 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   task, subscribes to `subscribe_state()`, `subscribe_cluster()`, `subscribe_errors()`.
 * Credentials: first login uses `Credentials::with_access_token(oauthToken)`; afterwards
   always the stored reusable credentials (JSON, `{"username","authType","authData"}`)
-  passed in by Kotlin. When librespot produces new reusable credentials (taken from the
+  passed in by Kotlin. A `session.start` with only `accessToken` is a fresh login: reusable
+  credentials still stored natively (possibly another account's) are dropped first, so the
+  token is what logs in. A start with only `credentials` drops an earlier access token, so a
+  rejection can't fall back on another account's token. When the account changes, the OAuth
+  token (`session.setOAuthToken`) and the username are dropped too. A supervisor that is
+  being stopped or replaced can't store or report credentials any more (login generation). When librespot produces new reusable credentials (taken from the
   Session after connect; the librespot `Cache` has no credentials location, so they are never
   written to disk in plaintext, and a `credentials.json` left by an older build is deleted),
   Rust emits a `credentials` event; Kotlin stores them encrypted.
@@ -188,10 +197,20 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   while Online (cheap, no network), reacts to `session.setNetworkAvailable`. Backoff
   1→60 s, reset on success; at most one attempt in flight; no attempts while the network
   is known to be down. On reconnect: `Session::new`, `player.set_session`, `Spirc::new`.
-* `session.stop`: `spirc.shutdown()`, await task ≤ 10 s (abort + `dealer().close()` on
-  timeout), `session.shutdown()`, drop Spirc/Session; the Player is dropped on a blocking
-  thread (its Drop joins the player thread) only on `session.stop {releasePlayer:true}`
-  (logout / process trim); otherwise kept for the offline mode.
+* `session.stop`: `spirc.shutdown()`, await task ≤ 4 s (abort + `dealer().close()` ≤ 2 s on
+  timeout), `session.shutdown()`, drop Spirc/Session; the supervisor gets 7 s for this, then it
+  is aborted (+ 0.5 s) and cleaned up by force. The Player is dropped on a blocking thread
+  (its Drop joins the player thread, which joins its loaders for at most 1 s) only on
+  `session.stop {releasePlayer:true}` (logout / process trim), awaited at most 1.5 s;
+  otherwise kept for the offline mode. Whole stop ≤ 10 s (checked at compile time). Start,
+  stop and logout are serialised by the supervisor lock, held for the whole teardown, so a
+  `session.start` after a stop always finds the old session completely gone. Kotlin waits up
+  to 15 s for `session.stop` and 30 s for `session.logout`.
+* `session.logout`: forgets the account first (credentials, access token, OAuth token,
+  username), then stops as above with `releasePlayer:true`, resets `connect`, and deletes the
+  credentials dir, the streaming cache and `librespot-tmp`, all under the supervisor lock: a
+  following login waits until it is done. Kotlin clears its `CredentialStore` before calling
+  it, so a process death mid-logout doesn't log the account back in.
 
 ### 4.3 Playback configuration
 
@@ -305,11 +324,11 @@ active** → connect-state command to that device.
 
 | method | args | result |
 |---|---|---|
-| `session.start` | `{"credentials":{…}?,"accessToken":"…"?,"settings":EngineSettings,"initialVolume":0..65535}` | `{}` once Online (or error). `initialVolume` = current `STREAM_MUSIC` volume mapped to 0..65535 (used for the mixer and Connect so startup never changes the system volume) |
-| `session.stop` | `{"releasePlayer":false}` | `{}` |
+| `session.start` | `{"credentials":{…}?,"accessToken":"…"?,"settings":EngineSettings,"initialVolume":0..65535}` | `{}` once Online (or error). `initialVolume` = current `STREAM_MUSIC` volume mapped to 0..65535 (used for the mixer and Connect so startup never changes the system volume). `accessToken` without `credentials` is a fresh login (§4.2). Cancelling only stops the wait |
+| `session.stop` | `{"releasePlayer":false}` | `{}` (≤ 10 s; runs to the end even if cancelled) |
 | `session.setNetworkAvailable` | `{"available":true,"metered":false}` | `{}` |
 | `session.updateSettings` | `EngineSettings` | `{}` |
-| `session.logout` | `{}` | `{}` (stops, clears caches/credentials file) |
+| `session.logout` | `{}` | `{}` (forgets the account, stops, deletes the caches; runs to the end even if cancelled) |
 | `session.zeroconfLogin` | `{"timeoutMs":180000}` | `{"credentials":{…}}` when another Spotify app hands over credentials (libmdns discovery; Kotlin holds a MulticastLock meanwhile) |
 | `session.token` | `{}` | `{"accessToken","expiresAtMs"}` login5 token (for Kotlin-side HTTP such as artwork never needs it; reserved) |
 | `session.setOAuthToken` | `{"accessToken","expiresAtMs"}` | `{}` (lets pathfinder fall back to the OAuth token) |

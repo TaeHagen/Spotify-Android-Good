@@ -10,7 +10,7 @@
 use super::{config, player_host, state};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{EngineSettings, StoredCredentials};
-use crate::{connect, events};
+use crate::connect;
 use librespot_connect::Spirc;
 use librespot_core::authentication::Credentials;
 use librespot_core::session::SessionInvalidReason;
@@ -22,9 +22,14 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Spirc's shutdown caps disconnect, DELETE and dealer close at 3 s each.
-const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
-const DEALER_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a graceful Spirc shutdown may take (its disconnect, DELETE and dealer close are
+/// each capped at 3 s, but on a working network the whole shutdown takes well under a second).
+/// Afterwards the task is aborted and the dealer closed by hand. Kept short so that
+/// `session.stop` stays within its 10 s bound (docs/ARCHITECTURE.md §4.2).
+const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(4);
+const DEALER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound of one connection teardown ([`teardown`], [`teardown_finished`], [`abandon`]).
+pub(crate) const TEARDOWN_BOUND: Duration = TASK_JOIN_TIMEOUT.saturating_add(DEALER_CLOSE_TIMEOUT);
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -194,14 +199,11 @@ pub(crate) async fn teardown_finished(live: Live, restore: bool) {
 }
 
 /// After `Spirc::new`: the reusable credentials of the connected session (`Session::connect`
-/// sets its username and auth data from the APWelcome), and a `credentials` event when they
-/// are new. Nothing is read from or written to disk (the Cache has no credentials location).
-pub(crate) fn harvest_credentials(session: &Session, used: Option<&StoredCredentials>) -> Option<StoredCredentials> {
-    let stored = config::from_session(session.username(), session.auth_data())?;
-    if used != Some(&stored) {
-        events::emit(events::CREDENTIALS, &stored);
-    }
-    Some(stored)
+/// sets its username and auth data from the APWelcome). Nothing is read from or written to disk
+/// (the Cache has no credentials location). The supervisor stores them and emits the
+/// `credentials` event (`state::store_harvested`).
+pub(crate) fn session_credentials(session: &Session) -> Option<StoredCredentials> {
+    config::from_session(session.username(), session.auth_data())
 }
 
 #[cfg(test)]

@@ -11,15 +11,15 @@ use super::backoff::{Backoff, RateLimiter};
 use super::connector::{self, Live};
 use super::state::{self, shared, update_status};
 use super::{config, player_host};
-use crate::connect;
 use crate::error::{AppError, ErrorCode};
+use crate::{connect, events};
 use crate::models::{EngineSettings, SessionState, User};
 use futures_util::FutureExt;
 use librespot_core::authentication::Credentials;
 use librespot_core::Session;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, interval_at, Instant, MissedTickBehavior};
 
@@ -31,7 +31,14 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 const OUTAGE_RECONNECT: Duration = Duration::from_secs(5);
 const RECONNECTS_PER_WINDOW: usize = 10;
 const RECONNECT_WINDOW: Duration = Duration::from_secs(10 * 60);
-const STOP_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a stopping supervisor may take for its graceful teardown before it is aborted.
+/// Its longest step is one connection teardown (`connector::TEARDOWN_BOUND`).
+pub(crate) const STOP_TIMEOUT: Duration = Duration::from_secs(7);
+/// After an abort: how long to wait for the aborted task to actually end.
+pub(crate) const ABORT_GRACE: Duration = Duration::from_millis(500);
+// A Stop that arrives during a reconnect teardown is handled right after it (the next connect
+// attempt is abandoned at once), so one teardown must fit into the graceful stop.
+const _: () = assert!(connector::TEARDOWN_BOUND.as_millis() < STOP_TIMEOUT.as_millis());
 
 pub(crate) enum Msg {
     Network { available: bool, outage: Option<Duration> },
@@ -39,7 +46,7 @@ pub(crate) enum Msg {
     Reconnect,
     Settings { old: EngineSettings },
     PlayerDead(u64),
-    Stop { reply: oneshot::Sender<()> },
+    Stop,
 }
 
 pub(crate) struct SupervisorHandle {
@@ -56,20 +63,25 @@ impl SupervisorHandle {
         let _ = self.tx.send(msg);
     }
 
-    /// Stops the supervisor (graceful teardown, bounded), then forgets it.
+    /// Stops the supervisor and waits until its task ended: a graceful teardown of at most
+    /// [`STOP_TIMEOUT`], then an abort (plus [`ABORT_GRACE`] for the task to end) and a forced
+    /// cleanup. Nothing of this supervisor runs afterwards, so a new one can start safely.
     pub async fn stop(self) {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let delivered = self.tx.send(Msg::Stop { reply: reply_tx }).is_ok();
+        let delivered = self.tx.send(Msg::Stop).is_ok();
         *shared().supervisor_tx.lock() = None;
         let mut join = self.join;
-        if delivered && matches!(tokio::time::timeout(STOP_TIMEOUT, reply_rx).await, Ok(Ok(()))) {
-            let _ = tokio::time::timeout(Duration::from_secs(1), &mut join).await;
+        if delivered && tokio::time::timeout(STOP_TIMEOUT, &mut join).await.is_ok() {
+            return;
         }
-        if !join.is_finished() {
-            log::error!("supervisor did not stop in time, aborting it");
-            join.abort();
-            force_cleanup();
+        if join.is_finished() {
+            return;
         }
+        log::error!("supervisor did not stop in time, aborting it");
+        join.abort();
+        if tokio::time::timeout(ABORT_GRACE, &mut join).await.is_err() {
+            log::error!("aborted supervisor did not end in time");
+        }
+        force_cleanup();
     }
 }
 
@@ -91,7 +103,7 @@ pub(crate) fn spawn() -> SupervisorHandle {
         limiter: RateLimiter::new(RECONNECTS_PER_WINDOW, RECONNECT_WINDOW),
         first: true,
         prefer_token: false,
-        stop_reply: None,
+        login_generation: state::login_generation(),
     };
     let join = crate::runtime::handle().spawn(async move {
         if AssertUnwindSafe(supervisor.run()).catch_unwind().await.is_err() {
@@ -131,7 +143,8 @@ struct Supervisor {
     first: bool,
     /// Stored credentials were rejected: try the OAuth access token.
     prefer_token: bool,
-    stop_reply: Option<oneshot::Sender<()>>,
+    /// The login this supervisor was started with (`state::Login::generation`).
+    login_generation: u64,
 }
 
 fn no_network() -> AppError {
@@ -166,18 +179,12 @@ impl Supervisor {
                 Phase::Exit => break,
             };
         }
-        if let Some(reply) = self.stop_reply.take() {
-            let _ = reply.send(());
-        }
     }
 
+    /// `None` when the supervisor must exit (stop requested, or the handle is gone).
     fn stop_requested(&mut self, msg: Option<Msg>) -> Option<Msg> {
         match msg {
-            None => None,
-            Some(Msg::Stop { reply }) => {
-                self.stop_reply = Some(reply);
-                None
-            }
+            None | Some(Msg::Stop) => None,
             Some(other) => Some(other),
         }
     }
@@ -214,8 +221,10 @@ impl Supervisor {
     }
 
     fn credentials(&self) -> Option<(Credentials, bool)> {
-        let stored = shared().credentials.lock().clone();
-        let token = shared().access_token.lock().clone();
+        let (stored, token) = {
+            let login = shared().login.lock();
+            (login.credentials.clone(), login.access_token.clone())
+        };
         if !self.prefer_token {
             if let Some(c) = stored.as_ref().and_then(|s| config::to_librespot(s).ok()) {
                 return Some((c, true));
@@ -284,7 +293,7 @@ impl Supervisor {
                 log::warn!("connect failed: {e}");
                 connector::abandon(session).await;
                 self.first = false;
-                if e.code == ErrorCode::BadCredentials && used_stored && shared().access_token.lock().is_some() {
+                if e.code == ErrorCode::BadCredentials && used_stored && shared().login.lock().access_token.is_some() {
                     self.prefer_token = true;
                     return Phase::Connect;
                 }
@@ -324,6 +333,7 @@ impl Supervisor {
     }
 
     fn declare_online(&mut self, live: &Live, user: Option<User>) {
+        state::record_username(self.login_generation, &live.session);
         state::set_online(Some(live.session.clone()));
         self.backoff.reset();
         self.first = false;
@@ -350,9 +360,10 @@ impl Supervisor {
     }
 
     async fn online(&mut self, mut live: Live) -> Phase {
-        let used = shared().credentials.lock().clone();
-        if let Some(stored) = connector::harvest_credentials(&live.session, used.as_ref()) {
-            *shared().credentials.lock() = Some(stored);
+        if let Some(harvested) = connector::session_credentials(&live.session) {
+            if state::store_harvested(self.login_generation, harvested.clone()) {
+                events::emit(events::CREDENTIALS, &harvested);
+            }
         }
         let mut declared = false;
         let mut user_known = false;
@@ -434,7 +445,7 @@ impl Supervisor {
                             return self.reconnect(live).await;
                         }
                     }
-                    Some(Msg::Stop { .. }) => {}
+                    Some(Msg::Stop) => {}
                 },
             }
         }

@@ -315,8 +315,11 @@ class SpotifyEngine(
         }
     }
 
-    /** Logs out: stops the engine, wipes credentials and user data (downloads included). */
-    suspend fun logout() {
+    /**
+     * Logs out: stops the engine, wipes credentials and user data (downloads included).
+     * Not cancellable: a half-done logout would leave the account behind.
+     */
+    suspend fun logout(): Unit = withContext(NonCancellable) {
         lifecycle.withLock {
             loginPending = false
             stopTimer?.cancel()
@@ -324,8 +327,15 @@ class SpotifyEngine(
             runningJob?.cancel()
             runningJob = null
             generation++
-            // Stops the session natively and clears its caches/credentials file.
-            callQuietly("session.logout", timeoutMs = STOP_TIMEOUT_MS)
+            // Forget the stored credentials first, so a process death during the native
+            // teardown can't log the account back in on the next start.
+            withContext(Dispatchers.IO) { credentialStore.clear() }
+            credentials = null
+            credentialsLoaded = true
+            // Natively: forgets the account, stops the session, deletes its caches. It always
+            // runs to the end (a timeout here only stops the wait) and a later session.start
+            // waits for it.
+            callQuietly("session.logout", timeoutMs = LOGOUT_TIMEOUT_MS)
             startCall?.cancel()
             startCall = null
             networkMonitor.stop()
@@ -334,9 +344,6 @@ class SpotifyEngine(
             offlineIndexPushed = false
             lastSentNetwork = null
             lastSentSettings = null
-            withContext(Dispatchers.IO) { credentialStore.clear() }
-            credentials = null
-            credentialsLoaded = true
             accountError = null
             updateState { EngineState(networkAvailable = it.networkAvailable) }
             _running.value = false
@@ -766,7 +773,14 @@ class SpotifyEngine(
         private const val LOGIN_TIMEOUT_MS = 60_000L
         private const val ZEROCONF_GRACE_MS = 15_000L
         private const val RPC_TIMEOUT_MS = 10_000L
-        private const val STOP_TIMEOUT_MS = 10_000L
+        /**
+         * Above the native bound of `session.stop` (10 s, docs/ARCHITECTURE.md §4.2), so the
+         * result is normally the real one. A timeout is harmless: the native stop runs to the
+         * end and a following `session.start` waits for it.
+         */
+        private const val STOP_TIMEOUT_MS = 15_000L
+        /** `session.logout` = the stop plus deleting the streaming cache. */
+        private const val LOGOUT_TIMEOUT_MS = 30_000L
         private const val OFFLINE_INDEX_TIMEOUT_MS = 30_000L
         private val FATAL_CODES = setOf(NativeErrorCode.BAD_CREDENTIALS, NativeErrorCode.PREMIUM_REQUIRED)
 
