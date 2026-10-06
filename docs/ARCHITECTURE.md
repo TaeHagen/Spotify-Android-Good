@@ -368,8 +368,8 @@ active** → connect-state command to that device.
 | method | args | result |
 |---|---|---|
 | `download.track` | `{"uri","bitrate":160,"dir":"…/offline/audio","imageDir":"…/offline/images"}` | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`) |
-| `offline.setIndex` | `{"tracks":[OfflineTrackRecord]}` | `{}` (replaces the in-memory resolver index) |
-| `offline.add` / `offline.remove` | `{"tracks":[…]}` / `{"uris":[…]}` | `{}` |
+| `offline.setIndex` | `{"tracks":[OfflineTrackRecord]}` | `{}` or `{"rejected":["uri",…]}` (replaces the in-memory resolver index; malformed records are skipped) |
+| `offline.add` / `offline.remove` | `{"tracks":[…]}` / `{"uris":[…]}` | `{}` (`add` may also return `"rejected"`; `remove` never deletes files — Kotlin owns deletion) |
 
 `OfflineTrackRecord`:
 `{"uri","playedUri","fileId","format","keyHex","path","sizeBytes","normalisation":{"trackGainDb","trackPeak","albumGainDb","albumPeak"},"track":Track|"episode":Episode,"imagePath":"…"}`.
@@ -561,7 +561,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
   of another downloaded collection).
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
-  `noBackupFilesDir/offline/images/<imageHex>`. Settings shows usage and "Remove all".
+  `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks adapt between 512 KiB and
+  4 MiB (≈4 s of transfer each); the first chunk validates the key. Settings shows usage and "Remove all".
 * Downloads require Premium (they are always Premium here) and are wiped on logout.
 
 ### 9.8 Data layer
