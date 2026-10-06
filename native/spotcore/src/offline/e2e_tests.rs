@@ -1,17 +1,20 @@
-//! End to end without a network: a Spotify-style encrypted file (Ogg: 0xA7-byte header with
-//! normalisation floats at 144; MP3: plain) is "downloaded" from an in-memory CDN through the
-//! real resumable downloader, verified and finalised, its `OfflineTrackRecord` goes through
-//! JSON (as Kotlin persists it) into an index, and the patched librespot Player plays it via
-//! the `OfflineSource` hook with a never-connected `Session`.
+//! End to end without the internet: a Spotify-style encrypted file (Ogg: 0xA7-byte header with
+//! normalisation floats at 144; MP3: plain) is downloaded over HTTP from a local fake CDN with
+//! the real `SessionTransport` and resumable downloader (resuming a half-written `.part`,
+//! surviving a stalled response), verified and finalised; its `OfflineTrackRecord` goes through
+//! JSON (as Kotlin persists it) into an index, and the patched librespot Player plays it via the
+//! `OfflineSource` hook with a never-connected `Session`.
 
 use super::disk;
-use super::fetch::tests::{fast_policy, MockCdn, KEY};
-use super::fetch::download_part;
+use super::fetch::{download_part, Policy};
+use super::fetch::tests::{fast_policy, KEY};
 use super::format::{self, decrypt_prefix, file_id_hex, SPOTIFY_OGG_HEADER_END};
 use super::index::tests::{scratch_dir, track_model, ALT_URI, TRACK_URI};
 use super::index::{build_entries, IndexSource, OfflineIndex};
 use super::progress::tests::recorder;
 use super::progress::Progress;
+use super::transport::tests::{Answer, FakeCdn};
+use super::transport::SessionTransport;
 use crate::models::{Normalisation, OfflineTrackRecord};
 use librespot_core::{FileId, Session, SessionConfig, SpotifyUri};
 use librespot_metadata::audio::{AudioFileFormat, UniqueFields};
@@ -53,15 +56,32 @@ fn spotify_ogg(ogg: &[u8]) -> Vec<u8> {
 }
 
 /// Runs the real download path into `<dir>/<fileId>` and returns the record as Kotlin stores it.
-async fn download(dir: &Path, uri: &str, played_uri: Option<&str>, fmt: AudioFileFormat, encrypted: Vec<u8>, file_id: FileId) -> OfflineTrackRecord {
+async fn download(
+    session: &Session,
+    dir: &Path,
+    uri: &str,
+    played_uri: Option<&str>,
+    fmt: AudioFileFormat,
+    encrypted: Vec<u8>,
+    file_id: FileId,
+) -> OfflineTrackRecord {
     let hex = file_id_hex(&file_id);
     let part = dir.join(format!("{hex}.part"));
     let dest = dir.join(&hex);
     // Pretend an earlier attempt was cancelled half way.
-    std::fs::write(&part, &encrypted[..encrypted.len() / 2]).expect("seed part");
-    let cdn = MockCdn::new(encrypted.clone());
+    let half = encrypted.len() / 2;
+    std::fs::write(&part, &encrypted[..half]).expect("seed part");
+    let cdn = FakeCdn::start(encrypted.clone()).await;
+    // The first response stalls after 1000 bytes; the idle timeout catches it.
+    cdn.answers.lock().push_back(Answer::StallAfter(1000));
+    let transport = SessionTransport::with_urls(session.clone(), vec![cdn.url.clone()]);
     let mut progress = Progress::new(uri, recorder().0);
-    let size = download_part(&cdn, &part, fmt, Some(KEY), &fast_policy(), &mut progress).await.expect("download");
+    // Real sockets: a generous idle timeout so a busy machine does not look like a stall.
+    let policy = Policy { idle_timeout: Duration::from_millis(500), ..fast_policy() };
+    let size = download_part(&transport, &part, fmt, Some(KEY), &policy, &mut progress).await.expect("download");
+    let ranges = cdn.ranges.lock().clone();
+    assert_eq!(ranges.first().map(|r| r.0), Some(half as u64), "resumed: {ranges:?}");
+    assert_eq!(ranges.get(1).map(|r| r.0), Some(half as u64 + 1000), "kept the bytes before the stall: {ranges:?}");
     let verified = disk::verify(&part, fmt, Some(KEY)).await.expect("io").expect("verifies");
     disk::finalize(&part, &dest).await.expect("finalize");
     progress.completed(size);
@@ -115,8 +135,12 @@ async fn downloaded_files_play_offline_through_the_index() {
     let dir = scratch_dir("e2e");
     let ogg_id = FileId([0x11; 20]);
     let mp3_id = FileId([0x22; 20]);
-    let ogg_record = download(&dir, TRACK_URI, Some(ALT_URI), AudioFileFormat::OGG_VORBIS_160, spotify_ogg(TONE_OGG), ogg_id).await;
-    let mp3_record = download(&dir, MP3_URI, None, AudioFileFormat::MP3_96, decrypt_prefix(Some(KEY), TONE_MP3), mp3_id).await;
+    // Never connected: the HTTP client works, any Spotify access would fail.
+    let session = Session::new(SessionConfig::default(), None);
+    let ogg_record =
+        download(&session, &dir, TRACK_URI, Some(ALT_URI), AudioFileFormat::OGG_VORBIS_160, spotify_ogg(TONE_OGG), ogg_id).await;
+    let mp3_record =
+        download(&session, &dir, MP3_URI, None, AudioFileFormat::MP3_96, decrypt_prefix(Some(KEY), TONE_MP3), mp3_id).await;
     assert_eq!(
         ogg_record.normalisation,
         Normalisation { track_gain_db: NORM[0], track_peak: NORM[1], album_gain_db: NORM[2], album_peak: NORM[3] },
@@ -130,8 +154,7 @@ async fn downloaded_files_play_offline_through_the_index() {
     assert!(rejected.is_empty());
     index.replace(entries);
 
-    // Never connected: any network access would fail the load with NetworkError.
-    let session = Session::new(SessionConfig::default(), None);
+    // Any network access by the Player would fail the load with NetworkError.
     let frames = Arc::new(AtomicU64::new(0));
     let sink_frames = frames.clone();
     let config = PlayerConfig { offline_source: Some(Arc::new(IndexSource(index.clone()))), ..PlayerConfig::default() };

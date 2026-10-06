@@ -1,8 +1,9 @@
 //! File operations of the downloader. All of them run on tokio's blocking pool, never on an
 //! async worker thread.
 //!
-//! Crash/cancellation safety: data only ever goes to `<fileId>.part`, appended in order and
-//! `fsync`ed after every chunk, so its length is always a valid resume offset. The final
+//! Crash/cancellation safety: data only ever goes to `<fileId>.part`, appended in order (in
+//! batches while a chunk streams in, `fsync`ed at the end of every chunk), so its length is
+//! always a valid resume offset. The final
 //! `<fileId>` appears only through an atomic rename after the `.part` was verified and synced.
 //! A blocking write that is already running finishes even if the awaiting task is aborted.
 
@@ -75,10 +76,10 @@ pub async fn remove(path: &Path) -> AppResult<()> {
     .await
 }
 
-/// Writes `bytes` at `offset` of `path` and syncs the data; returns the new length. A file
-/// longer than `offset` is cut back first; a shorter one is an error (the caller restarts from
-/// the real length).
-pub async fn append(path: &Path, offset: u64, bytes: Bytes) -> AppResult<u64> {
+/// Writes `bytes` at `offset` of `path` (and `fsync`s the data when `sync`); returns the new
+/// length. A file longer than `offset` is cut back first; a shorter one is an error (the caller
+/// restarts from the real length).
+pub async fn append(path: &Path, offset: u64, bytes: Bytes, sync: bool) -> AppResult<u64> {
     let path = path.to_owned();
     blocking(move || {
         let mut f = OpenOptions::new().create(true).write(true).truncate(false).open(&path)?;
@@ -91,7 +92,9 @@ pub async fn append(path: &Path, offset: u64, bytes: Bytes) -> AppResult<u64> {
         }
         f.seek(SeekFrom::Start(offset))?;
         f.write_all(&bytes)?;
-        f.sync_data()?;
+        if sync {
+            f.sync_data()?;
+        }
         Ok(offset + bytes.len() as u64)
     })
     .await
@@ -183,12 +186,13 @@ mod tests {
         let dir = scratch_dir("disk");
         let part = dir.join("f.part");
         assert_eq!(file_len(&part).await.ok(), Some(0));
-        assert_eq!(append(&part, 0, Bytes::from_static(b"hello")).await.ok(), Some(5));
-        assert_eq!(append(&part, 5, Bytes::from_static(b" world")).await.ok(), Some(11));
+        assert_eq!(append(&part, 0, Bytes::from_static(b"hello"), false).await.ok(), Some(5));
+        assert_eq!(append(&part, 5, Bytes::from_static(b" world"), true).await.ok(), Some(11));
+        assert_eq!(append(&part, 11, Bytes::new(), true).await.ok(), Some(11), "sync only");
         // A longer file is cut back to the offset (stale tail), a shorter one is an error.
-        assert_eq!(append(&part, 6, Bytes::from_static(b"W")).await.ok(), Some(7));
+        assert_eq!(append(&part, 6, Bytes::from_static(b"W"), true).await.ok(), Some(7));
         assert_eq!(std::fs::read(&part).ok().as_deref(), Some(&b"hello W"[..]));
-        assert!(append(&part, 100, Bytes::from_static(b"x")).await.is_err());
+        assert!(append(&part, 100, Bytes::from_static(b"x"), true).await.is_err());
         let dest = dir.join("f");
         finalize(&part, &dest).await.expect("finalize");
         assert!(!part.exists() && dest.exists());
