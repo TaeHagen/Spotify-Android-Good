@@ -538,6 +538,9 @@ class PlaybackService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = lifecycleScope.future(Dispatchers.Default) {
+            // Auto browses right after connecting, often on a cold engine: let the session come up
+            // first instead of answering from an empty cache.
+            if (LibraryTree.needsSession(parentId)) coordinator.environment.awaitSessionStart()
             val children = tree.children(parentId, params)
                 ?: return@future LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
             LibraryResult.ofItemList(children.page(page, pageSize), params)
@@ -551,6 +554,7 @@ class PlaybackService : MediaLibraryService() {
         ): ListenableFuture<LibraryResult<Void>> {
             lifecycleScope.launch(Dispatchers.Default) {
                 val results = try {
+                    coordinator.environment.awaitSessionStart()
                     tree.search(query)
                 } catch (e: CancellationException) {
                     throw e
@@ -575,6 +579,7 @@ class PlaybackService : MediaLibraryService() {
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = lifecycleScope.future(Dispatchers.Default) {
             val results = searchCache[query] ?: try {
+                coordinator.environment.awaitSessionStart()
                 tree.search(query).also { cacheSearch(query, it) }
             } catch (e: CancellationException) {
                 throw e
@@ -609,6 +614,8 @@ class PlaybackService : MediaLibraryService() {
                         ?: return@future MediaItemsWithStartPosition(emptyList(), C.INDEX_UNSET, C.TIME_UNSET)
                     MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
                 } else {
+                    // "Play X" right after a cold start: search needs the session (NOT_CONNECTED otherwise).
+                    coordinator.environment.awaitSessionStart()
                     val item = runCatching { tree.resolveVoiceQuery(query, first.requestMetadata.extras) }
                         .onFailure { if (it is CancellationException) throw it }
                         .getOrNull()

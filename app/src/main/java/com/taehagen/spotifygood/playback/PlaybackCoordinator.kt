@@ -56,6 +56,14 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
     /** Connect volume ↔ STREAM_MUSIC. */
     val volumeSync = VolumeSync(app, graph.rpc, graph.playback)
 
+    /** Engine / downloads knowledge of [PlayerController] (cold starts, offline context loads). */
+    val environment: PlaybackEnvironment = AppPlaybackEnvironment(graph)
+
+    init {
+        // Right away (not in initOnMain): the first command may be queued before that runs.
+        graph.player.environment = environment
+    }
+
     private val focus = AudioFocusController(
         app,
         object : AudioFocusController.Callbacks {

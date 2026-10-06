@@ -11,6 +11,8 @@ enum class PlaybackErrorKind {
     PREMIUM_REQUIRED,
     PLAYBACK_REFUSED,
     UNAVAILABLE,
+    /** Offline and the requested context / track is not downloaded. */
+    NOT_AVAILABLE_OFFLINE,
     NOT_FOUND,
     RATE_LIMITED,
     NOT_LOGGED_IN,
@@ -54,6 +56,7 @@ fun interface PlaybackErrorMessages {
                         PlaybackErrorKind.PREMIUM_REQUIRED -> R.string.playback_error_premium_required
                         PlaybackErrorKind.PLAYBACK_REFUSED -> R.string.playback_error_refused
                         PlaybackErrorKind.UNAVAILABLE -> R.string.playback_error_unavailable
+                        PlaybackErrorKind.NOT_AVAILABLE_OFFLINE -> R.string.playback_error_not_available_offline
                         PlaybackErrorKind.NOT_FOUND -> R.string.playback_error_not_found
                         PlaybackErrorKind.RATE_LIMITED -> R.string.playback_error_rate_limited
                         PlaybackErrorKind.NOT_LOGGED_IN -> R.string.playback_error_not_logged_in

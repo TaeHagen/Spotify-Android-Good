@@ -511,6 +511,11 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
          */
         fun likedMediaId(likedContextUri: String?): String = likedContextUri ?: LIKED
 
+        /** Whether the children of [parentId] come from the catalog (worth waiting for a starting session). */
+        fun needsSession(parentId: String): Boolean = parentId !in LOCAL_PARENTS
+
+        private val LOCAL_PARENTS = setOf(ROOT, ROOT_OFFLINE, ROOT_RECENT, LIBRARY, DOWNLOADS)
+
         private const val MAX_TABS = 4
         private const val MAX_ITEMS = 100
         private const val RECENT_LIMIT = 12
