@@ -9,6 +9,7 @@ comment so the patch can be re-applied when upgrading librespot.
 |-------|--------------------|
 | `librespot-core` | Stock `Session::check_catalogue` calls `std::process::exit(1)` for non-Premium accounts, which would kill the Android app. It is patched to report the error and shut the session down instead. |
 | `librespot-connect` | The stock crate keeps the Connect state private. The app needs to read the queue and context, edit the queue locally, see the other Connect devices in the account, and implement smart shuffle. |
+| `librespot-playback` | Offline playback of downloaded (still encrypted) tracks needs a hook in the track loader; the stock player also calls `exit(1)` on sink errors, gives no way to tell refused audio keys apart, and runs one tokio worker per CPU core. See `librespot-playback/PATCHES.md`. |
 
 ## Patches
 
