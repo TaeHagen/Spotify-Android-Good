@@ -1,5 +1,8 @@
 //! `download.track {uri, bitrate, dir, imageDir}` (docs/ARCHITECTURE.md §6.4, §9.7).
 //!
+//! 0. The session's country is needed for the availability check: it may arrive after the
+//!    session was declared online, so the download waits for it (≤ 10 s, else `NOT_CONNECTED`,
+//!    which Kotlin retries) instead of judging restrictions against an unknown country.
 //! 1. Metadata (`Track` via TRACK_V4, or the raw `Episode` via EPISODE_V4), relinking through
 //!    `alternatives` when the requested track has no available file; both the requested `uri`
 //!    and the `playedUri` are recorded.
@@ -26,7 +29,7 @@ use super::index;
 use super::keys;
 use super::progress::{self, Progress};
 use super::transport::SessionTransport;
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{self, OfflineTrackRecord};
 use crate::{engine, rpc};
 use bytes::Bytes;
@@ -44,7 +47,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One metadata request (spclient retries internally).
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
@@ -52,6 +55,9 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ALTERNATIVES: usize = 8;
 const COVER_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_COVER_BYTES: usize = 10 * 1024 * 1024;
+/// How long a download waits for the session's country (CountryCode / ProductInfo).
+const COUNTRY_TIMEOUT: Duration = Duration::from_secs(10);
+const COUNTRY_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +78,26 @@ pub async fn handle(args: Value) -> AppResult<Value> {
     let args: DownloadArgs = rpc::parse_args(args)?;
     let record = download_track(args).await?;
     rpc::to_value(&record)
+}
+
+/// The session's country: the CountryCode packet, else the `country` user attribute.
+fn session_country(session: &Session) -> Option<String> {
+    Some(session.country()).filter(|c| !c.is_empty()).or_else(|| session.get_user_attribute("country").filter(|c| !c.is_empty()))
+}
+
+/// Polls `get` every `poll` until it yields a value, `gone` reports the session ended or
+/// `timeout` passed.
+async fn await_value<T>(mut get: impl FnMut() -> Option<T>, gone: impl Fn() -> bool, timeout: Duration, poll: Duration) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = get() {
+            return Some(v);
+        }
+        if gone() || Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// What was chosen for download.
@@ -115,8 +141,13 @@ async fn run(uri_str: &str, args: &DownloadArgs, progress: &mut Progress) -> App
     if session.is_invalid() {
         return Err(AppError::not_connected());
     }
+    // Restrictions are per country: judging them before the country is known would fail the
+    // item as "not available in your country" for good. NOT_CONNECTED is retried by Kotlin.
+    let country = await_value(|| session_country(&session), || session.is_invalid(), COUNTRY_TIMEOUT, COUNTRY_POLL)
+        .await
+        .ok_or_else(|| AppError::new(ErrorCode::NotConnected, "The session has not reported its country yet"))?;
 
-    let prepared = prepare(&session, &uri, uri_str, args.bitrate).await?;
+    let prepared = prepare(&session, &uri, uri_str, args.bitrate, country).await?;
     let file_hex = file_id_hex(&prepared.file_id);
     let _file_lock = lock_file(&file_hex).await;
 
@@ -187,9 +218,9 @@ struct Account {
 }
 
 impl Account {
-    fn of(session: &Session) -> Self {
+    fn of(session: &Session, country: String) -> Self {
         Self {
-            country: session.country(),
+            country,
             catalogue: session.get_user_attribute("catalogue").unwrap_or_else(|| "premium".to_owned()),
             filter_explicit: session.filter_explicit_content(),
             // Downloads are a Premium feature; if another product ever gets here, stay ≤ 160 kbps.
@@ -221,8 +252,8 @@ async fn get_track(session: &Session, uri: &SpotifyUri) -> AppResult<Track> {
     Ok(tokio::time::timeout(METADATA_TIMEOUT, Track::get(session, uri)).await??)
 }
 
-async fn prepare(session: &Session, uri: &SpotifyUri, uri_str: &str, bitrate: u32) -> AppResult<Prepared> {
-    let account = Account::of(session);
+async fn prepare(session: &Session, uri: &SpotifyUri, uri_str: &str, bitrate: u32, country: String) -> AppResult<Prepared> {
+    let account = Account::of(session, country);
     let now = Date::now_utc();
     match uri {
         SpotifyUri::Episode { .. } => prepare_episode(session, uri, uri_str, bitrate, &account, &now).await,
@@ -381,7 +412,7 @@ async fn lock_file(file_hex: &str) -> tokio::sync::OwnedMutexGuard<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ErrorCode;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn file_lock_serialises_same_file() {
@@ -392,6 +423,33 @@ mod tests {
         assert!(same.is_err(), "same file blocks");
         drop(a);
         assert!(tokio::time::timeout(Duration::from_millis(200), lock_file("aa")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_late_country() {
+        let polls = AtomicUsize::new(0);
+        let late = || (polls.fetch_add(1, Ordering::SeqCst) >= 3).then(|| "SE".to_owned());
+        let got = await_value(late, || false, Duration::from_secs(5), Duration::from_millis(1)).await;
+        assert_eq!(got.as_deref(), Some("SE"));
+        assert_eq!(polls.load(Ordering::SeqCst), 4);
+
+        let started = Instant::now();
+        let never = await_value(|| None::<String>, || false, Duration::from_millis(30), Duration::from_millis(5)).await;
+        assert!(never.is_none() && started.elapsed() >= Duration::from_millis(30), "times out");
+
+        let gone = AtomicBool::new(false);
+        let started = Instant::now();
+        let ended = await_value(
+            || {
+                gone.store(true, Ordering::SeqCst);
+                None::<String>
+            },
+            || gone.load(Ordering::SeqCst),
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(ended.is_none() && started.elapsed() < Duration::from_secs(5), "stops when the session ends");
     }
 
     #[test]
