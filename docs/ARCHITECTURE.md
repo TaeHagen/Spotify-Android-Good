@@ -1,0 +1,600 @@
+# SpotifyGood architecture
+
+This document is the contract between the Rust engine (`native/spotcore`) and the
+Android app (`app/`). Every component author follows it; if something needs to change,
+change it here first and keep both sides in sync.
+
+```
+┌──────────────────────────── Android app (Kotlin, Jetpack Compose) ───────────────────────────┐
+│ ui/        Compose screens + ViewModels (observe StateFlows, call repositories/controller)    │
+│ data/      repositories (catalog, library, search, home, lyrics), Room, DataStore settings    │
+│ download/  DownloadManager + DownloadWorker (WorkManager, dataSync FGS)                        │
+│ playback/  PlaybackService (MediaLibraryService) + SpotifyPlayer (SimpleBasePlayer),          │
+│            AudioSinkBridge (AudioTrack), audio focus, noisy, output routing, volume, locks    │
+│ connect/   DevicesRepository (Connect device list, transfer)                                  │
+│ engine/    SpotifyEngine (native lifecycle, holders, network)   auth/ (OAuth PKCE, Keystore)   │
+│ nativebridge/  NativeBridge (JNI), NativeRpc (suspend calls), NativeEvents (event fan-out)    │
+└───┼───────────────────────────────────────────────────────────────────────────────────────────┘
+    │  JNI: JSON RPC (Kotlin → Rust), JSON events (Rust → Kotlin), PCM float writes (Rust → Kotlin)
+┌───┼──────────────────────────── libspotcore.so (Rust) ───────────────────────────────────────┐
+│ jni.rs / rpc.rs / events.rs   bridge, dispatcher, catch_unwind, thread attach                 │
+│ engine/     Session + Spirc + Player owner, supervisor/reconnect, offline mode                │
+│ connect/    local Spirc commands, remote device commands (connect-state), cluster → devices   │
+│ audio/      AndroidSink (PCM → AudioSinkBridge), AndroidMixer (volume ↔ Android)              │
+│ catalog/    metadata (extended-metadata), playlists, rootlist, collection, search, home,      │
+│             lyrics, radio — Spotify internal APIs (spclient / pathfinder), JSON to Kotlin     │
+│ offline/    downloader (encrypted CDN download, resumable), offline index + Player hook       │
+│ librespot 0.8.0: core, connect, playback vendored & patched (native/vendor); metadata, audio, │
+│ protocol, oauth, discovery from crates.io                                                    │
+└───────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 1. Ground rules
+
+* **Spotify internal APIs, not the Web API.** Since Dec 2025 the public Web API answers
+  calls made with librespot's (desktop "keymaster") client id with HTTP 429. Everything
+  (metadata, playlists, library, search, home, lyrics, Connect control) goes through the
+  session's spclient / pathfinder endpoints using the login5 token, like Spotify's own
+  clients. The Web API is never on a hot path.
+* **One owner per resource.** Rust `Engine` owns `Session`, `Spirc`, `Player`. Kotlin
+  `SpotifyEngine` owns *when* the engine runs. `PlaybackService` owns the `MediaSession`.
+  `AudioSinkBridge` owns the `AudioTrack`.
+* **No polling.** State flows from Rust as events when it changes. Positions are
+  interpolated from `(positionMs, positionTimestampMs, playbackSpeed, isPlaying)`; UI
+  tickers run only while the UI is visible (`collectAsStateWithLifecycle`).
+* **Idle means zero.** When nothing holds the engine (no visible UI, no playback, no
+  download, no opt-in Connect presence), the native session is shut down after a grace
+  period: no sockets, no timers, no wake-ups.
+* **Wake/Wi-Fi locks only while audio is playing locally**, never while paused.
+* **All JNI entry points catch panics** and never block the calling Java thread on
+  network work; asynchronous work goes through the RPC mechanism.
+* **Main thread is sacred.** No disk or network on main; JNI calls are cheap enqueues.
+* **Premium only.** librespot cannot stream for Free accounts; the engine reports
+  `PREMIUM_REQUIRED` and the app shows an explanatory screen (never crashes).
+
+## 2. Repository layout
+
+```
+app/src/main/java/com/taehagen/spotifygood/
+  App.kt, AppGraph.kt, MainActivity.kt
+  nativebridge/   NativeBridge.kt NativeCallbacksImpl.kt NativeRpc.kt NativeEvents.kt AudioSinkBridge.kt
+  model/          Models.kt (catalog + playback + device models, @Serializable)
+  engine/         SpotifyEngine.kt EngineHolder.kt NetworkMonitor.kt
+  auth/           OAuthManager.kt LoopbackServer.kt CredentialStore.kt AuthRepository.kt Pkce.kt
+  playback/       PlaybackService.kt SpotifyPlayer.kt PlayerController.kt PlaybackRepository.kt
+                  AudioFocusController.kt BecomingNoisyReceiver.kt OutputRouteManager.kt
+                  VolumeSync.kt LibraryTree.kt SessionCommands.kt SleepTimer.kt ResumeStore.kt
+                  ArtworkProvider.kt (content:// artwork for Auto/notification)
+  connect/        DevicesRepository.kt
+  data/           CatalogRepository.kt LibraryRepository.kt SearchRepository.kt HomeRepository.kt
+                  LyricsRepository.kt PlaylistEditor.kt ResponseCache.kt
+  data/db/        AppDatabase.kt Entities.kt Daos.kt
+  data/settings/  SettingsRepository.kt Settings.kt
+  download/       DownloadManager.kt DownloadWorker.kt DownloadNotifications.kt
+  ui/             theme/ navigation/ components/ screens/<feature>/
+native/
+  Cargo.toml (workspace, [patch.crates-io] → vendor/)
+  spotcore/  build.rs (compiles extra Spotify protos), proto/, src/
+  vendor/    librespot-core, librespot-connect, librespot-playback (patched, see README)
+docs/ARCHITECTURE.md (this file)
+```
+
+## 3. JNI contract
+
+### 3.1 Kotlin → Rust (`com.taehagen.spotifygood.nativebridge.NativeBridge`)
+
+```kotlin
+object NativeBridge {
+    external fun nativeInit(callbacks: NativeCallbacks, audio: AudioSinkBridge, configJson: String)
+    external fun nativeCall(requestId: Long, method: String, argsJson: String)
+    external fun nativeCancel(requestId: Long)
+}
+```
+
+* `nativeInit` — once per process (from `App.onCreate`). Creates the tokio runtime,
+  stores global refs and installs the logger. No network. `configJson`:
+  `{"filesDir","cacheDir","noBackupDir","deviceId","deviceName","logLevel"}`.
+* `nativeCall` — never blocks. Result delivered later via
+  `NativeCallbacks.onResult(requestId, ok, json)`. `requestId == 0` means
+  fire-and-forget. `argsJson` is a JSON object (`{}` when no args).
+* `nativeCancel` — aborts the tokio task of an in-flight call. A cancelled call delivers
+  `onResult(id, false, {"code":"CANCELLED","message":"…"})`.
+
+### 3.2 Rust → Kotlin
+
+```kotlin
+interface NativeCallbacks {
+    fun onResult(requestId: Long, ok: Boolean, json: String)  // any thread
+    fun onEvent(type: String, json: String)                  // any thread
+}
+class AudioSinkBridge {                      // called ONLY on the librespot player thread
+    fun start(): Boolean                     // Sink::start → create/resume AudioTrack
+    fun stop()                               // Sink::stop  → pause (not release) AudioTrack
+    fun write(frames: Int): Int              // blocking; PCM is already in `buffer`
+    val buffer: java.nio.ByteBuffer          // direct, native order, BUFFER_FRAMES*2*4 bytes
+    fun onVolume(volume: Int)                // AndroidMixer::set_volume (0..65535), non-blocking
+}
+```
+
+* PCM format: **float32 interleaved stereo, 44100 Hz** (librespot's native format).
+  `BUFFER_FRAMES = 4096`. Rust copies up to `BUFFER_FRAMES` frames into the shared
+  direct buffer (address obtained once with `GetDirectBufferAddress`) and calls
+  `write(frames)`; Kotlin does `AudioTrack.write(buffer, bytes, WRITE_BLOCKING)` which
+  gives natural back-pressure. Returns frames written, or `-1` on a fatal error (Rust then
+  returns `SinkError::OnWrite`, librespot stops the track; Kotlin recreates the track on
+  the next `start()`).
+* The player thread attaches to the JVM once (`attach_current_thread_permanently`).
+* `onVolume` must not block: Kotlin posts to main and applies `setStreamVolume` there.
+
+### 3.3 Errors
+
+Error results and error events use
+`{"code":"…","message":"…","retryAfterMs":<optional>}` with `code` one of
+`NOT_LOGGED_IN, NOT_CONNECTED, BAD_CREDENTIALS, PREMIUM_REQUIRED, NETWORK, NOT_FOUND,
+RATE_LIMITED, INVALID_ARGUMENT, UNAVAILABLE, NOT_ACTIVE_DEVICE, CANCELLED, INTERNAL`.
+Kotlin maps them to `NativeException(code, message)`.
+
+### 3.4 JSON conventions
+
+camelCase keys; absent optional values are omitted (Kotlin `explicitNulls = false`,
+`ignoreUnknownKeys = true`, `coerceInputValues = true`). Times are ms. URIs are Spotify
+URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/image/<hex>`).
+
+## 4. Native engine
+
+### 4.1 Runtime and threads
+
+* One multi-thread tokio runtime, 2 worker threads, `max_blocking_threads(4)`, named
+  `spotcore-*`, created in `nativeInit` and kept for the process lifetime (idle workers
+  park; no timers when the engine is stopped).
+* librespot's Player runs its own thread (`Sink::write` happens there).
+* Every RPC spawns a task on the runtime; the task's `AbortHandle` is stored in a
+  `DashMap<requestId, AbortHandle>`-like registry for `nativeCancel`.
+* `Session::new` is always called inside the runtime context.
+
+### 4.2 Engine state machine
+
+```
+          session.start            connected               network lost / session invalid
+ Stopped ───────────────▶ Connecting ─────────▶ Online ───────────────────────────────┐
+    ▲   ◀── session.stop ──┤  ▲  failed (retryable)                                   │
+    │                      │  └──────────── Reconnecting(backoff 1s,2s,4s…60s) ◀──────┘
+    │                      └─ BAD_CREDENTIALS / PREMIUM_REQUIRED ─▶ Error (no retry)
+    └── session.stop (from any state; graceful, bounded to 5 s)
+ Offline mode (settings.offline or no network): Player runs without Spirc; only downloaded
+ tracks playable; OfflineController owns the queue; emits the same playback snapshots.
+```
+
+* `session.start` creates `Session::new(SessionConfig{client_id: KEYMASTER, device_id,
+  tmp_dir: cacheDir/librespot-tmp, autoplay: Some(settings.autoplay) ..}, Some(Cache))`,
+  the `Player` (once; re-bound with `player.set_session` on reconnect), the `AndroidMixer`,
+  and `Spirc::new(ConnectConfig{name, device_type: Smartphone, initial_volume:
+  <current Android volume>, auto_takeover: false, volume_steps: 64 ..})`, spawns the spirc
+  task, subscribes to `subscribe_state()`, `subscribe_cluster()`, `subscribe_errors()`.
+* Credentials: first login uses `Credentials::with_access_token(oauthToken)`; afterwards
+  always the stored reusable credentials (JSON, `{"username","authType","authData"}`)
+  passed in by Kotlin. When librespot produces new reusable credentials (read from the
+  Cache `credentials.json` after connect, then that file is deleted), Rust emits a
+  `credentials` event; Kotlin stores them encrypted.
+* Reconnect supervisor: awaits the spirc task end / polls `session.is_invalid()` every 5 s
+  while Online (cheap, no network), reacts to `session.setNetworkAvailable`. Backoff
+  1→60 s, reset on success; at most one attempt in flight; no attempts while the network
+  is known to be down. On reconnect: `Session::new`, `player.set_session`, `Spirc::new`.
+* `session.stop`: `spirc.shutdown()`, await task ≤ 5 s (abort + `dealer().close()` on
+  timeout), `session.shutdown()`, drop Spirc/Session; the Player is dropped on a blocking
+  thread (its Drop joins the player thread) only on `session.stop {releasePlayer:true}`
+  (logout / process trim); otherwise kept for the offline mode.
+
+### 4.3 Playback configuration
+
+`PlayerConfig { bitrate: from settings (96/160/320), gapless: true, normalisation:
+settings.normalize, normalisation_type: Auto, normalisation_pregain_db: settings
+(quiet −5, normal 0, loud +5), position_update_interval: None, ditherer: None, .. }`.
+Changing the bitrate/normalisation requires `player.applySettings`, which recreates the
+Player only while nothing is playing (otherwise applied at the next idle point).
+
+### 4.4 Audio output
+
+* `AndroidSink` (Sink impl): `start()` → `AudioSinkBridge.start()`; `stop()` →
+  `AudioSinkBridge.stop()`; `write(packet, converter)` → `converter.f64_to_f32`, chunk
+  into the direct buffer, `AudioSinkBridge.write(frames)`.
+* `AndroidMixer` (Mixer impl): `volume()` returns the last value; `set_volume(v)` stores
+  it and calls `AudioSinkBridge.onVolume(v)` unless `quantize(v) == quantize(last)` (avoids
+  the Android-step ping-pong; Android has ~15–25 steps). Kotlin reports hardware volume
+  changes with `player.setVolume {volume, fromSystem:true}`, which updates the mixer's
+  stored value *without* calling back to Kotlin, then informs Spirc.
+* Soft volume: none (`NoOpVolume`); attenuation is the system stream volume. Ducking is
+  done in Kotlin with `AudioTrack.setVolume`.
+
+### 4.5 Offline playback hook (vendored librespot-playback)
+
+`librespot-playback` is vendored with a hook in `PlayerTrackLoader::load_remote_track`:
+
+```rust
+pub struct OfflineTrack { audio_item: AudioItem, path: PathBuf, format: AudioFileFormat,
+                          key: AudioKey, normalisation: NormalisationData }
+pub trait OfflineResolver: Send + Sync { fn resolve(&self, uri: &SpotifyUri) -> Option<OfflineTrack>; }
+Player::set_offline_resolver(Option<Arc<dyn OfflineResolver>>)
+```
+
+If the resolver returns a track, the Player decrypts the local file (AES-128-CTR via
+`AudioDecrypt`, skipping the 0xA7 Ogg header) and never touches the network for metadata,
+key or audio. This is used both online (downloaded tracks play from disk) and offline. A
+decode failure of an offline file is reported (`playback` error event) and the file is
+**never deleted** by the Player.
+
+### 4.6 Offline mode controller
+
+When `settings.offline == true` or the network is down and no session is Online, playback
+commands are handled by `OfflineController`: a local queue of downloaded tracks with
+shuffle (seeded), repeat context/track, user queue (add/remove/move/clear/skipTo),
+prev/next semantics identical to Spirc (prev restarts if position > 3 s). It drives the
+same Player and emits the same `playback` snapshots with `source:"local"`,
+`isActiveDevice:true`, `offline:true`. When the session comes back Online, the offline
+queue keeps playing; the next `player.load` goes through Spirc again.
+
+## 5. Events (Rust → Kotlin `onEvent(type, json)`)
+
+| type | payload |
+|---|---|
+| `session` | `SessionEvent` |
+| `credentials` | `{"username","authType","authData"}` — store encrypted, replaces previous |
+| `playback` | `PlaybackSnapshot` (full snapshot, only on change) |
+| `devices` | `DeviceList` |
+| `queueMetadata` | `{"tracks":[Track|Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri) |
+| `download` | `DownloadProgress` |
+| `error` | `{"code","message","context":"playback|connect|session|…"}` user-visible, transient |
+| `log` | not used (logs go to logcat via android_logger, tag `spotcore`) |
+
+```jsonc
+// SessionEvent
+{ "state": "stopped|connecting|online|reconnecting|offline|error",
+  "error": {"code":"…","message":"…"},            // when state == error or last failure
+  "user": {"username":"…","displayName":"…","country":"US","product":"premium",
+           "explicitFilter":false,"imageUrl":"…"},  // when known (after ProductInfo)
+  "deviceId": "…", "nextRetryMs": 4000 }            // when reconnecting
+
+// PlaybackSnapshot
+{ "source": "local|remote|none",        // local = this phone is the active device
+  "offline": false,
+  "activeDevice": {"id","name","type"},  // omitted when none
+  "status": "stopped|loading|playing|paused",
+  "positionMs": 0, "positionTimestampMs": 0,   // wall-clock epoch ms when positionMs was valid
+  "playbackSpeed": 1.0, "durationMs": 0,
+  "context": {"uri":"spotify:playlist:…","name":"…","type":"playlist|album|artist|collection|search|show|station|tracks|unknown"},
+  "track": PlaybackTrack, "prevTracks": [PlaybackTrack], "nextTracks": [PlaybackTrack],  // next ≤ 80, prev ≤ 10, hidden delimiters removed
+  "shuffle": false, "smartShuffle": false, "repeat": "off|context|track",
+  "isPlayingAutoplay": false,
+  "restrictions": {"canSkipPrev":true,"canSkipNext":true,"canSeek":true,"canToggleShuffle":true,"canToggleRepeat":true,"canPause":true},
+  "volume": 0,                          // 0..65535 of the active device
+  "lastError": "…" }
+// PlaybackTrack
+{ "uri","uid","provider":"context|queue|autoplay|suggestion|unavailable",
+  "name","artists":[{"uri","name"}],"album":{"uri","name","images":[Image]},
+  "durationMs","explicit", "isEpisode":false, "show":{"uri","name"} }   // metadata fields present when known
+
+// DeviceList
+{ "activeDeviceId": "…", "thisDeviceId": "…",
+  "devices": [ { "id","name","type":"smartphone|computer|tablet|speaker|tv|avr|stb|audio_dongle|game_console|cast_audio|cast_video|automobile|smartwatch|chromebook|unknown",
+                 "volume":0,"supportsVolume":true,"isActive":false,"isThisDevice":false,
+                 "isGroup":false,"canPlay":true,"brand":"…","model":"…",
+                 "audioOutput": {"type":"bluetooth|speaker|line_out|airplay|car|unknown","name":"…"} } ] }
+
+// DownloadProgress
+{ "uri","state":"queued|preparing|downloading|completed|failed|cancelled",
+  "bytes":0,"totalBytes":0,"error":{"code","message"} }
+```
+
+## 6. RPC methods (`nativeCall(id, method, args)`)
+
+All results are JSON objects (`{}` when nothing to return). Commands that act on
+playback are routed by the engine: **if this device is active (or nothing is active)**
+→ local Spirc (activating first when needed) / OfflineController; **if another device is
+active** → connect-state command to that device.
+
+### 6.1 Session
+
+| method | args | result |
+|---|---|---|
+| `session.start` | `{"credentials":{…}?,"accessToken":"…"?,"settings":EngineSettings}` | `{}` once Online (or error) |
+| `session.stop` | `{"releasePlayer":false}` | `{}` |
+| `session.setNetworkAvailable` | `{"available":true,"metered":false}` | `{}` |
+| `session.updateSettings` | `EngineSettings` | `{}` |
+| `session.logout` | `{}` | `{}` (stops, clears caches/credentials file) |
+| `session.zeroconfLogin` | `{"timeoutMs":180000}` | `{"credentials":{…}}` when another Spotify app hands over credentials (libmdns discovery; Kotlin holds a MulticastLock meanwhile) |
+
+`EngineSettings`: `{"bitrate":96|160|320,"normalize":true,"normalizePregain":"quiet|normal|loud",
+"autoplay":true,"gapless":true,"deviceName":"…","streamingCacheMb":1024,"offline":false}`.
+
+### 6.2 Player (routed local/remote)
+
+| method | args |
+|---|---|
+| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true}` |
+| `player.play` / `player.pause` / `player.togglePlay` | `{}` |
+| `player.next` / `player.prev` | `{}` |
+| `player.seek` | `{"positionMs":0}` |
+| `player.setShuffle` | `{"enabled":true}` |
+| `player.setSmartShuffle` | `{"enabled":true}` (turns shuffle on too) |
+| `player.setRepeat` | `{"mode":"off|context|track"}` |
+| `player.setVolume` | `{"volume":0..65535,"fromSystem":false}` |
+| `player.setAudioOutput` | `{"type":"speaker|bluetooth|line_out|car|unknown","name":"…"}` (local only; reported to Connect) |
+| `player.applySettings` | `EngineSettings` subset (bitrate/normalisation) |
+| `queue.add` | `{"uri":"spotify:track:…"}` |
+| `queue.remove` | `{"uid":"…"}` |
+| `queue.move` | `{"uid":"…","toIndex":0}` |
+| `queue.clear` | `{}` |
+| `queue.skipTo` | `{"uid":"…"}` |
+| `connect.transfer` | `{"deviceId":"…","play":true?}` (self = pull, other = push) |
+| `connect.refreshDevices` | `{}` → `DeviceList` |
+
+### 6.3 Catalog (Spotify internal APIs, JSON shaped for the UI)
+
+| method | args | result |
+|---|---|---|
+| `catalog.tracks` | `{"uris":[…≤200]}` | `{"tracks":[Track]}` (extended-metadata batched, LRU cached) |
+| `catalog.episodes` | `{"uris":[…]}` | `{"episodes":[Episode]}` |
+| `catalog.album` | `{"uri"}` | `Album` (with tracks) |
+| `catalog.artist` | `{"uri"}` | `Artist` |
+| `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
+| `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
+| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` | `SearchResults` |
+| `catalog.home` | `{}` | `{"sections":[HomeSection]}` |
+| `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
+| `catalog.radio` | `{"uri"}` | `{"contextUri":"spotify:playlist:…"}` (inspiredby-mix) |
+| `catalog.recentlyPlayed` | `{"limit":50}` | `{"items":[MediaRef]}` |
+| `catalog.user` | `{"username"?}` | `User` (me when omitted) |
+| `library.playlists` | `{}` | `{"items":[RootlistEntry]}` (rootlist, folders preserved) |
+| `library.tracks` | `{"offset":0,"limit":100}` | `{"total","items":[{"addedAt","track":Track}]}` (Liked Songs) |
+| `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"}` | paged `{"total","items":[…]}` |
+| `library.contains` | `{"uris":[…]}` | `{"contains":[bool]}` |
+| `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
+| `playlist.create` | `{"name","description"?,"public":false}` | `{"uri"}` (also added to rootlist) |
+| `playlist.addItems` | `{"uri","uris":[…],"position":null}` | `{"revision"}` |
+| `playlist.removeItems` | `{"uri","items":[{"uri","index"}],"revision"}` | `{"revision"}` |
+| `playlist.moveItems` | `{"uri","fromIndex","length","toIndex","revision"}` | `{"revision"}` |
+| `playlist.updateDetails` | `{"uri","name"?,"description"?}` | `{}` |
+| `playlist.delete` | `{"uri"}` | `{}` (removes from rootlist; unfollow) |
+| `playlist.follow` / `playlist.unfollow` | `{"uri"}` | `{}` |
+
+### 6.4 Downloads / offline
+
+| method | args | result |
+|---|---|---|
+| `download.track` | `{"uri","bitrate":160,"dir":"…/offline/audio","imageDir":"…/offline/images"}` | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`) |
+| `offline.setIndex` | `{"tracks":[OfflineTrackRecord]}` | `{}` (replaces the in-memory resolver index) |
+| `offline.add` / `offline.remove` | `{"tracks":[…]}` / `{"uris":[…]}` | `{}` |
+
+`OfflineTrackRecord`:
+`{"uri","playedUri","fileId","format","keyHex","path","sizeBytes","normalisation":{"trackGainDb","trackPeak","albumGainDb","albumPeak"},"track":Track|"episode":Episode,"imagePath":"…"}`.
+Kotlin persists it in Room (key encrypted with the Keystore key) and sends the decrypted
+records to `offline.setIndex` each time the engine starts.
+
+### 6.5 Catalog JSON shapes
+
+```jsonc
+Image        {"url","width"?,"height"?}
+ArtistRef    {"uri","name","images"?:[Image]}
+AlbumRef     {"uri","name","images":[Image],"artists"?:[ArtistRef],"releaseDate"?,"albumType"?:"album|single|compilation|ep","totalTracks"?}
+Track        {"uri","name","artists":[ArtistRef],"album":AlbumRef,"durationMs","explicit","playable":true,
+              "trackNumber"?,"discNumber"?,"popularity"?,"hasLyrics"?}
+Episode      {"uri","name","show":{"uri","name","images"},"description","durationMs","releaseDate","images",
+              "explicit","playable","resumePositionMs"?,"fullyPlayed"?}
+Album        AlbumRef + {"label"?,"copyrights":[String],"tracks":[Track],"releaseDatePrecision"?}
+Artist       {"uri","name","images","headerImages"?,"biography"?,"topTracks":[Track],"albums":[AlbumRef],
+              "singles":[AlbumRef],"compilations":[AlbumRef],"appearsOn":[AlbumRef],"related":[ArtistRef],"following"?:bool}
+PlaylistRef  {"uri","name","description"?,"images","owner":{"username","displayName"?},"totalTracks"?}
+Playlist     PlaylistRef + {"collaborative","isOwnedByMe","canEdit","revision","offset","total",
+              "items":[{"uid"?,"addedAt"?,"addedBy"?,"track"?:Track,"episode"?:Episode}],"following"?:bool}
+ShowRef      {"uri","name","publisher"?,"images"}
+Show         ShowRef + {"description","episodes":[Episode],"total","offset","following"?}
+SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef}
+MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
+HomeSection  {"id","title","items":[MediaRef]}
+RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry]}
+Lyrics       {"syncType":"LINE_SYNCED|UNSYNCED|SYLLABLE_SYNCED","lines":[{"startTimeMs","words"}],
+              "provider"?,"colors"?:{"background","text","highlightText"}}
+User         {"username","displayName","images","product","country","explicitFilter"}
+```
+
+## 7. Smart shuffle
+
+Implemented inside the vendored Spirc (`Spirc::smart_shuffle`). Turning it on enables
+shuffle, fetches recommendations for the current context through the autoplay context
+endpoint off the event loop, and interleaves one suggestion after every 3rd context track
+while filling the upcoming list. Suggestions carry provider `suggestion` in snapshots.
+UI: shuffle button cycles **off → shuffle → smart shuffle → off**; suggested rows show a
+sparkle badge with "Add to playlist / Remove suggestion" actions (`queue.remove`).
+Media3: `shuffleModeEnabled=true` plus a custom command button (`ICON_SHUFFLE_STAR`).
+For a remote active device, smart shuffle is not supported (the command reports
+`UNAVAILABLE`), plain shuffle is.
+
+## 8. Spotify Connect
+
+* **This phone as a target**: Spirc registers the device via the dealer; other devices see
+  it while the engine is Online. Remote commands, transfers and volume arrive through
+  Spirc. `auto_takeover` is off: the phone never starts audio on its own at launch.
+* **Controlling others**: device list and remote player state come from
+  `Spirc::subscribe_cluster()`. Commands go to
+  `POST /connect-state/v1/player/command/from/{me}/to/{target}` with bodies
+  `{"command":{"endpoint":"pause|resume|skip_next|skip_prev|seek_to|set_shuffling_context|set_repeating_context|set_repeating_track|add_to_queue|set_queue|play","…","logging_params":{"command_id":"<hex32>"}}}`;
+  volume `PUT /connect-state/v1/connect/volume/from/{me}/to/{target}` `{"volume":n}`
+  (debounced ≥ 200 ms); transfer `SpClient::transfer(me, target, TransferOptions{restore_paused:"restore"})`.
+  Remote queue edits are sent as `set_queue` with the cluster's `queue_revision`.
+* **Remote playback in the app**: `PlaybackSnapshot.source == "remote"` is built from the
+  cluster's `player_state` (position extrapolated with `session.time_delta()`); the
+  MediaSession switches to `DeviceInfo(PLAYBACK_TYPE_REMOTE)` so hardware volume keys
+  control the remote device; the notification says "Playing on <device>".
+* **Audio output reporting**: Kotlin reports the current local output (speaker /
+  Bluetooth "<name>" / wired / USB / car) with `player.setAudioOutput`.
+
+## 9. Android app
+
+### 9.1 Dependency injection
+
+Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependencies via
+`viewModelFactory { initializer { … } }` reading `(application as App).graph`. No Hilt.
+
+### 9.2 Engine lifecycle (Kotlin `SpotifyEngine`)
+
+* `holders`: a ref-counted set of `EngineHolder` tokens: `UI` (ProcessLifecycleOwner
+  STARTED), `PLAYBACK` (PlaybackService while it has playback or is foreground),
+  `DOWNLOAD` (DownloadWorker while running), `PRESENCE` (opt-in Connect presence).
+* When the first holder is acquired and credentials exist → `session.start`.
+  When the last holder is released → after `IDLE_GRACE` (60 s) `session.stop`.
+* `NetworkMonitor` (ConnectivityManager default-network callback, registered only while
+  the engine is running) → `session.setNetworkAvailable`.
+* `state: StateFlow<EngineState>` mirrors `session` events; `user: StateFlow<User?>`.
+* Writes reusable credentials from `credentials` events to `CredentialStore`.
+
+### 9.3 Auth
+
+* OAuth Authorization Code + PKCE with the desktop client id
+  `65b708073fc0480ea92a077233ca87bd`, redirect `http://127.0.0.1:5588/login` (fallback
+  port 8898), desktop scope list, `state` verified. `LoopbackServer` binds 127.0.0.1 only,
+  loops until `/login`, 5 min timeout, replies with a 302 to `spotifygood://auth` plus an
+  HTML "Return to the app" link, then closes. Custom Tab launched with an explicit browser
+  package so the official Spotify app cannot intercept. Exchange at
+  `https://accounts.spotify.com/api/token` with OkHttp. The access token goes to
+  `session.start {accessToken}`; the refresh token is stored encrypted as a fallback.
+* Alternative login: "Use another device" → `session.zeroconfLogin` (mDNS, MulticastLock
+  only while that screen is visible).
+* `CredentialStore`: AES-256-GCM key in AndroidKeyStore; ciphertext in
+  `noBackupFilesDir/credentials.bin`. Also encrypts per-download audio keys.
+* Logout: `session.logout`, delete credentials, downloads, caches, DB, settings
+  (with confirmation).
+
+### 9.4 Playback service
+
+* `PlaybackService : MediaLibraryService`, `foregroundServiceType="mediaPlayback|connectedDevice"`.
+  Session player = `SpotifyPlayer : SimpleBasePlayer(mainLooper)` built from
+  `PlaybackRepository.snapshot` (window: last 10 prev + current + next 50, uids from
+  Connect). `invalidateState()` on every snapshot. Position via `PositionSupplier` from the
+  snapshot (extrapolating). Media items carry title/artist/album/artworkUri
+  (`content://<app>.artwork/<urlhash>` served by `ArtworkProvider` from the Coil disk cache).
+* Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
+  set-media-items (Auto/Assistant/resumption), device volume only when remote.
+  Media button preferences: like/unlike, shuffle (3-state), repeat (3-state). `onSetRating`
+  (HeartRating) toggles like.
+* `onConnectAsync` grants commands to the notification, SysUI, Auto/AAOS, Wear and the
+  app's own controller; others get read-only.
+* `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
+  Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
+  context, track, position, metadata) persisted on pause and every 15 s while playing.
+* Foreground: Media3 default (10 min after pause, then notification becomes dismissable).
+  `onForegroundServiceStartNotAllowedException` → post a "Tap to resume" notification.
+  `onTaskRemoved` default behaviour. Engine holder released when the service is destroyed.
+* **Opt-in Connect presence** (setting "Stay available for Spotify Connect", default off):
+  when enabled and the app goes to background while idle, the service keeps itself in the
+  foreground as `connectedDevice` with a low-importance "Available on Spotify Connect"
+  notification (Stop action), so remote "play on this phone" works. Uses
+  `onUpdateNotificationAsync` override as described in research; off by default because of
+  the battery cost (~2 radio wake-ups per minute).
+* Audio focus (`AudioFocusController`, AudioManagerCompat): requested when local playback
+  starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
+  LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
+  0.2 → restore. Request failure → pause.
+* `BecomingNoisyReceiver`: registered only while playing locally → `player.pause`.
+* Wake locks: Media3 `WakeLockManager` + `WifiLockManager` `setStayAwake(true)` only while
+  local status is playing/loading; false otherwise.
+
+### 9.5 Audio output routing (Bluetooth / external)
+
+* `OutputRouteManager` lists media outputs (`AudioManager.getDevices(OUTPUTS)` filtered to
+  speaker, wired headset/headphones, BT A2DP / BLE headset/speaker / hearing aid, USB,
+  HDMI, line out, dock), tracks the current route via `AudioTrack.getRoutedDevice()` +
+  `OnRoutingChangedListener`, and listens with `AudioDeviceCallback` (registered only
+  while the engine runs).
+* User selection → `AudioSinkBridge.setPreferredDevice(AudioDeviceInfo?)` (`null` =
+  system default). "More devices…" opens the system output switcher
+  (`MediaRouter.showSystemOutputSwitcher` / platform media output panel) — includes Cast
+  and BT devices not yet connected.
+* Device sheet (one UI for everything, like Spotify's): **This phone** (with current output
+  name + icon and local output choices), then **Spotify Connect devices**, then
+  "More devices…". Selecting a Connect device → `connect.transfer`.
+* On BT disconnect: `ACTION_AUDIO_BECOMING_NOISY` pauses; route listener updates UI and
+  reports `player.setAudioOutput`. AudioTrack `ERROR_DEAD_OBJECT` → recreate track.
+
+### 9.6 Volume
+
+* Local active device: Connect volume ↔ `STREAM_MUSIC`. Mixer callbacks
+  (`AudioSinkBridge.onVolume`) → `setStreamVolume` (no UI flag) unless the quantized step
+  is unchanged; `VolumeSync` observes stream volume changes (ContentObserver on
+  `Settings.System` + `VOLUME_CHANGED_ACTION`, registered only while the engine runs) and
+  sends `player.setVolume {fromSystem:true}`.
+* Remote active device: MediaSession `DeviceInfo(REMOTE, 0..100)`; `handleSetDeviceVolume`
+  / increase / decrease → `player.setVolume`. In-app slider in the device sheet.
+
+### 9.7 Downloads
+
+* `DownloadManager`: enqueue track / album / playlist / Liked Songs / show episodes;
+  persists `DownloadEntity` (state QUEUED) and `DownloadCollectionEntity` (collection URI,
+  auto-sync); enqueues unique work `downloads` (KEEP) with constraints (network CONNECTED
+  or UNMETERED per setting, storage not low). Removal deletes files + rows.
+* `DownloadWorker : CoroutineWorker` → `setForeground` (dataSync, progress notification,
+  Cancel action), acquires the `DOWNLOAD` holder, waits for Online (≤ 60 s), then downloads
+  queued items one at a time with `download.track` (cancellation propagates to
+  `nativeCancel`), stores records (encrypted key), updates `offline.add`, retries failures
+  with backoff (max 3), stops gracefully on `onStopped`/timeout (Android 15 6 h limit),
+  re-enqueues itself if work remains.
+* Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
+  playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
+  of another downloaded collection).
+* Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
+  `noBackupFilesDir/offline/images/<imageHex>`. Settings shows usage and "Remove all".
+* Downloads require Premium (they are always Premium here) and are wiped on logout.
+
+### 9.8 Data layer
+
+Repositories call the native catalog RPCs and expose `suspend` functions / `Flow`s.
+`ResponseCache` (Room table `response_cache`: key, json, fetchedAt) stores the last
+successful response of browse calls (home, library lists, album/artist/playlist pages) so
+the app opens instantly and works offline; stale-while-revalidate. Library mutations are
+optimistic (local state flips immediately, rolled back on error). Liked-state of the
+current track is cached in memory (LRU) and refreshed via `library.contains`.
+
+### 9.9 UI
+
+* Material 3, dark-first theme (Spotify-like near-black, green accent); optional dynamic
+  color; edge-to-edge; predictive back; adaptive (bottom bar on phones, navigation rail on
+  large screens via `NavigationSuiteScaffold`).
+* Screens: Login, Premium-required, Home, Search (+ browse/recent searches), Library
+  (filters: Playlists/Albums/Artists/Podcasts/Downloaded; sort; grid/list), Liked Songs,
+  Album, Artist, Playlist (edit mode for owned), Show, Episode, Downloads, Now Playing
+  (full screen, palette gradient, seek bar, like, shuffle tri-state, repeat, queue, lyrics,
+  devices, share, sleep timer), Queue (reorder, remove, suggestions), Lyrics (synced,
+  auto-scroll, tap to seek), Devices/Output sheet, Track/Album/Playlist action sheets,
+  Add-to-playlist sheet, Create playlist dialog, Settings, Profile.
+* Mini player above the navigation bar (swipe/tap to expand, progress line, play/pause,
+  device indicator).
+* Deep links: `https://open.spotify.com/{type}/{id}` and `spotify:{type}:{id}` intents.
+* Offline: banner + downloaded-only filtering when offline mode or no network.
+
+## 10. Lifecycle & battery policy (summary)
+
+| Situation | Native session | FGS | Locks |
+|---|---|---|---|
+| App visible | Online | none unless playing | none |
+| Playing locally | Online (or offline mode) | mediaPlayback | wake + Wi-Fi |
+| Paused < 10 min | Online | mediaPlayback (Media3 timeout) | none |
+| Paused ≥ 10 min, app background | stopped 60 s after release | none | none |
+| Remote device playing, our session mirrors | Online | mediaPlayback | none |
+| Downloading | Online | dataSync (WorkManager) | Worker's |
+| Presence opt-in, idle | Online | connectedDevice (low-importance) | none |
+| Nothing | stopped | none | none |
+
+## 11. Feature checklist
+
+Login (OAuth, other-device), Premium gate, logout, background play, notification &
+lock-screen controls, Bluetooth/headset buttons, Android Auto, playback resumption,
+audio focus & ducking, becoming-noisy pause, output switching (speaker/BT/wired/USB +
+system switcher), Connect send (device list, transfer, remote control incl. volume keys)
+and receive (phone as Connect device), shuffle, smart shuffle with suggestions, repeat
+all/one, queue (view, add, remove, reorder, clear, jump), autoplay, gapless,
+normalisation, streaming quality, playlists (view, create, edit, reorder, delete,
+follow), Liked Songs, saved albums/artists/podcasts, follow artists, search (all types,
+recent searches), home feed, album/artist/playlist/show/episode pages, lyrics (synced),
+radio, share links, deep links, downloads (track/album/playlist/liked/podcast, Wi-Fi only
+option, storage management, auto-sync), offline mode, sleep timer, explicit-content
+filter, system equalizer, settings, adaptive layouts, accessibility (content
+descriptions, touch targets, TalkBack-friendly controls).
