@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Browse area: Home, Search, Library, Liked Songs, Downloads, Profile. -->
+<resources>
+    <!-- Common -->
+    <string name="browse_back">Back</string>
+    <string name="browse_cancel">Cancel</string>
+    <string name="browse_retry">Retry</string>
+    <string name="browse_loading">Loading</string>
+    <string name="browse_settings">Settings</string>
+    <string name="browse_more_options">More options</string>
+    <string name="browse_profile_open">Your profile</string>
+    <string name="browse_liked_songs">Liked Songs</string>
+    <string name="browse_go_to_downloads">Go to Downloads</string>
+    <string name="browse_subtitle_separator">%1$s • %2$s</string>
+    <string name="browse_play">Play</string>
+
+    <string name="browse_type_song">Song</string>
+    <string name="browse_type_album">Album</string>
+    <string name="browse_type_artist">Artist</string>
+    <string name="browse_type_playlist">Playlist</string>
+    <string name="browse_type_podcast">Podcast</string>
+    <string name="browse_type_episode">Episode</string>
+    <string name="browse_type_collection">Collection</string>
+
+    <string name="browse_error_offline">You\'re offline. Connect to the internet to see this.</string>
+    <string name="browse_error_search_offline">Search needs an internet connection</string>
+    <string name="browse_error_rate_limited">Spotify is busy right now. Try again in a moment.</string>
+    <string name="browse_error_not_found">We couldn\'t find that.</string>
+    <string name="browse_error_generic">Something went wrong. Please try again.</string>
+
+    <!-- Home -->
+    <string name="browse_greeting_morning">Good morning</string>
+    <string name="browse_greeting_afternoon">Good afternoon</string>
+    <string name="browse_greeting_evening">Good evening</string>
+    <string name="browse_filter_all">All</string>
+    <string name="browse_filter_music">Music</string>
+    <string name="browse_filter_podcasts">Podcasts</string>
+    <string name="browse_home_recently_played">Recently played</string>
+    <string name="browse_home_downloaded">Downloaded</string>
+    <string name="browse_home_refresh_failed">Couldn\'t refresh. Showing saved content.</string>
+    <string name="browse_home_offline_empty_title">Nothing downloaded yet</string>
+    <string name="browse_home_offline_empty_message">You\'re offline. Playlists, albums and podcasts you download will show up here.</string>
+    <string name="browse_home_filter_empty">Nothing here yet</string>
+
+    <!-- Search -->
+    <string name="browse_search_title">Search</string>
+    <string name="browse_search_placeholder">Artists, songs, podcasts and more</string>
+    <string name="browse_search_clear">Clear search</string>
+    <string name="browse_search_filter_top">Top</string>
+    <string name="browse_search_filter_songs">Songs</string>
+    <string name="browse_search_filter_artists">Artists</string>
+    <string name="browse_search_filter_albums">Albums</string>
+    <string name="browse_search_filter_playlists">Playlists</string>
+    <string name="browse_search_filter_podcasts">Podcasts</string>
+    <string name="browse_search_filter_episodes">Episodes</string>
+    <string name="browse_search_top_result">Top result</string>
+    <string name="browse_search_see_all">See all</string>
+    <string name="browse_search_recent">Recent searches</string>
+    <string name="browse_search_clear_recent">Clear all</string>
+    <string name="browse_search_clear_recent_title">Clear recent searches?</string>
+    <string name="browse_search_clear_recent_confirm">Clear</string>
+    <string name="browse_search_remove_recent">Remove from recent searches</string>
+    <string name="browse_search_browse_all">Browse all</string>
+    <string name="browse_search_no_results_title">No results for “%1$s”</string>
+    <string name="browse_search_no_results_message">Check the spelling, or try fewer or different keywords.</string>
+    <string name="browse_search_results_subtitle">Results for “%1$s”</string>
+
+    <string name="browse_category_pop">Pop</string>
+    <string name="browse_category_hiphop">Hip-Hop</string>
+    <string name="browse_category_rock">Rock</string>
+    <string name="browse_category_chill">Chill</string>
+    <string name="browse_category_workout">Workout</string>
+    <string name="browse_category_focus">Focus</string>
+    <string name="browse_category_sleep">Sleep</string>
+    <string name="browse_category_party">Party</string>
+    <string name="browse_category_podcasts">Podcasts</string>
+    <string name="browse_category_electronic">Electronic</string>
+    <string name="browse_category_jazz">Jazz</string>
+    <string name="browse_category_classical">Classical</string>
+    <string name="browse_category_rnb">R&amp;B</string>
+    <string name="browse_category_indie">Indie</string>
+    <string name="browse_category_latin">Latin</string>
+    <string name="browse_category_mood">Mood</string>
+    <string name="browse_category_playlists">Playlists</string>
+
+    <!-- Library -->
+    <string name="browse_library_title">Your Library</string>
+    <string name="browse_library_search">Search in Your Library</string>
+    <string name="browse_library_close_search">Close search</string>
+    <string name="browse_library_create">Create playlist</string>
+    <string name="browse_library_filter_playlists">Playlists</string>
+    <string name="browse_library_filter_albums">Albums</string>
+    <string name="browse_library_filter_artists">Artists</string>
+    <string name="browse_library_filter_podcasts">Podcasts</string>
+    <string name="browse_library_filter_downloaded">Downloaded</string>
+    <string name="browse_library_sort_by">Sort by</string>
+    <string name="browse_library_sort_recent">Recents</string>
+    <string name="browse_library_sort_recently_added">Recently added</string>
+    <string name="browse_library_sort_alphabetical">Alphabetical</string>
+    <string name="browse_library_sort_creator">Creator</string>
+    <string name="browse_library_show_grid">Show as grid</string>
+    <string name="browse_library_show_list">Show as list</string>
+    <string name="browse_library_your_episodes">Your Episodes</string>
+    <string name="browse_library_your_episodes_subtitle">Saved episodes</string>
+    <string name="browse_library_downloads">Downloads</string>
+    <string name="browse_library_folder">Folder</string>
+    <string name="browse_library_empty_title">Your library is empty</string>
+    <string name="browse_library_empty_message">Save albums, follow artists and create playlists to find them here.</string>
+    <string name="browse_library_no_match_title">Couldn\'t find “%1$s”</string>
+    <string name="browse_library_no_match_message">Try a different spelling or keyword.</string>
+    <string name="browse_library_offline_empty_title">No downloads</string>
+    <string name="browse_library_offline_empty_message">Download playlists, albums and podcasts to listen when you\'re offline.</string>
+    <string name="browse_library_filter_empty">Nothing here yet</string>
+    <string name="browse_library_folder_empty">This folder is empty</string>
+    <string name="browse_library_episodes_empty_title">No saved episodes</string>
+    <string name="browse_library_episodes_empty_message">Episodes you save will show up here.</string>
+
+    <!-- Liked Songs -->
+    <string name="browse_liked_filter">Find in Liked Songs</string>
+    <string name="browse_clear_filter">Clear filter</string>
+    <string name="browse_liked_empty_title">Songs you like will appear here</string>
+    <string name="browse_liked_empty_message">Save songs by tapping the heart icon.</string>
+    <string name="browse_liked_offline_empty_title">No downloaded liked songs</string>
+    <string name="browse_liked_offline_empty_message">Download Liked Songs to listen while you\'re offline.</string>
+    <string name="browse_liked_remove_download_title">Remove Liked Songs from downloads?</string>
+    <string name="browse_liked_remove_download_message">You won\'t be able to play these songs offline.</string>
+    <string name="browse_shuffle_play">Shuffle play</string>
+
+    <!-- Downloads -->
+    <string name="browse_download">Download</string>
+    <string name="browse_downloaded">Downloaded</string>
+    <string name="browse_remove">Remove</string>
+    <string name="browse_remove_all">Remove all</string>
+    <string name="browse_remove_download">Remove download</string>
+    <string name="browse_retry_download">Retry download</string>
+    <string name="browse_download_progress">Downloading %1$d of %2$d</string>
+    <string name="browse_download_waiting_progress">Waiting to download • %1$d of %2$d</string>
+    <string name="browse_download_waiting">Waiting to download</string>
+    <string name="browse_download_downloading">Downloading…</string>
+    <string name="browse_download_downloading_percent">Downloading %1$d%%</string>
+    <string name="browse_download_item_failed">Download failed</string>
+    <string name="browse_download_failed">Couldn\'t update downloads</string>
+    <string name="browse_download_started">Download started</string>
+    <string name="browse_download_removed">Removed from downloads</string>
+    <string name="browse_nothing_to_play">Nothing downloaded to play</string>
+    <string name="browse_downloads_storage">%1$s used</string>
+    <string name="browse_downloads_active">Now downloading: %1$s</string>
+    <string name="browse_downloads_retry_failed">Retry failed downloads</string>
+    <string name="browse_downloads_remove_all">Remove all downloads</string>
+    <string name="browse_downloads_remove_all_title">Remove all downloads?</string>
+    <string name="browse_downloads_remove_all_message">All downloaded music and podcasts will be deleted from this device.</string>
+    <string name="browse_downloads_remove_item_title">Remove “%1$s” from downloads?</string>
+    <string name="browse_downloads_remove_item_message">You won\'t be able to play it offline anymore.</string>
+    <string name="browse_downloads_section_playlists">Playlists</string>
+    <string name="browse_downloads_section_albums">Albums</string>
+    <string name="browse_downloads_section_podcasts">Podcasts</string>
+    <string name="browse_downloads_section_songs">Songs</string>
+    <string name="browse_downloads_section_episodes">Episodes</string>
+    <string name="browse_downloads_empty_title">No downloads yet</string>
+    <string name="browse_downloads_empty_message">Tap the download button on a playlist, album or podcast to listen without a connection.</string>
+    <string name="browse_downloads_browse_library">Browse your library</string>
+    <string name="browse_go_to_playlist">Go to playlist</string>
+    <string name="browse_go_to_album">Go to album</string>
+    <string name="browse_go_to_podcast">Go to podcast</string>
+
+    <!-- Profile -->
+    <string name="browse_profile_playlists">Playlists</string>
+    <string name="browse_profile_premium">Premium</string>
+    <string name="browse_profile_logout">Log out</string>
+    <string name="browse_profile_logging_out">Logging out…</string>
+    <string name="browse_profile_logout_title">Log out?</string>
+    <string name="browse_profile_logout_message">Downloads, saved searches and cached data on this device will be removed.</string>
+
+    <plurals name="browse_song_count">
+        <item quantity="one">%d song</item>
+        <item quantity="other">%d songs</item>
+    </plurals>
+    <plurals name="browse_episode_count">
+        <item quantity="one">%d episode</item>
+        <item quantity="other">%d episodes</item>
+    </plurals>
+    <plurals name="browse_playlist_count">
+        <item quantity="one">%d playlist</item>
+        <item quantity="other">%d playlists</item>
+    </plurals>
+    <plurals name="browse_download_count">
+        <item quantity="one">%d download</item>
+        <item quantity="other">%d downloads</item>
+    </plurals>
+    <plurals name="browse_downloads_pending">
+        <item quantity="one">Downloading %d item</item>
+        <item quantity="other">Downloading %d items</item>
+    </plurals>
+    <plurals name="browse_downloads_failed">
+        <item quantity="one">%d download failed</item>
+        <item quantity="other">%d downloads failed</item>
+    </plurals>
+    <plurals name="browse_profile_playlist_count">
+        <item quantity="one">%d playlist</item>
+        <item quantity="other">%d playlists</item>
+    </plurals>
+    <plurals name="browse_profile_following_count">
+        <item quantity="one">%d artist followed</item>
+        <item quantity="other">%d artists followed</item>
+    </plurals>
+</resources>

@@ -1,0 +1,165 @@
+package com.taehagen.spotifygood.ui.screens.search
+
+import androidx.compose.runtime.Immutable
+import com.taehagen.spotifygood.data.SearchType
+import com.taehagen.spotifygood.model.AlbumRef
+import com.taehagen.spotifygood.model.ArtistRef
+import com.taehagen.spotifygood.model.Episode
+import com.taehagen.spotifygood.model.MediaRef
+import com.taehagen.spotifygood.model.PlaylistRef
+import com.taehagen.spotifygood.model.SearchResults
+import com.taehagen.spotifygood.model.ShowRef
+import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import com.taehagen.spotifygood.ui.screens.library.BrowseError
+import com.taehagen.spotifygood.ui.screens.library.toMediaRef
+
+// Pure search shaping (JVM-testable).
+
+enum class SearchFilter(val type: SearchType?) {
+    TOP(null),
+    SONGS(SearchType.TRACK),
+    ARTISTS(SearchType.ARTIST),
+    ALBUMS(SearchType.ALBUM),
+    PLAYLISTS(SearchType.PLAYLIST),
+    PODCASTS(SearchType.SHOW),
+    EPISODES(SearchType.EPISODE),
+}
+
+fun searchTypeOf(wire: String): SearchType? = SearchType.entries.firstOrNull { it.wire == wire }
+
+/** One row of a single-type result list. */
+@Immutable
+sealed interface SearchItem {
+    val key: String
+    val ref: MediaRef
+
+    data class Song(val track: Track) : SearchItem {
+        override val key: String get() = "track:${track.uri}"
+        override val ref: MediaRef by lazy(LazyThreadSafetyMode.NONE) { track.toMediaRef() }
+    }
+
+    data class ArtistItem(val artist: ArtistRef) : SearchItem {
+        override val key: String get() = "artist:${artist.uri}"
+        override val ref: MediaRef by lazy(LazyThreadSafetyMode.NONE) { artist.toMediaRef() }
+    }
+
+    data class AlbumItem(val album: AlbumRef) : SearchItem {
+        override val key: String get() = "album:${album.uri}"
+        override val ref: MediaRef by lazy(LazyThreadSafetyMode.NONE) { album.toMediaRef() }
+    }
+
+    data class PlaylistItem(val playlist: PlaylistRef) : SearchItem {
+        override val key: String get() = "playlist:${playlist.uri}"
+        override val ref: MediaRef by lazy(LazyThreadSafetyMode.NONE) { playlist.toMediaRef() }
+    }
+
+    data class ShowItem(val show: ShowRef) : SearchItem {
+        override val key: String get() = "show:${show.uri}"
+        override val ref: MediaRef by lazy(LazyThreadSafetyMode.NONE) { show.toMediaRef() }
+    }
+
+    data class EpisodeItem(val episode: Episode) : SearchItem {
+        override val key: String get() = "episode:${episode.uri}"
+        override val ref: MediaRef by lazy(LazyThreadSafetyMode.NONE) { episode.toMediaRef() }
+    }
+}
+
+fun SearchResults.itemsOf(type: SearchType): List<SearchItem> = when (type) {
+    SearchType.TRACK -> tracks.map(SearchItem::Song)
+    SearchType.ARTIST -> artists.map(SearchItem::ArtistItem)
+    SearchType.ALBUM -> albums.map(SearchItem::AlbumItem)
+    SearchType.PLAYLIST -> playlists.map(SearchItem::PlaylistItem)
+    SearchType.SHOW -> shows.map(SearchItem::ShowItem)
+    SearchType.EPISODE -> episodes.map(SearchItem::EpisodeItem)
+}
+
+/** The server's top result, else the most likely intent (artist, then song, album, ...). */
+fun SearchResults.topResultOrBest(): MediaRef? = topResult
+    ?: artists.firstOrNull()?.toMediaRef()
+    ?: tracks.firstOrNull()?.toMediaRef()
+    ?: albums.firstOrNull()?.toMediaRef()
+    ?: playlists.firstOrNull()?.toMediaRef()
+    ?: shows.firstOrNull()?.toMediaRef()
+    ?: episodes.firstOrNull()?.toMediaRef()
+
+/** De-duplicates every list of a results page by URI (the server sometimes repeats items). */
+fun SearchResults.distinct(): SearchResults = copy(
+    tracks = tracks.distinctBy { it.uri },
+    artists = artists.distinctBy { it.uri },
+    albums = albums.distinctBy { it.uri },
+    playlists = playlists.distinctBy { it.uri },
+    shows = shows.distinctBy { it.uri },
+    episodes = episodes.distinctBy { it.uri },
+)
+
+/** Action sheet target for a result row. */
+fun SearchItem.actionTarget(myUsername: String?): MediaActionTarget = when (this) {
+    is SearchItem.Song -> MediaActionTarget.TrackTarget(track, contextUri = track.album?.uri)
+    is SearchItem.ArtistItem -> MediaActionTarget.ArtistTarget(artist)
+    is SearchItem.AlbumItem -> MediaActionTarget.AlbumTarget(album)
+    is SearchItem.PlaylistItem -> MediaActionTarget.PlaylistTarget(
+        playlist,
+        isOwned = myUsername != null && playlist.owner?.username == myUsername,
+    )
+    is SearchItem.ShowItem -> MediaActionTarget.ShowTarget(show)
+    is SearchItem.EpisodeItem -> MediaActionTarget.EpisodeTarget(episode)
+}
+
+/** The "Top" filter page, precomputed for the UI. */
+@Immutable
+data class TopSections(
+    val top: MediaRef?,
+    val songs: List<Track>,
+    val artists: List<MediaRef>,
+    val albums: List<MediaRef>,
+    val playlists: List<MediaRef>,
+    val shows: List<MediaRef>,
+    val episodes: List<Episode>,
+    /** Every result by URI (full models for actions and playback). */
+    val byUri: Map<String, SearchItem>,
+)
+
+fun SearchResults.toTopSections(songCount: Int = 5, episodeCount: Int = 3): TopSections {
+    val items = SearchType.entries.flatMap { itemsOf(it) }
+    return TopSections(
+        top = topResultOrBest(),
+        songs = tracks.take(songCount),
+        artists = artists.map { it.toMediaRef() },
+        albums = albums.map { it.toMediaRef() },
+        playlists = playlists.map { it.toMediaRef() },
+        shows = shows.map { it.toMediaRef() },
+        episodes = episodes.take(episodeCount),
+        byUri = items.associateBy { it.ref.uri },
+    )
+}
+
+/** "All results" (Top filter) state. */
+@Immutable
+sealed interface TopResultsState {
+    data object Idle : TopResultsState
+    data object Loading : TopResultsState
+    data class Ready(
+        val query: String,
+        val sections: TopSections,
+        /** A newer query is loading; [sections] are from the previous one. */
+        val isRefreshing: Boolean = false,
+    ) : TopResultsState
+    data class Empty(val query: String) : TopResultsState
+    data class Failed(val query: String, val error: BrowseError) : TopResultsState
+}
+
+/** Small LRU of recent result pages so switching filters or going back does not refetch. */
+class SearchCache<V>(private val capacity: Int = 12) {
+    private val map = object : LinkedHashMap<String, V>(capacity, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, V>?): Boolean = size > capacity
+    }
+
+    @Synchronized operator fun get(key: String): V? = map[key]
+
+    @Synchronized operator fun set(key: String, value: V) {
+        map[key] = value
+    }
+
+    @Synchronized fun clear() = map.clear()
+}
