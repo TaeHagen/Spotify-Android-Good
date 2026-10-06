@@ -220,6 +220,25 @@ internal object DownloadRules {
         return maxOf(afterSync, lastAttemptAt + backoff)
     }
 
+    // ---- scheduling ----------------------------------------------------------------------------------
+
+    /**
+     * Whether a pending user-initiated job is left to drain the queue: unless the network policy
+     * changed ([replace]), or it is not executing and either has the wrong network constraint
+     * ([stale]) or a user action wants it to start now instead of after its backoff ([kick]).
+     */
+    fun keepPendingJob(replace: Boolean, kick: Boolean, executing: Boolean, stale: Boolean): Boolean =
+        !replace && (executing || (!stale && !kick))
+
+    /**
+     * Whether unique download work is re-created rather than kept: for a policy change ([replace]);
+     * otherwise only work that is still enqueued (never running work), when its network constraint
+     * does not match the setting ([stale]) or a user action finds it waiting out a retry backoff
+     * ([kick] after [runAttempts] > 0).
+     */
+    fun replaceWork(replace: Boolean, kick: Boolean, enqueued: Boolean, stale: Boolean, runAttempts: Int): Boolean =
+        replace || (enqueued && (stale || (kick && runAttempts > 0)))
+
     /** Rough size of [count] items at [kbps] (≈ 4 min each) for the job's network estimate. */
     fun estimateBytes(count: Int, kbps: Int): Long = count.toLong() * kbps * 1000 / 8 * AVERAGE_DURATION_S
 

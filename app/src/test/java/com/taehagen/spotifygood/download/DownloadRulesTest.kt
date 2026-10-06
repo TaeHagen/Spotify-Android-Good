@@ -169,6 +169,32 @@ class DownloadRulesTest {
         )
     }
 
+    // ---- scheduling ------------------------------------------------------------------------------------
+
+    @Test
+    fun aPendingJobIsKeptUnlessItIsStaleBackedOffOrThePolicyChanged() {
+        // Plain enqueue (sync found new items): the pending job will drain the queue.
+        assertTrue(DownloadRules.keepPendingJob(replace = false, kick = false, executing = false, stale = false))
+        // A user action does not wait out the pending job's backoff …
+        assertEquals(false, DownloadRules.keepPendingJob(replace = false, kick = true, executing = false, stale = false))
+        // … nor keeps a job scheduled with the other network policy by an earlier process …
+        assertEquals(false, DownloadRules.keepPendingJob(replace = false, kick = false, executing = false, stale = true))
+        // … but never cancels a job that is starting.
+        assertTrue(DownloadRules.keepPendingJob(replace = false, kick = true, executing = true, stale = true))
+        // Mobile data was turned off: the running job with the old constraint was stopped, replace it.
+        assertEquals(false, DownloadRules.keepPendingJob(replace = true, kick = false, executing = true, stale = false))
+    }
+
+    @Test
+    fun enqueuedWorkIsRecreatedWhenStaleOrBackedOffButRunningWorkIsKept() {
+        assertEquals(false, DownloadRules.replaceWork(replace = false, kick = false, enqueued = true, stale = false, runAttempts = 3))
+        assertTrue(DownloadRules.replaceWork(replace = false, kick = true, enqueued = true, stale = false, runAttempts = 3))
+        assertEquals(false, DownloadRules.replaceWork(replace = false, kick = true, enqueued = true, stale = false, runAttempts = 0))
+        assertTrue(DownloadRules.replaceWork(replace = false, kick = false, enqueued = true, stale = true, runAttempts = 0))
+        assertEquals(false, DownloadRules.replaceWork(replace = false, kick = true, enqueued = false, stale = true, runAttempts = 5))
+        assertTrue(DownloadRules.replaceWork(replace = true, kick = false, enqueued = false, stale = false, runAttempts = 0))
+    }
+
     // ---- sync backoff ---------------------------------------------------------------------------------
 
     @Test

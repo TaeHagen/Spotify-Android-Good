@@ -4,10 +4,13 @@ import android.app.job.JobInfo
 import android.app.job.JobScheduler
 import android.content.ComponentName
 import android.content.Context
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.util.Log
 import androidx.annotation.RequiresApi
+import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.room.withTransaction
 import androidx.work.BackoffPolicy
@@ -17,6 +20,7 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.auth.CredentialStore
@@ -44,7 +48,6 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -159,8 +162,8 @@ class DownloadManager(
         appContext, database, rpc, events, engine, settings, credentialStore, storage, notifications, keys, mutex, index,
     )
 
-    /** Network policy (`downloadOverCellular`) of what this process scheduled last; null = nothing. */
-    @Volatile private var scheduledCellular: Boolean? = null
+    /** True while [DownloadJobService] runs a job (it must not be replaced then, see [scheduleExecution]). */
+    @Volatile internal var jobExecuting = false
 
     /** URIs of completed downloads (hot), iterating newest download first (Android Auto queue order). */
     val downloadedUris: StateFlow<Set<String>> = dao.observeCompletedUris()
@@ -195,8 +198,9 @@ class DownloadManager(
     init {
         scope.launch {
             try {
-                // Resume after process death / reboot (a non-persisted job does not survive a reboot).
-                if (dao.pendingCount() > 0) scheduleExecution()
+                // Resume after process death / reboot (a non-persisted job does not survive a reboot);
+                // work left in a long backoff by an earlier process starts again now.
+                if (dao.pendingCount() > 0) scheduleExecution(kick = true)
                 updateSyncSchedule(collectionDao.count() > 0)
             } catch (e: CancellationException) {
                 throw e
@@ -206,15 +210,45 @@ class DownloadManager(
         }
         scope.launch {
             // Network policy or offline mode changed: reschedule with the new constraints.
+            var previousCellular: Boolean? = null
             settings.settings.map { it.downloadOverCellular to it.offlineMode }
                 .distinctUntilChanged()
-                .drop(1)
                 .collect { (cellular, offline) ->
-                    if (!offline) scheduleExecution(replace = scheduledCellular?.let { it != cellular } ?: false)
+                    val first = previousCellular == null
+                    val policyChanged = !first && previousCellular != cellular
+                    previousCellular = cellular
+                    if (first || offline) return@collect
+                    if (policyChanged && runner.isRunning) {
+                        // The running job / worker keeps the old network constraint (and downloads over
+                        // the mobile data the user just turned off): stop it; its item resumes from the
+                        // .part under the new constraint.
+                        runner.stopAndAwaitIdle()
+                    }
+                    scheduleExecution(replace = policyChanged)
                 }
         }
         scope.launch {
-            engine.isOnline.filter { it }.collect { syncIfStale() }
+            engine.isOnline.filter { it }.collect {
+                syncIfStale()
+                // Work waiting out a backoff from an unreachable network starts now.
+                if (!runner.isRunning && dao.pendingCount() > 0) scheduleExecution(kick = true)
+            }
+        }
+        scope.launch(Dispatchers.Main) {
+            // Back in the app: resume a queue that stopped (storage was full, retries ran out …).
+            ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
+                override fun onStart(owner: LifecycleOwner) {
+                    scope.launch {
+                        try {
+                            if (!runner.isRunning && dao.pendingCount() > 0) scheduleExecution(kick = true)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Resuming downloads failed", e)
+                        }
+                    }
+                }
+            })
         }
     }
 
@@ -267,7 +301,7 @@ class DownloadManager(
         }
         afterRemoval(listOf(removed))
         updateSyncSchedule(true)
-        scheduleExecution()
+        scheduleExecution(kick = true)
     }
 
     /** Stops keeping [uri] offline; deletes its items unless another download still needs them. */
@@ -315,7 +349,7 @@ class DownloadManager(
                 metadata.forEach { (uri, meta) -> dao.fillMetadata(uri, meta) }
             }
         }
-        scheduleExecution()
+        scheduleExecution(kick = true)
     }
 
     /** Deletes the given downloads (files, rows, offline index), whatever collection they belong to. */
@@ -346,14 +380,17 @@ class DownloadManager(
             keys.clear()
             Removal(all, index.next())
         }
-        scheduledCellular = null
         notifications.cancelAll()
         index.remove(removal.uris, removal.seq)
     }
 
-    /** Puts failed and cancelled downloads back into the queue. */
+    /**
+     * Puts failed and cancelled downloads back into the queue and (re)starts the queue, also when only
+     * pending items wait (a run stopped because storage was full).
+     */
     suspend fun retryFailed() {
-        if (dao.requeueFailed() > 0) scheduleExecution()
+        dao.requeueFailed()
+        scheduleExecution(kick = true)
     }
 
     /**
@@ -665,9 +702,14 @@ class DownloadManager(
     /**
      * Makes sure pending items get downloaded: nothing to do while a run is active (it picks new rows
      * up); otherwise a user-initiated job when allowed (API 34+, app visible), else WorkManager.
-     * [replace] re-creates pending work with the current network constraints.
+     *
+     * Pending work is kept unless: [replace] (the network policy changed; the caller stopped a running
+     * run first), its network constraint does not match the setting (scheduled by an earlier process),
+     * or [kick] (a user action, app start, coming online) while it waits out a retry backoff, which
+     * the system would otherwise let grow to hours. A job that is executing is never replaced except
+     * for [replace].
      */
-    private suspend fun scheduleExecution(replace: Boolean = false): Unit = withContext(Dispatchers.IO) {
+    private suspend fun scheduleExecution(replace: Boolean = false, kick: Boolean = false): Unit = withContext(Dispatchers.IO) {
         try {
             if (runner.isRunning) return@withContext
             val pending = dao.pendingCount()
@@ -676,17 +718,27 @@ class DownloadManager(
             if (current.offlineMode) return@withContext
             val cellular = current.downloadOverCellular
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val scheduler = appContext.getSystemService(JobScheduler::class.java)
+                val job = scheduler?.getPendingJob(JOB_ID)
+                val jobStale = job != null && job.requiresUnmetered() == cellular
                 // A pending (or just started) user-initiated job will drain the queue; a WorkManager
                 // fallback next to it would only start and find the queue taken.
-                if (!replace && hasUserInitiatedJob()) return@withContext
+                if (job != null && DownloadRules.keepPendingJob(replace, kick, jobExecuting, jobStale)) return@withContext
                 val estimate = DownloadRules.estimateBytes(pending, current.downloadQuality.kbps)
+                // Scheduling with the same id replaces the pending job: new constraint, no backoff.
                 if (isAppVisible() && scheduleUserInitiatedJob(cellular, estimate)) {
-                    scheduledCellular = cellular
+                    if (replace) cancelWorker()
                     return@withContext
                 }
+                if (job != null) {
+                    // Cannot re-create a user-initiated job from the background: keep a good one, and
+                    // let the worker below take over from one with the wrong network constraint.
+                    if (!replace && !jobStale) return@withContext
+                    scheduler.cancel(JOB_ID)
+                }
             }
-            enqueueWorker(cellular, replace)
-            scheduledCellular = cellular
+            enqueueWorker(cellular, replace, kick)
+            if (replace) appContext.getSystemService(JobScheduler::class.java)?.cancel(JOB_ID)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -694,12 +746,22 @@ class DownloadManager(
         }
     }
 
+    /** True when the job may only run on an unmetered network. */
+    @RequiresApi(Build.VERSION_CODES.P)
+    private fun JobInfo.requiresUnmetered(): Boolean =
+        requiredNetwork?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == true
+
+    private fun cancelWorker() {
+        try {
+            WorkManager.getInstance(appContext).cancelUniqueWork(WORK_NAME)
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "WorkManager unavailable", e)
+        }
+    }
+
     private suspend fun isAppVisible(): Boolean = withContext(Dispatchers.Main.immediate) {
         ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
     }
-
-    private fun hasUserInitiatedJob(): Boolean =
-        appContext.getSystemService(JobScheduler::class.java)?.getPendingJob(JOB_ID) != null
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private fun scheduleUserInitiatedJob(cellular: Boolean, estimatedBytes: Long): Boolean {
@@ -720,17 +782,32 @@ class DownloadManager(
         }
     }
 
-    private fun enqueueWorker(cellular: Boolean, replace: Boolean) {
+    /** Blocking (reads the pending work): call off the main thread. See [scheduleExecution]. */
+    private fun enqueueWorker(cellular: Boolean, replace: Boolean, kick: Boolean) {
+        val network = if (cellular) NetworkType.CONNECTED else NetworkType.UNMETERED
         val constraints = Constraints.Builder()
-            .setRequiredNetworkType(if (cellular) NetworkType.CONNECTED else NetworkType.UNMETERED)
+            .setRequiredNetworkType(network)
             .setRequiresStorageNotLow(true)
             .build()
         val request = OneTimeWorkRequestBuilder<DownloadWorker>()
             .setConstraints(constraints)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, WORK_BACKOFF_S, TimeUnit.SECONDS)
             .build()
-        WorkManager.getInstance(appContext)
-            .enqueueUniqueWork(WORK_NAME, if (replace) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP, request)
+        val workManager = WorkManager.getInstance(appContext)
+        val existing = try {
+            workManager.getWorkInfosForUniqueWork(WORK_NAME).get().firstOrNull { !it.state.isFinished }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not read the pending download work", e)
+            null
+        }
+        val recreate = DownloadRules.replaceWork(
+            replace = replace,
+            kick = kick,
+            enqueued = existing?.state == WorkInfo.State.ENQUEUED,
+            stale = existing != null && existing.constraints.requiredNetworkType != network,
+            runAttempts = existing?.runAttemptCount ?: 0,
+        )
+        workManager.enqueueUniqueWork(WORK_NAME, if (recreate) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP, request)
     }
 
     private fun updateSyncSchedule(enabled: Boolean) {

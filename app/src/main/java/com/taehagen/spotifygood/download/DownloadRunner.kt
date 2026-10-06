@@ -2,6 +2,8 @@ package com.taehagen.spotifygood.download
 
 import android.app.Notification
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.SystemClock
 import android.text.format.Formatter
 import android.util.Log
@@ -57,10 +59,13 @@ internal enum class RunOutcome {
     /** The queue is drained. */
     FINISHED,
 
-    /** Work remains but cannot proceed now (offline, backoff): reschedule with system backoff. */
+    /**
+     * Work remains but cannot proceed now (offline, backoff, storage full, metered network not
+     * allowed): reschedule with system backoff (the host's constraints include storage not low).
+     */
     RESCHEDULE,
 
-    /** Stopped for a reason the user must resolve (cancel, storage, account): do not reschedule. */
+    /** Stopped for a reason the user must resolve (cancel, account, offline mode): do not reschedule. */
     STOPPED,
 }
 
@@ -168,6 +173,15 @@ internal class DownloadRunner(
         withTimeoutOrNull(STOP_TIMEOUT_MS) { active.cancelAndJoin() }
     }
 
+    /**
+     * [stop], then waits (bounded) until the run released the queue, so that a host scheduled next
+     * does not find the queue still taken and finish at once.
+     */
+    suspend fun stopAndAwaitIdle() {
+        stop()
+        withTimeoutOrNull(STOP_TIMEOUT_MS) { runLock.withLock {} }
+    }
+
     /** Deletes orphaned files when nothing is running or pending (after removals). */
     suspend fun collectGarbageIfIdle() {
         if (!runLock.tryLock()) return
@@ -202,6 +216,7 @@ internal class DownloadRunner(
         // bring the engine up only to find that out.
         val paused = pausedForMs(System.currentTimeMillis())
         if (paused != null && paused > MAX_INLINE_WAIT_MS) return RunOutcome.RESCHEDULE
+        if (meteredNotAllowed()) return RunOutcome.RESCHEDULE
         val holder = engine.acquire(HolderType.DOWNLOAD)
         val receiver = notifications.registerCancelReceiver(::requestCancel)
         val stats = RunStats()
@@ -226,6 +241,12 @@ internal class DownloadRunner(
                     delay(wait.coerceAtLeast(MIN_WAIT_MS))
                     continue
                 }
+                if (meteredNotAllowed()) {
+                    // The host's network constraint is stale (it predates the setting): never use
+                    // mobile data against the setting; the manager re-creates the work.
+                    Log.i(TAG, "On a metered network with mobile data downloads off: rescheduling")
+                    return RunOutcome.RESCHEDULE
+                }
                 val free = withContext(Dispatchers.IO) { storage.freeBytes() }
                 if (free < DownloadRules.MIN_FREE_BYTES) {
                     val message = context.getString(
@@ -234,7 +255,9 @@ internal class DownloadRunner(
                     )
                     stats.stopMessage = message
                     notifications.showStopped(message)
-                    return RunOutcome.STOPPED
+                    // Resumed by the host once storage is no longer low (its constraint), or when the
+                    // user comes back to the app / retries.
+                    return RunOutcome.RESCHEDULE
                 }
                 when (val result = processItem(item, host, stats)) {
                     ItemResult.Done -> Unit
@@ -260,6 +283,14 @@ internal class DownloadRunner(
                 _activity.value = DownloadActivity(lastError = stats.stopMessage)
             }
         }
+    }
+
+    /** Mobile data downloads are off and the default network is metered (no network: false). */
+    private fun meteredNotAllowed(): Boolean {
+        if (settings.settings.value.downloadOverCellular) return false
+        val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return false
+        val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork) ?: return false
+        return !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
     }
 
     /** How long until a pending item may run; null when one may run now or nothing is pending. */
