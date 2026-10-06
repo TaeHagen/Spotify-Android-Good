@@ -1,0 +1,33 @@
+[package]
+name = "spotcore"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "librespot-based Spotify engine exposed to the Android app over JNI"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+librespot-core = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-connect = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-playback = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-metadata = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-audio = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-oauth = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-protocol = "0.8.0"
+jni = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "fs"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+thiserror = "2"
+parking_lot = "0.12"
+protobuf = "3.7"
+hex = "0.4"
+bytes = "1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"

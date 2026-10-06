@@ -1,0 +1,23 @@
+[workspace]
+members = ["spotcore"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+
+# Patched librespot crates, see vendor/README.md.
+[patch.crates-io]
+librespot-connect = { path = "vendor/librespot-connect" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Panics are caught at the JNI boundary (catch_unwind), so unwinding must stay on.
+panic = "unwind"
+strip = "debuginfo"
+
+[profile.dev]
+# Audio decoding is far too slow unoptimised.
+opt-level = 2
