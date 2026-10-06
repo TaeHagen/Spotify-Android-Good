@@ -198,6 +198,7 @@ class PlaybackService : MediaLibraryService() {
 
     override fun onDestroy() {
         isRunning = false
+        coordinator.closeEffectSession()
         presence.release()
         clearListener()
         session?.release()

@@ -3,6 +3,7 @@ package com.taehagen.spotifygood.playback
 import android.content.Context
 import android.content.Intent
 import android.media.AudioDeviceInfo
+import android.media.audiofx.AudioEffect
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -37,7 +38,9 @@ import kotlinx.coroutines.launch
  * * sink stopped → release locks, unregister the receiver, abandon focus after
  *   [AudioFocusController.RESUME_WINDOW_MS] (or immediately on stop / remote playback / engine stop);
  * * mixer volume → `STREAM_MUSIC` via [VolumeSync], which also observes the system volume while the
- *   engine runs.
+ *   engine runs;
+ * * the system equalizer's audio-effect session is opened when local audio first starts and
+ *   closed when the engine stops or the playback service is destroyed (not on pauses).
  *
  * It also makes sure the [PlaybackService] runs when playback is requested while the app is
  * visible, and starts the opt-in Connect presence while the app is visible.
@@ -70,6 +73,9 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
 
     @Volatile private var sinkActive = false
     private val foreground = MutableStateFlow(false)
+
+    /** The system audio-effect (equalizer) control session is open. Main thread. */
+    private var effectSessionOpen = false
 
     /** True while any activity of the app is started (ProcessLifecycleOwner). */
     val isAppInForeground: Boolean get() = foreground.value
@@ -177,6 +183,7 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
         noisy.register()
         updateLocks()
         ensureServiceStarted()
+        openEffectSession()
     }
 
     private fun onLocalAudioStopped() {
@@ -205,6 +212,39 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
         focus.abandon()
         noisy.unregister()
         updateLocks()
+        closeEffectSession() // the AudioTrack is released with the engine
+    }
+
+    // ---- system equalizer ---------------------------------------------------------------------
+
+    /**
+     * Lets equalizer / audio-effect apps attach to the (stable) AudioTrack session: opened once
+     * when local audio starts, kept across pauses, closed by [closeEffectSession]. Main thread.
+     */
+    private fun openEffectSession() {
+        if (effectSessionOpen) return
+        effectSessionOpen = true
+        sendEffectBroadcast(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
+    }
+
+    /** Playback ended for good (engine stopped, playback service destroyed). Main thread. */
+    fun closeEffectSession() {
+        if (!effectSessionOpen) return
+        effectSessionOpen = false
+        sendEffectBroadcast(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
+    }
+
+    private fun sendEffectBroadcast(action: String) {
+        try {
+            app.sendBroadcast(
+                Intent(action)
+                    .putExtra(AudioEffect.EXTRA_AUDIO_SESSION, graph.audioSink.audioSessionId)
+                    .putExtra(AudioEffect.EXTRA_PACKAGE_NAME, app.packageName)
+                    .putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC),
+            )
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Audio effect session broadcast failed", e)
+        }
     }
 
     /** Wake + Wi-Fi locks only while audio plays (or loads) locally (docs §1, §9.4). */
