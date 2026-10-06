@@ -65,6 +65,10 @@ class PlaylistEditor(private val rpc: NativeRpc, private val library: LibraryRep
         library.onPlaylistEdited(playlistUri)
     }
 
+    /**
+     * Moves one item. [toIndex] is the playlist4 MOV insert-before position in the list *before*
+     * the move (e.g. moving index 2 to the end of a 5-item list uses toIndex = 5).
+     */
     suspend fun moveItem(playlistUri: String, fromIndex: Int, toIndex: Int, revision: String?) {
         if (fromIndex == toIndex) return
         rpc.callOffMain<RevisionResult>(
