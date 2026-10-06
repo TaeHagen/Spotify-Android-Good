@@ -699,6 +699,7 @@ private fun YourEpisodesList(
                 onClick = { onPlay(episode) },
                 isCurrent = state.nowPlaying.isCurrent(episode.uri),
                 isPlaying = state.nowPlaying.isPlaying,
+                onLongClick = { onActions(episode) },
                 onMoreClick = { onActions(episode) },
             )
         }

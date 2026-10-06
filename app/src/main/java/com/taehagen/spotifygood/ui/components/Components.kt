@@ -198,7 +198,10 @@ fun TrackRow(
     isSuggestion: Boolean = false,
     onMoreClick: (() -> Unit)? = null,
     onLongClick: (() -> Unit)? = null,
-    /** False: dimmed and not clickable (kept before [trailing] so trailing-lambda calls still work). */
+    /**
+     * False: dimmed and not clickable; the overflow button ([onMoreClick]) stays usable so the
+     * item's actions remain reachable. Kept before [trailing] so trailing-lambda calls still work.
+     */
     enabled: Boolean = true,
     trailing: (@Composable () -> Unit)? = null,
 ) {
@@ -311,7 +314,7 @@ fun TrackRow(
             Box(Modifier.alpha(if (enabled) 1f else DISABLED_ALPHA), contentAlignment = Alignment.Center) { trailing() }
         }
         if (onMoreClick != null) {
-            IconButton(onClick = onMoreClick, enabled = enabled) {
+            IconButton(onClick = onMoreClick) {
                 Icon(Icons.Rounded.MoreVert, contentDescription = moreLabel, tint = colors.onSurfaceVariant)
             }
         }
@@ -328,7 +331,10 @@ fun EpisodeRow(
     isPlaying: Boolean = false,
     downloadState: DownloadState? = null,
     onLongClick: (() -> Unit)? = null,
-    /** False: dimmed and not clickable. Both new parameters precede [onMoreClick] for trailing-lambda calls. */
+    /**
+     * False: dimmed and not clickable; the overflow button ([onMoreClick]) stays usable. Both new
+     * parameters precede [onMoreClick] for trailing-lambda calls.
+     */
     enabled: Boolean = true,
     onMoreClick: (() -> Unit)? = null,
 ) {
@@ -421,7 +427,7 @@ fun EpisodeRow(
             }
         }
         if (onMoreClick != null) {
-            IconButton(onClick = onMoreClick, enabled = enabled) {
+            IconButton(onClick = onMoreClick) {
                 Icon(Icons.Rounded.MoreVert, contentDescription = moreLabel, tint = colors.onSurfaceVariant)
             }
         }

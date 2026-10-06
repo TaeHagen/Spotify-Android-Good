@@ -319,6 +319,7 @@ private fun DownloadsList(
                     isCurrent = state.nowPlaying.isCurrent(entry.uri),
                     isPlaying = state.nowPlaying.isPlaying,
                     downloadState = entry.state,
+                    onLongClick = { onEntryMore(entry) },
                     onMoreClick = { onEntryMore(entry) },
                 )
             }

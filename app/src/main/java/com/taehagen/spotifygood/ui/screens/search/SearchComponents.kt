@@ -363,6 +363,7 @@ internal fun SearchItemRow(
             onClick = onClick,
             isCurrent = nowPlaying.isCurrent(item.episode.uri),
             isPlaying = nowPlaying.isPlaying,
+            onLongClick = onActions,
             onMoreClick = onActions,
             modifier = modifier,
         )
