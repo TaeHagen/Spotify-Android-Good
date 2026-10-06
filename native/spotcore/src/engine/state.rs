@@ -3,7 +3,8 @@
 //! `status` is the single source of truth of the session state machine; every change that is
 //! visible in the `SessionEvent` JSON is emitted exactly once (`update_status`).
 
-use super::supervisor::Msg;
+use super::backoff::RateLimiter;
+use super::supervisor::{self, Msg};
 use crate::error::AppError;
 use crate::models::{EngineSettings, SessionEvent, SessionState, StoredCredentials, User};
 use crate::{bridge, connect, events, runtime};
@@ -70,6 +71,8 @@ pub(crate) struct Shared {
     /// The session while the engine is online.
     pub live_session: RwLock<Option<Session>>,
     pub login: Mutex<Login>,
+    /// Reconnect attempts of all supervisors (a restart by Kotlin doesn't start a new burst).
+    pub reconnects: Mutex<RateLimiter>,
     pub network: Mutex<NetworkState>,
     /// Message channel of the running supervisor (quick access without the supervisor slot).
     pub supervisor_tx: Mutex<Option<mpsc::UnboundedSender<Msg>>>,
@@ -86,6 +89,7 @@ pub(crate) static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     username: RwLock::new(None),
     live_session: RwLock::new(None),
     login: Mutex::new(Login::default()),
+    reconnects: Mutex::new(supervisor::reconnect_limiter()),
     network: Mutex::new(NetworkState { available: true, metered: false, lost_at: None }),
     supervisor_tx: Mutex::new(None),
     supervisor: tokio::sync::Mutex::new(None),
@@ -166,6 +170,7 @@ pub(crate) fn forget_account() {
         login.generation += 1;
         forget_account_state();
     }
+    shared().reconnects.lock().reset();
 }
 
 /// The per-account state besides the login (a new account starts without it).

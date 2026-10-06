@@ -259,6 +259,10 @@ async fn configure_start(args: StartArgs) -> AppResult<u64> {
         }
         login.access_token = plan.access_token;
     }
+    if plan.changed {
+        // A new login isn't throttled by the previous one's failed reconnects.
+        shared().reconnects.lock().reset();
+    }
     if plan.new_account {
         state::forget_account_state();
     }

@@ -6,6 +6,11 @@
 //! PREMIUM_REQUIRED) park in `Halted`; more than 10 reconnects in 10 minutes park in `Throttled`
 //! until the network changes. Every phase reacts to messages (stop, network, settings, player
 //! death) without waiting for timers; the connect attempt itself is cancellable.
+//!
+//! The backoff is reset only once a connection stayed up for `backoff::STABLE_AFTER` (or the
+//! network changes): a connection that fails right after connecting keeps backing off. The
+//! reconnect limit is process-wide (`state::Shared::reconnects`), and the first attempt of a
+//! new supervisor counts too, so Kotlin restarting the session can't undo the throttle.
 
 use super::backoff::{Backoff, RateLimiter};
 use super::connector::{self, Live};
@@ -94,13 +99,17 @@ fn force_cleanup() {
     player_host::detach_session();
 }
 
+/// The process-wide reconnect limit (`state::Shared::reconnects`).
+pub(crate) fn reconnect_limiter() -> RateLimiter {
+    RateLimiter::new(RECONNECTS_PER_WINDOW, RECONNECT_WINDOW)
+}
+
 pub(crate) fn spawn() -> SupervisorHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     *shared().supervisor_tx.lock() = Some(tx.clone());
     let supervisor = Supervisor {
         rx,
         backoff: Backoff::default(),
-        limiter: RateLimiter::new(RECONNECTS_PER_WINDOW, RECONNECT_WINDOW),
         first: true,
         prefer_token: false,
         login_generation: state::login_generation(),
@@ -138,7 +147,6 @@ enum AttemptEnd {
 struct Supervisor {
     rx: mpsc::UnboundedReceiver<Msg>,
     backoff: Backoff,
-    limiter: RateLimiter,
     /// No attempt finished yet (state `connecting` instead of `reconnecting`).
     first: bool,
     /// Stored credentials were rejected: try the OAuth access token.
@@ -245,7 +253,18 @@ impl Supervisor {
         if super::settings().offline || !state::network_available() {
             return Phase::Gate;
         }
-        if !self.first && !self.limiter.try_acquire(std::time::Instant::now()) {
+        let allowed = {
+            let mut limiter = shared().reconnects.lock();
+            let now = std::time::Instant::now();
+            if self.first {
+                // Always allowed (an explicit start), but counted.
+                limiter.record(now);
+                true
+            } else {
+                limiter.try_acquire(now)
+            }
+        };
+        if !allowed {
             return Phase::Throttled(AppError::new(
                 ErrorCode::Network,
                 "Too many reconnects; retrying when the network changes",
@@ -335,7 +354,7 @@ impl Supervisor {
     fn declare_online(&mut self, live: &Live, user: Option<User>) {
         state::record_username(self.login_generation, &live.session);
         state::set_online(Some(live.session.clone()));
-        self.backoff.reset();
+        // No backoff reset here: only a connection that proves stable resets it (`online`).
         self.first = false;
         self.prefer_token = false;
         update_status(|s| {
@@ -365,6 +384,8 @@ impl Supervisor {
                 events::emit(events::CREDENTIALS, &harvested);
             }
         }
+        let connected_at = std::time::Instant::now();
+        let mut stable = false;
         let mut declared = false;
         let mut user_known = false;
         let mut verify_ticks = 0u32;
@@ -375,6 +396,7 @@ impl Supervisor {
         loop {
             tokio::select! {
                 _ = &mut live.task => {
+                    self.backoff.note_uptime(connected_at, std::time::Instant::now());
                     let premium = connector::premium_error(&live.session);
                     log::warn!("spirc task ended (session invalid: {})", live.session.is_invalid());
                     connector::teardown_finished(live, premium.is_none()).await;
@@ -401,8 +423,19 @@ impl Supervisor {
                         connector::teardown(live, false).await;
                         return Phase::Halted(e);
                     }
-                    if live.session.is_invalid() || player_host::dead_generation().is_some() {
+                    if !stable {
+                        stable = self.backoff.note_uptime(connected_at, std::time::Instant::now());
+                    }
+                    if player_host::dead_generation().is_some() {
                         return self.reconnect(live).await;
+                    }
+                    if live.session.is_invalid() {
+                        if stable {
+                            return self.reconnect(live).await;
+                        }
+                        // Lost right after connecting: back off like a failed attempt.
+                        connector::teardown(live, true).await;
+                        return self.retry_after(AppError::new(ErrorCode::Network, "Connection to Spotify lost"));
                     }
                     if !user_known {
                         if let Some(user) = user_of(&live.session) {
@@ -465,12 +498,12 @@ impl Supervisor {
             match self.stop_requested(msg) {
                 None => return Phase::Exit,
                 Some(Msg::Network { available: true, .. }) if throttled => {
-                    self.limiter.reset();
+                    shared().reconnects.lock().reset();
                     self.backoff.reset();
                     return Phase::Connect;
                 }
                 Some(Msg::Reconnect) => {
-                    self.limiter.reset();
+                    shared().reconnects.lock().reset();
                     self.backoff.reset();
                     return Phase::Connect;
                 }

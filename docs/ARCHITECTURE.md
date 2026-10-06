@@ -195,8 +195,12 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   Rust emits a `credentials` event; Kotlin stores them encrypted.
 * Reconnect supervisor: awaits the spirc task end / polls `session.is_invalid()` every 5 s
   while Online (cheap, no network), reacts to `session.setNetworkAvailable`. Backoff
-  1→60 s, reset on success; at most one attempt in flight; no attempts while the network
-  is known to be down. On reconnect: `Session::new`, `player.set_session`, `Spirc::new`.
+  1→60 s, reset once a connection stayed up 60 s (or when the network comes back), so a
+  connection that drops right after connecting keeps backing off; at most one attempt in
+  flight; no attempts while the network is known to be down. At most 10 attempts per
+  10 minutes, counted process-wide (the first attempt after a Kotlin restart is always made
+  but counts), then `Error`/`NETWORK` until the network changes. On reconnect:
+  `Session::new`, `player.set_session`, `Spirc::new`.
 * `session.stop`: `spirc.shutdown()`, await task ≤ 4 s (abort + `dealer().close()` ≤ 2 s on
   timeout), `session.shutdown()`, drop Spirc/Session; the supervisor gets 7 s for this, then it
   is aborted (+ 0.5 s) and cleaned up by force. The Player is dropped on a blocking thread
