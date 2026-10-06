@@ -11,8 +11,10 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
+import com.taehagen.spotifygood.playback.PlaybackCoordinator
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CopyOnWriteArraySet
 
 /**
  * PCM output for the native librespot player (docs/ARCHITECTURE.md §3.2, §4.4).
@@ -37,6 +39,7 @@ class AudioSinkBridge(context: Context) {
         fun onConnectVolume(volume: Int) {}
     }
 
+    private val appContext: Context = context.applicationContext
     private val audioManager = context.getSystemService(AudioManager::class.java)
 
     /** Shared with native code (address taken once at init). Float32 stereo frames. */
@@ -53,13 +56,18 @@ class AudioSinkBridge(context: Context) {
     @Volatile private var started = false
     @Volatile private var preferredDevice: AudioDeviceInfo? = null
     @Volatile private var trackVolume = 1f
+    @Volatile private var duckVolume = 1f
+    @Volatile private var fadeVolume = 1f
+    private val routingListeners = CopyOnWriteArraySet<(AudioDeviceInfo?) -> Unit>()
     @Volatile private var lastWriteMs = 0L
 
     private var watchdogThread: HandlerThread? = null
     private var watchdog: Handler? = null
 
     private val routingListener = AudioRouting.OnRoutingChangedListener { router ->
-        listener?.onRoutedDeviceChanged(router.routedDevice)
+        val device = router.routedDevice
+        listener?.onRoutedDeviceChanged(device)
+        routingListeners.forEach { it(device) }
     }
 
     private val idleCheck = object : Runnable {
@@ -83,6 +91,7 @@ class AudioSinkBridge(context: Context) {
 
     /** Sink::start. Never throws. */
     fun start(): Boolean {
+        ensureListener()
         return try {
             val t = synchronized(lock) { track ?: createTrack().also { track = it } }
             t.play()
@@ -161,10 +170,52 @@ class AudioSinkBridge(context: Context) {
 
     fun routedDevice(): AudioDeviceInfo? = track?.routedDevice
 
-    /** Ducking / fades: per-track gain (system volume is untouched). */
+    /**
+     * Base per-track gain (system volume is untouched). The effective AudioTrack gain is
+     * `trackVolume * duckVolume * fadeVolume`, so ducking (audio focus) and fades (sleep timer)
+     * can overlap without clobbering each other.
+     */
     fun setTrackVolume(volume: Float) {
         trackVolume = volume.coerceIn(0f, 1f)
-        synchronized(lock) { track?.setVolume(trackVolume) }
+        applyGain()
+    }
+
+    /** Audio-focus ducking gain (1 = not ducked). */
+    fun setDuckVolume(volume: Float) {
+        duckVolume = volume.coerceIn(0f, 1f)
+        applyGain()
+    }
+
+    /** Fade gain (sleep timer; 1 = no fade). */
+    fun setFadeVolume(volume: Float) {
+        fadeVolume = volume.coerceIn(0f, 1f)
+        applyGain()
+    }
+
+    /** Additional observers of [AudioRouting] changes (main thread), e.g. the output route manager. */
+    fun addRoutingListener(listener: (AudioDeviceInfo?) -> Unit) {
+        routingListeners += listener
+    }
+
+    fun removeRoutingListener(listener: (AudioDeviceInfo?) -> Unit) {
+        routingListeners -= listener
+    }
+
+    private fun effectiveGain(): Float = trackVolume * duckVolume * fadeVolume
+
+    private fun applyGain() {
+        synchronized(lock) { track?.setVolume(effectiveGain()) }
+    }
+
+    /**
+     * The playback coordinator (audio focus, noisy receiver, locks, volume sync) is normally
+     * installed by the playback service or the UI; if audio starts before either exists (e.g. a
+     * Connect transfer while only a download holds the engine), install it now.
+     */
+    private fun ensureListener() {
+        if (listener != null) return
+        runCatching { PlaybackCoordinator.install(appContext) }
+            .onFailure { Log.w(TAG, "Could not install the playback coordinator", it) }
     }
 
     val isPlaying: Boolean get() = started
@@ -208,7 +259,7 @@ class AudioSinkBridge(context: Context) {
             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_POWER_SAVING)
             .build()
         t.preferredDevice = preferredDevice
-        t.setVolume(trackVolume)
+        t.setVolume(effectiveGain())
         t.addOnRoutingChangedListener(routingListener, android.os.Handler(android.os.Looper.getMainLooper()))
         return t
     }
