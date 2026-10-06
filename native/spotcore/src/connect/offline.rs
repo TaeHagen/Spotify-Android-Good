@@ -72,8 +72,24 @@ fn album_uri(r: &OfflineTrackRecord) -> Option<&str> {
     r.track.as_ref()?.album.as_ref().map(|a| a.uri.as_str())
 }
 
-/// Downloaded members of a context, in record order. Records carry album / artist / show
-/// references; for other contexts (playlists, Liked Songs) every download is used.
+/// Disc and track number (missing numbers sort last).
+fn track_position(r: &OfflineTrackRecord) -> (u32, u32) {
+    let t = r.track.as_ref();
+    (t.and_then(|t| t.disc_number).unwrap_or(1), t.and_then(|t| t.track_number).unwrap_or(u32::MAX))
+}
+
+fn album_release_date(r: &OfflineTrackRecord) -> Option<&str> {
+    r.track.as_ref()?.album.as_ref()?.release_date.as_deref()
+}
+
+fn episode_release_date(r: &OfflineTrackRecord) -> Option<&str> {
+    r.episode.as_ref()?.release_date.as_deref()
+}
+
+/// Downloaded members of a context, in context order: albums by disc and track number, artists
+/// by album (newest first) and track, shows newest episode first. Only album, artist and show
+/// membership is known from the records; for other contexts (playlists, Liked Songs, stations)
+/// the result is empty, the caller has to send the downloaded items as `trackUris`.
 fn context_members(context_uri: &str, records: &[OfflineTrackRecord]) -> Vec<String> {
     let kind = uri::context_type(context_uri);
     let member = |r: &OfflineTrackRecord| match kind {
@@ -83,9 +99,23 @@ fn context_members(context_uri: &str, records: &[OfflineTrackRecord]) -> Vec<Str
                 || t.album.as_ref().is_some_and(|al| al.artists.iter().any(|a| a.uri == context_uri))
         }),
         "show" => r.episode.as_ref().and_then(|e| e.show.as_ref()).is_some_and(|s| s.uri == context_uri),
-        _ => true,
+        _ => false,
     };
-    records.iter().filter(|r| member(r)).map(|r| r.uri.clone()).collect()
+    let mut members: Vec<&OfflineTrackRecord> = records.iter().filter(|r| member(r)).collect();
+    match kind {
+        "album" => members.sort_by(|a, b| track_position(a).cmp(&track_position(b)).then_with(|| a.uri.cmp(&b.uri))),
+        "artist" => members.sort_by(|a, b| {
+            album_release_date(b)
+                .cmp(&album_release_date(a))
+                .then_with(|| album_uri(a).cmp(&album_uri(b)))
+                .then_with(|| track_position(a).cmp(&track_position(b)))
+                .then_with(|| a.uri.cmp(&b.uri))
+        }),
+        "show" => members
+            .sort_by(|a, b| episode_release_date(b).cmp(&episode_release_date(a)).then_with(|| a.uri.cmp(&b.uri))),
+        _ => {}
+    }
+    members.into_iter().map(|r| r.uri.clone()).collect()
 }
 
 /// The downloaded items `args` asks for and the start index among them.
@@ -108,8 +138,8 @@ pub(crate) fn resolve(args: &LoadArgs) -> (Vec<String>, usize) {
                 return if downloads::is_downloaded(ctx) { (vec![ctx.to_string()], 0) } else { (Vec::new(), 0) };
             }
             let members = context_members(ctx, &downloads::all_records());
-            let (items, start) =
-                select_downloaded(&members, |_| true, args.start_index.map(|i| i as usize), args.start_uri.as_deref());
+            // `startIndex` refers to the caller's whole context, not to the downloaded members.
+            let (items, start) = select_downloaded(&members, |_| true, None, args.start_uri.as_deref());
             let start = uid_index.filter(|&i| i < items.len()).unwrap_or(start);
             (items, start)
         }
@@ -263,7 +293,7 @@ pub(crate) fn on_player_event(event: &PlayerEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{AlbumRef, ArtistRef, Track};
+    use crate::models::{AlbumRef, ArtistRef, Episode, ShowRef, Track};
 
     fn record(uri: &str, album: &str, artist: &str) -> OfflineTrackRecord {
         OfflineTrackRecord {
@@ -287,6 +317,27 @@ mod tests {
         }
     }
 
+    fn numbered(mut r: OfflineTrackRecord, disc: u32, track: u32, released: &str) -> OfflineTrackRecord {
+        let t = r.track.as_mut().unwrap();
+        t.disc_number = Some(disc);
+        t.track_number = Some(track);
+        t.album.as_mut().unwrap().release_date = Some(released.into());
+        r
+    }
+
+    fn episode(uri: &str, show: &str, released: &str) -> OfflineTrackRecord {
+        OfflineTrackRecord {
+            track: None,
+            episode: Some(Episode {
+                uri: uri.into(),
+                show: Some(ShowRef { uri: show.into(), name: "s".into(), publisher: None, images: vec![] }),
+                release_date: Some(released.into()),
+                ..Default::default()
+            }),
+            ..record(uri, "", "")
+        }
+    }
+
     #[test]
     fn context_membership() {
         let records = vec![
@@ -295,7 +346,31 @@ mod tests {
             record("spotify:track:3", "spotify:album:a", "spotify:artist:y"),
         ];
         assert_eq!(context_members("spotify:album:a", &records), vec!["spotify:track:1", "spotify:track:3"]);
-        assert_eq!(context_members("spotify:artist:y", &records), vec!["spotify:track:2", "spotify:track:3"]);
-        assert_eq!(context_members("spotify:playlist:p", &records).len(), 3, "no membership info: all downloads");
+        assert_eq!(context_members("spotify:artist:y", &records), vec!["spotify:track:3", "spotify:track:2"]);
+        // no membership info: nothing (instead of every download)
+        assert!(context_members("spotify:playlist:p", &records).is_empty());
+        assert!(context_members("spotify:user:u:collection", &records).is_empty());
+    }
+
+    #[test]
+    fn context_members_in_context_order() {
+        // records come sorted by uri, which isn't the album order
+        let records = vec![
+            numbered(record("spotify:track:a", "spotify:album:x", "spotify:artist:y"), 2, 1, "2020"),
+            numbered(record("spotify:track:b", "spotify:album:x", "spotify:artist:y"), 1, 3, "2020"),
+            numbered(record("spotify:track:c", "spotify:album:x", "spotify:artist:y"), 1, 1, "2020"),
+            numbered(record("spotify:track:d", "spotify:album:z", "spotify:artist:y"), 1, 1, "2023"),
+            episode("spotify:episode:e", "spotify:show:s", "2024-01-01"),
+            episode("spotify:episode:f", "spotify:show:s", "2024-03-01"),
+        ];
+        assert_eq!(
+            context_members("spotify:album:x", &records),
+            vec!["spotify:track:c", "spotify:track:b", "spotify:track:a"]
+        );
+        assert_eq!(
+            context_members("spotify:artist:y", &records),
+            vec!["spotify:track:d", "spotify:track:c", "spotify:track:b", "spotify:track:a"]
+        );
+        assert_eq!(context_members("spotify:show:s", &records), vec!["spotify:episode:f", "spotify:episode:e"]);
     }
 }

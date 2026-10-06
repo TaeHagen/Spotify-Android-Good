@@ -237,7 +237,11 @@ commands are handled by `OfflineController`: a local queue of downloaded tracks 
 shuffle (seeded), repeat context/track, user queue (add/remove/move/clear/skipTo),
 prev/next semantics identical to Spirc (prev restarts if position > 3 s). It drives the
 same Player and emits the same `playback` snapshots with `source:"local"`,
-`isActiveDevice:true`, `offline:true`. When the session comes back Online, the offline
+`isActiveDevice:true`, `offline:true`. A `player.load` with `trackUris` queues the downloaded
+ones among them; a bare album / artist / show `contextUri` queues its downloads in context
+order (disc and track number; newest episode first). Downloads carry no playlist or Liked
+Songs membership, so such a context without `trackUris` fails with `UNAVAILABLE` "Not
+available offline" (Kotlin sends the downloaded items as `trackUris`). When the session comes back Online, the offline
 queue keeps playing; the next `player.load` goes through Spirc again.
 
 ## 5. Events (Rust → Kotlin `onEvent(type, json)`)
