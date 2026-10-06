@@ -3,8 +3,10 @@
 //! * The mixer is created once per process (first `session.start`, with the current Android
 //!   media volume) and never dropped, so the volume survives player re-creation.
 //! * The Player is created once and re-bound to every new Session (`Player::set_session`). It is
-//!   dropped (on a blocking thread: its `Drop` joins the player thread) only on
+//!   dropped (on a blocking thread, bounded: its `Drop` joins the player thread) only on
 //!   `session.stop {releasePlayer:true}`, or replaced when its thread died (`is_invalid`).
+//! * Only the online bind (`bind`) and `detach_session` change the session of an existing
+//!   Player; offline playback uses whatever Player exists.
 //! * Without an online session the Player is bound to a never-connected "offline" Session, so no
 //!   dead online session (and its sockets) is kept alive by the Player.
 //! * One task per Player forwards its events to `connect`; when the channel closes while the
@@ -34,7 +36,8 @@ struct Host {
 static HOST: Mutex<Option<Host>> = parking_lot::const_mutex(None);
 static MIXER: OnceLock<Arc<AndroidMixer>> = OnceLock::new();
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-/// Serialises Player creation (online bind vs. offline playback).
+/// Serialises Player creation (online bind vs. offline playback). The offline path must never
+/// rebind an existing Player: a connect attempt may have just bound it to the online session.
 static CREATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The process mixer, if a session was ever started.
@@ -94,14 +97,18 @@ fn create(session: &Session, settings: &EngineSettings) -> Arc<Player> {
     player
 }
 
-/// Binds `session` to the Player, creating it first if there is none (or it died).
-pub(crate) async fn bind(session: &Session, settings: &EngineSettings) -> Arc<Player> {
+/// The healthy Player, created first if there is none (or it died), under `CREATE`.
+/// `rebind`: bind an existing Player to this session (the online bind); a new Player gets it, or
+/// an offline session when `None`. With `None` an existing Player keeps its session.
+async fn get_or_create(rebind: Option<&Session>, settings: &EngineSettings) -> Arc<Player> {
     let _creating = CREATE.lock().await;
     let dead = {
         let mut host = HOST.lock();
         match host.as_ref() {
             Some(h) if !h.player.is_invalid() => {
-                h.player.set_session(session.clone());
+                if let Some(session) = rebind {
+                    h.player.set_session(session.clone());
+                }
                 return h.player.clone();
             }
             _ => host.take(),
@@ -111,16 +118,24 @@ pub(crate) async fn bind(session: &Session, settings: &EngineSettings) -> Arc<Pl
         log::warn!("player {} died, creating a new one", dead.generation);
         drop_player(dead.player).await;
     }
-    create(session, settings)
+    match rebind {
+        Some(session) => create(session, settings),
+        None => create(&offline_session(), settings),
+    }
 }
 
-/// A Player for the OfflineController (bound to an offline session if it has to be created).
+/// Binds `session` to the Player, creating it first if there is none (or it died).
+pub(crate) async fn bind(session: &Session, settings: &EngineSettings) -> Arc<Player> {
+    get_or_create(Some(session), settings).await
+}
+
+/// A Player for the OfflineController. An existing Player is used as it is (it may be bound to
+/// the online session of a connect attempt that won `CREATE`); a new one gets an offline session.
 pub(crate) async fn ensure_player_for_offline() -> AppResult<Arc<Player>> {
     if let Some(p) = player() {
         return Ok(p);
     }
-    let session = offline_session();
-    Ok(bind(&session, &super::settings()).await)
+    Ok(get_or_create(None, &super::settings()).await)
 }
 
 /// Releases the online session held by the Player (rebinds it to an offline session).
