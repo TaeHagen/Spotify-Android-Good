@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
@@ -41,6 +42,7 @@ import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Repeat
 import androidx.compose.material.icons.rounded.RepeatOne
+import androidx.compose.material.icons.rounded.Replay
 import androidx.compose.material.icons.rounded.SettingsInputHdmi
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.SkipNext
@@ -84,6 +86,7 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -91,6 +94,7 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
@@ -169,6 +173,43 @@ internal fun SkipButton(next: Boolean, enabled: Boolean, onClick: () -> Unit, mo
             contentDescription = stringResource(if (next) R.string.player_next else R.string.player_previous),
             modifier = Modifier.size(iconSize),
         )
+    }
+}
+
+/**
+ * Podcast skip back / forward by [SEEK_STEP_MS]: a circular arrow (mirrored for forward) with the
+ * step in seconds inside (Material has no 15 s icon).
+ */
+@Composable
+internal fun SeekStepButton(forward: Boolean, enabled: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier, iconSize: Dp = 36.dp) {
+    val seconds = (SEEK_STEP_MS / 1000).toInt()
+    val label = stringResource(if (forward) R.string.player_seek_forward_step else R.string.player_seek_back_step, seconds)
+    // Sized with the icon, independent of the font scale (the number must fit inside the arrow).
+    val numberSize = with(LocalDensity.current) { (iconSize * 0.3f).toSp() }
+    IconButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier
+            .size(maxOf(iconSize + 12.dp, 48.dp))
+            .semantics { contentDescription = label },
+    ) {
+        Box(Modifier.size(iconSize).clearAndSetSemantics {}, contentAlignment = Alignment.Center) {
+            Icon(
+                imageVector = Icons.Rounded.Replay,
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { if (forward) scaleX = -1f },
+            )
+            Text(
+                text = seconds.toString(),
+                fontSize = numberSize,
+                fontWeight = FontWeight.Bold,
+                color = LocalContentColor.current,
+                // The arrow's circle is centred slightly below the icon's centre.
+                modifier = Modifier.offset(y = iconSize / 24),
+            )
+        }
     }
 }
 

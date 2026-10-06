@@ -314,6 +314,7 @@ private fun NowPlayingBody(
             onPlayPause = viewModel::togglePlayPause,
             onNext = viewModel::next,
             onRepeat = viewModel::cycleRepeat,
+            onSeekBy = viewModel::seekBy,
         )
         // Fixed-volume receivers and some groups ignore volume changes (the thumb would snap back).
         if (isRemote && remoteVolumeSupported) {
@@ -811,28 +812,36 @@ private fun TransportControls(
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
     onRepeat: () -> Unit,
+    onSeekBy: (deltaMs: Long) -> Unit,
 ) {
     val restrictions = snapshot.restrictions
+    // Podcasts: skip back / forward 15 s next to play/pause instead of shuffle and repeat.
+    val episode = snapshot.track?.isEpisode == true
+    val skipSize = if (episode) 32.dp else 40.dp
     Row(
         Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        ShuffleButton(
-            shuffle = snapshot.shuffle,
-            smart = snapshot.smartShuffle,
-            enabled = restrictions.canToggleShuffle,
-            onClick = onShuffle,
-        )
-        SkipButton(next = false, enabled = restrictions.canSkipPrev, onClick = onPrevious, iconSize = 40.dp)
+        if (!episode) {
+            ShuffleButton(
+                shuffle = snapshot.shuffle,
+                smart = snapshot.smartShuffle,
+                enabled = restrictions.canToggleShuffle,
+                onClick = onShuffle,
+            )
+        }
+        SkipButton(next = false, enabled = restrictions.canSkipPrev, onClick = onPrevious, iconSize = skipSize)
+        if (episode) SeekStepButton(forward = false, enabled = restrictions.canSeek, onClick = { onSeekBy(-SEEK_STEP_MS) })
         PlayPauseButton(
             status = snapshot.status,
             onClick = onPlayPause,
             enabled = !(snapshot.status == PlaybackStatus.PLAYING && !restrictions.canPause),
             size = 68.dp,
         )
-        SkipButton(next = true, enabled = restrictions.canSkipNext, onClick = onNext, iconSize = 40.dp)
-        RepeatButton(mode = snapshot.repeat, enabled = restrictions.canToggleRepeat, onClick = onRepeat)
+        if (episode) SeekStepButton(forward = true, enabled = restrictions.canSeek, onClick = { onSeekBy(SEEK_STEP_MS) })
+        SkipButton(next = true, enabled = restrictions.canSkipNext, onClick = onNext, iconSize = skipSize)
+        if (!episode) RepeatButton(mode = snapshot.repeat, enabled = restrictions.canToggleRepeat, onClick = onRepeat)
     }
 }
 

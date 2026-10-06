@@ -56,6 +56,8 @@
     <string name="player_seek">Playback position</string>
     <string name="player_seek_state">%1$s of %2$s</string>
     <string name="player_volume">Volume</string>
+    <string name="player_seek_back_step">Back %1$d seconds</string>
+    <string name="player_seek_forward_step">Forward %1$d seconds</string>
     <string name="player_volume_state">%1$d percent</string>
     <string name="player_open_now_playing">Open now playing</string>
     <string name="player_open_queue">Queue</string>

@@ -53,6 +53,46 @@ class TimeFormatTest {
     }
 }
 
+class SeekStepTest {
+    private val episode = "spotify:episode:e"
+
+    @Test
+    fun stepsStayInsideTheItem() {
+        assertEquals(45_000, seekStepTarget(30_000, SEEK_STEP_MS, durationMs = 600_000))
+        assertEquals(15_000, seekStepTarget(30_000, -SEEK_STEP_MS, durationMs = 600_000))
+        assertEquals(0, seekStepTarget(10_000, -SEEK_STEP_MS, durationMs = 600_000))
+        assertEquals(600_000, seekStepTarget(590_000, SEEK_STEP_MS, durationMs = 600_000))
+        // Unknown duration: only the start is a limit.
+        assertEquals(605_000, seekStepTarget(590_000, SEEK_STEP_MS, durationMs = 0))
+        assertEquals(0, seekStepTarget(5_000, -SEEK_STEP_MS, durationMs = 0))
+    }
+
+    @Test
+    fun quickRepeatedStepsBuildOnEachOther() {
+        // Back 15 s twice within a second while the snapshot still shows 100 s: 70 s, not 85 s.
+        val first = seekStepTarget(seekStepBase(episode, 100_000, null, nowMs = 0, playing = false), -SEEK_STEP_MS, 600_000)
+        val pending = PendingSeek(episode, first, atMs = 0)
+        val second = seekStepTarget(seekStepBase(episode, 100_000, pending, nowMs = 400, playing = false), -SEEK_STEP_MS, 600_000)
+        assertEquals(85_000, first)
+        assertEquals(70_000, second)
+    }
+
+    @Test
+    fun aChainedStepAccountsForTheTimePlayedSince() {
+        val pending = PendingSeek(episode, 85_000, atMs = 1_000)
+        assertEquals(85_500, seekStepBase(episode, 100_000, pending, nowMs = 1_500, playing = true))
+        assertEquals(85_000, seekStepBase(episode, 100_000, pending, nowMs = 1_500, playing = false))
+    }
+
+    @Test
+    fun anOldOrForeignPendingStepIsIgnored() {
+        val pending = PendingSeek(episode, 85_000, atMs = 1_000)
+        assertEquals(100_000, seekStepBase(episode, 100_000, pending, nowMs = 1_000 + SEEK_CHAIN_WINDOW_MS + 1, playing = false))
+        assertEquals(100_000, seekStepBase("spotify:episode:other", 100_000, pending, nowMs = 1_200, playing = false))
+        assertEquals(100_000, seekStepBase(episode, 100_000, pending, nowMs = 500, playing = false))
+    }
+}
+
 class LyricsIndexTest {
     private val lines = listOf(1_000L, 4_000L, 4_000L, 9_500L, 15_000L).map { LyricsLine(startTimeMs = it, words = "l$it") }
 

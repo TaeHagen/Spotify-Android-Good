@@ -47,6 +47,44 @@ internal fun PlaybackSnapshot.effectiveDurationMs(): Long =
     if (durationMs > 0) durationMs else track?.durationMs ?: 0L
 
 // ---------------------------------------------------------------------------------------------
+// Skip back / forward (podcast episodes)
+// ---------------------------------------------------------------------------------------------
+
+/** Step of the podcast skip-back / skip-forward buttons. */
+internal const val SEEK_STEP_MS = 15_000L
+
+/** Quick repeated steps within this window build on each other (see [seekStepBase]). */
+internal const val SEEK_CHAIN_WINDOW_MS = 1_500L
+
+/** A skip the engine may not reflect yet: [targetMs] in [uri], requested at [atMs] (monotonic clock). */
+internal data class PendingSeek(val uri: String, val targetMs: Long, val atMs: Long)
+
+/**
+ * Where the next skip step starts. Right after a step the snapshot may still show the old position
+ * (remote devices take a moment), so quick taps build on the previous target, plus the time played
+ * since, instead of all starting from the same stale position.
+ */
+internal fun seekStepBase(
+    uri: String,
+    positionMs: Long,
+    pending: PendingSeek?,
+    nowMs: Long,
+    playing: Boolean,
+    windowMs: Long = SEEK_CHAIN_WINDOW_MS,
+): Long {
+    if (pending == null || pending.uri != uri) return positionMs
+    val elapsed = nowMs - pending.atMs
+    if (elapsed !in 0..windowMs) return positionMs
+    return pending.targetMs + if (playing) elapsed else 0
+}
+
+/** [baseMs] moved by [deltaMs], kept inside the item (0..[durationMs] when the duration is known). */
+internal fun seekStepTarget(baseMs: Long, deltaMs: Long, durationMs: Long): Long {
+    val target = baseMs + deltaMs
+    return if (durationMs > 0) target.coerceIn(0, durationMs) else target.coerceAtLeast(0)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Lyrics
 // ---------------------------------------------------------------------------------------------
 

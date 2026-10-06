@@ -219,7 +219,25 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
     fun togglePlayPause() = player.togglePlayPause()
     fun next() = player.next()
     fun previous() = player.previous()
-    fun seekTo(positionMs: Long) = player.seekTo(positionMs.coerceAtLeast(0))
+    fun seekTo(positionMs: Long) {
+        pendingSeek = null
+        player.seekTo(positionMs.coerceAtLeast(0))
+    }
+
+    /** Last skip step, so quick repeated taps add up before the snapshot catches up (main thread). */
+    private var pendingSeek: PendingSeek? = null
+
+    /** Podcast skip back / forward by [deltaMs] (e.g. ±[SEEK_STEP_MS]). */
+    fun seekBy(deltaMs: Long) {
+        val s = playback.snapshot.value
+        val uri = s.track?.uri ?: return
+        if (!s.restrictions.canSeek) return
+        val now = SystemClock.elapsedRealtime()
+        val base = seekStepBase(uri, playback.positionMs(), pendingSeek, now, s.isPlaying)
+        val target = seekStepTarget(base, deltaMs, s.effectiveDurationMs())
+        pendingSeek = PendingSeek(uri, target, now)
+        player.seekTo(target)
+    }
     fun cycleShuffle() = player.cycleShuffle()
     fun cycleRepeat() = player.cycleRepeat()
     fun setVolume(volume: Int) = volumeThrottle.offer(volume)
