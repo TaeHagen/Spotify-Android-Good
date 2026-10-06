@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.os.Looper
+import android.os.SystemClock
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.DeviceInfo
@@ -25,10 +26,13 @@ import com.taehagen.spotifygood.model.RepeatMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.guava.future
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -63,6 +67,9 @@ internal class SpotifyPlayer(
     private var itemCache: Map<String, CachedItem> = emptyMap()
     private var unmutePercent = DEFAULT_UNMUTE_PERCENT
     private var mutedByUs = false
+    /** Last remote volume we sent, so quick volume-key steps accumulate before the snapshot catches up. */
+    private val remoteVolume = RemoteVolumeTarget(SystemClock::elapsedRealtime)
+    private var remoteVolumeExpiry: Job? = null
 
     private data class ItemKey(
         val track: PlaybackTrack,
@@ -132,12 +139,15 @@ internal class SpotifyPlayer(
             )
 
         if (remote) {
-            val percent = VolumeMath.connectToPercent(s.volume)
+            // While a target we sent is in flight, report it instead of the stale snapshot value
+            // (the system volume UI would otherwise bounce between old and new).
+            val percent = remoteVolume.reported(s.activeDevice?.id, VolumeMath.connectToPercent(s.volume))
             if (percent > 0) mutedByUs = false
             builder.setDeviceInfo(REMOTE_DEVICE_INFO)
                 .setDeviceVolume(percent)
                 .setIsDeviceMuted(mutedByUs && percent == 0)
         } else {
+            remoteVolume.clear()
             val min = volume.minIndex
             val max = volume.maxIndex.coerceAtLeast(min)
             builder.setDeviceInfo(DeviceInfo.Builder(DeviceInfo.PLAYBACK_TYPE_LOCAL).setMinVolume(min).setMaxVolume(max).build())
@@ -328,7 +338,7 @@ internal class SpotifyPlayer(
 
     override fun handleSetDeviceVolume(deviceVolume: Int, flags: Int): ListenableFuture<*> {
         mutedByUs = false
-        return track(controller.setVolumeAsync(VolumeMath.percentToConnect(deviceVolume)))
+        return sendRemoteVolume(deviceVolume)
     }
 
     override fun handleIncreaseDeviceVolume(flags: Int): ListenableFuture<*> =
@@ -340,15 +350,31 @@ internal class SpotifyPlayer(
     override fun handleSetDeviceMuted(muted: Boolean, flags: Int): ListenableFuture<*> {
         return if (muted) {
             currentRemotePercent().takeIf { it > 0 }?.let { unmutePercent = it }
-            val op = controller.setVolumeAsync(0)
             mutedByUs = true
-            track(op)
+            sendRemoteVolume(0)
         } else {
             handleSetDeviceVolume(unmutePercent, flags)
         }
     }
 
-    private fun currentRemotePercent(): Int = VolumeMath.connectToPercent(playback.snapshot.value.volume)
+    /** Sends [percent] to the active (remote) device and remembers it as the base of the next step. */
+    private fun sendRemoteVolume(percent: Int): ListenableFuture<*> {
+        val target = percent.coerceIn(0, 100)
+        remoteVolume.set(target, playback.snapshot.value.activeDevice?.id)
+        // Re-publish from the snapshot once the target expires unconfirmed (e.g. a failed PUT).
+        remoteVolumeExpiry?.cancel()
+        remoteVolumeExpiry = scope.launch {
+            delay((remoteVolume.remainingMs() ?: 0) + 1)
+            invalidateState()
+        }
+        return track(controller.setVolumeAsync(VolumeMath.percentToConnect(target)))
+    }
+
+    /** The remote volume a relative step starts from: our in-flight target, else the device's. */
+    private fun currentRemotePercent(): Int {
+        val s = playback.snapshot.value
+        return remoteVolume.base(s.activeDevice?.id, VolumeMath.connectToPercent(s.volume))
+    }
 
     /**
      * Future completing when all [ops] finished and the engine published a new snapshot (or after
