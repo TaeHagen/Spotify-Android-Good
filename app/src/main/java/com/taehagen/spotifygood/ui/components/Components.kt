@@ -131,7 +131,7 @@ import kotlinx.coroutines.delay
 private const val DISABLED_ALPHA = 0.38f
 
 /** Space below the status bar kept free for the transparent back-button bar of detail pages. */
-private val OVERLAID_TOP_BAR_SPACE = 48.dp
+private val OVERLAID_TOP_BAR_SPACE = 56.dp
 
 /** Cover art / artist image with placeholder, crossfade and Coil caching. */
 @Composable
