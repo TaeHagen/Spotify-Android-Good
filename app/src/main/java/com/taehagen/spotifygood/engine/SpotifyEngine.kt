@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioManager
 import android.util.Log
 import com.taehagen.spotifygood.auth.CredentialStore
+import com.taehagen.spotifygood.auth.KeystoreUnavailableException
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.data.settings.toEngineSettings
 import com.taehagen.spotifygood.model.EngineSettings
@@ -48,6 +49,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Who needs the native session to run (docs/ARCHITECTURE.md §9.2). */
@@ -147,8 +149,11 @@ class SpotifyEngine(
         launchSafe("load-credentials") {
             try {
                 val stored = try {
-                    withContext(Dispatchers.IO) { credentialStore.loadCredentials() }
+                    loadStoredCredentials()
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
+                    // Nothing was deleted: the next process start reads them again.
                     Log.e(TAG, "Loading credentials failed", e)
                     null
                 }
@@ -169,6 +174,26 @@ class SpotifyEngine(
         launchSafe("session-events") { events.session.collect { onSessionEvent(it) } }
         launchSafe("credential-events") { events.credentials.collect { onCredentials(it) } }
         launchSafe("error-events") { events.errors.collect { onErrorEvent(it) } }
+    }
+
+    /**
+     * Reads the stored credentials. A Keystore that is briefly unavailable (keystore2 busy right
+     * after boot) is retried; CredentialStore never deletes anything for such a failure.
+     */
+    private suspend fun loadStoredCredentials(): StoredCredentials? {
+        var delayMs = CREDENTIALS_RETRY_DELAY_MS
+        repeat(CREDENTIALS_LOAD_ATTEMPTS - 1) { attempt ->
+            try {
+                return withContext(Dispatchers.IO) { credentialStore.loadCredentials() }
+            } catch (e: KeystoreUnavailableException) {
+                Log.w(TAG, "Credentials not readable yet (attempt ${attempt + 1}), retrying")
+            } catch (e: IOException) {
+                Log.w(TAG, "Credentials not readable yet (attempt ${attempt + 1}): ${e.javaClass.simpleName}, retrying")
+            }
+            delay(delayMs)
+            delayMs *= 3
+        }
+        return withContext(Dispatchers.IO) { credentialStore.loadCredentials() }
     }
 
     /** Supplies decrypted download records pushed to `offline.setIndex` whenever the engine starts. */
@@ -782,6 +807,8 @@ class SpotifyEngine(
         /** `session.logout` = the stop plus deleting the streaming cache. */
         private const val LOGOUT_TIMEOUT_MS = 30_000L
         private const val OFFLINE_INDEX_TIMEOUT_MS = 30_000L
+        private const val CREDENTIALS_LOAD_ATTEMPTS = 4
+        private const val CREDENTIALS_RETRY_DELAY_MS = 200L
         private val FATAL_CODES = setOf(NativeErrorCode.BAD_CREDENTIALS, NativeErrorCode.PREMIUM_REQUIRED)
 
         private fun nativeUnavailableInfo() =
