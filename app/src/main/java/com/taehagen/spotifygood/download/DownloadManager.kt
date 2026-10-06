@@ -21,13 +21,10 @@ import androidx.work.WorkManager
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.auth.CredentialStore
 import com.taehagen.spotifygood.data.SpotifyUris
-import com.taehagen.spotifygood.data.callUnitOffMain
 import com.taehagen.spotifygood.data.db.AppDatabase
 import com.taehagen.spotifygood.data.db.DownloadCollectionEntity
 import com.taehagen.spotifygood.data.db.DownloadEntity
 import com.taehagen.spotifygood.data.db.DownloadFileRow
-import com.taehagen.spotifygood.data.putStrings
-import com.taehagen.spotifygood.data.rpcArgs
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.engine.SpotifyEngine
@@ -55,7 +52,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
 import java.io.File
@@ -124,6 +120,8 @@ data class DownloadActivity(
  *   and downloads older than 30 days are re-validated. Items the user removed individually from a
  *   downloaded collection stay removed until the collection is downloaded again.
  * * Removal deletes files, rows and the native offline index entries.
+ * * The native offline index follows the database through numbered changes ([OfflineIndexSync]):
+ *   every commit and removal takes its number under [mutex] with its database write.
  */
 class DownloadManager(
     context: Context,
@@ -141,16 +139,17 @@ class DownloadManager(
     private val json = rpc.json
     private val itemsSerializer = ListSerializer(String.serializer())
 
-    /** Serializes membership changes, removals and the runner's commits. */
+    /** Serializes membership changes, removals, the runner's commits and offline index snapshots. */
     private val mutex = Mutex()
     private val syncMutex = Mutex()
     private val keys = KeyCache()
     private val resolver = CollectionResolver(rpc, json)
+    private val index = OfflineIndexSync(rpc)
 
     internal val storage = DownloadStorage(appContext)
     internal val notifications = DownloadNotifications(appContext)
     internal val runner = DownloadRunner(
-        appContext, database, rpc, events, engine, settings, credentialStore, storage, notifications, keys, mutex,
+        appContext, database, rpc, events, engine, settings, credentialStore, storage, notifications, keys, mutex, index,
     )
 
     /** Network policy (`downloadOverCellular`) of what this process scheduled last; null = nothing. */
@@ -246,9 +245,9 @@ class DownloadManager(
                 addedAt = existing?.addedAt ?: now,
                 lastSyncedAt = existing?.lastSyncedAt,
             )
-            applyMembershipLocked(entity, resolved, userInitiated = true).removed
+            applyMembershipLocked(entity, resolved, userInitiated = true).removal
         }
-        afterRemoval(removed)
+        afterRemoval(listOf(removed))
         updateSyncSchedule(true)
         scheduleExecution()
     }
@@ -266,9 +265,9 @@ class DownloadManager(
                 deleteRows(toDelete)
             }
             deleteFiles(files)
-            toDelete
+            Removal(toDelete, index.next())
         }
-        afterRemoval(removed)
+        afterRemoval(listOf(removed))
         if (collectionDao.count() == 0) updateSyncSchedule(false)
     }
 
@@ -310,16 +309,16 @@ class DownloadManager(
             val files = fileRows(targets)
             database.withTransaction { deleteRows(targets) }
             deleteFiles(files)
-            files.map { it.uri }
+            Removal(files.map { it.uri }, index.next())
         }
-        afterRemoval(removed)
+        afterRemoval(listOf(removed))
     }
 
     /** Deletes every download and collection and cancels pending work (settings "Remove all", logout). */
     suspend fun removeAll() {
         cancelScheduledWork()
         runner.stop()
-        val uris = mutex.withLock {
+        val removal = mutex.withLock {
             val all = dao.allUris()
             database.withTransaction {
                 dao.deleteAll()
@@ -327,11 +326,11 @@ class DownloadManager(
             }
             withContext(Dispatchers.IO) { storage.deleteAll() }
             keys.clear()
-            all
+            Removal(all, index.next())
         }
         scheduledCellular = null
         notifications.cancelAll()
-        if (uris.isNotEmpty()) offlineRemove(uris)
+        index.remove(removal.uris, removal.seq)
     }
 
     /** Puts failed and cancelled downloads back into the queue. */
@@ -339,9 +338,13 @@ class DownloadManager(
         if (dao.requeueFailed() > 0) scheduleExecution()
     }
 
-    /** Decrypted records of all completed downloads (engine pushes them to `offline.setIndex`). */
+    /**
+     * Decrypted records of all completed downloads: the snapshot the engine pushes with
+     * `offline.setIndex`. It is announced natively (`offline.beginIndex`) with the number of the last
+     * change it contains, so commits and removals made while it is built and sent survive the push.
+     */
     suspend fun offlineRecords(): List<OfflineTrackRecord> = withContext(Dispatchers.IO) {
-        val rows = dao.withState(DownloadState.COMPLETED)
+        val (seq, rows) = mutex.withLock { index.last() to dao.withState(DownloadState.COMPLETED) }
         val records = ArrayList<OfflineTrackRecord>(rows.size)
         val undecryptable = ArrayList<String>()
         val missing = ArrayList<String>()
@@ -369,6 +372,7 @@ class DownloadManager(
         if (undecryptable.isNotEmpty() || missing.isNotEmpty()) {
             Log.w(TAG, "Skipped ${undecryptable.size} undecryptable and ${missing.size} missing downloads")
         }
+        index.beginSnapshot(seq)
         records
     }
 
@@ -395,7 +399,7 @@ class DownloadManager(
             try {
                 if (!engine.awaitOnline(SYNC_ONLINE_TIMEOUT_MS)) return false
                 var added = 0
-                val removed = ArrayList<String>()
+                val removed = ArrayList<Removal>()
                 for (collection in all) {
                     val type = CollectionType.fromWire(collection.type) ?: continue
                     val resolved = try {
@@ -416,7 +420,7 @@ class DownloadManager(
                         }
                     } ?: continue
                     added += result.added
-                    removed += result.removed
+                    removed += result.removal
                 }
                 revalidate()
                 afterRemoval(removed)
@@ -436,7 +440,10 @@ class DownloadManager(
 
     // ---- membership ----------------------------------------------------------------------------------
 
-    private class MembershipResult(val added: Int, val removed: List<String>)
+    private class MembershipResult(val added: Int, val removal: Removal)
+
+    /** Downloads deleted by one change of the offline index ([OfflineIndexSync.next]). */
+    private class Removal(val uris: List<String>, val seq: Long)
 
     /**
      * Must hold [mutex]. Stores [resolved] as the new membership of [entity], queues items (all of
@@ -474,7 +481,7 @@ class DownloadManager(
             deleteRows(toDelete)
         }
         deleteFiles(files)
-        return MembershipResult(toQueue.size, toDelete)
+        return MembershipResult(toQueue.size, Removal(toDelete, index.next()))
     }
 
     private suspend fun insertRows(items: List<CollectionResolver.Item>, quality: Int, individual: Boolean, now: Long) {
@@ -518,23 +525,12 @@ class DownloadManager(
     }
 
     /** After deletions (outside [mutex]): drop them from the native index and collect orphans. */
-    private suspend fun afterRemoval(uris: List<String>) {
-        if (uris.isEmpty()) return
-        offlineRemove(uris)
+    private suspend fun afterRemoval(removals: List<Removal>) {
+        val nonEmpty = removals.filter { it.uris.isNotEmpty() }
+        if (nonEmpty.isEmpty()) return
+        // Each with its own number: a later commit of one of these URIs (downloaded again) must win.
+        nonEmpty.forEach { index.remove(it.uris, it.seq) }
         runner.collectGarbageIfIdle()
-    }
-
-    private suspend fun offlineRemove(uris: List<String>) {
-        try {
-            withTimeoutOrNull(NATIVE_CALL_TIMEOUT_MS) {
-                uris.chunked(SQL_CHUNK).forEach { chunk -> rpc.callUnitOffMain("offline.remove", rpcArgs { putStrings("uris", chunk) }) }
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // Not fatal: the engine rebuilds its index from offlineRecords() at the next start.
-            Log.w(TAG, "offline.remove failed", e)
-        }
     }
 
     private suspend fun revalidate() {
@@ -555,9 +551,12 @@ class DownloadManager(
         if (gone.isNotEmpty()) {
             // Marked failed (not playable offline any more); the file stays until the user removes it.
             val message = appContext.getString(R.string.data_dl_error_unplayable)
-            gone.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, message, now) }
-            keys.remove(gone)
-            offlineRemove(gone)
+            val seq = mutex.withLock {
+                gone.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, message, now) }
+                keys.remove(gone)
+                index.next()
+            }
+            index.remove(gone, seq)
         }
     }
 
@@ -714,7 +713,6 @@ class DownloadManager(
         private const val SQL_CHUNK = 500
         private const val STATES_STOP_TIMEOUT_MS = 5_000L
         private const val METADATA_TIMEOUT_MS = 10_000L
-        private const val NATIVE_CALL_TIMEOUT_MS = 10_000L
         private const val SYNC_ONLINE_TIMEOUT_MS = 60_000L
         private const val SYNC_STALE_MS = 12L * 60 * 60 * 1000
         private const val JOB_BACKOFF_MS = 30_000L

@@ -8,7 +8,6 @@ import android.util.Log
 import androidx.room.withTransaction
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.auth.CredentialStore
-import com.taehagen.spotifygood.data.callUnitOffMain
 import com.taehagen.spotifygood.data.callWith
 import com.taehagen.spotifygood.data.db.AppDatabase
 import com.taehagen.spotifygood.data.db.DownloadEntity
@@ -45,7 +44,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
@@ -96,8 +94,8 @@ internal class KeyCache {
  * files are kept and resumed natively, and the row records the file it writes via `download.fileId`
  * so garbage collection keeps that `.part` while the row exists), mirrors `download` events into the
  * database (≥ 500 ms apart) and the notification, stores the record with its key encrypted, and
- * registers it with `offline.add`. Failures are retried with exponential backoff up to
- * [DownloadRules.MAX_ATTEMPTS].
+ * registers it with `offline.add` (numbered with the commit, see [OfflineIndexSync]). Failures are
+ * retried with exponential backoff up to [DownloadRules.MAX_ATTEMPTS].
  *
  * Lock order: [runLock] before [commitLock] (the manager's mutation lock).
  */
@@ -113,6 +111,7 @@ internal class DownloadRunner(
     private val notifications: DownloadNotifications,
     private val keys: KeyCache,
     private val commitLock: Mutex,
+    private val index: OfflineIndexSync,
 ) {
     private val dao = database.downloads()
     private val json: Json = rpc.json
@@ -384,7 +383,12 @@ internal class DownloadRunner(
         }
     }
 
-    private enum class Commit { KEPT, REMOVED, FILE_GONE }
+    private sealed interface Commit {
+        /** Stored as change [seq] of the offline index. */
+        class Kept(val seq: Long) : Commit
+        data object Removed : Commit
+        data object FileGone : Commit
+    }
 
     /**
      * Persists a finished download (key encrypted) unless the item was removed meanwhile; returns
@@ -402,8 +406,8 @@ internal class DownloadRunner(
             // (relinking) is deleted when that download is removed before this row names the file.
             val present = withContext(Dispatchers.IO) { File(record.path).isFile }
             val result = database.withTransaction {
-                val row = dao.get(item.uri) ?: return@withTransaction Commit.REMOVED
-                if (!present) return@withTransaction Commit.FILE_GONE
+                val row = dao.get(item.uri) ?: return@withTransaction Commit.Removed
+                if (!present) return@withTransaction Commit.FileGone
                 dao.upsert(
                     row.copy(
                         state = DownloadState.COMPLETED,
@@ -423,38 +427,26 @@ internal class DownloadRunner(
                         retryAt = null,
                     ),
                 )
-                Commit.KEPT
+                Commit.Kept(index.next())
             }
             // Removed while downloading: drop the file unless another download uses it (images and
             // partial files are collected once the queue is idle).
-            if (result == Commit.REMOVED && dao.countFileUsers(record.fileId) == 0) {
+            if (result == Commit.Removed && dao.countFileUsers(record.fileId) == 0) {
                 withContext(Dispatchers.IO) { storage.deleteAudio(record.path) }
             }
             result
         }
-        when (outcome) {
-            Commit.KEPT -> Unit
-            Commit.REMOVED -> return false
-            Commit.FILE_GONE -> {
+        val seq = when (outcome) {
+            is Commit.Kept -> outcome.seq
+            Commit.Removed -> return false
+            Commit.FileGone -> {
                 Log.w(TAG, "The file of ${item.uri} was removed with another download; downloading it again")
                 dao.requeue(item.uri)
                 return false
             }
         }
         keys[item.uri] = keyHex
-        try {
-            withTimeoutOrNull(NATIVE_CALL_TIMEOUT_MS) {
-                rpc.callUnitOffMain(
-                    "offline.add",
-                    rpcArgs { put("tracks", json.encodeToJsonElement(ListSerializer(OfflineTrackRecord.serializer()), listOf(record.copy(keyHex = keyHex)))) },
-                )
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // The full index is pushed again (offline.setIndex) at the next engine start.
-            Log.w(TAG, "offline.add failed for ${item.uri}", e)
-        }
+        index.add(listOf(record.copy(keyHex = keyHex)), seq)
         return true
     }
 
