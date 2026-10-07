@@ -43,6 +43,9 @@ const NETWORK_LOSS_GRACE: Duration = Duration::from_secs(12);
 /// While this device is still streaming from its buffer when the grace ran out, check again
 /// this often (a short tunnel must not interrupt playback).
 const NETWORK_LOSS_RECHECK: Duration = Duration::from_secs(5);
+/// ... but for at most this long after the loss: the session then goes offline anyway (a Spirc
+/// whose loop hangs on the dead network keeps reporting "playing").
+const NETWORK_LOSS_MAX: Duration = Duration::from_secs(60);
 const RECONNECTS_PER_WINDOW: usize = 10;
 const RECONNECT_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// How long a stopping supervisor may take for its graceful teardown before it is aborted.
@@ -60,6 +63,9 @@ pub(crate) enum Msg {
     Reconnect,
     Settings { old: EngineSettings },
     PlayerDead(u64),
+    /// No network: a load of downloads takes the Player (`engine::go_offline`), the session
+    /// goes offline right away.
+    GoOffline,
     Stop,
 }
 
@@ -172,16 +178,20 @@ struct Supervisor {
 #[derive(Debug, Default)]
 struct NetworkLoss {
     deadline: Option<Instant>,
+    /// When the network was reported lost.
+    since: Option<Instant>,
 }
 
 impl NetworkLoss {
     /// The network was reported lost at `now`; an earlier loss keeps its deadline.
     fn lost(&mut self, now: Instant) {
+        self.since.get_or_insert(now);
         self.deadline.get_or_insert(now + NETWORK_LOSS_GRACE);
     }
 
     fn restored(&mut self) {
         self.deadline = None;
+        self.since = None;
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -189,24 +199,30 @@ impl NetworkLoss {
     }
 
     /// The deadline passed at `now`. Returns true to go offline; while this device is still
-    /// `streaming` a buffered track, the decision is deferred by [`NETWORK_LOSS_RECHECK`].
+    /// `streaming` a buffered track, the decision is deferred by [`NETWORK_LOSS_RECHECK`], up to
+    /// [`NETWORK_LOSS_MAX`] after the loss.
     fn expired(&mut self, now: Instant, streaming: bool) -> bool {
-        if streaming {
-            self.deadline = Some(now + NETWORK_LOSS_RECHECK);
+        let cap = self.since.map(|since| since + NETWORK_LOSS_MAX);
+        if streaming && cap.is_none_or(|cap| now < cap) {
+            let next = now + NETWORK_LOSS_RECHECK;
+            self.deadline = Some(cap.map_or(next, |cap| next.min(cap)));
             return false;
         }
-        self.deadline = None;
+        self.restored();
         true
     }
 }
 
-/// This device is the active Connect device and playing (from its buffer, as there is no
-/// network): tearing the session down now would cut the music off.
+/// This device is the active Connect device and streams (from its buffer, as there is no
+/// network): tearing the session down now would cut the music off. Not for a downloaded track:
+/// that playback goes on in the OfflineController (`connect::hand_off_to_offline`).
 fn streaming_locally(live: &Live) -> bool {
     live.device.as_ref().is_some_and(|device| {
         let state = device.spirc.subscribe_state();
         let snapshot = state.borrow();
-        snapshot.is_active && matches!(snapshot.status, SnapshotPlayStatus::Playing)
+        snapshot.is_active
+            && matches!(snapshot.status, SnapshotPlayStatus::Playing)
+            && snapshot.track.as_ref().is_some_and(|t| !crate::offline::is_downloaded(&t.uri))
     })
 }
 
@@ -372,6 +388,7 @@ impl Supervisor {
                     msg = self.rx.recv() => match self.stop_requested(msg) {
                         None => break AttemptEnd::Abort(Phase::Exit),
                         Some(Msg::Network { available: false, .. }) => break AttemptEnd::Abort(Phase::Gate),
+                        Some(Msg::GoOffline) if !state::network_available() => break AttemptEnd::Abort(Phase::Gate),
                         Some(Msg::Settings { .. }) if super::settings().offline => break AttemptEnd::Abort(Phase::Gate),
                         Some(_) => {}
                     },
@@ -420,6 +437,7 @@ impl Supervisor {
                         return Phase::Connect;
                     }
                     Some(Msg::Reconnect) => return Phase::Connect,
+                    Some(Msg::GoOffline) if !state::network_available() => return Phase::Gate,
                     Some(Msg::Settings { .. }) if super::settings().offline => return Phase::Gate,
                     Some(_) => {}
                 },
@@ -525,7 +543,7 @@ impl Supervisor {
                         continue;
                     }
                     if network_loss.expired(Instant::now(), streaming_locally(&live)) {
-                        log::info!("network lost for {NETWORK_LOSS_GRACE:?}: going offline");
+                        log::info!("network lost: going offline");
                         connector::teardown(live, true).await;
                         return Phase::Gate;
                     }
@@ -632,6 +650,13 @@ impl Supervisor {
                             return self.reconnect(live).await;
                         }
                     }
+                    Some(Msg::GoOffline) => {
+                        if !state::network_available() {
+                            log::info!("downloads play without a network: going offline");
+                            connector::teardown(live, false).await;
+                            return Phase::Gate;
+                        }
+                    }
                     Some(Msg::Stop) => {}
                 },
             }
@@ -707,5 +732,23 @@ mod tests {
         assert_eq!(loss.deadline(), Some(due + NETWORK_LOSS_RECHECK));
         // Once playback stopped (the buffer ran out, paused), the next check goes offline.
         assert!(loss.expired(due + NETWORK_LOSS_RECHECK, false));
+    }
+
+    #[test]
+    fn the_deferral_is_capped() {
+        let t0 = Instant::now();
+        let mut loss = NetworkLoss::default();
+        loss.lost(t0);
+        let mut now = t0 + NETWORK_LOSS_GRACE;
+        // a Spirc stuck on the dead network keeps saying "playing"
+        while !loss.expired(now, true) {
+            now = loss.deadline().expect("deferred");
+            assert!(now <= t0 + NETWORK_LOSS_MAX, "never past the cap");
+        }
+        assert_eq!(now, t0 + NETWORK_LOSS_MAX);
+        assert_eq!(loss.deadline(), None);
+        // a new loss starts over
+        loss.lost(now + Duration::from_secs(1));
+        assert!(!loss.expired(now + Duration::from_secs(1) + NETWORK_LOSS_GRACE, true));
     }
 }

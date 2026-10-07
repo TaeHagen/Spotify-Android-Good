@@ -17,7 +17,7 @@ use std::collections::{HashSet, VecDeque};
 /// Below this position `prev` goes to the previous track, above it restarts the current one.
 const PREV_RESTART_MS: u64 = 3000;
 /// Upper bound of the next tracks put into a snapshot.
-const MAX_NEXT: usize = super::snapshot::MAX_NEXT;
+pub(crate) const MAX_NEXT: usize = super::snapshot::MAX_NEXT;
 
 /// What the driver must do with the Player.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +121,28 @@ pub(crate) struct OfflineQueue {
     /// nothing takes over): only a change since then is a takeover. Spotify keeps a paused
     /// device as the account's active one for hours, that one doesn't take over.
     takeover_mark: Option<Elsewhere>,
+    /// The Player's latest request id, whoever loaded it (see [`OfflineQueue::adopt`]).
+    last_request: Option<u64>,
+}
+
+/// Playback the Player is already doing (Spirc's, on a downloaded track) that the queue takes
+/// over as it is (see [`OfflineQueue::adopt`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Adoption {
+    pub context_uri: Option<String>,
+    /// In play order; `uris[start]` is the track the Player has loaded.
+    pub uris: Vec<String>,
+    pub start: usize,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+    /// It plays, or loads to play.
+    pub playing: bool,
+    /// It is still loading.
+    pub loading: bool,
+    pub repeat: RepeatMode,
+    /// Repeat context is on (also under repeat-track).
+    pub repeat_context: bool,
+    pub shuffle: bool,
 }
 
 impl Default for OfflineQueue {
@@ -149,6 +171,7 @@ impl Default for OfflineQueue {
             pending_loads: 0,
             elsewhere: None,
             takeover_mark: None,
+            last_request: None,
         }
     }
 }
@@ -298,17 +321,22 @@ impl OfflineQueue {
             (false, _) => (0..items.len()).collect(),
         };
         let start = spec.start.map(|s| s.min(items.len() - 1)).unwrap_or(order[0]);
+        // The user queue survives a load, like Spirc's (a queue left by a superseded session
+        // doesn't: it was reset, or another controller took the Player over).
+        let queue = if self.active { std::mem::take(&mut self.queue) } else { VecDeque::new() };
         *self = OfflineQueue {
             active: true,
             context_uri: spec.context_uri,
             order,
             items,
+            queue,
             shuffle: spec.shuffle,
             seed: spec.seed,
             repeat: spec.repeat,
             repeat_context: spec.repeat == RepeatMode::Context,
             next_queue_id: self.next_queue_id,
             pending_loads: self.pending_loads,
+            last_request: self.last_request,
             ..Default::default()
         };
         self.pos = self.order.iter().position(|&i| i == start).unwrap_or(0);
@@ -368,8 +396,10 @@ impl OfflineQueue {
                 Some(Action::Play)
             }
             PlaybackStatus::Stopped => {
+                // At the kept position (0 after the end; where it was when the Player died).
                 let item = self.current_item()?;
-                Some(self.begin_load(item.uri, true, 0, now_ms))
+                let position_ms = self.position_ms;
+                Some(self.begin_load(item.uri, true, position_ms, now_ms))
             }
             PlaybackStatus::Loading | PlaybackStatus::Playing => {
                 self.play_intent = true;
@@ -554,13 +584,74 @@ impl OfflineQueue {
     /// for it.
     pub fn load_not_sent(&mut self) {
         self.pending_loads = self.pending_loads.saturating_sub(1);
+        if self.active && self.status == PlaybackStatus::Loading {
+            // Nothing loads: stopped where it was meant to start (a play loads it again).
+            self.status = PlaybackStatus::Stopped;
+            self.play_intent = false;
+        }
+    }
+
+    /// The Player's thread died: none of its request ids will come, and the queue's playback
+    /// is gone. It stops where it was (a play loads it again there, on a new Player).
+    pub fn player_lost(&mut self, now_ms: i64) {
+        self.pending_loads = 0;
+        self.own_request = None;
+        self.last_request = None;
+        if self.active && self.status != PlaybackStatus::Stopped {
+            self.position_ms = self.position_at(now_ms);
+            self.position_ts = now_ms;
+            self.status = PlaybackStatus::Stopped;
+            self.play_intent = false;
+        }
+    }
+
+    /// Takes over what the Player is playing for someone else (Spirc, with the session going
+    /// away): `a.uris[a.start]` is the loaded track, the latest request. Nothing is loaded
+    /// again, so it plays on without a gap; returns `Play` to resume a Player paused meanwhile.
+    /// Without a known request the track is loaded at the position (a short gap).
+    pub fn adopt(&mut self, a: Adoption, now_ms: i64) -> Option<Action> {
+        let request = self.last_request;
+        let spec = LoadSpec {
+            context_uri: a.context_uri,
+            uris: a.uris,
+            start: Some(a.start),
+            position_ms: a.position_ms,
+            shuffle: false,
+            repeat: if a.repeat_context { RepeatMode::Context } else { RepeatMode::Off },
+            play: a.playing,
+            seed: 0,
+        };
+        // The user queue is in the handed over tracks already.
+        self.queue.clear();
+        let load = self.load(spec, now_ms)?;
+        if a.repeat == RepeatMode::Track {
+            self.set_repeat(RepeatMode::Track);
+        }
+        // Already in play order: shown as shuffled, a toggle reshuffles or keeps this order.
+        self.shuffle = a.shuffle;
+        let Some(request) = request else { return Some(load) };
+        self.pending_loads = self.pending_loads.saturating_sub(1);
+        self.own_request = Some(request);
+        self.status = if a.loading {
+            PlaybackStatus::Loading
+        } else if a.playing {
+            PlaybackStatus::Playing
+        } else {
+            PlaybackStatus::Paused
+        };
+        self.play_intent = a.playing;
+        self.position_ms = a.position_ms;
+        self.position_ts = now_ms;
+        self.duration_ms = a.duration_ms;
+        a.playing.then_some(Action::Play)
     }
 
     /// Stops and forgets everything (another controller took over, or a user stop).
     pub fn reset(&mut self) {
         let next_queue_id = self.next_queue_id;
         let pending_loads = self.pending_loads;
-        *self = OfflineQueue { next_queue_id, pending_loads, ..Default::default() };
+        let last_request = self.last_request;
+        *self = OfflineQueue { next_queue_id, pending_loads, last_request, ..Default::default() };
     }
 
     fn own(&self, id: u64) -> bool {
@@ -582,6 +673,7 @@ impl OfflineQueue {
     pub fn on_event(&mut self, event: Event, now_ms: i64) -> Outcome {
         let mut out = Outcome::default();
         if let Event::RequestId(id) = event {
+            self.last_request = Some(id);
             // Bookkeeping also while inactive, so that ids of loads we sent before a reset are
             // never mistaken for later (foreign) loads.
             if self.own(id) {
@@ -1186,6 +1278,113 @@ mod tests {
         // a foreign load supersedes
         q.on_event(Event::RequestId(5), 0);
         assert!(!q.active);
+    }
+
+    #[test]
+    fn a_load_keeps_the_user_queue() {
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 0, false, RepeatMode::Off), 0);
+        started(&mut q, 1);
+        assert!(q.add_to_queue("spotify:track:x".into()));
+        assert!(q.add_to_queue("spotify:track:y".into()));
+        q.load(spec(2, 1, false, RepeatMode::Off), 0);
+        started(&mut q, 2);
+        let next: Vec<String> = q.snapshot(dev(), 0).next_tracks.iter().map(|t| t.uri.clone()).collect();
+        assert_eq!(next, ["spotify:track:x", "spotify:track:y"], "queued first, the new context has nothing after its last item");
+        // a bulk add still running appends to the same queue, uids stay unique
+        assert!(q.add_to_queue("spotify:track:z".into()));
+        let uids: HashSet<String> = q.snapshot(dev(), 0).next_tracks.iter().map(|t| t.uid.clone()).collect();
+        assert_eq!(uids.len(), 3);
+        // queue.clear still clears it
+        q.clear_queue();
+        assert!(q.snapshot(dev(), 0).next_tracks.is_empty());
+        // a queue superseded by another controller doesn't come back
+        assert!(q.add_to_queue("spotify:track:x".into()));
+        q.on_event(Event::RequestId(9), 0);
+        assert!(!q.active);
+        q.load(spec(2, 1, false, RepeatMode::Off), 0);
+        assert!(q.snapshot(dev(), 0).next_tracks.is_empty());
+        q.add_to_queue("spotify:track:x".into());
+        q.reset();
+        q.load(spec(2, 1, false, RepeatMode::Off), 0);
+        assert!(q.snapshot(dev(), 0).next_tracks.is_empty());
+    }
+
+    fn adoption(n: usize, start: usize) -> Adoption {
+        Adoption {
+            context_uri: Some("spotify:playlist:p".into()),
+            uris: uris(n),
+            start,
+            position_ms: 42_000,
+            duration_ms: 200_000,
+            playing: true,
+            loading: false,
+            repeat: RepeatMode::Off,
+            repeat_context: false,
+            shuffle: false,
+        }
+    }
+
+    #[test]
+    fn handed_over_playback_plays_on_without_a_reload() {
+        let mut q = OfflineQueue::default();
+        // Spirc's load of the current track (the queue was inactive)
+        q.on_event(Event::RequestId(7), 0);
+        let action = q.adopt(Adoption { repeat: RepeatMode::Track, repeat_context: true, shuffle: true, ..adoption(3, 1) }, 1_000);
+        assert_eq!(action, Some(Action::Play), "resumes a Player paused meanwhile, no load");
+        let s = q.snapshot(dev(), 0);
+        assert_eq!(s.status, PlaybackStatus::Playing);
+        assert_eq!(s.track.as_ref().map(|t| t.uri.as_str()), Some("spotify:track:1"));
+        assert_eq!((s.position_ms, s.position_timestamp_ms, s.duration_ms), (42_000, 1_000, 200_000));
+        assert_eq!((s.repeat, s.shuffle), (RepeatMode::Track, true));
+        assert_eq!(s.next_tracks.first().map(|t| t.uri.as_str()), Some("spotify:track:2"));
+        // the Player's events for that request are the queue's now
+        let out = q.on_event(Event::EndOfTrack(7), 2_000);
+        assert_eq!(load_uri(&out.action).as_deref(), Some("spotify:track:1"), "repeat one");
+        // a paused one stays paused
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(3), 0);
+        assert_eq!(q.adopt(Adoption { playing: false, ..adoption(2, 0) }, 0), None);
+        assert_eq!(q.snapshot(dev(), 0).status, PlaybackStatus::Paused);
+        q.on_event(Event::Playing { id: 3, position_ms: 42_000 }, 10);
+        assert_eq!(q.snapshot(dev(), 0).status, PlaybackStatus::Playing);
+        // no request seen: loaded at the position
+        let mut q = OfflineQueue::default();
+        let action = q.adopt(adoption(2, 0), 0);
+        assert!(matches!(action, Some(Action::Load { ref uri, play: true, position_ms: 42_000 }) if uri == "spotify:track:0"));
+    }
+
+    #[test]
+    fn a_dead_player_stops_the_queue_where_it_was() {
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 0, false, RepeatMode::Off), 0);
+        q.on_event(Event::RequestId(1), 0);
+        q.on_event(Event::Playing { id: 1, position_ms: 10_000 }, 0);
+        q.next(1_000);
+        q.player_lost(5_000);
+        assert_eq!(q.status(), PlaybackStatus::Stopped);
+        assert!(!q.is_playing());
+        // a play loads it again at that position, on the new Player
+        let a = q.play(6_000);
+        assert!(matches!(a, Some(Action::Load { ref uri, play: true, .. }) if uri == "spotify:track:1"));
+        // the new Player's ids start over: its first load is ours, a later foreign one isn't
+        q.on_event(Event::RequestId(1), 6_000);
+        assert!(q.active);
+        q.on_event(Event::RequestId(2), 6_000);
+        assert!(!q.active);
+        // while playing: the position is kept
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 0, false, RepeatMode::Off), 0);
+        started(&mut q, 1);
+        q.on_event(Event::Playing { id: 1, position_ms: 10_000 }, 0);
+        q.player_lost(5_000);
+        assert_eq!(q.snapshot(dev(), 0).position_ms, 15_000);
+        assert!(matches!(q.play(6_000), Some(Action::Load { position_ms: 15_000, .. })));
+        // a load that never reached a Player doesn't stay loading
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 0, false, RepeatMode::Off), 0);
+        q.load_not_sent();
+        assert_eq!(q.status(), PlaybackStatus::Stopped);
     }
 
     #[test]

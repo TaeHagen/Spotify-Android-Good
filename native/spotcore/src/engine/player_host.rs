@@ -204,6 +204,9 @@ async fn forward_events(generation: u64, mut events: PlayerEventChannel) {
     let current = HOST.lock().as_ref().map(|h| h.generation) == Some(generation);
     if current {
         log::error!("player {generation} thread ended unexpectedly");
+        // The offline queue gets no more events (it would show playing for ever); also without
+        // a supervisor (offline playback after `session.stop`).
+        connect::on_player_lost();
         state::send_to_supervisor(Msg::PlayerDead(generation));
     }
 }
