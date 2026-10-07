@@ -141,6 +141,24 @@ class ResumePlaceholderTest {
     }
 }
 
+class PlayerArtworkTest {
+    private val cdn = "https://i.scdn.co/image/x"
+    private val cover = "/data/user/0/app/no_backup/offline/images/ab12.jpg"
+
+    @Test
+    fun offlineADownloadedItemShowsItsDownloadedCover() {
+        assertEquals(cover, playerArtwork(cdn, cover, offline = true))
+        assertEquals(cover, playerArtwork(null, cover, offline = false))
+    }
+
+    @Test
+    fun onlineOrNotDownloadedTheCdnImageIsUsed() {
+        assertEquals(cdn, playerArtwork(cdn, cover, offline = false))
+        assertEquals(cdn, playerArtwork(cdn, null, offline = true))
+        assertNull(playerArtwork(null, null, offline = true))
+    }
+}
+
 class SeekStepTest {
     private val episode = "spotify:episode:e"
 

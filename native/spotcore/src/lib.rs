@@ -20,5 +20,6 @@ pub mod models;
 pub mod offline;
 pub mod rpc;
 pub mod runtime;
+pub mod zeroconf_client;
 
 pub use error::{AppError, AppResult, ErrorCode};

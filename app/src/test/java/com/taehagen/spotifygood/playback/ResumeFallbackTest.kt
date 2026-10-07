@@ -12,6 +12,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ResumeFallbackTest {
@@ -58,6 +59,43 @@ class ResumeFallbackTest {
         assertEquals(42_000L, load["positionMs"]?.jsonPrimitive?.content?.toLong())
         assertEquals(JsonPrimitive(true), load["play"])
         assertNull(load["trackUris"])
+    }
+
+    @Test
+    fun noSessionYetLoadsTheLastSessionToo() = runTest {
+        // Cold start: the session did not come up in time (or there is no network).
+        val notConnected = NativeException(NativeErrorInfo(NativeErrorCode.NOT_CONNECTED, "not connected"))
+        val rpc = FakeRpc { if (it == "player.play") notConnected else null }
+        PlayerController.resumeOrLoadLast(
+            "player.play",
+            rpc::call,
+            prepare = { it.copy(trackUris = listOf("spotify:track:t")) },
+        ) { state("spotify:album:a") }
+        assertEquals(listOf("player.play", "player.load"), rpc.calls.map { it.first })
+        assertEquals(listOf("spotify:track:t"), rpc.calls[1].second["trackUris"]?.jsonArray?.map { it.jsonPrimitive.content })
+
+        val remote = FakeRpc { notConnected }
+        val thrown = runCatching {
+            PlayerController.resumeOrLoadLast("player.play", remote::call, fallBackOn = { false }) { state(null) }
+        }.exceptionOrNull()
+        assertSame(notConnected, thrown)
+        assertEquals(listOf("player.play"), remote.calls.map { it.first })
+    }
+
+    @Test
+    fun whenToResumeTheLastSession() {
+        fun resume(code: String, remote: Boolean = false, reach: EngineReach? = EngineReach.ONLINE) =
+            PlayerController.shouldResumeLast(code, remote, reach)
+        assertTrue(resume(NativeErrorCode.NOT_ACTIVE_DEVICE))
+        assertTrue(resume(NativeErrorCode.NOT_CONNECTED, reach = EngineReach.CONNECTING))
+        assertTrue(resume(NativeErrorCode.NOT_CONNECTED, reach = EngineReach.OFFLINE))
+        assertTrue(resume(NativeErrorCode.UNAVAILABLE, reach = EngineReach.CONNECTING))
+        assertFalse(resume(NativeErrorCode.UNAVAILABLE, reach = EngineReach.OFFLINE))
+        assertFalse(resume(NativeErrorCode.UNAVAILABLE, reach = EngineReach.ONLINE))
+        assertFalse("mirroring a remote device", resume(NativeErrorCode.NOT_CONNECTED, remote = true))
+        assertFalse(resume(NativeErrorCode.UNAVAILABLE, remote = true, reach = EngineReach.CONNECTING))
+        assertFalse(resume(NativeErrorCode.NETWORK))
+        assertFalse(resume(NativeErrorCode.PREMIUM_REQUIRED))
     }
 
     @Test

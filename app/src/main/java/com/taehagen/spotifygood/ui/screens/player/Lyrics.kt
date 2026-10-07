@@ -117,7 +117,8 @@ internal fun LyricsScreenContent(onDismiss: () -> Unit, modifier: Modifier = Mod
     BackHandler(enabled = coverage.coversWindow, onBack = onDismiss)
 
     val track = snapshot.track
-    val artworkColor by rememberArtworkColor(track?.imageUrl)
+    val artwork by viewModel.artwork.collectAsStateWithLifecycle()
+    val artworkColor by rememberArtworkColor(artwork)
     val loaded = (lyricsState as? LyricsState.Loaded)?.takeIf { it.trackUri == track?.uri }
     val palette = rememberLyricsPalette(loaded?.lyrics, artworkColor)
     val background by animateColorAsState(palette.background, animationSpec = tween(600), label = "lyricsBackground")

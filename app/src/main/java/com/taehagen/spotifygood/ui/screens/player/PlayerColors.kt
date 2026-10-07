@@ -22,6 +22,7 @@ import coil3.request.ImageRequest
 import coil3.request.SuccessResult
 import coil3.request.allowHardware
 import coil3.toBitmap
+import com.taehagen.spotifygood.ui.components.imageData
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -67,7 +68,7 @@ internal object ArtworkColorCache {
 
     private suspend fun extract(context: Context, url: String): Int? {
         val request = ImageRequest.Builder(context)
-            .data(url)
+            .data(imageData(url))
             .size(PALETTE_SIZE_PX)
             .allowHardware(false)
             .build()

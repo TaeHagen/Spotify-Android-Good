@@ -47,6 +47,20 @@ class PlaybackModesTest {
     }
 
     @Test
+    fun smartShuffleIsNotOfferedByTheOfflineQueue() {
+        val offline = PlaybackSnapshot(
+            source = PlaybackSource.LOCAL,
+            offline = true,
+            shuffle = true,
+            context = PlaybackContext("spotify:playlist:p", type = ContextType.PLAYLIST),
+        )
+        assertFalse(offline.isSmartShuffleAvailable)
+        // The cycle therefore goes shuffle → off instead of asking for smart shuffle again.
+        assertEquals(ShuffleMode.OFF, PlaybackModes.nextShuffle(offline.shuffleMode, offline.isSmartShuffleAvailable))
+        assertEquals(ShuffleMode.SHUFFLE, PlaybackModes.nextShuffle(ShuffleMode.OFF, offline.isSmartShuffleAvailable))
+    }
+
+    @Test
     fun shuffleModeOfSnapshot() {
         assertEquals(ShuffleMode.OFF, PlaybackSnapshot().shuffleMode)
         assertEquals(ShuffleMode.SHUFFLE, PlaybackSnapshot(shuffle = true).shuffleMode)
