@@ -630,6 +630,14 @@ For a remote active device, smart shuffle is not supported (the command reports
   volume `PUT /connect-state/v1/connect/volume/from/{me}/to/{target}` `{"volume":n}`
   (debounced ≥ 200 ms); transfer `SpClient::transfer(me, target, TransferOptions{restore_paused:"restore"})`.
   Remote queue edits are sent as `set_queue` with the cluster's `queue_revision`.
+* **Pending target** (the "send" with nothing playing anywhere): a device picked while nothing
+  is active and with no session to resume (`connect.transfer` → `NOT_ACTIVE_DEVICE`) is kept by
+  `DevicesRepository.pendingTarget`, and the next in-app play or radio start carries it as
+  `player.load {deviceId}` (a connect-state `play` command there). Media-session loads (Auto,
+  Assistant, watches, resumption), the stored session and offline plays never take it: they
+  play on this phone. It is used once and expires 10 minutes after the pick (also checked when
+  taken, so a timer delayed by Doze cannot let an old pick through); it is cleared too when any
+  device becomes active, when this phone is picked, and on logout.
 * **Remote playback in the app**: `PlaybackSnapshot.source == "remote"` is built from the
   cluster's `player_state` (position extrapolated with `session.time_delta()`); the
   MediaSession switches to `DeviceInfo(PLAYBACK_TYPE_REMOTE)` so hardware volume keys
@@ -784,11 +792,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   play) is merged into it, or waits ≤ 3 s for the activation, and is dropped if the load failed.
   Plain track-list contexts (`spotify:web-api`) are never resumed or loaded as a context.
   Auto browse/search/voice wait the same way.
-* Pending Connect target (§9.5): a user-started `player.load` that plays (in-app plays, radio,
-  media-session picks) takes `DevicesRepository.consumePendingTarget()` as `deviceId` when no
-  device is active. The stored session (the Play fallback, Media3 resumption, Tap to resume,
-  "play something") and offline plans (offline reach, or rewritten for the offline queue) never
-  take it: this phone plays them.
+* Pending Connect target (§8): an in-app `player.load` that plays (`PlayerController.play`,
+  radio) takes `DevicesRepository.consumePendingTarget()` as `deviceId` when no device is
+  active. Media-session loads (`SpotifyPlayer.handleSetMediaItems`: Auto, Assistant, watches,
+  Media3 resumption, Tap to resume, "play something"), the Play fallback to the stored session
+  and offline plans (offline reach, or rewritten for the offline queue) never take it: they play
+  through this phone (in a car, a speaker picked earlier at home would be wrong).
 * `onConnectAsync` grants full commands to Media3-trusted controllers (MEDIA_CONTENT_CONTROL /
   notification listener: SysUI, Bluetooth, watch apps), the media notification, Auto/AAOS, our
   own uid and known system packages (package name verified by Media3); connection hints are not
@@ -865,9 +874,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   name + icon and local output choices), then **Spotify Connect devices**, then
   "More devices…". Selecting a Connect device → `connect.transfer`. With nothing playing
   anywhere and no session to resume, the picked device becomes the pending target
-  (`DevicesRepository.pendingTarget`): the next play goes there (`player.load {deviceId}`),
-  the standard Connect "send". It is used once, and cleared when any device becomes active,
-  when this phone is picked, and on logout.
+  (`DevicesRepository.pendingTarget`): the next in-app play goes there (`player.load
+  {deviceId}`), the standard Connect "send" (§8). It is used once, expires 10 minutes after the
+  pick, and is cleared when any device becomes active, when this phone is picked, and on logout.
 * On BT disconnect: `ACTION_AUDIO_BECOMING_NOISY` pauses; route listener updates UI and
   reports `player.setAudioOutput`. AudioTrack `ERROR_DEAD_OBJECT` → recreate track.
 
