@@ -155,28 +155,49 @@ pub(crate) fn pathfinder_failure(answer: &pathfinder::Answer, types: &Types) -> 
     if !answer.data.get("searchV2").is_some_and(Value::is_object) {
         return Some(reason("searchV2 missing"));
     }
+    if answer.errors.iter().any(|e| e.path.len() == 1 && e.path[0] == "searchV2") {
+        return Some(reason("searchV2 failed"));
+    }
+    let failed = failed_sections(answer, types);
+    let all_failed = requested_lists(types).iter().all(|name| failed.contains(name));
+    all_failed.then(|| reason("every requested section failed"))
+}
+
+/// The requested list keys whose `searchV2` section failed: the answer is partial when some are
+/// missing that way (see [`pathfinder_failure`] for when a section counts as failed).
+pub(crate) fn failed_sections(answer: &pathfinder::Answer, types: &Types) -> HashSet<&'static str> {
     let items_readable =
         |section: &str| answer.data.pointer(&format!("/searchV2/{section}/items")).and_then(Value::as_array).is_some();
-    let mut failed: HashSet<&str> = HashSet::new();
-    for e in &answer.errors {
-        match e.path.as_slice() {
-            [root] if root == "searchV2" => return Some(reason("searchV2 failed")),
-            [root, section, ..] if root == "searchV2" && !items_readable(section) => {
-                failed.extend(list_of_section(section))
-            }
-            _ => {}
-        }
-    }
-    let requested = [
+    let requested = requested_lists(types);
+    answer
+        .errors
+        .iter()
+        .filter_map(|e| match e.path.as_slice() {
+            [root, section, ..] if root == "searchV2" && !items_readable(section) => list_of_section(section),
+            _ => None,
+        })
+        .filter(|name| requested.contains(name))
+        .collect()
+}
+
+/// List keys of the requested types.
+fn requested_lists(types: &Types) -> Vec<&'static str> {
+    [
         ("tracks", types.tracks),
         ("artists", types.artists),
         ("albums", types.albums),
         ("playlists", types.playlists),
         ("shows", types.shows),
         ("episodes", types.episodes),
-    ];
-    let all_failed = requested.iter().filter(|(_, on)| *on).all(|(name, _)| failed.contains(name));
-    all_failed.then(|| reason("every requested section failed"))
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect()
+}
+
+/// Whether a tracks-only (context-resolve) answer misses requested types.
+fn tracks_only_is_partial(types: &Types) -> bool {
+    requested_lists(types).iter().any(|name| *name != "tracks")
 }
 
 /// Requested from the server per page: more than `limit`, so that entities the parsers drop
@@ -236,6 +257,7 @@ pub(crate) fn parse_pathfinder(data: &Value, limit: usize, filter_explicit: bool
         episodes: parsed(root, "episodes", limit, pfparse::episode),
         top_result: top_item.map(|(_, m)| m),
         totals,
+        partial: false,
     };
     if filter_explicit {
         hide_explicit(&mut r, top_explicit);
@@ -400,7 +422,7 @@ fn searchview_results(results: &Value) -> SearchResults {
         };
         Some(MediaRef { kind, uri, name: hit_str(h, "name")?, subtitle: None, images: hit_image(h) })
     });
-    SearchResults { tracks, artists, albums, playlists, shows, episodes, top_result, totals: HashMap::new() }
+    SearchResults { tracks, artists, albums, playlists, shows, episodes, top_result, totals: HashMap::new(), partial: false }
 }
 
 pub(crate) fn variables(query: &str, offset: u32, limit: u32) -> Value {
@@ -463,7 +485,12 @@ pub(crate) async fn rpc(args: Value) -> AppResult<Value> {
     let filter_explicit = session.filter_explicit_content();
     let first = match pathfinder::query(&session, "searchDesktop", variables(query, a.offset, fetch_limit(limit))).await {
         Ok(answer) => match pathfinder_failure(&answer, &types) {
-            None => return to_value(&types.apply(parse_pathfinder(&answer.data, limit as usize, filter_explicit))),
+            None => {
+                let mut r = parse_pathfinder(&answer.data, limit as usize, filter_explicit);
+                // Some requested sections failed while others answered: usable, not complete.
+                r.partial = !failed_sections(&answer, &types).is_empty();
+                return to_value(&types.apply(r));
+            }
             Some(why) => {
                 // Not "no results": the search backend failed behind pathfinder.
                 let e = AppError::unavailable(format!("pathfinder search: {why}"));
@@ -498,7 +525,11 @@ pub(crate) async fn rpc(args: Value) -> AppResult<Value> {
         return Err(first);
     }
     match via_context(&session, query, a.offset, limit).await {
-        Ok(r) => to_value(&types.apply(r)),
+        Ok(mut r) => {
+            // Tracks only: degraded when other types were asked for too.
+            r.partial = tracks_only_is_partial(&types);
+            to_value(&types.apply(r))
+        }
         Err(e) => {
             log::info!("context-resolve search failed: {e}");
             Err(first)
@@ -589,6 +620,9 @@ mod tests {
         let partial = pathfinder::Answer { data: no_tracks, errors: vec![error_at(&["searchV2", "tracksV2"])] };
         assert!(pathfinder_failure(&partial, &tracks_only).is_some(), "the Songs tab falls back");
         assert!(pathfinder_failure(&partial, &all).is_none(), "the other sections still answer");
+        assert_eq!(failed_sections(&partial, &all), HashSet::from(["tracks"]), "…but the answer is partial");
+        assert!(failed_sections(&partial, &Types::from_list(&["album".into()])).is_empty(), "a section not asked for");
+        assert!(failed_sections(&ok, &all).is_empty(), "a full answer");
         let albums_only = Types::from_list(&["album".into()]);
         assert!(pathfinder_failure(&partial, &albums_only).is_none());
 
@@ -616,6 +650,13 @@ mod tests {
         assert!(context_fallback_applies(&Types::from_list(&["track".into()])));
         assert!(context_fallback_applies(&Types::from_list(&[])), "top results: tracks-only is a degraded answer");
         assert!(context_fallback_applies(&Types::from_list(&["track".into(), "album".into()])));
+        // Its tracks-only answer is partial when other types were asked for as well.
+        assert!(tracks_only_is_partial(&Types::from_list(&[])));
+        assert!(tracks_only_is_partial(&Types::from_list(&["track".into(), "album".into()])));
+        assert!(!tracks_only_is_partial(&Types::from_list(&["track".into()])));
+        let json = serde_json::to_value(SearchResults { partial: true, ..Default::default() }).unwrap();
+        assert_eq!(json["partial"], true);
+        assert!(serde_json::to_value(SearchResults::default()).unwrap().get("partial").is_none());
     }
 
     #[test]

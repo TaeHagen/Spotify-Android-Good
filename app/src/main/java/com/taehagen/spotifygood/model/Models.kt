@@ -216,6 +216,8 @@ data class SearchResults(
     val topResult: MediaRef? = null,
     /** Server-side result counts by list key ("tracks", "albums", …), when known (docs §6.3). */
     val totals: Map<String, Int> = emptyMap(),
+    /** Some requested types are missing because their source failed: not the full answer (docs §6.3). */
+    val partial: Boolean = false,
 ) {
     val isEmpty: Boolean
         get() = tracks.isEmpty() && artists.isEmpty() && albums.isEmpty() &&
