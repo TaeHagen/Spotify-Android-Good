@@ -114,9 +114,65 @@ impl ConnectState {
             .get_context(ContextType::Default)
             .map(|c| c.tracks.len())
             .unwrap_or_default();
+        // without repeat the context ends with this pass, later passes are never reached (and
+        // would block new suggestions, they are assigned after the last one)
+        let last_pass = if self.repeat_context() {
+            u32::MAX
+        } else {
+            pass
+        };
         let unavailable = &self.unavailable_uri;
+        self.suggestions.retain(|(p, position), s| {
+            *p <= last_pass && *position < len && !unavailable.contains(&s.uri)
+        });
+    }
+
+    /// Forgets the suggestions that were inserted into the next tracks and aren't there anymore
+    /// (played, skipped or removed), keeps those waiting in the next tracks and those the fill up
+    /// hasn't reached yet
+    ///
+    /// Call it before the next tracks are cleared, see [ConnectState::reset_playback_to_position]
+    pub(super) fn forget_passed_suggestions(&mut self) {
+        let Ok(ctx) = self.get_context(ContextType::Default) else {
+            return;
+        };
+        let fill_up_position = (ctx.index.page, ctx.index.track as usize);
+        let waiting = self
+            .next_tracks()
+            .iter()
+            .filter(|t| t.is_suggestion())
+            .map(|t| t.uid.clone())
+            .collect::<HashSet<_>>();
         self.suggestions
-            .retain(|(_, position), s| *position < len && !unavailable.contains(&s.uri));
+            .retain(|key, s| *key >= fill_up_position || waiting.contains(&s.uid));
+    }
+
+    /// The playback continues at `position` of the pass `pass` (the next tracks are empty, apart
+    /// from the queue): forgets the suggestions the fill up doesn't reach anymore, and returns
+    /// the waiting suggestion after the context track right before `position`, which the fill up
+    /// doesn't insert (it starts at `position`)
+    ///
+    /// See [ConnectState::forget_passed_suggestions], which has to be called before.
+    pub(super) fn continue_suggestions_at(
+        &mut self,
+        pass: u32,
+        position: usize,
+    ) -> Option<ProvidedTrack> {
+        self.suggestions = self
+            .suggestions
+            .split_off(&(pass, position.saturating_sub(1)));
+        if !self.repeat_context() {
+            // the context ends with this pass
+            self.suggestions.retain(|(p, _), _| *p <= pass);
+        }
+
+        let anchor_position = position.checked_sub(1)?;
+        let anchor = self
+            .get_context(ContextType::Default)
+            .ok()?
+            .tracks
+            .get(anchor_position)?;
+        self.suggestion_after(pass, anchor_position, anchor)
     }
 
     /// The pass and position (in the shuffled default context) of the first upcoming plain
@@ -372,7 +428,7 @@ impl ConnectState {
     }
 
     /// a default context track, no queued track, suggestion or delimiter
-    fn is_plain_context_track(track: &ProvidedTrack) -> bool {
+    pub(super) fn is_plain_context_track(track: &ProvidedTrack) -> bool {
         track.is_context() && !track.is_suggestion() && !track.uid.starts_with(IDENTIFIER_DELIMITER)
     }
 }

@@ -83,7 +83,7 @@ internal class PresenceController(private val service: Service, private val grap
             // The media notification (if any) is replaced while idle.
             notifications.cancel(Notifications.ID_PLAYBACK)
             // Keep the service started: it must outlive unbinding controllers.
-            runCatching { service.startService(Intent(service, PlaybackService::class.java)) }
+            runCatching { service.startService(PlaybackService.internalIntent(service, null)) }
                 .onFailure { Log.w(TAG, "Could not keep the service started", it) }
             true
         } catch (e: IllegalStateException) {

@@ -43,11 +43,14 @@ class PlayerControllerTest {
     private class Harness(scope: TestScope, val env: Env?, val resume: ResumeState? = null) {
         val calls = mutableListOf<Pair<String, JsonObject>>()
         var fail: (String) -> NativeException? = { null }
+        /** Suspends inside the transport (e.g. a slow request to a remote device). */
+        var hold: suspend (String) -> Unit = {}
         val snapshot = MutableStateFlow(PlaybackSnapshot())
         val controller = PlayerController(
             scope = scope.backgroundScope,
             transport = { method, args ->
                 calls += method to args
+                hold(method)
                 fail(method)?.let { throw it }
                 JsonObject(emptyMap()) as JsonElement
             },
@@ -208,6 +211,60 @@ class PlayerControllerTest {
         assertEquals(listOf("queue.add", "queue.add", "queue.add"), h.methods())
         assertTrue("no generic player error", h.errors.isEmpty())
         assertEquals(QueueAddResult(0, null), h.controller.addToQueueCounted(emptyList()).await())
+    }
+
+    @Test
+    fun bulkQueueAddsLetOtherCommandsThroughAndEachAddHasItsOwnTimeout() = runTest {
+        val h = Harness(this, null)
+        val slow = CompletableDeferred<Unit>()
+        var adds = 0
+        h.hold = { method -> if (method == "queue.add" && ++adds == 2) slow.await() }
+        val result = h.controller.addToQueueCounted(listOf(t(1), t(2), t(3)))
+        runCurrent()
+        // The user pauses while the second add is still in flight: it does not wait for the rest.
+        val pause = h.controller.pauseAsync()
+        slow.complete(Unit)
+        assertTrue(pause.await())
+        assertEquals(QueueAddResult(3, null), result.await())
+        assertEquals(listOf("queue.add", "queue.add", "player.pause", "queue.add"), h.methods())
+
+        // A request that never answers fails that item (and stops the batch) after its own timeout.
+        h.calls.clear()
+        adds = 0
+        h.hold = { method -> if (method == "queue.add" && ++adds == 2) CompletableDeferred<Unit>().await() }
+        val stuck = h.controller.addToQueueCounted(listOf(t(1), t(2), t(3))).await()
+        assertEquals(1, stuck.added)
+        assertEquals(NativeErrorCode.NETWORK, stuck.error?.code)
+        assertEquals(listOf("queue.add", "queue.add"), h.methods())
+        runCurrent()
+        assertTrue("silent: the caller reports it", h.errors.isEmpty())
+    }
+
+    @Test
+    fun bulkQueueAddsStayInOrderAndAreCappedAtTheQueueSize() = runTest {
+        val h = Harness(this, null)
+        val first = h.controller.addToQueueCounted(listOf(t(1), t(2)))
+        val second = h.controller.addToQueueCounted(listOf(t(3), t(4)))
+        assertEquals(QueueAddResult(2, null), first.await())
+        assertEquals(QueueAddResult(2, null), second.await())
+        assertEquals((1..4).map(::t), h.calls.map { it.second["uri"]?.jsonPrimitive?.content })
+
+        h.calls.clear()
+        val many = h.controller.addToQueueCounted((1..100).map(::t)).await()
+        assertEquals(PlayerController.MAX_QUEUE_ADD, many.added)
+        assertEquals(NativeErrorCode.UNAVAILABLE, many.error?.code)
+        assertEquals(PlayerController.MAX_QUEUE_ADD, h.calls.size)
+    }
+
+    @Test
+    fun mediaSessionQueueAddsReportTheirFailure() = runTest {
+        val h = Harness(this, null)
+        h.fail = { if (it == "queue.add") NativeException(NativeErrorInfo(NativeErrorCode.UNAVAILABLE, "The queue is full")) else null }
+        runCurrent() // the error collector is subscribed
+        assertFalse(h.controller.addToQueueAsync(listOf(t(1), t(2))).await())
+        runCurrent()
+        assertEquals(listOf(PlaybackErrorKind.UNAVAILABLE.name), h.errors)
+        assertEquals(1, h.calls.size)
     }
 
     @Test

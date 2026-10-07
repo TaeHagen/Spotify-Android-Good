@@ -1,7 +1,12 @@
 use crate::state::ConnectState;
+// SPOTIFYGOOD: ContextType
+use crate::state::context::ContextType;
 use crate::state::provider::IsProvider;
 use librespot_protocol::player::Restrictions;
 use protobuf::MessageField;
+
+// SPOTIFYGOOD: module level for the snapshot (can_skip_prev)
+pub(super) const NO_PREV: &str = "no previous tracks";
 
 impl ConnectState {
     pub fn clear_restrictions(&mut self) {
@@ -12,10 +17,11 @@ impl ConnectState {
     }
 
     pub fn update_restrictions(&mut self) {
-        const NO_PREV: &str = "no previous tracks";
         const AUTOPLAY: &str = "autoplay";
 
         let prev_tracks_is_empty = self.prev_tracks().is_empty();
+        // SPOTIFYGOOD: see below
+        let autoplay_active = matches!(self.active_context, ContextType::Autoplay);
 
         let is_paused = self.is_pause();
         let is_playing = self.is_playing();
@@ -56,6 +62,12 @@ impl ConnectState {
                     .disallow_toggling_repeat_context_reasons
                     .clear();
                 restrictions.disallow_toggling_repeat_track_reasons.clear();
+                // SPOTIFYGOOD: also while a queued track plays after the default context ended,
+                // ConnectState::handle_set_repeat_context refuses it then
+                if autoplay_active {
+                    restrictions.disallow_toggling_repeat_context_reasons =
+                        vec![AUTOPLAY.to_string()];
+                }
             }
         }
     }

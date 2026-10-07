@@ -6,7 +6,7 @@ use crate::{
     snapshot::{ConnectSnapshot, SnapshotPlayStatus, SnapshotTrack, TrackProvider},
     state::{
         ConnectState, context::ContextType, metadata::Metadata, provider::IsProvider,
-        tracks::IDENTIFIER_DELIMITER,
+        restrictions::NO_PREV, tracks::IDENTIFIER_DELIMITER,
     },
 };
 use std::{
@@ -95,7 +95,13 @@ impl ConnectState {
             smart_shuffle: self.smart_shuffle(),
             repeat_context: self.repeat_context(),
             repeat_track: self.repeat_track(),
-            can_skip_prev: restrictions.disallow_skipping_prev_reasons.is_empty(),
+            // without a previous track, previous restarts the current one (Spirc::handle_prev),
+            // the restriction only says that there is none
+            can_skip_prev: player.track.is_some()
+                && restrictions
+                    .disallow_skipping_prev_reasons
+                    .iter()
+                    .all(|reason| reason == NO_PREV),
             can_skip_next,
             can_toggle_shuffle: restrictions.disallow_toggling_shuffle_reasons.is_empty(),
             can_toggle_repeat: restrictions

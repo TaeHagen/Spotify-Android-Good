@@ -6,19 +6,27 @@ use crate::{
     core::{Session, SessionConfig, SpotifyId, SpotifyUri, dealer::protocol::Request},
     protocol::{
         connect::AudioOutputDeviceType, context::Context, context_page::ContextPage,
-        context_track::ContextTrack,
+        context_track::ContextTrack, player::ProvidedTrack,
     },
     state::{
-        ConnectState, context::ContextType, metadata::Metadata, provider::IsProvider,
-        smart_shuffle::SMART_SHUFFLE_INTERVAL, tracks::IDENTIFIER_DELIMITER,
+        ConnectState, SPOTIFY_MAX_NEXT_TRACKS_SIZE,
+        context::ContextType,
+        metadata::Metadata,
+        provider::IsProvider,
+        smart_shuffle::{SMART_SHUFFLE_BATCH_SIZE, SMART_SHUFFLE_INTERVAL},
+        tracks::IDENTIFIER_DELIMITER,
     },
 };
+use protobuf::MessageField;
+use std::collections::HashSet;
+
 const CONTEXT_URI: &str = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
 
-fn track_uri(n: u8, salt: u8) -> String {
+fn track_uri(n: usize, salt: u8) -> String {
     let mut raw = [0u8; 16];
     raw[0] = salt;
-    raw[15] = n;
+    raw[14] = (n >> 8) as u8;
+    raw[15] = n as u8;
     SpotifyUri::Track {
         id: SpotifyId::from_raw(&raw).unwrap(),
     }
@@ -26,7 +34,7 @@ fn track_uri(n: u8, salt: u8) -> String {
     .unwrap()
 }
 
-fn context(len: u8, salt: u8) -> Context {
+fn context(len: usize, salt: u8) -> Context {
     Context {
         uri: Some(CONTEXT_URI.to_string()),
         url: Some(format!("context://{CONTEXT_URI}")),
@@ -45,7 +53,7 @@ fn context(len: u8, salt: u8) -> Context {
 }
 
 /// a state with an active default context of `len` tracks, playing the first one
-fn state(len: u8) -> (tokio::runtime::Runtime, ConnectState) {
+fn state(len: usize) -> (tokio::runtime::Runtime, ConnectState) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -158,7 +166,7 @@ fn skip_to_keeps_the_queue_and_moves_skipped_to_prev() {
     assert_queue_contiguous(&state);
 }
 
-fn suggestions(len: u8) -> Context {
+fn suggestions(len: usize) -> Context {
     let mut ctx = context(len, 7);
     // two tracks that are already part of the context are ignored
     ctx.pages[0].tracks.push(ContextTrack {
@@ -312,7 +320,8 @@ fn snapshot_maps_tracks() {
     assert_eq!(snapshot.playback_speed, 0.);
     assert_eq!(snapshot.last_error.as_deref(), Some("x: y"));
     assert!(snapshot.repeat_context);
-    assert!(!snapshot.can_skip_prev);
+    // previous restarts the first track
+    assert!(snapshot.can_skip_prev);
     assert!(snapshot.can_skip_next);
 
     let track = snapshot.track.unwrap();
@@ -548,7 +557,11 @@ fn smart_shuffle_with_repeat_plays_each_suggestion_once() {
     let (_rt, mut state) = state(10);
     state.set_repeat_context(true);
     state.handle_smart_shuffle(true).unwrap();
-    assert_eq!(state.next_tracks().len(), 80, "the window covers several passes");
+    assert_eq!(
+        state.next_tracks().len(),
+        80,
+        "the window covers several passes"
+    );
     assert_unique_uids(&state);
 
     // one after every 3rd context track, continuing through the following passes
@@ -561,7 +574,11 @@ fn smart_shuffle_with_repeat_plays_each_suggestion_once() {
             .filter(|t| t.is_suggestion())
             .count()
     };
-    assert_eq!(in_window(&state), 10, "each one once, not again in every pass");
+    assert_eq!(
+        in_window(&state),
+        10,
+        "each one once, not again in every pass"
+    );
     assert_unique_uids(&state);
 
     // 10 suggestions and 30 context tracks (3 passes)
@@ -581,12 +598,483 @@ fn smart_shuffle_with_repeat_plays_each_suggestion_once() {
     assert_eq!(in_window(&state), added);
     assert_unique_uids(&state);
     let played = play_through(&mut state, 60);
-    assert_eq!(played.iter().filter(|uid| uid.starts_with('s')).count(), added);
+    assert_eq!(
+        played.iter().filter(|uid| uid.starts_with('s')).count(),
+        added
+    );
 
     // without repeat only the rest of the context gets suggestions
     let (_rt, mut state) = self::state(10);
     state.handle_smart_shuffle(true).unwrap();
     assert_eq!(state.add_suggestions(suggestions(10)).unwrap(), 3);
+}
+
+fn is_suggestion_uid(uid: &str) -> bool {
+    uid.starts_with('s')
+}
+
+/// plays through the whole context like spirc does with smart shuffle: suggestions are fetched
+/// whenever they run low, returns the played uids and the uids of all assigned suggestions
+fn play_smart_shuffle_to_the_end(state: &mut ConnectState) -> (Vec<String>, HashSet<String>) {
+    let mut assigned = HashSet::new();
+    let mut played = Vec::new();
+    let mut salt = 10;
+    loop {
+        if state.needs_suggestions() && state.prune_suggestions() {
+            state
+                .add_suggestions(context(SMART_SHUFFLE_BATCH_SIZE, salt))
+                .unwrap();
+            salt += 1;
+            assigned.extend(state.suggestions.values().map(|s| s.uid.clone()));
+            assert!(state.next_tracks().len() <= SPOTIFY_MAX_NEXT_TRACKS_SIZE);
+        }
+        if state.next_track().unwrap().is_none() {
+            break;
+        }
+        played.push(state.current_track(|t| t.uid.clone()));
+    }
+    (played, assigned)
+}
+
+#[test]
+fn smart_shuffle_suggestion_at_the_end_of_the_next_tracks_is_not_lost() {
+    let (_rt, mut state) = state(400);
+    state.handle_smart_shuffle(true).unwrap();
+
+    let (played, assigned) = play_smart_shuffle_to_the_end(&mut state);
+    let played_suggestions = played
+        .iter()
+        .filter(|uid| is_suggestion_uid(uid))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(assigned.len() > 100, "{}", assigned.len());
+    assert_eq!(
+        played_suggestions.iter().collect::<HashSet<_>>().len(),
+        played_suggestions.len(),
+        "a suggestion was played twice"
+    );
+    let missing = assigned
+        .iter()
+        .filter(|uid| !played_suggestions.contains(uid))
+        .count();
+    assert_eq!(missing, 0, "assigned suggestions that were never played");
+    // every context track once
+    assert_eq!(played.len() - played_suggestions.len(), 399);
+}
+
+#[test]
+fn smart_shuffle_suggestion_dropped_from_the_end_comes_back() {
+    // a queue add drops the last entry of the next tracks
+    let (_rt, mut state) = state(200);
+    state.handle_smart_shuffle(true).unwrap();
+    assert_eq!(state.add_suggestions(suggestions(20)).unwrap(), 20);
+    assert!(state.next_tracks().last().unwrap().is_suggestion());
+    state.queue_add_uri(&track_uri(1, 9)).unwrap();
+    assert_queue_contiguous(&state);
+    assert!(state.next_tracks().len() <= SPOTIFY_MAX_NEXT_TRACKS_SIZE);
+    let played = play_through(&mut state, 100);
+    assert_eq!(played[0], "q0");
+    assert_eq!(
+        played.iter().filter(|uid| is_suggestion_uid(uid)).count(),
+        20
+    );
+
+    // so does a prev
+    let (_rt, mut state) = self::state(200);
+    state.handle_smart_shuffle(true).unwrap();
+    play_through(&mut state, 1);
+    assert_eq!(state.add_suggestions(suggestions(20)).unwrap(), 20);
+    assert!(state.next_tracks().last().unwrap().is_suggestion());
+    state.prev_track().unwrap();
+    assert!(state.next_tracks().len() <= SPOTIFY_MAX_NEXT_TRACKS_SIZE);
+    let played = play_through(&mut state, 100);
+    assert_eq!(
+        played.iter().filter(|uid| is_suggestion_uid(uid)).count(),
+        20
+    );
+}
+
+fn suggestion_uids(tracks: &[ProvidedTrack]) -> Vec<String> {
+    tracks
+        .iter()
+        .filter(|t| t.is_suggestion())
+        .map(|t| t.uid.clone())
+        .collect()
+}
+
+/// the next tracks up to the first delimiter (the rest of the current pass)
+fn rest_of_pass(state: &ConnectState) -> &[ProvidedTrack] {
+    let next = state.next_tracks();
+    let end = next
+        .iter()
+        .position(|t| t.uid.starts_with(IDENTIFIER_DELIMITER))
+        .unwrap_or(next.len());
+    &next[..end]
+}
+
+fn assert_played_once(played: &[String]) {
+    let suggestions = played
+        .iter()
+        .filter(|uid| is_suggestion_uid(uid))
+        .collect::<Vec<_>>();
+    let unique = suggestions.iter().collect::<HashSet<_>>();
+    assert_eq!(
+        unique.len(),
+        suggestions.len(),
+        "a suggestion was played twice"
+    );
+}
+
+#[test]
+fn smart_shuffle_continues_after_repeat_is_turned_off_after_a_wrap() {
+    let (_rt, mut state) = state(30);
+    state.set_repeat_context(true);
+    state.handle_smart_shuffle(true).unwrap();
+    // one after every 3rd track: 9 in the first pass, one in the second
+    assert_eq!(state.add_suggestions(suggestions(10)).unwrap(), 10);
+
+    // through the first pass (29 tracks and 9 suggestions) and 4 entries into the second
+    let mut played = play_through(&mut state, 43);
+    assert_eq!(
+        played.iter().filter(|uid| is_suggestion_uid(uid)).count(),
+        10
+    );
+    assert!(state.current_track(|t| !t.is_suggestion()));
+
+    state.handle_set_repeat_context(false).unwrap();
+    // the played suggestions don't come back
+    assert!(suggestion_uids(state.next_tracks()).is_empty());
+
+    // and new ones go into the rest of this pass, the last one without repeat
+    assert!(state.needs_suggestions());
+    assert!(state.prune_suggestions());
+    let added = state.add_suggestions(context(10, 8)).unwrap();
+    assert!(added > 0);
+    assert_eq!(suggestion_uids(state.next_tracks()).len(), added);
+
+    played.extend(play_through(&mut state, 100));
+    assert_played_once(&played);
+    assert_eq!(
+        played.iter().filter(|uid| is_suggestion_uid(uid)).count(),
+        10 + added
+    );
+}
+
+#[test]
+fn smart_shuffle_suggestions_stay_in_their_pass_when_repeat_is_toggled() {
+    let (_rt, mut state) = state(10);
+    state.set_repeat_context(true);
+    state.handle_smart_shuffle(true).unwrap();
+    // spread over four passes of the 10 tracks
+    assert_eq!(state.add_suggestions(suggestions(10)).unwrap(), 10);
+
+    // through the first pass (9 tracks and 3 suggestions) and 2 tracks into the second
+    let mut played = play_through(&mut state, 14);
+    let ahead_in_this_pass = suggestion_uids(rest_of_pass(&state));
+    assert!(!ahead_in_this_pass.is_empty());
+
+    state.handle_set_repeat_context(false).unwrap();
+    assert_eq!(suggestion_uids(state.next_tracks()), ahead_in_this_pass);
+    state.handle_set_repeat_context(true).unwrap();
+    // still in this pass, not a pass later
+    assert_eq!(suggestion_uids(rest_of_pass(&state)), ahead_in_this_pass);
+    assert_unique_uids(&state);
+
+    played.extend(play_through(&mut state, 60));
+    assert_played_once(&played);
+    for uid in &ahead_in_this_pass {
+        assert!(played.contains(uid));
+    }
+
+    // the suggestion after the current track stays the next track
+    let (_rt, mut state) = self::state(10);
+    state.set_repeat_context(true);
+    state.handle_smart_shuffle(true).unwrap();
+    state.add_suggestions(suggestions(10)).unwrap();
+    play_through(&mut state, SMART_SHUFFLE_INTERVAL);
+    let next = state.next_tracks()[0].clone();
+    assert!(next.is_suggestion());
+    state.handle_set_repeat_context(false).unwrap();
+    assert_eq!(state.next_tracks()[0].uid, next.uid);
+    state.handle_set_repeat_context(true).unwrap();
+    assert_eq!(state.next_tracks()[0].uid, next.uid);
+    assert_unique_uids(&state);
+}
+
+/// `uid{n}` -> n
+fn uid_index(uid: &str) -> usize {
+    uid.strip_prefix("uid").unwrap().parse().unwrap()
+}
+
+#[test]
+fn unshuffle_while_a_queued_track_plays_continues_after_the_last_context_track() {
+    // a uri that isn't in the context, and one that is (the track at position 30)
+    for queued_uri in [track_uri(1, 9), track_uri(30, 0)] {
+        let (_rt, mut state) = state(40);
+        state.handle_smart_shuffle(true).unwrap();
+        state.add_suggestions(suggestions(10)).unwrap();
+        let played = play_through(&mut state, 5);
+        let last_played = played
+            .iter()
+            .rev()
+            .find(|uid| uid.starts_with("uid"))
+            .unwrap()
+            .clone();
+        state.queue_add_uri(&queued_uri).unwrap();
+        state.queue_add_uri(&track_uri(2, 9)).unwrap();
+        state.next_track().unwrap();
+        assert!(state.current_track(|t| t.is_queue()));
+
+        state.handle_shuffle(false).unwrap();
+        assert!(!state.shuffling_context());
+        assert!(!state.smart_shuffle());
+        assert_eq!(state.current_track(|t| t.uri.clone()), queued_uri);
+        // the rest of the queue, then the context in its order after the last played track
+        let next = next_uids(&state);
+        assert_eq!(next[0], "q1");
+        assert_eq!(next[1..], uids(uid_index(&last_played) + 1..40));
+        assert!(state.next_tracks().iter().all(|t| !t.is_suggestion()));
+        assert_eq!(state.prev_tracks().last().unwrap().uid, last_played);
+    }
+}
+
+#[test]
+fn repeat_toggle_while_a_queued_track_plays() {
+    let (_rt, mut state) = state(5);
+    state.set_repeat_context(true);
+    state.reset_playback_to_position(Some(0)).unwrap();
+    play_through(&mut state, 2);
+    state.queue_add_uri(&track_uri(1, 9)).unwrap();
+    state.next_track().unwrap();
+    assert_eq!(state.current_track(|t| t.uid.clone()), "q0");
+
+    // the wraps of the context are gone
+    state.handle_set_repeat_context(false).unwrap();
+    assert!(!state.repeat_context());
+    assert_eq!(state.current_track(|t| t.uid.clone()), "q0");
+    assert_eq!(next_uids(&state), ["uid3", "uid4"]);
+
+    // and back after the last track
+    state.handle_set_repeat_context(true).unwrap();
+    let next = next_uids(&state);
+    assert_eq!(next[..2], ["uid3", "uid4"]);
+    assert!(next[2].starts_with(IDENTIFIER_DELIMITER));
+    assert_eq!(next[3], "uid0");
+    assert_unique_uids(&state);
+}
+
+#[test]
+fn shuffle_and_repeat_toggles_while_autoplay_plays() {
+    let (_rt, mut state) = state(3);
+    state
+        .update_context(
+            Context {
+                uri: Some(CONTEXT_URI.to_string()),
+                ..context(20, 5)
+            },
+            ContextType::Autoplay,
+        )
+        .unwrap();
+    state.handle_shuffle(true).unwrap();
+    // the other two context tracks, then autoplay
+    play_through(&mut state, 3);
+    assert!(state.current_track(|t| t.is_autoplay()));
+    let next = next_uids(&state);
+
+    // refused without changing anything
+    assert!(state.handle_set_repeat_context(true).is_err());
+    assert!(!state.repeat_context());
+    assert_eq!(next_uids(&state), next);
+
+    // the played default context is unshuffled, autoplay goes on
+    state.handle_shuffle(false).unwrap();
+    assert!(!state.shuffling_context());
+    assert!(state.current_track(|t| t.is_autoplay()));
+    assert_eq!(next_uids(&state), next);
+    let default_uids = state
+        .get_context(ContextType::Default)
+        .unwrap()
+        .tracks
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(default_uids, uids(0..3));
+
+    // a queued track that plays during autoplay can't toggle repeat either
+    state.queue_add_uri(&track_uri(1, 9)).unwrap();
+    state.next_track().unwrap();
+    assert!(state.current_track(|t| t.is_queue()));
+    let snapshot = state.snapshot(SnapshotPlayStatus::Playing, 0, None);
+    assert!(!snapshot.can_toggle_repeat);
+    assert!(state.handle_set_repeat_context(true).is_err());
+}
+
+/// a playlist modification: the same context is resolved again, then the state is set up like
+/// `ContextResolver::try_finish` does it (without shuffle)
+fn update_same_context(state: &mut ConnectState, ctx: Context) {
+    state.update_context(ctx, ContextType::Default).unwrap();
+    if !matches!(state.active_context, ContextType::Default) {
+        // try_finish skips the default context while it isn't the active one
+        return;
+    }
+    let ctx = state.get_context(ContextType::Default).unwrap();
+    if ctx.index.track == 0 {
+        let idx =
+            ConnectState::find_index_in_context(ctx, |t| state.current_track(|c| t.uri == c.uri))
+                .ok();
+        state.reset_playback_to_position(idx).unwrap();
+    } else {
+        state.fill_up_next_tracks().unwrap();
+    }
+}
+
+fn context_uids(played: &[String]) -> Vec<String> {
+    played
+        .iter()
+        .filter(|uid| uid.starts_with("uid"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn playlist_update_continues_where_the_playback_is() {
+    // with 0, 1 and 5 queued tracks (each one rewinds the fill up)
+    for queued in [0, 1, 5] {
+        let (_rt, mut state) = state(200);
+        play_through(&mut state, 30);
+        for i in 0..queued {
+            state.queue_add_uri(&track_uri(i, 9)).unwrap();
+        }
+        update_same_context(&mut state, context(200, 0));
+        assert_eq!(state.current_track(|t| t.uid.clone()), "uid30");
+
+        let played = play_through(&mut state, 100);
+        assert_eq!(
+            played.iter().filter(|uid| uid.starts_with('q')).count(),
+            queued
+        );
+        let played = context_uids(&played);
+        assert_eq!(played, uids(31..31 + played.len()), "{queued} queued");
+    }
+
+    // while a queued track plays
+    let (_rt, mut state) = state(200);
+    play_through(&mut state, 30);
+    for i in 0..5 {
+        state.queue_add_uri(&track_uri(i, 9)).unwrap();
+    }
+    play_through(&mut state, 2);
+    update_same_context(&mut state, context(200, 0));
+    assert_eq!(state.current_track(|t| t.uid.clone()), "q1");
+    let played = play_through(&mut state, 100);
+    assert_eq!(played[..3], ["q2", "q3", "q4"]);
+    assert_eq!(played[3..], uids(31..128));
+
+    // with a track removed from the next tracks
+    let (_rt, mut state) = self::state(200);
+    play_through(&mut state, 30);
+    state.queue_remove("uid32").unwrap();
+    update_same_context(&mut state, context(200, 0));
+    assert_eq!(play_through(&mut state, 3), ["uid31", "uid33", "uid34"]);
+
+    // the update removed the current track and added one after the next one
+    let (_rt, mut state) = self::state(50);
+    play_through(&mut state, 10);
+    let mut modified = context(50, 0);
+    modified.pages[0].tracks.remove(10);
+    modified.pages[0].tracks.insert(
+        11,
+        ContextTrack {
+            uri: Some(track_uri(99, 3)),
+            uid: Some("new".to_string()),
+            ..Default::default()
+        },
+    );
+    update_same_context(&mut state, modified);
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid10");
+    assert_eq!(play_through(&mut state, 3), ["uid11", "new", "uid12"]);
+}
+
+/// an autoplay context with the uids `a0`, `a1`, ...
+fn autoplay_context(len: usize) -> Context {
+    let mut ctx = context(len, 5);
+    for (i, track) in ctx.pages[0].tracks.iter_mut().enumerate() {
+        track.uid = Some(format!("a{i}"));
+    }
+    ctx
+}
+
+#[test]
+fn playlist_update_while_the_fill_up_is_in_autoplay() {
+    // the default context ends within the next tracks
+    let (_rt, mut state) = state(3);
+    state
+        .update_context(autoplay_context(20), ContextType::Autoplay)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    assert!(next_uids(&state)[2].starts_with(IDENTIFIER_DELIMITER));
+    update_same_context(&mut state, context(3, 0));
+    let played = play_through(&mut state, 6);
+    assert_eq!(played, ["uid1", "uid2", "a0", "a1", "a2", "a3"]);
+
+    // autoplay plays
+    let (_rt, mut state) = self::state(3);
+    state
+        .update_context(autoplay_context(20), ContextType::Autoplay)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    play_through(&mut state, 4);
+    assert_eq!(state.current_track(|t| t.uid.clone()), "a1");
+    let next = next_uids(&state);
+    update_same_context(&mut state, context(3, 0));
+    assert_eq!(next_uids(&state), next);
+    assert_eq!(play_through(&mut state, 3), ["a2", "a3", "a4"]);
+}
+
+#[test]
+fn repeat_toggle_keeps_the_autoplay_tracks_that_were_in_the_next_tracks() {
+    let (_rt, mut state) = state(3);
+    state
+        .update_context(autoplay_context(20), ContextType::Autoplay)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    // the next tracks covered autoplay up to a77, repeat replaces them with the wraps
+    state.handle_set_repeat_context(true).unwrap();
+    assert!(state.next_tracks().iter().all(|t| !t.is_autoplay()));
+    state.handle_set_repeat_context(false).unwrap();
+    let played = play_through(&mut state, 4);
+    assert_eq!(played, ["uid1", "uid2", "a0", "a1"]);
+}
+
+#[test]
+fn previous_is_available_whenever_a_track_plays() {
+    let can_skip_prev = |state: &ConnectState| {
+        state
+            .snapshot(SnapshotPlayStatus::Playing, 0, None)
+            .can_skip_prev
+    };
+
+    // the first track of a load
+    let (_rt, mut state) = state(20);
+    state.reset_playback_to_position(Some(0)).unwrap();
+    assert!(state.prev_tracks().is_empty());
+    assert!(can_skip_prev(&state));
+
+    // after a shuffle, which clears the prev tracks
+    state.shuffle_new().unwrap();
+    assert!(state.prev_tracks().is_empty());
+    assert!(can_skip_prev(&state));
+
+    // without a previous track nothing changes (spirc restarts the current track)
+    let current = state.current_track(|t| t.uid.clone());
+    let next = next_uids(&state);
+    assert!(state.prev_track().unwrap().is_none());
+    assert_eq!(state.current_track(|t| t.uid.clone()), current);
+    assert_eq!(next_uids(&state), next);
+
+    // nothing to restart without a track
+    state.player_mut().track = MessageField::none();
+    assert!(!can_skip_prev(&state));
 }
 
 /// compile time check: the engine spawns the task and shares the handle between threads

@@ -207,7 +207,7 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
         startService()
     }
 
-    private fun startService(intent: Intent = Intent(app, PlaybackService::class.java)) {
+    private fun startService(intent: Intent = PlaybackService.internalIntent(app, null)) {
         try {
             app.startService(intent)
         } catch (e: IllegalStateException) {
