@@ -5,7 +5,8 @@
 //! issues HTTP range requests through the session's HTTP client (Spotify user agent, the
 //! client-side rate limiter, proxy settings). [`Transport::open`] resolves once the response
 //! *headers* arrived and were interpreted (status, `Content-Range`, `Content-Length`,
-//! `Retry-After`); the body is then pulled frame by frame with [`RangeBody::next_data`], so the
+//! rate-limit delays, see [`parse_retry_after`]); the body is then pulled frame by frame with
+//! [`RangeBody::next_data`], so the
 //! caller streams it to disk with an idle timeout between frames and stops reading as soon as it
 //! has the bytes it asked for (a host that ignores `Range` and sends the whole file with `200`
 //! is cut off there; nothing beyond one frame is buffered here).
@@ -20,8 +21,9 @@ use http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::BodyExt;
 use librespot_core::cdn_url::CdnUrl;
+use librespot_core::date::Date;
 use librespot_core::error::ErrorKind;
-use librespot_core::http_client::{HttpClient, HttpClientError};
+use librespot_core::http_client::HttpClientError;
 use librespot_core::{FileId, Session};
 use parking_lot::Mutex;
 use std::future::Future;
@@ -29,6 +31,10 @@ use std::time::Duration;
 
 /// Storage-resolve request timeout.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longest rate-limit delay taken from a response (anything longer is clamped to it).
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+/// Below this a `Fastly-RateLimit-Reset` value is in seconds, above in milliseconds.
+const EPOCH_MS_THRESHOLD: i64 = 100_000_000_000;
 
 /// Why a CDN request failed (no URLs inside).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +133,55 @@ fn header(headers: &HeaderMap, name: http::header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
+/// Days since 1970-01-01 of a proleptic Gregorian date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`, the HTTP-date senders must use) as epoch ms.
+pub fn parse_http_date(value: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mut parts = value.split_ascii_whitespace();
+    let _weekday = parts.next().filter(|w| w.ends_with(','))?;
+    let day: i64 = parts.next()?.parse().ok().filter(|d| (1..=31).contains(d))?;
+    let month_name = parts.next()?;
+    let month = MONTHS.iter().position(|m| *m == month_name)? as i64 + 1;
+    let year: i64 = parts.next()?.parse().ok().filter(|y| *y >= 1970)?;
+    let mut hms = parts.next()?.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, m, sec) = (hms.next()??, hms.next()??, hms.next()??);
+    if hms.next().is_some() || parts.next() != Some("GMT") || parts.next().is_some() || h > 23 || m > 59 || sec > 60 {
+        return None;
+    }
+    let secs = days_from_civil(year, month, day) * 86_400 + h * 3_600 + m * 60 + sec;
+    secs.checked_mul(1000)
+}
+
+/// How long a `429` asks to wait, from every header that may say so (the longest wins):
+/// `Retry-After` (delta-seconds or HTTP-date), Akamai's `X-RateLimit-Next` (ISO 8601) and
+/// Fastly's `Fastly-RateLimit-Reset` (epoch time). Unlike librespot's helper there is no 10 s
+/// cap: a long delay is exactly what the download queue must know. Clamped to
+/// [`MAX_RETRY_AFTER`]; a time in the past is zero.
+pub fn parse_retry_after(headers: &HeaderMap, now_ms: i64) -> Option<Duration> {
+    let until = |target_ms: i64| u64::try_from(target_ms.saturating_sub(now_ms)).unwrap_or(0);
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+    let candidates = [
+        text("retry-after").and_then(|v| match v.parse::<u64>() {
+            Ok(secs) => Some(secs.saturating_mul(1000)),
+            Err(_) => parse_http_date(v).map(until),
+        }),
+        text("x-ratelimit-next").and_then(|v| Date::from_iso8601(v).ok()).map(|d| until(d.as_timestamp_ms())),
+        text("fastly-ratelimit-reset")
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|t| until(if t < EPOCH_MS_THRESHOLD { t.saturating_mul(1000) } else { t })),
+    ];
+    candidates.into_iter().flatten().max().map(|ms| Duration::from_millis(ms).min(MAX_RETRY_AFTER))
+}
+
 /// Interprets the status and headers of the response to `Range: bytes=<offset>-…`.
 pub fn interpret_head(status: StatusCode, headers: &HeaderMap, offset: u64) -> Result<Head, FetchError> {
     match status {
@@ -146,9 +201,10 @@ pub fn interpret_head(status: StatusCode, headers: &HeaderMap, offset: u64) -> R
                 _ => None,
             },
         }),
-        StatusCode::TOO_MANY_REQUESTS => {
-            Err(FetchError::Status { code: 429, retry_after: HttpClient::get_retry_after(headers) })
-        }
+        StatusCode::TOO_MANY_REQUESTS => Err(FetchError::Status {
+            code: 429,
+            retry_after: parse_retry_after(headers, Date::now_utc().as_timestamp_ms()),
+        }),
         other => Err(FetchError::Status { code: other.as_u16(), retry_after: None }),
     }
 }
@@ -315,6 +371,40 @@ pub(crate) mod tests {
             interpret_head(StatusCode::SERVICE_UNAVAILABLE, &HeaderMap::new(), 0),
             Err(FetchError::Status { code: 503, retry_after: None })
         );
+        assert_eq!(
+            interpret_head(StatusCode::TOO_MANY_REQUESTS, &headers(&[("retry-after", "120")]), 0),
+            Err(FetchError::Status { code: 429, retry_after: Some(Duration::from_secs(120)) }),
+            "no 10 s cap"
+        );
+    }
+
+    #[test]
+    fn retry_after_headers() {
+        // RFC 9110's example date.
+        let date_ms = 784_111_777_000;
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"), Some(date_ms));
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(parse_http_date("Tue, 29 Feb 2028 23:59:59 GMT"), Some(1_835_481_599_000));
+        for bad in ["", "Sun 06 Nov 1994 08:49:37 GMT", "Sun, 06 Nov 1994 08:49:37", "Sun, 32 Nov 1994 08:49:37 GMT", "Sun, 06 Foo 1994 08:49:37 GMT", "Sun, 06 Nov 1994 8:49 GMT", "Sun, 06 Nov 1994 08:49:37 GMT x"] {
+            assert_eq!(parse_http_date(bad), None, "{bad:?}");
+        }
+
+        let now = date_ms;
+        let wait = |pairs: &[(&'static str, &str)]| parse_retry_after(&headers(pairs), now);
+        assert_eq!(wait(&[]), None);
+        assert_eq!(wait(&[("retry-after", "120")]), Some(Duration::from_secs(120)));
+        assert_eq!(wait(&[("retry-after", "Sun, 06 Nov 1994 08:51:37 GMT")]), Some(Duration::from_secs(120)), "HTTP-date");
+        assert_eq!(wait(&[("retry-after", "Sun, 06 Nov 1994 08:00:00 GMT")]), Some(Duration::ZERO), "in the past");
+        assert_eq!(wait(&[("retry-after", "soon")]), None);
+        assert_eq!(wait(&[("fastly-ratelimit-reset", "784111837")]), Some(Duration::from_secs(60)), "epoch seconds");
+        assert_eq!(wait(&[("fastly-ratelimit-reset", "784111787000")]), Some(Duration::from_secs(10)), "epoch ms");
+        assert_eq!(wait(&[("x-ratelimit-next", "1994-11-06T08:50:07Z")]), Some(Duration::from_secs(30)), "ISO 8601");
+        assert_eq!(
+            wait(&[("retry-after", "5"), ("fastly-ratelimit-reset", "784111837"), ("x-ratelimit-next", "garbage")]),
+            Some(Duration::from_secs(60)),
+            "the longest valid value wins"
+        );
+        assert_eq!(wait(&[("retry-after", "999999999")]), Some(MAX_RETRY_AFTER), "clamped");
     }
 
     /// How the fake CDN answers one request.

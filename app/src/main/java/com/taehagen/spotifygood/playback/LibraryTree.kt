@@ -239,14 +239,15 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
     /** The last locally played item (for "recent" roots of non-SysUI browsers). */
     private suspend fun recentItem(): MediaItem? = graph.resumeStore.read()?.let(::resumeItem)
 
-    fun resumeItem(state: ResumeState): MediaItem = MediaItem.Builder()
+    /** [downloadedImage]: path of the downloaded cover of the track, preferred (works offline). */
+    fun resumeItem(state: ResumeState, downloadedImage: String? = null): MediaItem = MediaItem.Builder()
         .setMediaId(state.mediaId)
         .setMediaMetadata(
             MediaMetadata.Builder()
                 .setTitle(state.title)
                 .setArtist(state.artist)
                 .setAlbumTitle(state.album)
-                .setArtworkUri(artworkUri(context, state.artworkUrl))
+                .setArtworkUri(artworkUri(context, downloadedImage) ?: artworkUri(context, state.artworkUrl))
                 .setDurationMs(state.durationMs)
                 .setIsBrowsable(false)
                 .setIsPlayable(true)
@@ -307,7 +308,10 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
     private fun likedFolder(): MediaItem {
         val uri = likedContextUri()
         return MediaItem.Builder()
-            .setMediaId(LIKED)
+            // Playable ("Play" on the folder) only works with the context uri as the media id:
+            // MediaIds/SpotifyPlayer cannot load "library:liked". Browsing/lookup of the context
+            // uri lands on the Liked Songs branches as well.
+            .setMediaId(likedMediaId(uri))
             .setMediaMetadata(
                 MediaMetadata.Builder()
                     .setTitle(context.getString(R.string.playback_liked_songs))
@@ -499,6 +503,18 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         const val ALBUMS = "library:albums"
         const val ARTISTS = "library:artists"
         const val PODCASTS = "library:podcasts"
+
+        /**
+         * Media id of the Liked Songs folder: its context uri when the user is known (so the folder
+         * is playable), otherwise [LIKED] (browsable only). [LIKED] keeps working for browsers that
+         * cached it.
+         */
+        fun likedMediaId(likedContextUri: String?): String = likedContextUri ?: LIKED
+
+        /** Whether the children of [parentId] come from the catalog (worth waiting for a starting session). */
+        fun needsSession(parentId: String): Boolean = parentId !in LOCAL_PARENTS
+
+        private val LOCAL_PARENTS = setOf(ROOT, ROOT_OFFLINE, ROOT_RECENT, LIBRARY, DOWNLOADS)
 
         private const val MAX_TABS = 4
         private const val MAX_ITEMS = 100

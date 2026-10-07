@@ -2,15 +2,20 @@ package com.taehagen.spotifygood.ui.screens.player
 
 import com.taehagen.spotifygood.model.ActiveDeviceRef
 import com.taehagen.spotifygood.model.ArtistRef
+import com.taehagen.spotifygood.model.ConnectDevice
+import com.taehagen.spotifygood.model.ContextType
+import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.DeviceType
 import com.taehagen.spotifygood.model.LyricsLine
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
+import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.model.ShowRef
 import com.taehagen.spotifygood.model.TrackProvider
 import com.taehagen.spotifygood.playback.AudioOutput
 import com.taehagen.spotifygood.playback.OutputKind
+import com.taehagen.spotifygood.playback.ResumeState
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -48,6 +53,149 @@ class TimeFormatTest {
         assertEquals(180_000, PlaybackSnapshot(track = track, durationMs = 180_000).effectiveDurationMs())
         assertEquals(200_000, PlaybackSnapshot(track = track, durationMs = 0).effectiveDurationMs())
         assertEquals(0, PlaybackSnapshot().effectiveDurationMs())
+    }
+}
+
+class ResumePlaceholderTest {
+    private fun state(
+        isEpisode: Boolean = false,
+        contextUri: String? = "spotify:album:a",
+        durationMs: Long? = 200_000,
+        positionMs: Long = 42_000,
+    ) = ResumeState(
+        contextUri = contextUri,
+        trackUri = if (isEpisode) "spotify:episode:e" else "spotify:track:t",
+        positionMs = positionMs,
+        title = "Song",
+        artist = if (isEpisode) "The Show" else "Artist A, Artist B",
+        album = if (isEpisode) "The Show" else "Album",
+        artworkUrl = "https://i.scdn.co/image/x",
+        durationMs = durationMs,
+        isEpisode = isEpisode,
+    )
+
+    @Test
+    fun aSavedTrackBecomesAPausedSnapshotThatCanOnlyBePlayed() {
+        val snapshot = state().toPlaceholderSnapshot()
+        val track = snapshot.track!!
+        assertEquals("spotify:track:t", track.uri)
+        assertEquals("Song", track.name)
+        assertEquals("Artist A, Artist B", track.artistLine)
+        assertEquals("Album", track.album?.name)
+        assertEquals("https://i.scdn.co/image/x", track.imageUrl)
+        // Name-only refs: there is no page to open for them.
+        assertTrue(track.album!!.uri.isEmpty() && track.artists.all { it.uri.isEmpty() })
+        assertEquals(PlaybackStatus.PAUSED, snapshot.status)
+        assertEquals(PlaybackSource.NONE, snapshot.source)
+        assertEquals(42_000, snapshot.positionAt())
+        assertEquals(200_000, snapshot.effectiveDurationMs())
+        assertEquals(ContextType.ALBUM, snapshot.context?.type)
+        with(snapshot.restrictions) {
+            assertTrue(canPause)
+            assertFalse(canSeek || canSkipNext || canSkipPrev || canToggleShuffle || canToggleRepeat)
+        }
+    }
+
+    @Test
+    fun aSavedEpisodeShowsItsShow() {
+        val track = state(isEpisode = true, contextUri = "spotify:show:s").toPlaceholderSnapshot().track!!
+        assertTrue(track.isEpisode)
+        assertEquals("The Show", track.artistLine)
+        assertEquals("https://i.scdn.co/image/x", track.imageUrl)
+        assertNull(track.album)
+    }
+
+    @Test
+    fun positionIsKeptInsideTheDurationAndATrackContextIsDropped() {
+        val snapshot = state(contextUri = "spotify:track:t", durationMs = 100_000, positionMs = 150_000).toPlaceholderSnapshot()
+        assertEquals(100_000, snapshot.positionAt())
+        assertNull(snapshot.context)
+    }
+
+    @Test
+    fun theEngineSnapshotWinsAsSoonAsItHasATrack() {
+        val placeholder = state().toPlaceholderSnapshot()
+        val playing = PlaybackSnapshot(
+            source = PlaybackSource.LOCAL,
+            status = PlaybackStatus.PLAYING,
+            track = PlaybackTrack(uri = "spotify:track:other"),
+        )
+        assertEquals(playing, displaySnapshot(playing, placeholder, resuming = false))
+        assertEquals(placeholder, displaySnapshot(PlaybackSnapshot.EMPTY, placeholder, resuming = false))
+        assertEquals(PlaybackStatus.LOADING, displaySnapshot(PlaybackSnapshot.EMPTY, placeholder, resuming = true).status)
+        assertEquals(PlaybackSnapshot.EMPTY, displaySnapshot(PlaybackSnapshot.EMPTY, null, resuming = false))
+        // A remote device is active (even without a track): play would go there, not resume this.
+        val remote = PlaybackSnapshot(source = PlaybackSource.REMOTE)
+        assertFalse(wantsResumePlaceholder(remote))
+        assertEquals(remote, displaySnapshot(remote, placeholder, resuming = false))
+    }
+
+    @Test
+    fun contextTypesFromUris() {
+        assertEquals(ContextType.PLAYLIST, contextTypeOf("spotify:playlist:p"))
+        assertEquals(ContextType.PLAYLIST, contextTypeOf("spotify:user:u:playlist:p"))
+        assertEquals(ContextType.COLLECTION, contextTypeOf("spotify:user:u:collection"))
+        assertEquals(ContextType.ARTIST, contextTypeOf("spotify:artist:a"))
+        assertEquals(ContextType.SHOW, contextTypeOf("spotify:show:s"))
+        assertEquals(ContextType.UNKNOWN, contextTypeOf("spotify:user:u:collection:your-episodes"))
+    }
+}
+
+class PlayerArtworkTest {
+    private val cdn = "https://i.scdn.co/image/x"
+    private val cover = "/data/user/0/app/no_backup/offline/images/ab12.jpg"
+
+    @Test
+    fun offlineADownloadedItemShowsItsDownloadedCover() {
+        assertEquals(cover, playerArtwork(cdn, cover, offline = true))
+        assertEquals(cover, playerArtwork(null, cover, offline = false))
+    }
+
+    @Test
+    fun onlineOrNotDownloadedTheCdnImageIsUsed() {
+        assertEquals(cdn, playerArtwork(cdn, cover, offline = false))
+        assertEquals(cdn, playerArtwork(cdn, null, offline = true))
+        assertNull(playerArtwork(null, null, offline = true))
+    }
+}
+
+class SeekStepTest {
+    private val episode = "spotify:episode:e"
+
+    @Test
+    fun stepsStayInsideTheItem() {
+        assertEquals(45_000, seekStepTarget(30_000, SEEK_STEP_MS, durationMs = 600_000))
+        assertEquals(15_000, seekStepTarget(30_000, -SEEK_STEP_MS, durationMs = 600_000))
+        assertEquals(0, seekStepTarget(10_000, -SEEK_STEP_MS, durationMs = 600_000))
+        assertEquals(600_000, seekStepTarget(590_000, SEEK_STEP_MS, durationMs = 600_000))
+        // Unknown duration: only the start is a limit.
+        assertEquals(605_000, seekStepTarget(590_000, SEEK_STEP_MS, durationMs = 0))
+        assertEquals(0, seekStepTarget(5_000, -SEEK_STEP_MS, durationMs = 0))
+    }
+
+    @Test
+    fun quickRepeatedStepsBuildOnEachOther() {
+        // Back 15 s twice within a second while the snapshot still shows 100 s: 70 s, not 85 s.
+        val first = seekStepTarget(seekStepBase(episode, 100_000, null, nowMs = 0, playing = false), -SEEK_STEP_MS, 600_000)
+        val pending = PendingSeek(episode, first, atMs = 0)
+        val second = seekStepTarget(seekStepBase(episode, 100_000, pending, nowMs = 400, playing = false), -SEEK_STEP_MS, 600_000)
+        assertEquals(85_000, first)
+        assertEquals(70_000, second)
+    }
+
+    @Test
+    fun aChainedStepAccountsForTheTimePlayedSince() {
+        val pending = PendingSeek(episode, 85_000, atMs = 1_000)
+        assertEquals(85_500, seekStepBase(episode, 100_000, pending, nowMs = 1_500, playing = true))
+        assertEquals(85_000, seekStepBase(episode, 100_000, pending, nowMs = 1_500, playing = false))
+    }
+
+    @Test
+    fun anOldOrForeignPendingStepIsIgnored() {
+        val pending = PendingSeek(episode, 85_000, atMs = 1_000)
+        assertEquals(100_000, seekStepBase(episode, 100_000, pending, nowMs = 1_000 + SEEK_CHAIN_WINDOW_MS + 1, playing = false))
+        assertEquals(100_000, seekStepBase("spotify:episode:other", 100_000, pending, nowMs = 1_200, playing = false))
+        assertEquals(100_000, seekStepBase(episode, 100_000, pending, nowMs = 500, playing = false))
     }
 }
 
@@ -287,6 +435,22 @@ class DeviceAndShareTest {
         assertEquals(DeviceIndicator.None, deviceIndicator(snapshot, output(OutputKind.SPEAKER)))
         assertEquals(DeviceIndicator.None, deviceIndicator(snapshot, null))
         assertEquals(DeviceIndicator.None, deviceIndicator(PlaybackSnapshot(source = PlaybackSource.REMOTE), null))
+    }
+
+    @Test
+    fun remoteVolumeFollowsTheDevicesSupportsVolume() {
+        val kitchen = ActiveDeviceRef(id = "d", name = "Kitchen", type = DeviceType.SPEAKER)
+        val remote = PlaybackSnapshot(source = PlaybackSource.REMOTE, activeDevice = kitchen)
+        val fixed = DeviceList(activeDeviceId = "d", devices = listOf(ConnectDevice(id = "d", name = "Kitchen", supportsVolume = false)))
+        val adjustable = DeviceList(activeDeviceId = "d", devices = listOf(ConnectDevice(id = "d", name = "Kitchen")))
+        assertFalse(remoteVolumeSupported(remote, fixed))
+        assertTrue(remoteVolumeSupported(remote, adjustable))
+        // Not (yet) listed, or no device reference: assume it works, like the playback service.
+        assertTrue(remoteVolumeSupported(remote, DeviceList()))
+        assertTrue(remoteVolumeSupported(PlaybackSnapshot(source = PlaybackSource.REMOTE), fixed))
+        // This phone plays: no remote volume slider at all.
+        assertFalse(remoteVolumeSupported(PlaybackSnapshot(source = PlaybackSource.LOCAL), adjustable))
+        assertFalse(remoteVolumeSupported(PlaybackSnapshot.EMPTY, adjustable))
     }
 
     @Test

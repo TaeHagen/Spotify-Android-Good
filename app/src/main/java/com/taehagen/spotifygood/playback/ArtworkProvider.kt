@@ -189,10 +189,13 @@ class ArtworkProvider : ContentProvider() {
             }
         }
 
-        /** Downloaded copy of a CDN image (`offline/images/<image id>`), if any. */
+        /**
+         * Downloaded copy of a CDN image, if any: `offline/images/<image id>.jpg` (what the native
+         * downloader writes), or the extension-less name of older downloads.
+         */
         private fun offlineImageFor(context: Context, url: String): File? {
             val id = Uri.parse(url).lastPathSegment?.takeIf { it.matches(Regex("[0-9a-fA-F]{16,64}")) } ?: return null
-            return offlineDirs(context).map { File(it, id) }.firstOrNull { it.isFile }
+            return offlineDirs(context).flatMap { listOf(File(it, "$id.jpg"), File(it, id)) }.firstOrNull { it.isFile }
         }
     }
 }

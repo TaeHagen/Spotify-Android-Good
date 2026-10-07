@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.ui.screens.album
 
+import android.util.Log
 import androidx.annotation.StringRes
 import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
@@ -16,12 +17,14 @@ import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.playback.PlayRequest
+import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -29,15 +32,11 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onStart
-import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 // ViewModel-side plumbing shared by the detail pages.
-
-/** A user-visible one-off message, resolved to a string by the screen. */
-internal data class UiMessage(@StringRes val res: Int, val args: List<Any> = emptyList())
 
 internal enum class FailureReason { OFFLINE, NOT_FOUND, GENERIC }
 
@@ -136,31 +135,55 @@ internal fun AppGraph.savedFlow(uri: String): Flow<Boolean?> =
         .distinctUntilChanged()
         .catch { emit(null) }
 
-/** Base ViewModel of a detail page whose playback context is [contextUri]. */
+/**
+ * Base ViewModel of a detail page whose playback context is [contextUri].
+ *
+ * Writes (library, downloads, playlist edits) run in the app scope, not in [viewModelScope]: this
+ * ViewModel is cleared right after its page is popped, and cancelling a write half-way would e.g.
+ * queue nothing of a collection download or leave the files of a removed one behind. Their results
+ * go through [BackgroundMessages], so they are shown even after the page was left.
+ */
 internal abstract class DetailViewModel(
     protected val graph: AppGraph,
     protected val contextUri: String,
 ) : ViewModel() {
-    private val messageChannel = Channel<UiMessage>(Channel.BUFFERED)
-
-    /** One-off user messages (snackbars), shown via the navigator. */
-    val messages: Flow<UiMessage> = messageChannel.receiveAsFlow()
-
     /** Incremented by [retry] to re-collect the page's data. */
     protected val retryTrigger = MutableStateFlow(0)
 
     protected val playbackInfo: Flow<PlaybackInfo> =
         graph.playback.snapshot.map { it.toPlaybackInfo() }.distinctUntilChanged()
 
-    protected val offline: Flow<Boolean> = graph.offlineFlow()
+    protected val offline: StateFlow<Boolean> = graph.offlineFlow()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     fun retry() {
         retryTrigger.update { it + 1 }
     }
 
+    /** A snackbar message, shown by the main scaffold (also once the page is gone). */
     protected fun message(@StringRes res: Int, vararg args: Any) {
-        messageChannel.trySend(UiMessage(res, args.toList()))
+        BackgroundMessages.post(graph.app.getString(res, *args))
+    }
+
+    /**
+     * Runs the write [block] in the app scope (see the class comment). On success shows
+     * [successRes] (if any), on failure [failureRes].
+     */
+    protected fun launchWrite(
+        @StringRes successRes: Int?,
+        @StringRes failureRes: Int,
+        block: suspend () -> Unit,
+    ): Job = graph.appScope.launch {
+        try {
+            block()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Write failed", e)
+            message(failureRes)
+            return@launch
+        }
+        if (successRes != null) message(successRes)
     }
 
     protected fun currentPlayback(): PlaybackInfo = graph.playback.snapshot.value.toPlaybackInfo()
@@ -184,8 +207,15 @@ internal abstract class DetailViewModel(
         }
     }
 
-    /** Smart shuffle button: toggles it for the current context, otherwise starts the context with it. */
+    /**
+     * Smart shuffle button: toggles it for the current context, otherwise starts the context with it.
+     * Offline the engine rejects smart shuffle (no recommendations), so plain shuffle is used.
+     */
     fun smartShuffleContext() {
+        if (offline.value) {
+            shuffleContext()
+            return
+        }
         val playback = currentPlayback()
         if (playback.isContext(contextUri)) {
             graph.player.setSmartShuffle(!playback.smartShuffle)
@@ -206,40 +236,24 @@ internal abstract class DetailViewModel(
         @StringRes removedMessage: Int = R.string.detail_removed_from_library,
     ) {
         if (saved == null) return
-        viewModelScope.launch {
-            try {
-                graph.library.toggleSaved(uri)
-                message(if (saved) removedMessage else addedMessage)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                message(R.string.detail_library_failed)
-            }
+        launchWrite(if (saved) removedMessage else addedMessage, R.string.detail_library_failed) {
+            graph.library.toggleSaved(uri)
         }
     }
 
     fun downloadCollection(ref: CollectionRef) {
-        viewModelScope.launch {
-            try {
-                graph.downloads.downloadCollection(ref)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                message(R.string.detail_download_failed)
-            }
+        launchWrite(successRes = null, failureRes = R.string.detail_download_failed) {
+            graph.downloads.downloadCollection(ref)
         }
     }
 
     fun removeCollectionDownload(uri: String = contextUri) {
-        viewModelScope.launch {
-            try {
-                graph.downloads.removeCollection(uri)
-                message(R.string.detail_download_removed)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                message(R.string.detail_download_failed)
-            }
+        launchWrite(R.string.detail_download_removed, R.string.detail_download_failed) {
+            graph.downloads.removeCollection(uri)
         }
+    }
+
+    private companion object {
+        const val TAG = "DetailViewModel"
     }
 }

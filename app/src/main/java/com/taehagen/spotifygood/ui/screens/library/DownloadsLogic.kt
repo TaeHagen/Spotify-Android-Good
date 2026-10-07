@@ -2,6 +2,7 @@ package com.taehagen.spotifygood.ui.screens.library
 
 import androidx.compose.runtime.Immutable
 import com.taehagen.spotifygood.download.CollectionType
+import com.taehagen.spotifygood.download.DownloadActivity
 import com.taehagen.spotifygood.download.DownloadItem
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
@@ -113,6 +114,13 @@ fun buildDownloadsContent(
         completed = completedUris,
     )
 }
+
+/**
+ * The queue stopped early ([DownloadActivity.lastError]: storage, account, network …) while items
+ * still wait: the header offers to resume it.
+ */
+fun canResumeDownloads(activity: DownloadActivity, pendingCount: Int): Boolean =
+    !activity.running && pendingCount > 0 && activity.lastError != null
 
 private val PENDING_STATES = setOf(DownloadState.QUEUED, DownloadState.PREPARING, DownloadState.DOWNLOADING)
 

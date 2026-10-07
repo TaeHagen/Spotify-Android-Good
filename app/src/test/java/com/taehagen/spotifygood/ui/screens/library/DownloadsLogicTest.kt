@@ -1,11 +1,13 @@
 package com.taehagen.spotifygood.ui.screens.library
 
 import com.taehagen.spotifygood.download.CollectionType
+import com.taehagen.spotifygood.download.DownloadActivity
 import com.taehagen.spotifygood.download.DownloadItem
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.Track
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -22,6 +24,16 @@ class DownloadsLogicTest {
         } else {
             DownloadMetadata.OfTrack(Track(item.uri, "Track ${item.uri.last()}"))
         }
+    }
+
+    @Test
+    fun resumeIsOfferedOnlyWhenAStoppedRunLeftItemsWaiting() {
+        val stopped = DownloadActivity(running = false, lastError = "Storage is full")
+        assertTrue(canResumeDownloads(stopped, pendingCount = 3))
+        // Nothing waits, the run is still going, or it did not stop early (waiting for Wi-Fi).
+        assertFalse(canResumeDownloads(stopped, pendingCount = 0))
+        assertFalse(canResumeDownloads(stopped.copy(running = true), pendingCount = 3))
+        assertFalse(canResumeDownloads(DownloadActivity(running = false), pendingCount = 3))
     }
 
     @Test

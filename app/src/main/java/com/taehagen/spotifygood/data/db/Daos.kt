@@ -22,6 +22,15 @@ data class DownloadListRow(
     val error: String?,
 )
 
+/** Sync bookkeeping of a downloaded collection (without its member list). */
+data class CollectionSyncRow(
+    val uri: String,
+    val type: String,
+    val lastSyncedAt: Long?,
+    val lastAttemptAt: Long?,
+    val syncFailures: Int,
+)
+
 /** Files referenced by a download row (deletion / garbage collection). */
 data class DownloadFileRow(val uri: String, val path: String?, val imagePath: String?, val individual: Boolean)
 
@@ -48,7 +57,14 @@ interface DownloadDao {
     @Query("SELECT COUNT(*) FROM downloads WHERE state IN ('queued','preparing','downloading')")
     fun observePendingCount(): Flow<Int>
 
-    @Query("SELECT COALESCE(SUM(sizeBytes), 0) FROM downloads WHERE state = 'completed'")
+    /**
+     * Bytes of downloaded audio on disk: every row that owns a finished file (also ones marked failed
+     * later, which keep it until removed), each shared file once.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(size), 0) FROM " +
+            "(SELECT MAX(sizeBytes) AS size FROM downloads WHERE path IS NOT NULL GROUP BY COALESCE(LOWER(fileId), path))",
+    )
     fun observeUsedBytes(): Flow<Long>
 
     /** Newest download first (like the Downloads screen). */
@@ -121,6 +137,13 @@ interface DownloadDao {
     @Query("UPDATE downloads SET state = 'failed', attempts = :attempts, retryAt = NULL, error = :error WHERE uri = :uri")
     suspend fun markFailed(uri: String, attempts: Int, error: String?)
 
+    /** Holds every pending item back until [until] (the whole queue pauses: rate limit, CDN outage). */
+    @Query(
+        "UPDATE downloads SET retryAt = :until WHERE state IN ('queued','preparing','downloading') " +
+            "AND (retryAt IS NULL OR retryAt < :until)",
+    )
+    suspend fun deferPending(until: Long): Int
+
     @Query("UPDATE downloads SET state = 'failed', retryAt = NULL, error = :error WHERE state IN ('queued','preparing','downloading')")
     suspend fun failAllPending(error: String?)
 
@@ -152,6 +175,22 @@ interface DownloadDao {
     @Query("SELECT path FROM downloads WHERE path IS NOT NULL")
     suspend fun allPaths(): List<String>
 
+    /** Files (hex ids) of all rows: completed ones and the ones unfinished downloads are writing. */
+    @Query("SELECT DISTINCT fileId FROM downloads WHERE fileId IS NOT NULL")
+    suspend fun allFileIds(): List<String>
+
+    /** Files whose `.part` an unfinished row (pending, failed, cancelled) may resume. */
+    @Query("SELECT DISTINCT fileId FROM downloads WHERE fileId IS NOT NULL AND state != 'completed'")
+    suspend fun unfinishedFileIds(): List<String>
+
+    /** Rows using the file [fileId] (several downloads can share one file). */
+    @Query("SELECT COUNT(*) FROM downloads WHERE fileId = :fileId COLLATE NOCASE")
+    suspend fun countFileUsers(fileId: String): Int
+
+    /** Records the file an unfinished download writes, so its `.part` survives garbage collection. */
+    @Query("UPDATE downloads SET fileId = :fileId WHERE uri = :uri AND state != 'completed'")
+    suspend fun setFileId(uri: String, fileId: String)
+
     @Query("SELECT DISTINCT imagePath FROM downloads WHERE imagePath IS NOT NULL")
     suspend fun allImagePaths(): List<String>
 
@@ -167,6 +206,13 @@ interface DownloadDao {
 
     @Query("UPDATE downloads SET state = 'failed', error = :error, lastValidatedAt = :at WHERE uri IN (:uris) AND state = 'completed'")
     suspend fun markUnavailable(uris: List<String>, error: String, at: Long)
+
+    /** Completed downloads whose file is gone: failed, and no longer counted as stored. */
+    @Query(
+        "UPDATE downloads SET state = 'failed', error = :error, lastValidatedAt = :at, path = NULL, sizeBytes = 0, bytesDone = 0 " +
+            "WHERE uri IN (:uris) AND state = 'completed'",
+    )
+    suspend fun markMissing(uris: List<String>, error: String, at: Long)
 
     @Query("UPDATE downloads SET metadataJson = :metadataJson WHERE uri = :uri AND metadataJson IS NULL")
     suspend fun fillMetadata(uri: String, metadataJson: String)
@@ -198,9 +244,12 @@ interface DownloadCollectionDao {
     @Query("SELECT COUNT(*) FROM download_collections")
     suspend fun count(): Int
 
-    /** Oldest sync time of any downloaded collection (never synced = 0), null without collections. */
-    @Query("SELECT MIN(COALESCE(lastSyncedAt, 0)) FROM download_collections")
-    suspend fun oldestSyncedAt(): Long?
+    @Query("SELECT uri, type, lastSyncedAt, lastAttemptAt, syncFailures FROM download_collections")
+    suspend fun syncStates(): List<CollectionSyncRow>
+
+    /** A sync of [uri] failed: counts towards its retry backoff. */
+    @Query("UPDATE download_collections SET lastAttemptAt = :at, syncFailures = syncFailures + 1 WHERE uri = :uri")
+    suspend fun recordSyncFailure(uri: String, at: Long)
 }
 
 @Dao

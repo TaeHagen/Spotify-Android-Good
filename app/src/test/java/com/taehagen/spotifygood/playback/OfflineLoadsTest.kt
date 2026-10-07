@@ -1,0 +1,155 @@
+package com.taehagen.spotifygood.playback
+
+import com.taehagen.spotifygood.download.CollectionRef
+import com.taehagen.spotifygood.download.CollectionType
+import com.taehagen.spotifygood.download.DownloadedCollection
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Test
+
+class OfflineLoadsTest {
+    private val playlist = "spotify:playlist:p"
+    private val album = "spotify:album:a"
+    private val liked = "spotify:user:me:collection"
+    private fun t(n: Int) = "spotify:track:$n"
+
+    private fun collection(uri: String, type: CollectionType, vararg items: String) =
+        DownloadedCollection(CollectionRef(uri, type, "name", null), items.toList(), addedAt = 0)
+
+    private fun load(plan: OfflineLoads.Plan): PlayRequest = (plan as OfflineLoads.Plan.Load).request
+
+    @Test
+    fun contextKinds() {
+        assertEquals(OfflineLoads.ContextKind.PLAYLIST, OfflineLoads.kindOf(playlist))
+        assertEquals(OfflineLoads.ContextKind.PLAYLIST, OfflineLoads.kindOf("spotify:user:me:playlist:p"))
+        assertEquals(OfflineLoads.ContextKind.LIKED_SONGS, OfflineLoads.kindOf(liked))
+        assertEquals(OfflineLoads.ContextKind.LIKED_SONGS, OfflineLoads.kindOf("spotify:collection:tracks"))
+        assertEquals(OfflineLoads.ContextKind.ALBUM, OfflineLoads.kindOf(album))
+        assertEquals(OfflineLoads.ContextKind.SHOW, OfflineLoads.kindOf("spotify:show:s"))
+        assertNull(OfflineLoads.kindOf("spotify:artist:x"))
+        assertNull(OfflineLoads.kindOf(t(1)))
+        assertNull(OfflineLoads.kindOf("spotify:user:me:collection:artist"))
+    }
+
+    @Test
+    fun downloadedCollectionGivesItsOrder() {
+        val members = OfflineLoads.members(
+            playlist, null,
+            listOf(collection(playlist, CollectionType.PLAYLIST, t(3), t(1), t(2))),
+            completed = setOf(t(1), t(3)),
+        ) { error("metadata not needed") }
+        assertEquals(OfflineMembers(listOf(t(3), t(1), t(2)), setOf(t(1), t(3))), members)
+    }
+
+    @Test
+    fun likedSongsMatchByTypeWhateverTheUriSpelling() {
+        val members = OfflineLoads.members(
+            "spotify:collection:tracks", null,
+            listOf(collection(liked, CollectionType.LIKED_SONGS, t(1), t(2))),
+            completed = setOf(t(2)),
+        ) { emptyList() }
+        assertEquals(listOf(t(1), t(2)), members?.order)
+    }
+
+    @Test
+    fun albumNotDownloadedAsAWholeUsesTrackNumbers() {
+        val entries = listOf(
+            DownloadedEntry(t(3), albumUri = album, discNumber = 1, trackNumber = 3),
+            DownloadedEntry(t(9), albumUri = "spotify:album:other", discNumber = 1, trackNumber = 1),
+            DownloadedEntry(t(5), albumUri = album, discNumber = 2, trackNumber = 1),
+            DownloadedEntry(t(1), albumUri = album, discNumber = 1, trackNumber = 1),
+        )
+        val members = OfflineLoads.members(album, null, emptyList(), setOf(t(1), t(3), t(5), t(9))) { entries }
+        assertEquals(listOf(t(1), t(3), t(5)), members?.order)
+    }
+
+    @Test
+    fun showNotDownloadedAsAWholeIsNewestFirst() {
+        val show = "spotify:show:s"
+        val entries = listOf(
+            DownloadedEntry("spotify:episode:old", showUri = show, releaseDate = "2024-01-01"),
+            DownloadedEntry("spotify:episode:new", showUri = show, releaseDate = "2025-06-01"),
+        )
+        val members = OfflineLoads.members(show, null, emptyList(), entries.map { it.uri }.toSet()) { entries }
+        assertEquals(listOf("spotify:episode:new", "spotify:episode:old"), members?.order)
+    }
+
+    @Test
+    fun playlistNotDownloadedOnlyKnowsTheTappedTrack() {
+        val members = OfflineLoads.members(playlist, t(2), emptyList(), setOf(t(2))) { error("not for playlists") }
+        assertEquals(listOf(t(2)), members?.order)
+        assertEquals(OfflineMembers(emptyList(), setOf(t(2))), OfflineLoads.members(playlist, null, emptyList(), setOf(t(2))) { emptyList() })
+        assertNull(OfflineLoads.members("spotify:artist:x", null, emptyList(), emptySet()) { emptyList() })
+    }
+
+    @Test
+    fun onlineAndTrackLoadsAreLeftAlone() {
+        val members = OfflineMembers(listOf(t(1)), setOf(t(1)))
+        val context = PlayRequest(contextUri = playlist)
+        assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(context, members, EngineReach.ONLINE))
+        val tracks = PlayRequest(contextUri = playlist, trackUris = listOf(t(1)))
+        assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(tracks, members, EngineReach.OFFLINE))
+        assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(PlayRequest(trackUris = listOf(t(1))), members, EngineReach.OFFLINE))
+        assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(context, null, EngineReach.OFFLINE))
+    }
+
+    @Test
+    fun contextLoadBecomesItsDownloadsKeepingTheContext() {
+        val members = OfflineMembers(listOf(t(1), t(2), t(3), t(4)), setOf(t(1), t(3), t(4)))
+        val request = PlayRequest(contextUri = playlist, startUri = t(3), startIndex = 2, startUid = "abc123", positionMs = 5_000, shuffle = false)
+        val converted = load(OfflineLoads.plan(request, members, EngineReach.OFFLINE))
+        assertEquals(listOf(t(1), t(3), t(4)), converted.trackUris)
+        assertEquals(1, converted.startIndex)
+        assertEquals(playlist, converted.contextUri)
+        assertEquals(t(3), converted.startUri)
+        assertEquals("abc123", converted.startUid)
+        assertEquals(5_000L, converted.positionMs)
+        assertEquals(false, converted.shuffle)
+    }
+
+    @Test
+    fun undownloadedStartMovesToTheNextDownloadFromItsStart() {
+        val members = OfflineMembers(listOf(t(1), t(2), t(3)), setOf(t(1), t(3)))
+        val converted = load(OfflineLoads.plan(PlayRequest(contextUri = playlist, startUri = t(2), positionMs = 9_000), members, EngineReach.OFFLINE))
+        assertEquals(listOf(t(1), t(3)), converted.trackUris)
+        assertEquals(1, converted.startIndex)
+        assertEquals("position belonged to the other track", 0L, converted.positionMs)
+        // Nothing downloaded after the requested start: from the top.
+        val last = load(OfflineLoads.plan(PlayRequest(contextUri = playlist, startIndex = 5), members, EngineReach.OFFLINE))
+        assertEquals(0, last.startIndex)
+    }
+
+    @Test
+    fun indexOnlyStartNamesTheStartTrackForSpirc() {
+        val members = OfflineMembers(listOf(t(1), t(2), t(3)), setOf(t(2), t(3)))
+        val converted = load(OfflineLoads.plan(PlayRequest(contextUri = playlist, startIndex = 2), members, EngineReach.CONNECTING))
+        assertEquals(listOf(t(2), t(3)), converted.trackUris)
+        assertEquals(1, converted.startIndex)
+        assertEquals(t(3), converted.startUri)
+    }
+
+    @Test
+    fun noStartStaysUnset() {
+        val members = OfflineMembers(listOf(t(1), t(2)), setOf(t(1), t(2)))
+        val converted = load(OfflineLoads.plan(PlayRequest(contextUri = liked, shuffle = true), members, EngineReach.OFFLINE))
+        assertNull(converted.startIndex)
+        assertNull(converted.startUri)
+        assertEquals(true, converted.shuffle)
+    }
+
+    @Test
+    fun offlineQueueUidsAreDropped() {
+        val members = OfflineMembers(listOf(t(1)), setOf(t(1)))
+        val converted = load(OfflineLoads.plan(PlayRequest(contextUri = playlist, startUid = "o7"), members, EngineReach.OFFLINE))
+        assertNull(converted.startUid)
+    }
+
+    @Test
+    fun nothingDownloadedFailsOnlyWhenReallyOffline() {
+        val none = OfflineMembers(listOf(t(1)), emptySet())
+        val request = PlayRequest(contextUri = playlist)
+        assertEquals(OfflineLoads.Plan.NotDownloaded, OfflineLoads.plan(request, none, EngineReach.OFFLINE))
+        // Still connecting: the engine may come online and play the context itself.
+        assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(request, none, EngineReach.CONNECTING))
+    }
+}
