@@ -415,7 +415,9 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 
 `scopeId` is the interface index for a link-local IPv6 host (`fe80::/10`), which a URL cannot
 carry; such a host is connected through that interface and rejected (`INVALID_ARGUMENT`) without
-one. Kotlin prefers an IPv4 address when the service has one.
+one. Kotlin probes only addresses this allowlist accepts (IPv4 first, then unique-local, then
+scoped link-local IPv6; never a global address), and re-probes with an address update that
+arrived while an earlier probe of the same service was failing.
 
 `LocalDeviceInfo`: `{"deviceId","remoteName","deviceType":<DeviceList type>,"activeUser"?,"tokenTypes":[…],"supportsAccessToken":bool,"version","brand"?,"model"?,"isGroup":bool,"availability"?}`.
 Key material (the device's DH public key, client id) never crosses the JNI boundary; Rust keeps it

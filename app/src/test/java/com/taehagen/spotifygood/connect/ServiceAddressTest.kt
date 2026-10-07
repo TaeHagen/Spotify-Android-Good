@@ -15,12 +15,41 @@ class ServiceAddressTest {
     private fun scopedLinkLocal(scope: Int): Inet6Address =
         Inet6Address.getByAddress(null, InetAddress.getByName("fe80::1").address, scope)
 
+    private val global = InetAddress.getByName("2a02:1234::5")
+
     @Test
-    fun picksIpv4FirstThenRoutableIpv6() {
+    fun picksIpv4FirstThenUniqueLocalThenLinkLocal() {
         assertEquals(v4, ServiceAddress.pick(listOf(linkLocal, ula, v4)))
         assertEquals(ula, ServiceAddress.pick(listOf(linkLocal, ula)))
         assertEquals(linkLocal, ServiceAddress.pick(listOf(linkLocal)))
         assertNull(ServiceAddress.pick(emptyList()))
+    }
+
+    @Test
+    fun neverPicksAnAddressRustRefuses() {
+        assertNull(ServiceAddress.pick(listOf(global)))
+        assertEquals(ula, ServiceAddress.pick(listOf(global, ula)))
+        assertEquals(linkLocal, ServiceAddress.pick(listOf(global, linkLocal)))
+        assertNull(ServiceAddress.pick(listOf(InetAddress.getByName("8.8.8.8"))))
+        val all = listOf(global, linkLocal, InetAddress.getByName("8.8.8.8"), ula, v4)
+        assertEquals(listOf(v4, ula, linkLocal), ServiceAddress.candidates(all))
+    }
+
+    @Test
+    fun allowlistMirrorsRust() {
+        // Same cases as Rust `zeroconf_client::http::tests::only_local_urls`.
+        for (ok in listOf("192.168.1.20", "10.0.0.5", "172.16.3.4", "169.254.10.10", "127.0.0.1", "fd00::1", "::1", "fe80::1")) {
+            assertEquals(ok, true, ServiceAddress.isLocal(InetAddress.getByName(ok)))
+        }
+        for (bad in listOf("8.8.8.8", "172.32.0.1", "2001:db8::1", "2a02:1234::5", "fec0::1")) {
+            assertEquals(bad, false, ServiceAddress.isLocal(InetAddress.getByName(bad)))
+        }
+        // An IPv4-mapped IPv6 address counts as its IPv4 address.
+        val mapped = ByteArray(16).also { it[10] = -1; it[11] = -1 }
+        val mappedPrivate = Inet6Address.getByAddress(null, mapped.copyOf().also { b -> byteArrayOf(192.toByte(), 168.toByte(), 1, 2).copyInto(b, 12) }, 0)
+        val mappedPublic = Inet6Address.getByAddress(null, mapped.copyOf().also { b -> byteArrayOf(8, 8, 8, 8).copyInto(b, 12) }, 0)
+        assertEquals(true, ServiceAddress.isLocal(mappedPrivate))
+        assertEquals(false, ServiceAddress.isLocal(mappedPublic))
     }
 
     @Test
