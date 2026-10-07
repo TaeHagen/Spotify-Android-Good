@@ -545,11 +545,12 @@ class PlayerController internal constructor(
         call("player.load", loadArgs(prepared.copy(play = play)))
     }
 
-    private suspend fun prepareLoad(request: PlayRequest): PlayRequest {
-        val env = environment ?: return request
+    private suspend fun prepareLoad(original: PlayRequest): PlayRequest {
+        val env = environment ?: return original
+        val reach = env.reach()
+        val request = OfflineLoads.withoutSmartShuffle(original, reach)
         val context = request.contextUri ?: return request
         if (!request.trackUris.isNullOrEmpty()) return request
-        val reach = env.reach()
         if (reach == EngineReach.ONLINE) return request
         val members = try {
             env.downloadedMembers(context, request.startUri)

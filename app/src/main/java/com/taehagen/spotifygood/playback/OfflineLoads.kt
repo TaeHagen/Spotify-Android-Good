@@ -49,6 +49,14 @@ internal object OfflineLoads {
         data object NotDownloaded : Plan
     }
 
+    /**
+     * Offline ([EngineReach.OFFLINE]) there is no smart shuffle: the offline queue only shuffles
+     * and reports smart shuffle unavailable. A load asking for it asks for a plain shuffle instead.
+     */
+    fun withoutSmartShuffle(request: PlayRequest, reach: EngineReach): PlayRequest =
+        if (reach != EngineReach.OFFLINE || request.smartShuffle != true) request
+        else request.copy(shuffle = true, smartShuffle = null)
+
     /** Uids of the native offline queue ("o<n>"), which the engine reads as an index. */
     private val OFFLINE_UID = Regex("o\\d+")
 

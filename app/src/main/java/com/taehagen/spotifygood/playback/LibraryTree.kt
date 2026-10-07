@@ -254,6 +254,8 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
                 .setMediaType(if (state.isEpisode) MediaMetadata.MEDIA_TYPE_PODCAST_EPISODE else MediaMetadata.MEDIA_TYPE_MUSIC)
                 .build(),
         )
+        // Shuffle / repeat of the session, for the load that resumes it (a load without them resets both).
+        .setRequestMetadata(MediaItem.RequestMetadata.Builder().setExtras(ResumeModes.extras(state)).build())
         .build()
 
     // ---- search -------------------------------------------------------------------------------
