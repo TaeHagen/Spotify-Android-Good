@@ -211,6 +211,11 @@ impl OfflineQueue {
         self.status
     }
 
+    /// Stopped (the end, a halt, a dead Player) with an item a play starts again.
+    pub fn stopped_with_item(&self) -> bool {
+        self.active && self.status == PlaybackStatus::Stopped && self.current.is_some()
+    }
+
     /// Playing, or loading to play.
     pub fn is_playing(&self) -> bool {
         self.status == PlaybackStatus::Playing || (self.status == PlaybackStatus::Loading && self.play_intent)
@@ -1363,6 +1368,7 @@ mod tests {
         q.next(1_000);
         q.player_lost(5_000);
         assert_eq!(q.status(), PlaybackStatus::Stopped);
+        assert!(q.stopped_with_item(), "a play starts it again");
         assert!(!q.is_playing());
         // a play loads it again at that position, on the new Player
         let a = q.play(6_000);

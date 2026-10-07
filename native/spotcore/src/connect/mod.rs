@@ -302,10 +302,26 @@ async fn control(mut cmd: Ctl) -> AppResult<Value> {
     ok()
 }
 
+/// Playback this device stopped (the context ended, the load brake halted it) with a track to
+/// play again.
+fn stopped_with_track(s: Option<&librespot_connect::ConnectSnapshot>) -> bool {
+    s.is_some_and(|s| s.is_active && s.track.is_some() && s.status == librespot_connect::SnapshotPlayStatus::Stopped)
+}
+
+/// A play / toggle of stopped playback loads its track again (Spirc's and the offline queue's
+/// play from stopped): like a new load, the load brake gets a fresh chance (latched, it stopped
+/// the first failure again).
+fn restarts_stopped(cmd: &Ctl, stopped_with_track: bool) -> bool {
+    matches!(cmd, Ctl::Play | Ctl::Toggle) && stopped_with_track
+}
+
 fn local_control(cmd: &Ctl, activate: bool) -> AppResult<()> {
     let spirc = spirc()?;
     if activate {
         local::sent(spirc.activate())?;
+    }
+    if restarts_stopped(cmd, stopped_with_track(hub::local_snapshot().as_ref())) {
+        player_events::on_user_load();
     }
     match cmd {
         Ctl::Play => local::sent(spirc.play()),
@@ -760,6 +776,32 @@ mod tests {
         assert!(body.contains("\"repeating_track\":true"), "{body}");
         assert!(body.contains("\"initially_paused\":true"), "{body}");
         assert!(body.contains("42000"), "{body}");
+    }
+
+    #[test]
+    fn a_play_of_stopped_playback_gets_a_fresh_load_brake() {
+        use librespot_connect::{ConnectSnapshot, SnapshotPlayStatus, SnapshotTrack, TrackProvider};
+        let track = SnapshotTrack {
+            uri: "spotify:track:a".into(),
+            uid: "a".into(),
+            provider: TrackProvider::Context,
+            context_index: None,
+            hidden: false,
+            metadata: Default::default(),
+        };
+        let halted = ConnectSnapshot { is_active: true, status: SnapshotPlayStatus::Stopped, track: Some(track), ..Default::default() };
+        assert!(stopped_with_track(Some(&halted)));
+        assert!(restarts_stopped(&Ctl::Play, true));
+        assert!(restarts_stopped(&Ctl::Toggle, true));
+        assert!(!restarts_stopped(&Ctl::Pause, true));
+        assert!(!restarts_stopped(&Ctl::Next, true));
+        assert!(!restarts_stopped(&Ctl::Play, false));
+        // paused, inactive, or nothing to play again: an ordinary play
+        let paused = ConnectSnapshot { status: SnapshotPlayStatus::Paused, ..halted.clone() };
+        assert!(!stopped_with_track(Some(&paused)));
+        assert!(!stopped_with_track(Some(&ConnectSnapshot { is_active: false, ..halted.clone() })));
+        assert!(!stopped_with_track(Some(&ConnectSnapshot { track: None, ..halted })));
+        assert!(!stopped_with_track(None));
     }
 
     #[test]

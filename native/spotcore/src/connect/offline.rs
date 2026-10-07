@@ -349,6 +349,14 @@ pub(crate) async fn control(cmd: &Ctl) -> AppResult<()> {
     // Online and visible, the Player is bound to the session: a queued track may stream.
     let can_stream = engine::is_online() && engine::network_available() && hub::spirc().is_some();
     let now = now_ms();
+    let restarts = {
+        let q = QUEUE.lock();
+        super::restarts_stopped(cmd, q.stopped_with_item())
+    };
+    if restarts {
+        // A fresh chance for the load brake, like a new load.
+        player_events::on_user_load();
+    }
     let action = {
         let mut q = QUEUE.lock();
         if !q.active {
