@@ -349,7 +349,7 @@ active** → connect-state command to that device.
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
 | `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
 | `catalog.recentlyPlayed` | `{"limit":50}` | `{"items":[MediaRef]}` |
-| `catalog.user` | `{"username"?}` | `User` (me when omitted) |
+| `catalog.user` | `{"username"?}` | `User` (me when omitted; other users include their `publicPlaylists`) |
 | `library.playlists` | `{}` | `{"items":[RootlistEntry],"partial"?:true}` (rootlist, folders preserved; entries without decorations are named through cached header lookups, ≤100 requests per call; deleted/inaccessible playlists are remembered for 30 min; `partial` when some names could not be looked up yet and those playlists are missing) |
 | `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}],"partial"?}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` (no metadata involved: the membership source for downloads) |
 | `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"≤500}` | paged `{"total","items":[…],"partial"?}` |
@@ -435,7 +435,8 @@ HomeSection  {"id","title","items":[MediaRef]}
 RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit"}
 Lyrics       {"syncType":"LINE_SYNCED|UNSYNCED|SYLLABLE_SYNCED","lines":[{"startTimeMs","words"}],
               "provider"?,"colors"?:{"background","text","highlightText"}}
-User         {"username","displayName","images","product","country","explicitFilter"}
+User         {"username","displayName","images","product","country","explicitFilter",
+              "publicPlaylists"?:[PlaylistRef]}   (publicPlaylists: other users only, up to 50; mine come from the rootlist)
 ```
 
 ## 7. Smart shuffle

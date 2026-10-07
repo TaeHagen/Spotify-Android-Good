@@ -308,6 +308,8 @@ data class User(
     val product: String? = null,
     val country: String? = null,
     val explicitFilter: Boolean = false,
+    /** Another user's public playlists (`catalog.user {username}`); empty for me (use the rootlist). */
+    val publicPlaylists: List<PlaylistRef> = emptyList(),
 ) {
     val isPremium: Boolean get() = product == null || product == "premium"
 }
