@@ -148,6 +148,8 @@ struct SpircTask {
     suggestions_rx: mpsc::UnboundedReceiver<SuggestionResponse>,
     suggestion_fetch: SuggestionFetch,
     queue_gauge: Arc<QueueGauge>,
+    /// the local autoplay value set with Spirc::set_autoplay, it wins over the account value
+    autoplay_override: Option<bool>,
 }
 
 // SPOTIFYGOOD: lets Spirc::add_to_queue reject an add right away when the queue is full, the
@@ -427,6 +429,7 @@ impl Spirc {
             suggestions_rx,
             suggestion_fetch: SuggestionFetch::default(),
             queue_gauge: queue_gauge.clone(),
+            autoplay_override: None,
         };
 
         let spirc = Spirc {
@@ -723,7 +726,9 @@ impl Spirc {
 
     /// Enables or disables autoplay (continuing with similar tracks after the context ended)
     ///
-    /// This sets the local `autoplay` user attribute, it isn't synced to the account. Fails if
+    /// This sets the local `autoplay` user attribute, it isn't synced to the account. From then
+    /// on, autoplay changes made elsewhere (attribute mutations and updates pushed by spotify)
+    /// are ignored for this spirc. Fails if
     /// [SessionConfig::autoplay](librespot_core::SessionConfig) overrides the attribute. Also
     /// works while we are not the active device.
     pub fn set_autoplay(&self, autoplay: bool) -> Result<(), Error> {
@@ -1401,6 +1406,8 @@ impl SpircTask {
         let attributes: UserAttributes = update
             .pairs
             .iter()
+            // SPOTIFYGOOD: keep the local autoplay value, see Spirc::set_autoplay
+            .filter(|(key, _)| !(self.autoplay_override.is_some() && key.as_str() == "autoplay"))
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
         self.session.set_user_attributes(attributes)
@@ -1410,7 +1417,11 @@ impl SpircTask {
         for attribute in mutation.fields.iter() {
             let key = &attribute.name;
 
-            if key == "autoplay" && self.session.config().autoplay.is_some() {
+            // SPOTIFYGOOD: also for the local value of Spirc::set_autoplay. The mutation only
+            // names the field, flipping the local value assumed it mirrors the account.
+            if key == "autoplay"
+                && (self.session.config().autoplay.is_some() || self.autoplay_override.is_some())
+            {
                 trace!("Autoplay override active. Ignoring mutation.");
                 continue;
             }
@@ -1815,8 +1826,8 @@ impl SpircTask {
         self.player
             .emit_volume_changed_event(self.connect_state.device_info().volume as u16);
 
-        self.player
-            .emit_auto_play_changed_event(self.session.autoplay());
+        // SPOTIFYGOOD: Spirc::set_autoplay
+        self.player.emit_auto_play_changed_event(self.autoplay());
 
         self.player
             .emit_filter_explicit_content_changed_event(self.session.filter_explicit_content());
@@ -2185,13 +2196,21 @@ impl SpircTask {
         Ok(())
     }
 
+    // SPOTIFYGOOD: see Spirc::set_autoplay, the local value also survives a replacement of all
+    // user attributes (product info)
+    fn autoplay(&self) -> bool {
+        self.autoplay_override
+            .unwrap_or_else(|| self.session.autoplay())
+    }
+
     // SPOTIFYGOOD: see Spirc::set_autoplay
     fn handle_set_autoplay(&mut self, autoplay: bool) -> Result<(), Error> {
         if self.session.config().autoplay.is_some() {
             Err(SpircError::AutoplayOverridden)?
         }
 
-        let old_value = self.session.autoplay();
+        let old_value = self.autoplay();
+        self.autoplay_override = Some(autoplay);
         self.session
             .set_user_attribute("autoplay", if autoplay { "1" } else { "0" });
 
@@ -2405,7 +2424,8 @@ impl SpircTask {
         let require_load_new = !self
             .connect_state
             .has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
-            && self.session.autoplay()
+            // SPOTIFYGOOD: Spirc::set_autoplay
+            && self.autoplay()
             && !self.connect_state.context_uri().is_empty();
 
         if !require_load_new {
