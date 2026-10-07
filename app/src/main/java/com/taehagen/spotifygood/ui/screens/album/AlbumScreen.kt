@@ -102,6 +102,11 @@ private fun AlbumList(
                 onMore = { navigator.showActions(MediaActionTarget.AlbumTarget(album.toRef())) },
             )
         }
+        if (content.downloadedCopy) {
+            item(key = "downloaded", contentType = "notice") {
+                DownloadedCopyNotice(stringResource(R.string.detail_showing_downloaded_tracks))
+            }
+        }
         if (album.partial) {
             // Some tracks are placeholders (their metadata failed right now).
             item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetry) }
