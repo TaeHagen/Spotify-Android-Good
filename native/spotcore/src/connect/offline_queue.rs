@@ -68,6 +68,23 @@ pub(crate) struct Outcome {
     pub exhausted_after_error: bool,
 }
 
+/// The other Connect devices as a cluster shows them (see [`OfflineQueue::taken_over`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Elsewhere {
+    /// The cluster's active device, unless it is this one (`None`: nobody, or this device).
+    pub device: Option<String>,
+    /// ... and it plays.
+    pub playing: bool,
+}
+
+impl Elsewhere {
+    /// `now` took the session over from what this mark recorded: another device became active,
+    /// or the marked one started playing.
+    fn taken_over_by(&self, now: &Elsewhere) -> bool {
+        now.device.is_some() && (now.device != self.device || (now.playing && !self.playing))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct OfflineQueue {
     pub active: bool,
@@ -98,6 +115,12 @@ pub(crate) struct OfflineQueue {
     /// Loads sent to the Player whose `PlayRequestIdChanged` hasn't arrived yet. Every
     /// `Player::load` produces exactly one new request id, in command order.
     pending_loads: u32,
+    /// The latest cluster's view of the other devices (`None`: no cluster since the load).
+    elsewhere: Option<Elsewhere>,
+    /// The other devices when the queue first saw a cluster or last paused here (followed while
+    /// nothing takes over): only a change since then is a takeover. Spotify keeps a paused
+    /// device as the account's active one for hours, that one doesn't take over.
+    takeover_mark: Option<Elsewhere>,
 }
 
 impl Default for OfflineQueue {
@@ -124,6 +147,8 @@ impl Default for OfflineQueue {
             duration_ms: 0,
             own_request: None,
             pending_loads: 0,
+            elsewhere: None,
+            takeover_mark: None,
         }
     }
 }
@@ -168,6 +193,36 @@ impl OfflineQueue {
         self.status == PlaybackStatus::Playing || (self.status == PlaybackStatus::Loading && self.play_intent)
     }
 
+    /// Records a cluster's view of the other devices. The mark follows it while nothing takes
+    /// over, so a marked device that pauses and later resumes does take over.
+    pub fn observe(&mut self, now: Elsewhere) {
+        if !self.takeover_mark.as_ref().is_some_and(|m| m.taken_over_by(&now)) {
+            self.takeover_mark = Some(now.clone());
+        }
+        self.elsewhere = Some(now);
+    }
+
+    /// Another device took the session over since the queue first saw a cluster or last paused
+    /// here: a device became active, or the active one started playing. Not with no cluster seen.
+    pub fn taken_over(&self) -> bool {
+        match (&self.takeover_mark, &self.elsewhere) {
+            (Some(mark), Some(now)) => mark.taken_over_by(now),
+            _ => false,
+        }
+    }
+
+    /// A paused or finished queue that another device took over gives way to it (a playing one
+    /// keeps playing until something takes the Player over).
+    pub fn gives_way(&self) -> bool {
+        self.active && !self.is_playing() && self.taken_over()
+    }
+
+    /// Paused here: whatever the other devices do right now is no takeover (a pause on this
+    /// device never hands the session away, e.g. to a device that played meanwhile).
+    fn paused_here(&mut self) {
+        self.takeover_mark = self.elsewhere.clone();
+    }
+
     pub fn current_uri(&self) -> Option<&str> {
         match self.current.as_ref()? {
             Current::Context(i) => self.items.get(*i).map(|it| it.uri.as_str()),
@@ -197,13 +252,14 @@ impl OfflineQueue {
         !self.skipped.contains(&idx) && self.items.get(idx).is_some_and(|it| !self.unavailable.contains(&it.uri))
     }
 
-    /// Next context position in `order` after `from` (wrapping with repeat context).
+    /// Next context position in `order` after `from` (wrapping with repeat context, also under
+    /// repeat-track entered from it, like Spirc).
     fn next_context_pos(&self, from: Option<usize>) -> Option<usize> {
         let start = from.map(|p| p + 1).unwrap_or(0);
         if let Some(p) = (start..self.order.len()).find(|&p| self.playable(self.order[p])) {
             return Some(p);
         }
-        if self.repeat == RepeatMode::Context {
+        if self.repeat_context {
             return (0..self.order.len()).find(|&p| self.playable(self.order[p]));
         }
         None
@@ -213,7 +269,7 @@ impl OfflineQueue {
         if let Some(p) = (0..from).rev().find(|&p| self.playable(self.order[p])) {
             return Some(p);
         }
-        if self.repeat == RepeatMode::Context {
+        if self.repeat_context {
             return (from + 1..self.order.len()).rev().find(|&p| self.playable(self.order[p]));
         }
         None
@@ -329,10 +385,12 @@ impl OfflineQueue {
                 self.status = PlaybackStatus::Paused;
                 self.play_intent = false;
                 self.position_ts = now_ms;
+                self.paused_here();
                 Some(Action::Pause)
             }
             PlaybackStatus::Loading => {
                 self.play_intent = false;
+                self.paused_here();
                 Some(Action::Pause)
             }
             _ => None,
@@ -428,7 +486,7 @@ impl OfflineQueue {
         if matches!(self.current, Some(Current::Context(c)) if c == idx) {
             return false;
         }
-        self.order.iter().position(|&i| i == idx).is_some_and(|p| p > self.pos || self.repeat == RepeatMode::Context)
+        self.order.iter().position(|&i| i == idx).is_some_and(|p| p > self.pos || self.repeat_context)
     }
 
     /// Removes a queued entry or skips an upcoming context entry. False if `uid` isn't upcoming.
@@ -549,6 +607,9 @@ impl OfflineQueue {
                 out.changed = true;
             }
             Event::Paused { id, position_ms } if self.own(id) => {
+                if self.is_playing() {
+                    self.paused_here();
+                }
                 self.status = PlaybackStatus::Paused;
                 self.play_intent = false;
                 self.position_ms = position_ms as u64;
@@ -614,7 +675,7 @@ impl OfflineQueue {
         let mut steps = 0usize;
         while next.len() < MAX_NEXT && steps < self.order.len() {
             let Some(np) = self.next_context_pos(p) else { break };
-            if Some(np) <= p && self.repeat != RepeatMode::Context {
+            if Some(np) <= p && !self.repeat_context {
                 break;
             }
             let idx = self.order[np];
@@ -842,6 +903,110 @@ mod tests {
         assert_eq!(q.snapshot(dev(), 0).repeat, RepeatMode::Track);
         assert!(q.skip_to("o2", 0).is_some());
         assert_eq!(q.snapshot(dev(), 0).repeat, RepeatMode::Off);
+    }
+
+    #[test]
+    fn repeat_one_entered_from_repeat_all_wraps() {
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 2, false, RepeatMode::Context), 0);
+        started(&mut q, 1);
+        q.set_repeat(RepeatMode::Track);
+        let s = q.snapshot(dev(), 0);
+        assert_eq!(s.next_tracks.first().map(|t| t.uri.as_str()), Some("spotify:track:0"));
+        assert!(s.restrictions.can_skip_next, "Next stays offered on the last item");
+        assert_eq!(load_uri(&q.next(0)).as_deref(), Some("spotify:track:0"));
+        assert_eq!(q.snapshot(dev(), 0).repeat, RepeatMode::Context);
+        started(&mut q, 2);
+        // back to repeat-one on the first item: prev goes to the last one
+        q.set_repeat(RepeatMode::Track);
+        assert_eq!(load_uri(&q.prev(0)).as_deref(), Some("spotify:track:2"));
+
+        // from off, repeat-one on the last item doesn't wrap
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 2, false, RepeatMode::Off), 0);
+        started(&mut q, 1);
+        q.set_repeat(RepeatMode::Track);
+        let s = q.snapshot(dev(), 0);
+        assert!(s.next_tracks.is_empty());
+        assert!(!s.restrictions.can_skip_next);
+    }
+
+    fn elsewhere(device: Option<&str>, playing: bool) -> Elsewhere {
+        Elsewhere { device: device.map(str::to_string), playing }
+    }
+
+    #[test]
+    fn a_device_sitting_paused_as_the_active_one_never_takes_over() {
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 0, false, RepeatMode::Off), 0);
+        started(&mut q, 1);
+        assert!(!q.taken_over(), "no cluster seen yet");
+        // the first cluster after the network came back: the desktop left paused at the office
+        q.observe(elsewhere(Some("desktop"), false));
+        assert!(!q.taken_over());
+        // a pause here (call, headphones unplugged) keeps the session
+        q.pause(0);
+        assert!(!q.gives_way());
+        q.observe(elsewhere(Some("desktop"), false));
+        assert!(!q.gives_way());
+        // the desktop starts playing: it took over
+        q.observe(elsewhere(Some("desktop"), true));
+        assert!(q.gives_way());
+
+        // another device becomes active
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 0, false, RepeatMode::Off), 0);
+        started(&mut q, 1);
+        q.observe(elsewhere(Some("desktop"), false));
+        q.pause(0);
+        q.observe(elsewhere(Some("speaker"), false));
+        assert!(q.gives_way());
+        // nobody active any more: it doesn't
+        q.observe(elsewhere(None, false));
+        assert!(!q.gives_way());
+    }
+
+    #[test]
+    fn a_pause_here_never_hands_the_session_away() {
+        // the desktop started playing while the queue played on: the next pause here (a call)
+        // keeps the session, Play resumes here
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 0, false, RepeatMode::Off), 0);
+        started(&mut q, 1);
+        q.observe(elsewhere(None, false));
+        q.observe(elsewhere(Some("desktop"), true));
+        assert!(q.taken_over() && !q.gives_way(), "a playing queue keeps playing");
+        q.pause(0);
+        assert!(!q.gives_way());
+        q.observe(elsewhere(Some("desktop"), true));
+        assert!(!q.gives_way());
+        // the same through the Player's pause event
+        q.play(0);
+        q.observe(elsewhere(Some("speaker"), true));
+        q.on_event(Event::Paused { id: 1, position_ms: 0 }, 0);
+        assert!(!q.gives_way());
+        // the speaker pauses, then resumes: that is a takeover
+        q.observe(elsewhere(Some("speaker"), false));
+        assert!(!q.gives_way());
+        q.observe(elsewhere(Some("speaker"), true));
+        assert!(q.gives_way());
+    }
+
+    #[test]
+    fn a_finished_queue_gives_way_to_a_device_that_took_over_meanwhile() {
+        let mut q = OfflineQueue::default();
+        q.load(spec(1, 0, false, RepeatMode::Off), 0);
+        started(&mut q, 1);
+        q.observe(elsewhere(Some("desktop"), false));
+        q.observe(elsewhere(Some("desktop"), true));
+        assert!(!q.gives_way());
+        q.on_event(Event::EndOfTrack(1), 0);
+        assert!(q.gives_way());
+        // a new load starts over (no cluster seen)
+        q.load(spec(1, 0, false, RepeatMode::Off), 0);
+        assert!(!q.taken_over());
+        q.reset();
+        assert!(!q.taken_over() && !q.gives_way());
     }
 
     #[test]

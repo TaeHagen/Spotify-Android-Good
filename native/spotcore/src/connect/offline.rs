@@ -3,13 +3,14 @@
 //! them through the vendored offline hook without any network access.
 
 use super::args::LoadArgs;
-use super::offline_queue::{select_downloaded, Action, Event, Handover, LoadSpec, OfflineQueue};
+use super::offline_queue::{select_downloaded, Action, Elsewhere, Event, Handover, LoadSpec, OfflineQueue};
 use super::{hub, now_ms, player_events, uri, Ctl};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{ActiveDeviceRef, OfflineTrackRecord, PlaybackSnapshot, RepeatMode};
 use crate::{engine, events, offline as downloads};
 use librespot_core::SpotifyUri;
 use librespot_playback::player::PlayerEvent;
+use librespot_protocol::connect::Cluster;
 use parking_lot::Mutex;
 use std::sync::LazyLock;
 
@@ -19,29 +20,48 @@ pub(crate) fn is_active() -> bool {
     QUEUE.lock().active
 }
 
-/// Active and playing (or loading to play).
-pub(crate) fn is_playing() -> bool {
-    let q = QUEUE.lock();
-    q.active && q.is_playing()
+/// What a cluster says about the other devices (for the takeover rule).
+fn elsewhere(cluster: &Cluster, me: &str) -> Elsewhere {
+    let device = Some(cluster.active_device_id.as_str()).filter(|id| !id.is_empty() && *id != me).map(str::to_string);
+    let playing = device.is_some() && cluster.player_state.as_ref().is_some_and(|p| p.is_playing && !p.is_paused);
+    Elsewhere { device, playing }
 }
 
-/// A paused or finished queue gives way to another active device: it is stopped (frees the
-/// Player), so commands, the snapshot and transfers follow that device. A playing one keeps
-/// playing until something takes over.
-pub(crate) fn yield_to_active_device() {
-    if !engine::is_online() || !is_active() || is_playing() {
-        return;
+/// A cluster of the attached Spirc arrived: recorded for the takeover rule (see
+/// [`OfflineQueue::taken_over`]), then a paused or finished queue may give way.
+pub(crate) fn on_cluster(cluster: &Cluster) {
+    let now = elsewhere(cluster, &hub::me());
+    {
+        let mut q = QUEUE.lock();
+        if !q.active {
+            return;
+        }
+        q.observe(now);
     }
-    let me = hub::me();
-    if hub::active_device_id().is_some_and(|id| id != me) {
-        log::info!("another device is active, ending the paused offline queue");
+    yield_to_active_device();
+}
+
+/// Online, and another device took the session over from the paused or finished queue: it
+/// became active, or started playing, after the queue paused here (or first saw a cluster). A
+/// device that only sits paused as the account's active one doesn't take over.
+pub(crate) fn yields() -> bool {
+    engine::is_online() && QUEUE.lock().gives_way()
+}
+
+/// A queue that [`yields`] is stopped (frees the Player), so commands, the snapshot and
+/// transfers follow that device. A playing one keeps playing until something takes over.
+pub(crate) fn yield_to_active_device() {
+    if yields() {
+        log::info!("another device took over, ending the paused offline queue");
         stop();
     }
 }
 
+/// The queue's snapshot while it owns the session (active and not given way, see [`yields`]).
 pub(crate) fn snapshot(device: ActiveDeviceRef, volume: u16) -> Option<PlaybackSnapshot> {
+    let online = engine::is_online();
     let q = QUEUE.lock();
-    q.active.then(|| q.snapshot(device, volume))
+    (q.active && !(online && q.gives_way())).then(|| q.snapshot(device, volume))
 }
 
 /// The current and up to `max_next` next items, the current position, repeat mode and whether it
@@ -274,10 +294,8 @@ pub(crate) fn control(cmd: &Ctl) -> AppResult<()> {
     if let Some(action) = action {
         apply(action)?;
     }
+    // No yield here: a pause on this device never hands the session away.
     hub::publish();
-    if matches!(cmd, Ctl::Pause | Ctl::Toggle) {
-        yield_to_active_device();
-    }
     Ok(())
 }
 
@@ -329,7 +347,7 @@ pub(crate) fn on_player_event(event: &PlayerEvent) {
     }
     if outcome.changed {
         hub::publish();
-        // paused elsewhere, or the end of the queue
+        // the end of the queue, after another device took over meanwhile
         yield_to_active_device();
     }
 }

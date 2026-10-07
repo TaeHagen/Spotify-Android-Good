@@ -277,10 +277,15 @@ prev/next semantics identical to Spirc (prev restarts if position > 3 s). It dri
 same Player and emits the same `playback` snapshots with `source:"local"`,
 `isActiveDevice:true`, `offline:true`. When the session comes back Online, the offline
 queue keeps playing; the next `player.load` goes through Spirc again. A paused or finished
-offline queue gives way to another active device (it is stopped, commands and the snapshot
-follow that device). The user queue holds at most 80 tracks like Spirc's (`UNAVAILABLE` "The
-queue is full"); a manual next / skip leaves repeat-track like Spirc; a shuffle load without a
-start begins anywhere; a paused load stays paused through next / unavailable items.
+offline queue gives way only to a device that took over after it paused here (or after it first
+saw a cluster): one that became the active device, or the active one starting to play (the
+queue is stopped, commands and the snapshot follow that device). A device that only sits paused
+as the account's active one (Spotify keeps it for hours) never takes over, and a pause on this
+phone (user, call, headphones unplugged) never hands the session away. The user queue holds at
+most 80 tracks like Spirc's (`UNAVAILABLE` "The queue is full"); a manual next / skip leaves
+repeat-track like Spirc; repeat-one entered from repeat-all keeps wrapping (next / prev /
+upcoming tracks); a shuffle load without a start begins anywhere; a paused load stays paused
+through next / unavailable items.
 Native resolution of an offline `player.load`: `trackUris` queues the downloaded ones among
 them; a bare album / artist / show `contextUri` queues its downloads in context order (disc
 and track number; newest episode first); a playlist / Liked Songs / other `contextUri`
@@ -360,7 +365,10 @@ becoming visible isn't routed offline or as "nothing is active". Right after a l
 restore activated this device, commands go to it although its state doesn't say active yet.
 A pending reconnect restore (§8) is this device's session: a play / pause decides whether it
 comes back playing, other controls wait for it and then act on the restored session, a load
-replaces it only once the load goes through, a transfer to another device hands it over.
+replaces it only once the load goes through, a transfer to another device hands it over. A play
+without a session (no network, backoff) isn't answered by the restore: it fails or falls back as
+usual and leaves no intent behind. Once the new Spirc's first cluster is overdue (60 s),
+commands no longer wait for the restore and a play restores right away.
 
 ### 6.1 Session
 
@@ -400,7 +408,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
-| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs"}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE`. Pushing offline playback hands over its tracks (in play order), current position and repeat mode, and keeps it paused if it was |
+| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs"}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE`. Pushing offline playback hands over its tracks (in play order), current position and repeat mode, and keeps it paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as the visible track window in play order) |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
@@ -579,13 +587,19 @@ For a remote active device, smart shuffle is not supported (the command reports
 * **Audio output reporting**: Kotlin reports the current local output (speaker /
   Bluetooth "<name>" / wired / USB / car) with `player.setAudioOutput`.
 * **Reconnect restore**: when the engine rebuilds Session + Spirc (network switch, lost AP
-  connection), the last local playback is frozen and shown paused, and the Player is paused
-  (Spirc also pauses it when its task ends by itself or is aborted, and an inactive Spirc
-  never touches it). Once the new Spirc is online and its first cluster (never without one)
-  shows no other active device, the device activates and reloads context, track, position,
-  options and user queue: playing again if the gap was < 120 s, unless the user pressed play
-  or pause meanwhile. A queued or suggested current track keeps its context (the track is
-  requeued and restarts). An explicit `player.load` (local, remote or offline) or running
+  connection), the last local playback is frozen and shown paused (for at most 30 min), and the
+  Player is paused (Spirc also pauses it when its task ends by itself or is aborted, and an
+  inactive Spirc never touches it; once the engine detached a Spirc, the connect layer pauses
+  it instead and the Spirc leaves the Player alone, the offline queue may already use it). Once
+  the new Spirc is online and its first cluster (never without one, however late) shows no
+  other active device, the device activates and reloads context, track, position, options and
+  user queue: playing again if the gap was < 120 s, unless the user pressed pause meanwhile or
+  play within the last 30 s. Gaps count the time the phone slept (wall clock, never less than
+  the monotonic clock; a clock set back counts as a long gap). Without a first cluster after
+  60 s a play restores right away (the user asked for it here). A queued or suggested current
+  track keeps its context (the track is requeued, restarts, and gets repeat-one back; a full
+  queue loses its tail, not the track); handed to another device it goes as the visible track
+  window in play order instead. An explicit `player.load` (local, remote or offline) or running
   offline playback replaces the restore point; a dropped restore point stops the paused track
   nobody owns anymore.
 * **Local-network discovery (the "send" side)**: speakers and receivers on the LAN that are not

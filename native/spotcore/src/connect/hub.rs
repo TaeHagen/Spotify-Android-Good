@@ -47,6 +47,9 @@ pub(crate) struct HubState {
     pub reconnect: Option<restore::Frozen>,
     /// Commands holding the pending restore's decision (see `restore::hold`).
     pub restore_holds: u32,
+    /// The Spirc generation whose first cluster is overdue for the pending restore (see
+    /// `restore::schedule`).
+    pub restore_overdue: Option<u64>,
     /// Activate + load were sent to the attached Spirc (a local load or the restore) and its
     /// snapshot isn't active yet: commands go to it, not "nobody is active".
     pub activation: Option<Activation>,
@@ -137,12 +140,6 @@ pub(crate) fn activating_or_active(hub: &HubState) -> bool {
         })
 }
 
-/// An activation was sent to the attached Spirc and it doesn't report itself active yet.
-pub(crate) fn activating() -> bool {
-    let hub = HUB.lock();
-    !hub.snapshot.as_ref().is_some_and(|s| s.is_active) && activating_or_active(&hub)
-}
-
 /// A local load with activation was sent to the attached Spirc.
 pub(crate) fn set_activating() {
     let mut hub = HUB.lock();
@@ -201,13 +198,45 @@ pub(crate) fn detach_state(hub: &mut HubState, generation: u64, online: bool) {
     }
 }
 
+/// The engine is done with the attached Spirc: it no longer touches the shared Player, not even
+/// while it shuts down (the offline queue may take the Player over right away, see
+/// `Spirc::release_player`). Returns whether it was the active device playing: then the Player
+/// is to be paused instead (unless the offline queue owns it).
+fn release_link(hub: &HubState) -> bool {
+    let Some(link) = hub.link.as_ref() else { return false };
+    link.spirc.release_player();
+    hub.snapshot.as_ref().is_some_and(|s| {
+        s.is_active
+            && matches!(
+                s.status,
+                librespot_connect::SnapshotPlayStatus::Playing | librespot_connect::SnapshotPlayStatus::LoadingPlay
+            )
+    })
+}
+
+fn pause_released(was_playing: bool) {
+    if was_playing && !offline::is_active() {
+        if let Some(player) = engine::player_host::player() {
+            log::info!("the detached spirc was playing, pausing its player");
+            player.pause();
+        }
+    }
+}
+
 /// Called by the engine when a Spirc goes away (teardown or death, or hiding from Spotify
 /// Connect while the session stays online).
 pub(crate) fn detach(generation: u64) {
     // Hidden (the session stays online): keep the last cluster for the remote player state. A
     // later teardown of the hidden session (offline, stopped) drops it, there is no link then.
     let online = engine::is_online();
-    detach_state(&mut HUB.lock(), generation, online);
+    let was_playing = {
+        let mut hub = HUB.lock();
+        let current = hub.link.as_ref().is_some_and(|l| l.generation == generation);
+        let was_playing = current && release_link(&hub);
+        detach_state(&mut hub, generation, online);
+        was_playing
+    };
+    pause_released(was_playing);
     changed();
     publish();
     publish_devices();
@@ -223,13 +252,16 @@ pub(crate) fn drop_stale_cluster() {
 
 /// Forgets any attached Spirc (forced cleanup after an aborted supervisor).
 pub(crate) fn detach_all() {
-    {
+    let was_playing = {
         let mut hub = HUB.lock();
+        let was_playing = release_link(&hub);
         hub.link = None;
         hub.snapshot = None;
         hub.cluster = None;
         hub.activation = None;
-    }
+        was_playing
+    };
+    pause_released(was_playing);
     changed();
     publish();
     publish_devices();
@@ -280,9 +312,9 @@ async fn observe(
 }
 
 /// The Spirc task is gone (its state channel closed): if it was the active device playing, the
-/// Player is released (Spirc pauses it itself when it ends; this also covers a task whose
-/// future was dropped before its last snapshot). Not if a newer Spirc or the offline queue
-/// owns the Player by now.
+/// Player is released (Spirc pauses it itself when it ends, unless it was detached, then
+/// `detach` did; this also covers a task whose future was dropped before its last snapshot).
+/// Not if a newer Spirc or the offline queue owns the Player by now.
 fn on_spirc_ended(generation: u64, last: &ConnectSnapshot) {
     let playing = last.is_active
         && matches!(
@@ -354,12 +386,12 @@ fn on_cluster(generation: u64, cluster: Arc<Cluster>) {
         if hub.link.as_ref().map(|l| l.generation) != Some(generation) {
             return;
         }
-        hub.cluster = Some(cluster);
+        hub.cluster = Some(cluster.clone());
     }
     CLUSTER_CHANGED.notify_waiters();
     changed();
-    // A paused offline queue gives way to a device that became active.
-    offline::yield_to_active_device();
+    // A paused or finished offline queue gives way to a device that took over.
+    offline::on_cluster(&cluster);
     publish_devices();
     publish();
 }
@@ -392,13 +424,12 @@ pub(crate) fn compose() -> PlaybackSnapshot {
     let (local, cluster, placeholder, refused) = {
         let hub = HUB.lock();
         let local = hub.snapshot.clone().filter(|s| s.is_active);
-        let placeholder = hub.reconnect.as_ref().filter(|f| f.since.elapsed() < RECONNECT_PLACEHOLDER_MAX).cloned();
+        let (now, now_ms) = (Instant::now(), super::now_ms());
+        let placeholder = hub.reconnect.as_ref().filter(|f| f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned();
         (local, hub.cluster.clone(), placeholder, hub.refused_error.clone())
     };
-    // A paused or finished offline queue doesn't hide another active device.
-    let other_active = cluster.as_deref().is_some_and(|c| !c.active_device_id.is_empty() && c.active_device_id != device.id);
-    let offline = offline::snapshot(device.clone(), mixer_volume())
-        .filter(|s| !other_active || matches!(s.status, PlaybackStatus::Playing | PlaybackStatus::Loading));
+    // None once a paused or finished offline queue gave way to a device that took over.
+    let offline = offline::snapshot(device.clone(), mixer_volume());
     let mut snap = if let Some(s) = local {
         snapshot::map_local(&s, device.clone())
     } else if let Some(s) = offline {

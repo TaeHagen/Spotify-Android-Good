@@ -1,5 +1,5 @@
 use crate::{
-    core::{Error, Session},
+    core::{Error, Session, error::ErrorKind},
     protocol::{
         autoplay_context_request::AutoplayContextRequest, context::Context,
         transfer_state::TransferState,
@@ -37,11 +37,13 @@ pub(super) struct ResolveContext {
 }
 
 impl ResolveContext {
-    fn append_context(uri: impl Into<String>) -> Self {
+    // SPOTIFYGOOD: carries the type of the context the page belongs to (the pages of an autoplay
+    // context were appended to the default context)
+    fn append_context(uri: impl Into<String>, update: ContextType) -> Self {
         Self {
             resolve: Resolve::Uri(uri.into()),
             fallback: None,
-            update: ContextType::Default,
+            update,
             action: ContextAction::Append,
         }
     }
@@ -81,6 +83,16 @@ impl ResolveContext {
             }
         }
         .or(self.fallback.as_deref())
+    }
+
+    // SPOTIFYGOOD: a further page is resolved like a context, also one of an autoplay context
+    // (it is appended to that one)
+    /// how the resolve is requested
+    fn fetch_as(&self) -> ContextType {
+        match self.action {
+            ContextAction::Append => ContextType::Default,
+            ContextAction::Replace => self.update,
+        }
     }
 
     /// the actual context uri
@@ -174,6 +186,26 @@ impl ContextResolver {
         self.queue.push_back(resolve)
     }
 
+    // SPOTIFYGOOD: see Spirc::load_context_from_uri
+    /// Forgets that `resolve` failed, it is requested again when added
+    pub fn forget_unavailable(&mut self, resolve: &ResolveContext) {
+        self.unavailable_contexts.remove(resolve);
+    }
+
+    // SPOTIFYGOOD
+    /// Whether a failed resolve means the context can't be resolved (not found, not allowed,
+    /// invalid), as opposed to a transient failure that is worth another try right away
+    pub fn is_unavailable(error: &Error) -> bool {
+        matches!(
+            error.kind,
+            ErrorKind::NotFound
+                | ErrorKind::PermissionDenied
+                | ErrorKind::InvalidArgument
+                | ErrorKind::FailedPrecondition
+                | ErrorKind::Unimplemented
+        )
+    }
+
     pub fn add_list(&mut self, resolve: Vec<ResolveContext>) {
         for resolve in resolve {
             self.add(resolve)
@@ -226,7 +258,7 @@ impl ContextResolver {
     ) -> Result<Context, Error> {
         let (next, resolve_uri, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
-        match next.update {
+        match next.fetch_as() {
             ContextType::Default => {
                 let mut ctx = self.session.spclient().get_context(resolve_uri).await;
                 if let Ok(ctx) = ctx.as_mut() {
@@ -270,9 +302,12 @@ impl ContextResolver {
         let (next, _, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
         let remaining = match next.action {
-            // SPOTIFYGOOD: into the context of the resolve (it always went into the default one)
-            ContextAction::Append if context.pages.len() == 1 => state
-                .fill_context_from_page(context.pages.remove(0), next.update)
+            // SPOTIFYGOOD: into the context of the resolve (it always went into the default one).
+            // Every page is appended (more than one page failed with UnexpectedPagesSize).
+            ContextAction::Append if !context.pages.is_empty() => context
+                .pages
+                .drain(..)
+                .try_for_each(|page| state.fill_context_from_page(page, next.update))
                 .map(|_| None),
             ContextAction::Replace => {
                 let remaining = state.update_context(context, next.update);
@@ -291,7 +326,7 @@ impl ContextResolver {
         Ok(remaining.map(|remaining| {
             remaining
                 .into_iter()
-                .map(ResolveContext::append_context)
+                .map(|uri| ResolveContext::append_context(uri, next.update))
                 .collect::<Vec<_>>()
         }))
     }
@@ -357,5 +392,149 @@ impl ContextResolver {
         state.update_queue_revision();
 
         true
+    }
+}
+
+// SPOTIFYGOOD
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ConnectConfig,
+        core::{SessionConfig, SpotifyId, SpotifyUri},
+        protocol::{context_page::ContextPage, context_track::ContextTrack},
+    };
+
+    const PLAYLIST: &str = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
+
+    fn session() -> (tokio::runtime::Runtime, Session) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let session = {
+            let _guard = rt.enter();
+            Session::new(SessionConfig::default(), None)
+        };
+        (rt, session)
+    }
+
+    fn page(uids: std::ops::Range<u8>, prefix: &str) -> ContextPage {
+        ContextPage {
+            tracks: uids
+                .map(|i| {
+                    let mut raw = [0u8; 16];
+                    raw[0] = prefix.as_bytes()[0];
+                    raw[15] = i;
+                    let uri = SpotifyUri::Track {
+                        id: SpotifyId::from_raw(&raw).unwrap(),
+                    };
+                    ContextTrack {
+                        uri: Some(uri.to_uri().unwrap()),
+                        uid: Some(format!("{prefix}{i}")),
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn uids(state: &ConnectState, ty: ContextType) -> Vec<String> {
+        state
+            .get_context(ty)
+            .map(|c| c.tracks.iter().map(|t| t.uid.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn an_explicit_load_asks_again_after_a_failure() {
+        let (_rt, session) = session();
+        let mut resolver = ContextResolver::new(session);
+        let load = || {
+            ResolveContext::from_uri(PLAYLIST, "", ContextType::Default, ContextAction::Replace)
+        };
+        resolver.add(load());
+        resolver.mark_next_unavailable();
+        resolver.remove_used_and_invalid();
+        // the same context is refused for a while (playlist updates, autoplay re-resolves)
+        resolver.add(load());
+        assert!(!resolver.has_next());
+        // a load forgets that first
+        resolver.forget_unavailable(&load());
+        resolver.add(load());
+        assert!(resolver.has_next());
+    }
+
+    #[test]
+    fn only_a_context_that_cant_be_resolved_is_skipped_for_a_while() {
+        assert!(ContextResolver::is_unavailable(&Error::not_found("404")));
+        assert!(ContextResolver::is_unavailable(&Error::permission_denied("403")));
+        assert!(ContextResolver::is_unavailable(
+            &ContextResolverError::NotAllowedContext(String::new()).into()
+        ));
+        assert!(!ContextResolver::is_unavailable(&Error::unavailable("503")));
+        assert!(!ContextResolver::is_unavailable(&Error::deadline_exceeded("timeout")));
+        assert!(!ContextResolver::is_unavailable(&Error::resource_exhausted("429")));
+        assert!(!ContextResolver::is_unavailable(&Error::aborted("reset")));
+    }
+
+    #[test]
+    fn the_pages_of_an_autoplay_context_stay_autoplay() {
+        let (_rt, session) = session();
+        let mut state = ConnectState::new(ConnectConfig::default(), &session);
+        let mut resolver = ContextResolver::new(session);
+        state
+            .update_context(
+                Context {
+                    uri: Some(PLAYLIST.into()),
+                    pages: vec![page(0..3, "d")],
+                    ..Default::default()
+                },
+                ContextType::Default,
+            )
+            .unwrap();
+        resolver.add(ResolveContext::from_uri(
+            PLAYLIST,
+            "",
+            ContextType::Autoplay,
+            ContextAction::Replace,
+        ));
+        let further = ContextPage {
+            page_url: Some(
+                "hm://artistplaycontext/v1/page/spotify/album/5LFzwirfFwBKXJQGfwmiMY/km".into(),
+            ),
+            ..Default::default()
+        };
+        let response = Context {
+            uri: Some(PLAYLIST.into()),
+            pages: vec![page(0..2, "a"), further],
+            ..Default::default()
+        };
+        let remaining = resolver
+            .apply_next_context(&mut state, response)
+            .unwrap()
+            .expect("a further page");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].update, ContextType::Autoplay);
+        assert_eq!(remaining[0].action, ContextAction::Append);
+        // fetched like a context page, appended to the autoplay context
+        assert_eq!(remaining[0].fetch_as(), ContextType::Default);
+        resolver.remove_used_and_invalid();
+        resolver.add_list(remaining);
+        let page_response = Context {
+            pages: vec![page(2..4, "a"), page(4..5, "a")],
+            ..Default::default()
+        };
+        assert!(
+            resolver
+                .apply_next_context(&mut state, page_response)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(uids(&state, ContextType::Default), ["d0", "d1", "d2"]);
+        assert_eq!(
+            uids(&state, ContextType::Autoplay),
+            ["a0", "a1", "a2", "a3", "a4"]
+        );
     }
 }
