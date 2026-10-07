@@ -95,6 +95,21 @@ class CacheFreshnessTest {
     }
 }
 
+class SearchTotalsTest {
+    @Test
+    fun totalsAreReadByListKey() {
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val results = json.decodeFromString(
+            com.taehagen.spotifygood.model.SearchResults.serializer(),
+            """{"tracks":[],"totals":{"tracks":800,"shows":3}}""",
+        )
+        assertEquals(800, results.totalOf(SearchType.TRACK))
+        assertEquals(3, results.totalOf(SearchType.SHOW))
+        assertNull(results.totalOf(SearchType.ALBUM))
+        assertNull(com.taehagen.spotifygood.model.SearchResults().totalOf(SearchType.TRACK))
+    }
+}
+
 class SpotifyUrisTest {
     @Test
     fun parsesTypes() {

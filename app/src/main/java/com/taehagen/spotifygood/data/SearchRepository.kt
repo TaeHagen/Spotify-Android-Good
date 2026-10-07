@@ -14,9 +14,20 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.put
 
-enum class SearchType(val wire: String) {
-    TRACK("track"), ARTIST("artist"), ALBUM("album"), PLAYLIST("playlist"), SHOW("show"), EPISODE("episode")
+enum class SearchType(val wire: String, internal val listKey: String) {
+    TRACK("track", "tracks"),
+    ARTIST("artist", "artists"),
+    ALBUM("album", "albums"),
+    PLAYLIST("playlist", "playlists"),
+    SHOW("show", "shows"),
+    EPISODE("episode", "episodes"),
 }
+
+/**
+ * The server's result count for [type], when it reported one (docs §6.3). Pass it as the page
+ * total when paging one type: pages can be shorter than the limit while more results exist.
+ */
+fun SearchResults.totalOf(type: SearchType): Int? = totals[type.listKey]
 
 sealed interface RecentSearch {
     val key: String

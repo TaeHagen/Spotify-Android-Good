@@ -114,6 +114,8 @@ class BrowseLogicTest {
         assertEquals(300 to true, pageStep(offset = 200, pageSize = 100, received = 50, total = 250))
         assertEquals(100 to true, pageStep(offset = 0, pageSize = 100, received = 100, total = 100))
         assertTrue("an empty page ends the list", pageStep(offset = 0, pageSize = 100, received = 0, total = 250).second)
+        // A search page short of a dropped entity, with the server's total: not the end.
+        assertEquals(30 to false, pageStep(offset = 0, pageSize = 30, received = 29, total = 120))
         // Unknown total (search): a short page is the end.
         assertEquals(30 to false, pageStep(offset = 0, pageSize = 30, received = 30, total = null))
         assertEquals(42 to true, pageStep(offset = 30, pageSize = 30, received = 12, total = null))
