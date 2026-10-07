@@ -464,11 +464,25 @@ impl ConnectState {
             self.active_context, self.fill_up_context
         );
 
+        // SPOTIFYGOOD: the next tracks start over in the pass of the current track (see
+        // fill_up_next_tracks), which keys the smart shuffle suggestions. It used to start over
+        // at pass 0, so after a wrap (repeat) the suggestions of the passes ahead were never
+        // inserted, or came back a pass late, and already played ones were inserted again.
+        // Both the pass and the played suggestions are known only before the next tracks are
+        // cleared.
+        let default_ctx = matches!(self.active_context, ContextType::Default);
+        let pass = if default_ctx {
+            self.forget_passed_suggestions();
+            self.current_pass()
+        } else {
+            0
+        };
+
         let new_index = new_index.unwrap_or(0);
         self.update_current_index(|i| i.track = new_index as u32);
         self.update_context_index(self.active_context, new_index + 1)?;
-        // SPOTIFYGOOD: the next tracks start over, in the first pass (see fill_up_next_tracks)
-        self.get_context_mut(self.active_context)?.index.page = 0;
+        // SPOTIFYGOOD: see above
+        self.get_context_mut(self.active_context)?.index.page = pass;
         self.fill_up_context = self.active_context;
 
         // SPOTIFYGOOD: a playing smart shuffle suggestion is not part of the context, keep it
@@ -497,6 +511,12 @@ impl ConnectState {
         }
 
         self.clear_next_tracks();
+        // SPOTIFYGOOD: smart shuffle, see above
+        if default_ctx {
+            if let Some(suggestion) = self.continue_suggestions_at(pass, new_index + 1) {
+                self.next_tracks_mut().push(suggestion)
+            }
+        }
         self.fill_up_next_tracks()?;
         self.update_restrictions();
 

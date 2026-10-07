@@ -6,7 +6,7 @@ use crate::{
     core::{Session, SessionConfig, SpotifyId, SpotifyUri, dealer::protocol::Request},
     protocol::{
         connect::AudioOutputDeviceType, context::Context, context_page::ContextPage,
-        context_track::ContextTrack,
+        context_track::ContextTrack, player::ProvidedTrack,
     },
     state::{
         ConnectState, SPOTIFY_MAX_NEXT_TRACKS_SIZE,
@@ -673,6 +673,106 @@ fn smart_shuffle_suggestion_dropped_from_the_end_comes_back() {
     assert!(state.next_tracks().len() <= SPOTIFY_MAX_NEXT_TRACKS_SIZE);
     let played = play_through(&mut state, 100);
     assert_eq!(played.iter().filter(|uid| is_suggestion_uid(uid)).count(), 20);
+}
+
+fn suggestion_uids(tracks: &[ProvidedTrack]) -> Vec<String> {
+    tracks
+        .iter()
+        .filter(|t| t.is_suggestion())
+        .map(|t| t.uid.clone())
+        .collect()
+}
+
+/// the next tracks up to the first delimiter (the rest of the current pass)
+fn rest_of_pass(state: &ConnectState) -> &[ProvidedTrack] {
+    let next = state.next_tracks();
+    let end = next
+        .iter()
+        .position(|t| t.uid.starts_with(IDENTIFIER_DELIMITER))
+        .unwrap_or(next.len());
+    &next[..end]
+}
+
+fn assert_played_once(played: &[String]) {
+    let suggestions = played
+        .iter()
+        .filter(|uid| is_suggestion_uid(uid))
+        .collect::<Vec<_>>();
+    let unique = suggestions.iter().collect::<HashSet<_>>();
+    assert_eq!(unique.len(), suggestions.len(), "a suggestion was played twice");
+}
+
+#[test]
+fn smart_shuffle_continues_after_repeat_is_turned_off_after_a_wrap() {
+    let (_rt, mut state) = state(30);
+    state.set_repeat_context(true);
+    state.handle_smart_shuffle(true).unwrap();
+    // one after every 3rd track: 9 in the first pass, one in the second
+    assert_eq!(state.add_suggestions(suggestions(10)).unwrap(), 10);
+
+    // through the first pass (29 tracks and 9 suggestions) and 4 entries into the second
+    let mut played = play_through(&mut state, 43);
+    assert_eq!(played.iter().filter(|uid| is_suggestion_uid(uid)).count(), 10);
+    assert!(state.current_track(|t| !t.is_suggestion()));
+
+    state.handle_set_repeat_context(false).unwrap();
+    // the played suggestions don't come back
+    assert!(suggestion_uids(state.next_tracks()).is_empty());
+
+    // and new ones go into the rest of this pass, the last one without repeat
+    assert!(state.needs_suggestions());
+    assert!(state.prune_suggestions());
+    let added = state.add_suggestions(context(10, 8)).unwrap();
+    assert!(added > 0);
+    assert_eq!(suggestion_uids(state.next_tracks()).len(), added);
+
+    played.extend(play_through(&mut state, 100));
+    assert_played_once(&played);
+    assert_eq!(
+        played.iter().filter(|uid| is_suggestion_uid(uid)).count(),
+        10 + added
+    );
+}
+
+#[test]
+fn smart_shuffle_suggestions_stay_in_their_pass_when_repeat_is_toggled() {
+    let (_rt, mut state) = state(10);
+    state.set_repeat_context(true);
+    state.handle_smart_shuffle(true).unwrap();
+    // spread over four passes of the 10 tracks
+    assert_eq!(state.add_suggestions(suggestions(10)).unwrap(), 10);
+
+    // through the first pass (9 tracks and 3 suggestions) and 2 tracks into the second
+    let mut played = play_through(&mut state, 14);
+    let ahead_in_this_pass = suggestion_uids(rest_of_pass(&state));
+    assert!(!ahead_in_this_pass.is_empty());
+
+    state.handle_set_repeat_context(false).unwrap();
+    assert_eq!(suggestion_uids(state.next_tracks()), ahead_in_this_pass);
+    state.handle_set_repeat_context(true).unwrap();
+    // still in this pass, not a pass later
+    assert_eq!(suggestion_uids(rest_of_pass(&state)), ahead_in_this_pass);
+    assert_unique_uids(&state);
+
+    played.extend(play_through(&mut state, 60));
+    assert_played_once(&played);
+    for uid in &ahead_in_this_pass {
+        assert!(played.contains(uid));
+    }
+
+    // the suggestion after the current track stays the next track
+    let (_rt, mut state) = self::state(10);
+    state.set_repeat_context(true);
+    state.handle_smart_shuffle(true).unwrap();
+    state.add_suggestions(suggestions(10)).unwrap();
+    play_through(&mut state, SMART_SHUFFLE_INTERVAL);
+    let next = state.next_tracks()[0].clone();
+    assert!(next.is_suggestion());
+    state.handle_set_repeat_context(false).unwrap();
+    assert_eq!(state.next_tracks()[0].uid, next.uid);
+    state.handle_set_repeat_context(true).unwrap();
+    assert_eq!(state.next_tracks()[0].uid, next.uid);
+    assert_unique_uids(&state);
 }
 
 /// compile time check: the engine spawns the task and shares the handle between threads

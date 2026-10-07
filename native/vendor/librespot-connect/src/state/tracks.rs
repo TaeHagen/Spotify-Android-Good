@@ -395,6 +395,30 @@ impl<'ct> ConnectState {
         Ok(())
     }
 
+    // SPOTIFYGOOD: see fill_up_next_tracks, smart shuffle suggestions are keyed by the pass
+    /// The pass through the default context (the `index.page` of its fill up, counting the wraps
+    /// with repeat) that the current track belongs to
+    pub(super) fn current_pass(&self) -> u32 {
+        let page = self
+            .get_context(ContextType::Default)
+            .map(|ctx| ctx.index.page)
+            .unwrap_or_default();
+
+        // the first delimiter of the next tracks ends the pass of the current track (a wrap, or
+        // the transition to autoplay), its iteration is that pass
+        let mut delimiters = self
+            .next_tracks()
+            .iter()
+            .filter(|t| t.uid.starts_with(IDENTIFIER_DELIMITER));
+        match delimiters.next() {
+            None => page,
+            Some(first) => first
+                .get_iteration()
+                .and_then(|iteration| iteration.parse().ok())
+                .unwrap_or_else(|| page.saturating_sub(1 + delimiters.count() as u32)),
+        }
+    }
+
     pub fn preview_next_track(&mut self) -> Option<SpotifyUri> {
         let next = if self.repeat_track() {
             self.current_track(|t| &t.uri)
