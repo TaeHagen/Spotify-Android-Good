@@ -10,7 +10,7 @@ use crate::{
     },
     state::{
         ConnectState, SPOTIFY_MAX_NEXT_TRACKS_SIZE,
-        context::ContextType,
+        context::{ContextType, ResetContext},
         metadata::Metadata,
         provider::IsProvider,
         smart_shuffle::{SMART_SHUFFLE_BATCH_SIZE, SMART_SHUFFLE_INTERVAL},
@@ -1235,6 +1235,58 @@ fn autoplay_append_resolve_fills_the_autoplay_context() {
 
     assert!(resolver.try_finish(&mut state, &mut None));
     assert_eq!(next_uids(&state), ["a3", "a4", "a5"]);
+}
+
+/// a page of default context tracks `uid{n}`
+fn default_page(range: std::ops::Range<usize>) -> ContextPage {
+    ContextPage {
+        tracks: range
+            .map(|i| ContextTrack {
+                uri: Some(track_uri(i, 0)),
+                uid: Some(format!("uid{i}")),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn pages_appended_while_shuffled_still_unshuffle() {
+    // shuffle on while the further pages still resolve
+    let (_rt, mut state) = state(30);
+    state.handle_shuffle(true).unwrap();
+    let shuffled = default_uids(&state);
+    let next = next_uids(&state);
+
+    state
+        .fill_context_from_page(default_page(30..35), ContextType::Default)
+        .unwrap();
+    // the shuffled order and the next tracks stay, the new tracks follow them
+    assert_eq!(default_uids(&state)[..30], shuffled);
+    assert_eq!(default_uids(&state)[30..], uids(30..35));
+    state.fill_up_next_tracks().unwrap();
+    assert_eq!(next_uids(&state)[..29], next);
+    assert_eq!(next_uids(&state)[29..], uids(30..35));
+    let context_index =
+        state.get_context(ContextType::Default).unwrap().tracks[32].get_context_index();
+    assert_eq!(context_index, Some(32));
+
+    // shuffle off restores the order of the context, the playback continues after the current
+    // track
+    state.handle_shuffle(false).unwrap();
+    assert_eq!(default_uids(&state), uids(0..35));
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid0");
+    assert_eq!(next_uids(&state), uids(1..35));
+
+    // so does the reshuffle of the last resolve (ContextResolver::try_finish)
+    let (_rt, mut state) = self::state(30);
+    state.handle_shuffle(true).unwrap();
+    state
+        .fill_context_from_page(default_page(30..35), ContextType::Default)
+        .unwrap();
+    state.reset_context(ResetContext::DefaultIndex);
+    assert_eq!(default_uids(&state), uids(0..35));
 }
 
 /// compile time check: the engine spawns the task and shares the handle between threads
