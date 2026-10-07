@@ -132,6 +132,10 @@ data class DownloadActivity(
  * * Removal deletes files, rows and the native offline index entries.
  * * The native offline index follows the database through numbered changes ([OfflineIndexSync]):
  *   every commit and removal takes its number under [mutex] with its database write.
+ * * Writes (download, remove, remove all, retry, sync; settings changes are observed on [scope])
+ *   run on [scope], not in the caller ([detached]): a caller that goes away (a page popped) only
+ *   stops waiting, so a write never stops between its database commit and the file deletion,
+ *   `offline.add` / `offline.remove` and scheduling that must follow it.
  */
 class DownloadManager(
     context: Context,
@@ -273,7 +277,9 @@ class DownloadManager(
      * [com.taehagen.spotifygood.nativebridge.NativeException] when that fails. Calling it again
      * re-queues failed and individually removed items.
      */
-    suspend fun downloadCollection(ref: CollectionRef) {
+    suspend fun downloadCollection(ref: CollectionRef): Unit = scope.detached { downloadCollectionNow(ref) }
+
+    private suspend fun downloadCollectionNow(ref: CollectionRef) {
         val found = requireNotNull(resolver.resolve(ref.type, ref.uri))
         if (found.items.isEmpty() && !found.complete) {
             // Nothing listed and the lookup is not trustworthy: report it instead of storing an empty
@@ -305,7 +311,9 @@ class DownloadManager(
     }
 
     /** Stops keeping [uri] offline; deletes its items unless another download still needs them. */
-    suspend fun removeCollection(uri: String) {
+    suspend fun removeCollection(uri: String): Unit = scope.detached { removeCollectionNow(uri) }
+
+    private suspend fun removeCollectionNow(uri: String) {
         val removed = mutex.withLock {
             val entity = collectionDao.get(uri) ?: return
             val others = collectionDao.getAll().filter { it.uri != uri }.map { decodeItems(it.itemUrisJson) }
@@ -324,7 +332,9 @@ class DownloadManager(
     }
 
     /** Downloads single tracks / episodes (kept until removed, independent of collections). */
-    suspend fun downloadItems(uris: List<String>) {
+    suspend fun downloadItems(uris: List<String>): Unit = scope.detached { downloadItemsNow(uris) }
+
+    private suspend fun downloadItemsNow(uris: List<String>) {
         val targets = uris.filter(SpotifyUris::isPlayableItem).distinct()
         if (targets.isEmpty()) return
         // Names for the Downloads screen while queued; best effort (the record brings them anyway).
@@ -353,7 +363,9 @@ class DownloadManager(
     }
 
     /** Deletes the given downloads (files, rows, offline index), whatever collection they belong to. */
-    suspend fun removeItems(uris: List<String>) {
+    suspend fun removeItems(uris: List<String>): Unit = scope.detached { removeItemsNow(uris) }
+
+    private suspend fun removeItemsNow(uris: List<String>) {
         val targets = uris.distinct()
         if (targets.isEmpty()) return
         val removed = mutex.withLock {
@@ -367,7 +379,9 @@ class DownloadManager(
     }
 
     /** Deletes every download and collection and cancels pending work (settings "Remove all", logout). */
-    suspend fun removeAll() {
+    suspend fun removeAll(): Unit = scope.detached { removeAllNow() }
+
+    private suspend fun removeAllNow() {
         cancelScheduledWork()
         runner.stop()
         val removal = mutex.withLock {
@@ -388,7 +402,9 @@ class DownloadManager(
      * Puts failed and cancelled downloads back into the queue and (re)starts the queue, also when only
      * pending items wait (a run stopped because storage was full).
      */
-    suspend fun retryFailed() {
+    suspend fun retryFailed(): Unit = scope.detached { retryFailedNow() }
+
+    private suspend fun retryFailedNow() {
         dao.requeueFailed()
         scheduleExecution(kick = true)
     }
@@ -444,7 +460,9 @@ class DownloadManager(
      * [syncCollections]; false when it could not run because the session did not come online. With
      * [onlyDue], collections whose next sync ([DownloadRules.nextSyncAt]) is still ahead are skipped.
      */
-    internal suspend fun sync(onlyDue: Boolean = false): Boolean {
+    internal suspend fun sync(onlyDue: Boolean = false): Boolean = scope.detached { syncNow(onlyDue) }
+
+    private suspend fun syncNow(onlyDue: Boolean): Boolean {
         if (!syncMutex.tryLock()) return true // another sync is running
         try {
             if (settings.settings.value.offlineMode) return true
