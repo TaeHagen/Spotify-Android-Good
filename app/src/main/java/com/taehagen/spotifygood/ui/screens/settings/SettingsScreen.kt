@@ -163,6 +163,17 @@ class SettingsViewModel(private val graph: AppGraph) : ViewModel() {
         graph.appScope.launch { graph.settings.update(transform) }
     }
 
+    /**
+     * "Hide explicit content" (engine: `EngineSettings.filterExplicit`). Cached catalog pages
+     * carry the old `playable` flags, so they are dropped.
+     */
+    fun setHideExplicit(hide: Boolean) {
+        graph.appScope.launch {
+            graph.settings.update { it.copy(hideExplicit = hide) }
+            graph.responseCache.clear()
+        }
+    }
+
     fun removeAllDownloads(onDone: () -> Unit) = runInApp(onDone) { graph.downloads.removeAll() }
 
     fun retryFailed(onDone: () -> Unit) = runInApp(onDone) { graph.downloads.retryFailed() }
@@ -385,7 +396,7 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
                     summary = stringResource(R.string.shell_settings_hide_explicit_summary),
                     icon = Icons.Rounded.Explicit,
                     checked = settings.hideExplicit,
-                    onCheckedChange = { v -> vm.update { it.copy(hideExplicit = v) } },
+                    onCheckedChange = vm::setHideExplicit,
                 )
             }
             item(key = "sleep") {

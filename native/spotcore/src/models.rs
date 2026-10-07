@@ -664,6 +664,8 @@ pub struct EngineSettings {
     pub device_name: String,
     pub streaming_cache_mb: u64,
     pub offline: bool,
+    /// "Hide explicit content": OR-ed into the account's own filter (`engine::explicit`).
+    pub filter_explicit: bool,
 }
 
 impl Default for EngineSettings {
@@ -678,6 +680,7 @@ impl Default for EngineSettings {
             device_name: String::new(),
             streaming_cache_mb: 1024,
             offline: false,
+            filter_explicit: false,
         }
     }
 }

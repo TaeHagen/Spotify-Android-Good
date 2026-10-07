@@ -226,6 +226,15 @@ Changes (`player.applySettings` or `session.updateSettings`) are applied to the 
 through the patched runtime setters, without recreating it: bitrate and gapless from the next
 load (track change), normalisation from the next audio packet.
 
+Explicit filter: `EngineSettings.filterExplicit` is OR-ed into the session's own
+`filter-explicit-content` user attribute (the account's value is kept in a private attribute
+and restored when the setting goes off). librespot reads that attribute everywhere: the Player
+refuses explicit tracks (Spirc skips them) and skips a loaded one when the filter turns on,
+the catalog returns them with `playable:false` (its cached metadata is dropped when the
+effective filter changes), and downloads refuse them. It is applied to the live session (when
+it is declared online and on every health tick, since Spirc can overwrite it) and to the
+offline session the Player uses while not online. `User.explicitFilter` stays the account's.
+
 ### 4.4 Audio output
 
 * `AndroidSink` (Sink impl): `start()` → `AudioSinkBridge.start()`; `stop()` →
@@ -339,7 +348,9 @@ active** → connect-state command to that device.
 | `session.setOAuthToken` | `{"accessToken","expiresAtMs"}` | `{}` (lets pathfinder fall back to the OAuth token) |
 
 `EngineSettings`: `{"bitrate":96|160|320,"normalize":true,"normalizePregain":"quiet|normal|loud",
-"autoplay":true,"gapless":true,"deviceName":"…","streamingCacheMb":1024,"offline":false}`.
+"autoplay":true,"gapless":true,"deviceName":"…","streamingCacheMb":1024,"offline":false,
+"filterExplicit":false}`. `filterExplicit` ("Hide explicit content") is OR-ed into the account's
+own explicit filter (see §4.3); it can never turn the account's filter off.
 
 ### 6.2 Player (routed local/remote)
 

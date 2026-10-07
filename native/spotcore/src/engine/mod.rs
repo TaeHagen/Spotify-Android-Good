@@ -16,6 +16,7 @@
 mod backoff;
 mod config;
 mod connector;
+mod explicit;
 pub(crate) mod player_host;
 mod state;
 mod supervisor;
@@ -371,6 +372,9 @@ async fn logout() -> AppResult<Value> {
     state::forget_account();
     stop_locked(&mut slot, true).await;
     connect::reset();
+    // Cached metadata carries the account's country / filter in `playable`.
+    crate::catalog::metadata::clear_cache();
+    *CATALOG_FILTER.lock() = None;
     let dirs = [runtime::credentials_dir(), runtime::streaming_cache_dir(), runtime::librespot_tmp_dir()];
     let cleanup = tokio::task::spawn_blocking(move || {
         for dir in dirs {
@@ -436,6 +440,36 @@ fn apply_settings(new: EngineSettings) {
     if old.device_name != new.device_name {
         log::info!("device name change applies at the next connect");
         connect::on_engine_state_changed();
+    }
+    if old.filter_explicit != new.filter_explicit {
+        sync_explicit_filter();
+    }
+}
+
+/// The explicit filter the catalog's cached metadata was computed with (`playable` is baked in).
+static CATALOG_FILTER: parking_lot::Mutex<Option<bool>> = parking_lot::const_mutex(None);
+
+/// Applies "Hide explicit content" ([`explicit`]) to the sessions the Player and the catalog use
+/// (the live one, and the offline one the Player plays with while not online), tells the Player
+/// when its filter changed (it then skips a loaded explicit track), and drops cached catalog
+/// metadata computed with the other value. Cheap; idempotent.
+pub(crate) fn sync_explicit_filter() {
+    let filter = settings().filter_explicit;
+    let live = try_session().filter(|_| is_online());
+    let live_changed = live.as_ref().and_then(|s| explicit::apply(s, filter));
+    let offline_changed = player_host::apply_explicit_filter_offline(filter);
+    let player_changed = if live.is_some() { live_changed } else { offline_changed };
+    if let Some(on) = player_changed {
+        log::info!("explicit filter {}", if on { "on" } else { "off" });
+        player_host::emit_explicit_filter(on);
+    }
+    if let Some(session) = &live {
+        let effective = session.filter_explicit_content();
+        let mut last = CATALOG_FILTER.lock();
+        if last.is_some_and(|v| v != effective) {
+            crate::catalog::metadata::clear_cache();
+        }
+        *last = Some(effective);
     }
 }
 

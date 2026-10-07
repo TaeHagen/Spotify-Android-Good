@@ -539,6 +539,8 @@ data class EngineSettings(
     val deviceName: String = "Android",
     val streamingCacheMb: Int = 1024,
     val offline: Boolean = false,
+    /** "Hide explicit content": OR-ed natively into the account's own explicit filter. */
+    val filterExplicit: Boolean = false,
 )
 
 // ---------------------------------------------------------------------------------------------

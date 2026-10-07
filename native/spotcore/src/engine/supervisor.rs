@@ -169,7 +169,8 @@ fn user_of(session: &Session) -> Option<User> {
         images: Vec::new(),
         product: Some(product),
         country,
-        explicit_filter: session.filter_explicit_content(),
+        // The account's own filter; "Hide explicit content" may force the session's on.
+        explicit_filter: super::explicit::account_filter(session),
     })
 }
 
@@ -354,6 +355,8 @@ impl Supervisor {
     fn declare_online(&mut self, live: &Live, user: Option<User>) {
         state::record_username(self.login_generation, &live.session);
         state::set_online(Some(live.session.clone()));
+        // ProductInfo is in (that's what declares): now the account's filter is known.
+        super::sync_explicit_filter();
         // No backoff reset here: only a connection that proves stable resets it (`online`).
         self.first = false;
         self.prefer_token = false;
@@ -437,6 +440,8 @@ impl Supervisor {
                         connector::teardown(live, true).await;
                         return self.retry_after(AppError::new(ErrorCode::Network, "Connection to Spotify lost"));
                     }
+                    // Spirc may have overwritten the forced filter (a server attribute push).
+                    super::sync_explicit_filter();
                     if !user_known {
                         if let Some(user) = user_of(&live.session) {
                             user_known = true;

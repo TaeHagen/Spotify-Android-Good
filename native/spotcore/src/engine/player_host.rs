@@ -12,14 +12,14 @@
 //! * One task per Player forwards its events to `connect`; when the channel closes while the
 //!   Player is still current, its thread died and the supervisor rebuilds Player + Spirc.
 
-use super::{config, state, supervisor::Msg};
+use super::{config, explicit, state, supervisor::Msg};
 use crate::audio::{AndroidMixer, AndroidSink};
 use crate::connect;
 use crate::error::AppResult;
 use crate::models::EngineSettings;
 use librespot_core::Session;
 use librespot_playback::mixer::Mixer;
-use librespot_playback::player::{Player, PlayerEventChannel};
+use librespot_playback::player::{Player, PlayerEvent, PlayerEventChannel};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -34,6 +34,9 @@ struct Host {
 }
 
 static HOST: Mutex<Option<Host>> = parking_lot::const_mutex(None);
+/// The offline Session last handed to the Player (it plays with it while not online); kept to
+/// apply the explicit filter to it.
+static OFFLINE: Mutex<Option<Session>> = parking_lot::const_mutex(None);
 static MIXER: OnceLock<Arc<AndroidMixer>> = OnceLock::new();
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Serialises Player creation (online bind vs. offline playback). The offline path must never
@@ -66,9 +69,27 @@ pub(crate) fn dead_generation() -> Option<u64> {
     HOST.lock().as_ref().filter(|h| h.player.is_invalid()).map(|h| h.generation)
 }
 
-/// A never-connected Session (offline playback needs no network). Needs the runtime context.
+/// A never-connected Session (offline playback needs no network), with the explicit filter
+/// applied (offline loads check it too). Needs the runtime context.
 pub(crate) fn offline_session() -> Session {
-    Session::new(config::session_config(), None)
+    let session = Session::new(config::session_config(), None);
+    explicit::apply(&session, super::settings().filter_explicit);
+    *OFFLINE.lock() = Some(session.clone());
+    session
+}
+
+/// Applies the explicit filter to the offline Session; `Some(effective)` if it changed.
+pub(crate) fn apply_explicit_filter_offline(filter: bool) -> Option<bool> {
+    let session = OFFLINE.lock().clone()?;
+    explicit::apply(&session, filter)
+}
+
+/// Tells the Player its explicit filter changed (when it turns on, a loaded explicit track is
+/// skipped).
+pub(crate) fn emit_explicit_filter(filter: bool) {
+    if let Some(p) = player() {
+        p.emit_filter_explicit_content_changed_event(filter);
+    }
 }
 
 /// Drops a Player that is no longer in `HOST`, waiting at most [`PLAYER_DROP_TIMEOUT`]: its
@@ -171,7 +192,14 @@ pub(crate) fn apply_settings(old: &EngineSettings, new: &EngineSettings) {
 
 async fn forward_events(generation: u64, mut events: PlayerEventChannel) {
     while let Some(event) = events.recv().await {
+        // Spirc turned the filter off (an attribute mutation or its own report at connect):
+        // re-assert "Hide explicit content" if it is on.
+        let reassert = matches!(event, PlayerEvent::FilterExplicitContentChanged { filter: false })
+            && super::settings().filter_explicit;
         connect::on_player_event(event);
+        if reassert {
+            super::sync_explicit_filter();
+        }
     }
     let current = HOST.lock().as_ref().map(|h| h.generation) == Some(generation);
     if current {

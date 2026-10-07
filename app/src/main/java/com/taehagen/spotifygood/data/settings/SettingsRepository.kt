@@ -74,6 +74,7 @@ fun Settings.toEngineSettings(metered: Boolean, defaultDeviceName: String): Engi
     deviceName = deviceName.trim().ifBlank { defaultDeviceName },
     streamingCacheMb = streamingCacheMb,
     offline = offlineMode,
+    filterExplicit = hideExplicit,
 )
 
 /**
