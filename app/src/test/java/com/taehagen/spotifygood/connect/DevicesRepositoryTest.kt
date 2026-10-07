@@ -5,7 +5,13 @@ import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.RepeatMode
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.nativebridge.NativeEvents
+import com.taehagen.spotifygood.nativebridge.NativeRpc
 import com.taehagen.spotifygood.playback.ResumeState
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -81,5 +87,48 @@ class DevicesRepositoryTest {
         // the track as its own "context" is sent without one
         val resume = DevicesRepository.transferArgs("phone", play = true, resume = state("spotify:track:t"))["resume"]!!.jsonObject
         assertFalse(resume.containsKey("contextUri"))
+    }
+
+    @Test
+    fun thePendingTargetExpiresTenMinutesAfterItWasPicked() {
+        var now = 1_000L
+        val pending = PendingTarget({ now })
+        pending.set("speaker")
+        now += PendingTarget.TTL_MS - 1
+        assertEquals("speaker", pending.consume())
+        assertNull(pending.consume()) // used once
+
+        pending.set("speaker")
+        now += PendingTarget.TTL_MS
+        assertNull(pending.consume()) // too old, even if nothing cleared it yet
+        assertNull(pending.value.value)
+
+        // Picking again starts over; expire() only clears the expired target it names.
+        pending.set("speaker")
+        now += PendingTarget.TTL_MS / 2
+        pending.set("speaker")
+        now += PendingTarget.TTL_MS / 2
+        assertFalse(pending.expire("speaker"))
+        assertTrue(pending.expire("tv"))
+        assertEquals("speaker", pending.value.value)
+        now += PendingTarget.TTL_MS / 2
+        assertTrue(pending.expire("speaker"))
+        assertNull(pending.value.value)
+    }
+
+    @Test
+    fun theRepositoryClearsAnExpiredPendingTarget() = runTest {
+        val repo = DevicesRepository(backgroundScope, NativeRpc(Json), NativeEvents(Json), clock = { testScheduler.currentTime })
+        runCurrent()
+        repo.pick("speaker")
+        runCurrent()
+        assertEquals("speaker", repo.pendingTarget.value)
+        advanceTimeBy(PendingTarget.TTL_MS - 1)
+        runCurrent()
+        assertEquals("speaker", repo.pendingTarget.value)
+        advanceTimeBy(1)
+        runCurrent()
+        assertNull(repo.pendingTarget.value)
+        assertNull(repo.consumePendingTarget())
     }
 }

@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.playback
 
 import android.util.Log
+import com.taehagen.spotifygood.connect.DevicesRepository
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
@@ -93,9 +94,26 @@ class PlayerController internal constructor(
     private val json: Json,
     private val snapshot: StateFlow<PlaybackSnapshot>,
     private val lastSession: suspend () -> ResumeState?,
+    /**
+     * Takes the Connect device picked while nothing played anywhere
+     * ([DevicesRepository.consumePendingTarget]): the next user-started play goes there.
+     */
+    private val consumePendingTarget: () -> String? = { null },
 ) {
-    constructor(scope: CoroutineScope, rpc: NativeRpc, playback: PlaybackRepository, resumeStore: ResumeStore) :
-        this(scope, { method, args -> rpc.callRaw(method, args) }, rpc.json, playback.snapshot, resumeStore::read)
+    constructor(
+        scope: CoroutineScope,
+        rpc: NativeRpc,
+        playback: PlaybackRepository,
+        resumeStore: ResumeStore,
+        devices: DevicesRepository,
+    ) : this(
+        scope,
+        { method, args -> rpc.callRaw(method, args) },
+        rpc.json,
+        playback.snapshot,
+        resumeStore::read,
+        devices::consumePendingTarget,
+    )
 
     private val _errors = MutableSharedFlow<String>(extraBufferCapacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
@@ -148,6 +166,8 @@ class PlayerController internal constructor(
         var request: PlayRequest? = null
         /** The load request was handed to the engine (no more merging; guarded by [lock]). */
         var sent = false
+        /** `player.load` only: a user-started play, which may go to the pending Connect target. */
+        var toPendingTarget = false
     }
 
     /** How the last start-playback command ended (queue consumer only). */
@@ -192,8 +212,9 @@ class PlayerController internal constructor(
         }
     }
 
+    /** An in-app play: it goes to the pending Connect target when there is one. */
     fun play(request: PlayRequest) {
-        playAsync(request)
+        playAsync(request, toPendingTarget = true)
     }
 
     fun playContext(contextUri: String, startUri: String? = null, shuffle: Boolean? = null) {
@@ -305,7 +326,7 @@ class PlayerController internal constructor(
                 radio.trackUris.isNotEmpty() -> PlayRequest(trackUris = radio.trackUris)
                 else -> throw NativeException(NativeErrorInfo(NativeErrorCode.NOT_FOUND, "Radio station is empty"))
             }
-            load(request)
+            load(request, toPendingTarget = true)
         }
     }
 
@@ -321,7 +342,12 @@ class PlayerController internal constructor(
 
     // ---- awaitable variants (used by the media session player) --------------------------------
 
-    internal fun playAsync(request: PlayRequest): Deferred<Boolean> {
+    /**
+     * `player.load` of [request]. [toPendingTarget]: an in-app play, sent to the pending Connect
+     * target when there is one (see [pendingTargetFor]). The media session's loads (Auto,
+     * Assistant, watches, resumption) never are: they play through this phone's own audio path.
+     */
+    internal fun playAsync(request: PlayRequest, toPendingTarget: Boolean = false): Deferred<Boolean> {
         if (request.play) onPlaybackRequested?.invoke()
         lateinit var self: Command
         // A running bulk add keeps going: Spirc and remote devices keep the user queue across a
@@ -333,6 +359,7 @@ class PlayerController internal constructor(
             onQueued = { command ->
                 self = command
                 command.request = request
+                command.toPendingTarget = toPendingTarget
                 latestLoad = command
             },
         ) { sendLoad(self) }
@@ -530,39 +557,58 @@ class PlayerController internal constructor(
     }
 
     /** `player.load`, rewritten for the offline queue whenever the engine cannot stream ([OfflineLoads]). */
-    private suspend fun load(request: PlayRequest) {
-        call("player.load", loadArgs(prepareLoad(withLoadableContext(request))))
+    private suspend fun load(request: PlayRequest, toPendingTarget: Boolean) {
+        val prepared = prepare(withLoadableContext(request))
+        val target = if (toPendingTarget) pendingTargetFor(prepared, prepared.request.play) else null
+        call("player.load", loadArgs(prepared.request, deviceId = target))
     }
 
     /** [load] of a queued `player.load` [command], with a play merged in until the last moment. */
     private suspend fun sendLoad(command: Command) {
         val initial = synchronized(lock) { checkNotNull(command.request) }
-        val prepared = prepareLoad(withLoadableContext(initial))
+        val prepared = prepare(withLoadableContext(initial))
         val play = synchronized(lock) {
             command.sent = true
             checkNotNull(command.request).play
         }
-        call("player.load", loadArgs(prepared.copy(play = play)))
+        val target = if (command.toPendingTarget) pendingTargetFor(prepared, play) else null
+        call("player.load", loadArgs(prepared.request.copy(play = play), deviceId = target))
     }
 
-    private suspend fun prepareLoad(original: PlayRequest): PlayRequest {
-        val env = environment ?: return original
+    /**
+     * The pending Connect target for a user-started load, taken (it is used once) only when the
+     * load plays, no device is active, and the engine will not play it from this phone's downloads
+     * (offline, or rewritten for the offline queue): then the phone plays it itself.
+     */
+    private fun pendingTargetFor(prepared: PreparedLoad, play: Boolean): String? {
+        if (!play || prepared.offline || snapshot.value.activeDevice != null) return null
+        return consumePendingTarget()
+    }
+
+    /** A load after [prepare]; [offline]: the engine plays it from the downloads. */
+    private class PreparedLoad(val request: PlayRequest, val offline: Boolean)
+
+    private suspend fun prepareLoad(original: PlayRequest): PlayRequest = prepare(original).request
+
+    private suspend fun prepare(original: PlayRequest): PreparedLoad {
+        val env = environment ?: return PreparedLoad(original, offline = false)
         val reach = env.reach()
         val request = OfflineLoads.withoutSmartShuffle(original, reach)
-        val context = request.contextUri ?: return request
-        if (!request.trackUris.isNullOrEmpty()) return request
-        if (reach == EngineReach.ONLINE) return request
+        val asIs = PreparedLoad(request, offline = reach == EngineReach.OFFLINE)
+        val context = request.contextUri ?: return asIs
+        if (!request.trackUris.isNullOrEmpty()) return asIs
+        if (reach == EngineReach.ONLINE) return asIs
         val members = try {
             env.downloadedMembers(context, request.startUri)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             warn("Downloads of $context unavailable", e)
-            return request
+            return asIs
         }
         return when (val plan = OfflineLoads.plan(request, members, reach)) {
-            is OfflineLoads.Plan.Load -> plan.request
-            OfflineLoads.Plan.Unchanged -> request
+            is OfflineLoads.Plan.Load -> PreparedLoad(plan.request, offline = true)
+            OfflineLoads.Plan.Unchanged -> asIs
             OfflineLoads.Plan.NotDownloaded -> throw NotAvailableOfflineException(context)
         }
     }
@@ -874,7 +920,8 @@ class PlayerController internal constructor(
             return request.copy(contextUri = null, trackUris = listOf(start), startIndex = 0, startUid = null)
         }
 
-        fun loadArgs(request: PlayRequest): JsonObject = buildJsonObject {
+        /** `player.load` arguments; [deviceId]: play on that Connect device (the pending target). */
+        fun loadArgs(request: PlayRequest, deviceId: String? = null): JsonObject = buildJsonObject {
             request.contextUri?.let { put("contextUri", it) }
             request.trackUris?.let { uris -> putJsonArray("trackUris") { uris.forEach { add(it) } } }
             request.startUri?.let { put("startUri", it) }
@@ -885,6 +932,7 @@ class PlayerController internal constructor(
             request.smartShuffle?.let { put("smartShuffle", it) }
             request.repeat?.let { put("repeat", PlaybackModes.wire(it)) }
             put("play", request.play)
+            deviceId?.let { put("deviceId", it) }
         }
     }
 }
