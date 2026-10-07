@@ -412,12 +412,23 @@ class PlayerControllerTest {
     fun aPlayWhileNothingIsActiveGoesToThePendingTargetOnce() = runTest {
         val h = Harness(this, Env(EngineReach.ONLINE))
         h.target = "speaker"
-        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(1))).await())
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(1)), toPendingTarget = true).await())
         assertEquals("speaker", h.calls.single().second.deviceId())
         // Used once: the next play is routed as usual.
-        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist)).await())
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist), toPendingTarget = true).await())
         assertNull(h.calls[1].second.deviceId())
         assertNull(h.target)
+    }
+
+    @Test
+    fun mediaSessionLoadsPlayOnThisPhone() = runTest {
+        // Auto, Assistant, watches: the media session's loads use the default.
+        val h = Harness(this, Env(EngineReach.ONLINE))
+        h.target = "speaker"
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(1))).await())
+        assertNull(h.calls.single().second.deviceId())
+        assertEquals(0, h.targetTaken)
+        assertEquals("speaker", h.target)
     }
 
     @Test
@@ -425,7 +436,7 @@ class PlayerControllerTest {
         val h = Harness(this, Env(EngineReach.ONLINE))
         h.target = "speaker"
         h.snapshot.value = PlaybackSnapshot(activeDevice = ActiveDeviceRef("kitchen", "Kitchen"), track = PlaybackTrack(uri = t(5)))
-        assertTrue(h.controller.playAsync(PlayRequest(trackUris = listOf(t(1)))).await())
+        assertTrue(h.controller.playAsync(PlayRequest(trackUris = listOf(t(1))), toPendingTarget = true).await())
         assertNull(h.calls.single().second.deviceId())
         assertEquals(0, h.targetTaken)
     }
@@ -439,9 +450,9 @@ class PlayerControllerTest {
         assertTrue(h.controller.resumeAsync().await())
         assertEquals(listOf("player.play", "player.load"), h.methods())
         assertNull(h.calls[1].second.deviceId())
-        // Media3 resumption, "Tap to resume", "play something".
+        // Media3 resumption, "Tap to resume", "play something" (media-session loads).
         h.fail = { null }
-        assertTrue(h.controller.playAsync(resumeState(playlist).toPlayRequest(), toPendingTarget = false).await())
+        assertTrue(h.controller.playAsync(resumeState(playlist).toPlayRequest()).await())
         assertNull(h.calls[2].second.deviceId())
         assertEquals(0, h.targetTaken)
         assertEquals("speaker", h.target)
@@ -454,7 +465,7 @@ class PlayerControllerTest {
             // Rewritten for the offline queue (connecting: it may still go to Spirc).
             val h = Harness(this, Env(reach, members))
             h.target = "speaker"
-            assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(2))).await())
+            assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(2)), toPendingTarget = true).await())
             val load = h.calls.single().second
             assertEquals(listOf(t(1), t(2)), load["trackUris"]?.jsonArray?.map { it.jsonPrimitive.content })
             assertNull(load.deviceId())
@@ -463,12 +474,12 @@ class PlayerControllerTest {
         // Offline, a track list too.
         val offline = Harness(this, Env(EngineReach.OFFLINE))
         offline.target = "speaker"
-        assertTrue(offline.controller.playAsync(PlayRequest(trackUris = listOf(t(1)))).await())
+        assertTrue(offline.controller.playAsync(PlayRequest(trackUris = listOf(t(1))), toPendingTarget = true).await())
         assertNull(offline.calls.single().second.deviceId())
         // A load that does not play (Media3 setMediaItems before play) keeps it for the play.
         val paused = Harness(this, Env(EngineReach.ONLINE))
         paused.target = "speaker"
-        assertTrue(paused.controller.playAsync(PlayRequest(trackUris = listOf(t(1)), play = false)).await())
+        assertTrue(paused.controller.playAsync(PlayRequest(trackUris = listOf(t(1)), play = false), toPendingTarget = true).await())
         assertNull(paused.calls.single().second.deviceId())
         assertEquals(0, offline.targetTaken + paused.targetTaken)
     }

@@ -212,8 +212,9 @@ class PlayerController internal constructor(
         }
     }
 
+    /** An in-app play: it goes to the pending Connect target when there is one. */
     fun play(request: PlayRequest) {
-        playAsync(request)
+        playAsync(request, toPendingTarget = true)
     }
 
     fun playContext(contextUri: String, startUri: String? = null, shuffle: Boolean? = null) {
@@ -342,11 +343,11 @@ class PlayerController internal constructor(
     // ---- awaitable variants (used by the media session player) --------------------------------
 
     /**
-     * `player.load` of [request]. [toPendingTarget]: a user-started play, sent to the pending
-     * Connect target when there is one (see [pendingTargetFor]); false for the stored session
-     * (Media3 resumption, "Tap to resume", "play something"), which this phone plays.
+     * `player.load` of [request]. [toPendingTarget]: an in-app play, sent to the pending Connect
+     * target when there is one (see [pendingTargetFor]). The media session's loads (Auto,
+     * Assistant, watches, resumption) never are: they play through this phone's own audio path.
      */
-    internal fun playAsync(request: PlayRequest, toPendingTarget: Boolean = true): Deferred<Boolean> {
+    internal fun playAsync(request: PlayRequest, toPendingTarget: Boolean = false): Deferred<Boolean> {
         if (request.play) onPlaybackRequested?.invoke()
         lateinit var self: Command
         // A running bulk add keeps going: Spirc and remote devices keep the user queue across a

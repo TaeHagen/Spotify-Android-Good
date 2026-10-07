@@ -110,9 +110,6 @@ internal object ResumeModes {
         putString(REPEAT, PlaybackModes.wire(state.repeat))
     }
 
-    /** Whether [extras] are those of a resume item (the stored session). */
-    fun isResumeItem(extras: Bundle?): Boolean = extras?.getString(REPEAT) != null
-
     /** [request] with the modes in [extras]; unchanged when they carry none (any other item). */
     fun applyTo(request: PlayRequest, extras: Bundle?): PlayRequest {
         val repeat = extras?.getString(REPEAT) ?: return request
