@@ -20,6 +20,7 @@ import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import com.taehagen.spotifygood.ui.components.SessionMessenger
+import com.taehagen.spotifygood.ui.screens.library.explicitFilterFlow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -161,17 +162,25 @@ internal fun useDownloadFallback(reach: EngineReach, error: Throwable): Boolean 
 /**
  * Whether a row's item can be started right now. Playback routes by the engine's reach: unless the
  * session is ONLINE ([online]) a context load is rewritten to its downloads, so tapping an item
- * that isn't downloaded would start a different, downloaded one.
+ * that isn't downloaded would start a different, downloaded one. An [explicit] item doesn't start
+ * while [filterExplicit] (the player refuses it), also when the page is a stale cached copy from
+ * before the filter was turned on.
  */
-internal fun canStartNow(playable: Boolean, online: Boolean, downloadState: DownloadState?): Boolean =
-    playable && (online || downloadState == DownloadState.COMPLETED)
+internal fun canStartNow(
+    playable: Boolean,
+    online: Boolean,
+    downloadState: DownloadState?,
+    explicit: Boolean = false,
+    filterExplicit: Boolean = false,
+): Boolean = playable && !(explicit && filterExplicit) && (online || downloadState == DownloadState.COMPLETED)
 
 /**
  * [offline]: offline mode or no network (banner, Retry visibility); [online]: the engine's reach is
- * ONLINE (rows that aren't downloaded can start, see [canStartNow]).
+ * ONLINE (rows that aren't downloaded can start, see [canStartNow]); [filterExplicit]: Hide explicit
+ * content (or the account's filter) is on.
  */
 @Immutable
-internal data class Connectivity(val offline: Boolean = false, val online: Boolean = true)
+internal data class Connectivity(val offline: Boolean = false, val online: Boolean = true, val filterExplicit: Boolean = false)
 
 /** True while offline mode is on or there is no network. */
 internal fun AppGraph.offlineFlow(): Flow<Boolean> =
@@ -212,8 +221,9 @@ internal abstract class DetailViewModel(
 
     /** See [Connectivity]. */
     protected val connectivity: Flow<Connectivity> =
-        combine(offline, graph.engineReachFlow()) { offline, reach -> Connectivity(offline, reach == EngineReach.ONLINE) }
-            .distinctUntilChanged()
+        combine(offline, graph.engineReachFlow(), graph.explicitFilterFlow()) { offline, reach, filterExplicit ->
+            Connectivity(offline, reach == EngineReach.ONLINE, filterExplicit)
+        }.distinctUntilChanged()
 
     fun retry() {
         retryTrigger.update { it + 1 }

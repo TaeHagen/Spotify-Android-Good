@@ -53,6 +53,7 @@ internal data class AlbumUiState(
     val moreBy: List<AlbumRef> = emptyList(),
     /** The session is ONLINE: rows that aren't downloaded can start ([canStartNow]). */
     val online: Boolean = true,
+    val filterExplicit: Boolean = false,
 )
 
 internal class AlbumViewModel(graph: AppGraph, private val uri: String) : DetailViewModel(graph, uri) {
@@ -120,7 +121,7 @@ internal class AlbumViewModel(graph: AppGraph, private val uri: String) : Detail
         graph.downloads.collectionUi(uri),
         combine(graph.downloads.statesFor(trackUris), connectivity, moreBy, ::Triple),
     ) { load, playback, saved, download, (rows, connectivity, moreBy) ->
-        AlbumUiState(load, playback, saved, download, rows, connectivity.offline, moreBy, connectivity.online)
+        AlbumUiState(load, playback, saved, download, rows, connectivity.offline, moreBy, connectivity.online, connectivity.filterExplicit)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), AlbumUiState())
 
     /** Plays the album starting at [track]. */
