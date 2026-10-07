@@ -1,8 +1,10 @@
 //! `catalog.search`: pathfinder `searchDesktop` → spclient `searchview/km/v4` → context-resolve
 //! `spotify:search:<q>` (tracks only). A source that answers (even with no hits) wins; only
 //! errors fall through to the next one, and a transport error (offline, rate limited) of
-//! searchview ends the chain: context-resolve would hit the same spclient. A pathfinder answer
-//! whose `searchV2` field failed (`null` plus a GraphQL error) is an error, not "no results".
+//! searchview ends the chain: context-resolve would hit the same spclient, and it is only asked
+//! when tracks were requested (it finds nothing else). A pathfinder answer whose `searchV2` (or
+//! every requested section) failed (`null` plus a GraphQL error) is an error, not "no results";
+//! an error inside one item only loses that item.
 
 use super::context;
 use super::http::{self, JSON};
@@ -141,6 +143,11 @@ fn list_of_section(section: &str) -> Option<&'static str> {
 /// or `null` (graphql-java nulls a field whose resolver failed, e.g. a backend timeout), or every
 /// requested section failed. An answer that is merely empty (no hits) stands. Then the next
 /// source is asked instead of returning "no results".
+///
+/// graphql-java nulls the nearest nullable field of an error, so an error inside one item
+/// (`["searchV2","albumsV2","items",7,"data","coverArt"]`) leaves the section's other items in
+/// place: only a section whose `items` cannot be read counts as failed (the parsers skip the
+/// broken item, and over-fetching keeps the page full).
 pub(crate) fn pathfinder_failure(answer: &pathfinder::Answer, types: &Types) -> Option<String> {
     let reason = |fallback: &str| -> String {
         answer.errors.first().map(|e| e.message.clone()).filter(|m| !m.is_empty()).unwrap_or_else(|| fallback.to_string())
@@ -148,11 +155,15 @@ pub(crate) fn pathfinder_failure(answer: &pathfinder::Answer, types: &Types) -> 
     if !answer.data.get("searchV2").is_some_and(Value::is_object) {
         return Some(reason("searchV2 missing"));
     }
+    let items_readable =
+        |section: &str| answer.data.pointer(&format!("/searchV2/{section}/items")).and_then(Value::as_array).is_some();
     let mut failed: HashSet<&str> = HashSet::new();
     for e in &answer.errors {
         match e.path.as_slice() {
             [root] if root == "searchV2" => return Some(reason("searchV2 failed")),
-            [root, section, ..] if root == "searchV2" => failed.extend(list_of_section(section)),
+            [root, section, ..] if root == "searchV2" && !items_readable(section) => {
+                failed.extend(list_of_section(section))
+            }
             _ => {}
         }
     }
@@ -482,6 +493,10 @@ pub(crate) async fn rpc(args: Value) -> AppResult<Value> {
             }
         }
     }
+    if !context_fallback_applies(&types) {
+        // It can only find tracks: for any other type its answer would read as "no results".
+        return Err(first);
+    }
     match via_context(&session, query, a.offset, limit).await {
         Ok(r) => to_value(&types.apply(r)),
         Err(e) => {
@@ -489,6 +504,12 @@ pub(crate) async fn rpc(args: Value) -> AppResult<Value> {
             Err(first)
         }
     }
+}
+
+/// Whether the context-resolve source can answer: it finds tracks only. With tracks among other
+/// types (the top results) a tracks-only answer is the documented degraded result.
+fn context_fallback_applies(types: &Types) -> bool {
+    types.tracks
 }
 
 /// Errors after which the next spclient-based source is not tried.
@@ -557,15 +578,44 @@ mod tests {
         assert!(pathfinder_failure(&ok, &all).is_none());
         let empty = pathfinder::Answer { data: serde_json::json!({"searchV2": {"tracksV2": {"items": []}}}), errors: vec![] };
         assert!(pathfinder_failure(&empty, &tracks_only).is_none());
-        // A failed section only fails the search when it is all that was asked for.
-        let section_error = |section: &str| pathfinder::FieldError {
-            message: format!("Exception while fetching data (/searchV2/{section})"),
-            path: vec!["searchV2".into(), section.into()],
+        // A failed section (graphql-java nulled it) only fails the search when it is all that
+        // was asked for.
+        let error_at = |path: &[&str]| pathfinder::FieldError {
+            message: format!("Exception while fetching data (/{})", path.join("/")),
+            path: path.iter().map(|p| p.to_string()).collect(),
         };
-        let partial = pathfinder::Answer { data: real["data"].clone(), errors: vec![section_error("tracksV2")] };
+        let mut no_tracks = real["data"].clone();
+        no_tracks["searchV2"]["tracksV2"] = Value::Null;
+        let partial = pathfinder::Answer { data: no_tracks, errors: vec![error_at(&["searchV2", "tracksV2"])] };
         assert!(pathfinder_failure(&partial, &tracks_only).is_some(), "the Songs tab falls back");
         assert!(pathfinder_failure(&partial, &all).is_none(), "the other sections still answer");
-        assert!(pathfinder_failure(&partial, &Types::from_list(&["album".into()])).is_none());
+        let albums_only = Types::from_list(&["album".into()]);
+        assert!(pathfinder_failure(&partial, &albums_only).is_none());
+
+        // An error inside one item leaves the section usable: only that item is lost.
+        let item_error = error_at(&["searchV2", "albumsV2", "items", "7", "data", "coverArt"]);
+        let one_bad_item = pathfinder::Answer { data: real["data"].clone(), errors: vec![item_error.clone()] };
+        assert!(pathfinder_failure(&one_bad_item, &albums_only).is_none(), "the other albums stand");
+        // The same error propagated up to the section (null section) does fail it.
+        let mut no_albums = real["data"].clone();
+        no_albums["searchV2"]["albumsV2"] = Value::Null;
+        let section_gone = pathfinder::Answer { data: no_albums, errors: vec![item_error] };
+        assert!(pathfinder_failure(&section_gone, &albums_only).is_some());
+        // A section with an error and no `items` array is failed too.
+        let mut items_null = real["data"].clone();
+        items_null["searchV2"]["albumsV2"]["items"] = Value::Null;
+        let items_gone = pathfinder::Answer { data: items_null, errors: vec![error_at(&["searchV2", "albumsV2", "items"])] };
+        assert!(pathfinder_failure(&items_gone, &albums_only).is_some());
+    }
+
+    #[test]
+    fn context_resolve_only_answers_track_searches() {
+        for t in ["album", "artist", "playlist", "show", "episode"] {
+            assert!(!context_fallback_applies(&Types::from_list(&[t.into()])), "{t}");
+        }
+        assert!(context_fallback_applies(&Types::from_list(&["track".into()])));
+        assert!(context_fallback_applies(&Types::from_list(&[])), "top results: tracks-only is a degraded answer");
+        assert!(context_fallback_applies(&Types::from_list(&["track".into(), "album".into()])));
     }
 
     #[test]
