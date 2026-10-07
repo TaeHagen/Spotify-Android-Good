@@ -7,6 +7,7 @@ import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.download.DownloadActivity
 import com.taehagen.spotifygood.download.DownloadItem
+import com.taehagen.spotifygood.download.FailedCounts
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.ui.components.SessionMessenger
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +35,8 @@ data class DownloadsUiState(
     val nowPlaying: NowPlaying = NowPlaying(),
     /** Live downloader state (header progress, why a run stopped). */
     val activity: DownloadActivity = DownloadActivity(),
+    /** Failed downloads: retryable ones and those not playable here ("Retry" leaves them failed). */
+    val failed: FailedCounts = FailedCounts(),
 )
 
 class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
@@ -66,8 +69,8 @@ class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
         graph.downloads.usedBytes.onStart { emit(0L) }.catch { emit(0L) },
         graph.offlineFlow(),
         graph.nowPlayingFlow(),
-        graph.downloads.activity,
-    ) { content, used, offline, nowPlaying, activity ->
+        combine(graph.downloads.activity, graph.downloads.failedCounts.onStart { emit(FailedCounts()) }.catch { emit(FailedCounts()) }, ::Pair),
+    ) { content, used, offline, nowPlaying, (activity, failed) ->
         DownloadsUiState(
             isLoading = content == null,
             usedBytes = used,
@@ -75,6 +78,7 @@ class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
             offline = offline,
             nowPlaying = nowPlaying,
             activity = activity,
+            failed = failed,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DownloadsUiState())
 
