@@ -64,6 +64,8 @@ class ResumeFallbackTest {
         assertEquals(42_000L, load["positionMs"]?.jsonPrimitive?.content?.toLong())
         assertEquals(JsonPrimitive(true), load["play"])
         assertNull(load["trackUris"])
+        // This phone's session: played here, not pushed onto a remote device.
+        assertEquals(JsonPrimitive(true), load["local"])
     }
 
     @Test
@@ -133,6 +135,7 @@ class ResumeFallbackTest {
         }
         val args = PlayerController.loadArgs(state(null).toPlayRequest())
         assertEquals(listOf("spotify:track:t"), args["trackUris"]?.jsonArray?.map { it.jsonPrimitive.content })
+        assertNull(args["local"]) // only when asked for
         assertEquals("spotify:track:t", state("spotify:web-api").mediaId)
         assertEquals(MediaIds.inContext("spotify:playlist:p", "spotify:track:t"), state("spotify:playlist:p").mediaId)
         assertEquals("spotify:user:u:collection", state("spotify:user:u:collection").toPlayRequest().contextUri)

@@ -50,20 +50,16 @@ import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
-import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onStart
-import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.guava.future
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -82,7 +78,11 @@ import java.util.concurrent.ConcurrentHashMap
  * except that with Connect presence enabled the service stays foreground as `connectedDevice`
  * instead of leaving the foreground ([onUpdateNotificationAsync]).
  *
- * Holds the [HolderType.PLAYBACK] engine holder from [onCreate] to [onDestroy].
+ * Holds the [HolderType.PLAYBACK] engine holder from the first playback command (or local /
+ * mirrored playback, the media foreground, our own playback starts) to [onDestroy], never for a
+ * browse-only bind: SysUI's resumption card and Bluetooth's player discovery bind at boot and get
+ * the root and the stored session without the engine. Catalog browsing and search hold it while
+ * the browser keeps browsing ([holdForBrowsing]).
  */
 class PlaybackService : MediaLibraryService() {
     private lateinit var graph: AppGraph
@@ -92,7 +92,17 @@ class PlaybackService : MediaLibraryService() {
     private lateinit var resumeStore: ResumeStore
     private lateinit var presence: PresenceController
     private var session: MediaLibrarySession? = null
+    /** Guarded by [holderLock]. */
     private var playbackHolder: EngineHolder? = null
+    /** Held while a browser reads catalog content (guarded by [holderLock]). */
+    private var browseHolder: EngineHolder? = null
+    private val holderLock = Any()
+    private val releaseBrowseHolder = Runnable {
+        synchronized(holderLock) {
+            browseHolder?.release()
+            browseHolder = null
+        }
+    }
 
     /** Media3 currently keeps the service foreground with the media notification. */
     private var mediaForeground = false
@@ -124,7 +134,6 @@ class PlaybackService : MediaLibraryService() {
         isRunning = true
         graph = (application as App).graph
         coordinator = PlaybackCoordinator.install(this)
-        playbackHolder = graph.engine.acquire(HolderType.PLAYBACK)
         resumeStore = graph.resumeStore
         tree = LibraryTree(this, graph)
         presence = PresenceController(this, graph)
@@ -139,6 +148,7 @@ class PlaybackService : MediaLibraryService() {
             downloadedImage = { uri -> downloadedImages[uri] },
             playerError = ::currentPlayerError,
             onRetry = ::retryAfterError,
+            onCommand = ::ensurePlaybackHolder,
         )
 
         val provider = PlaybackNotificationProvider(this).apply { setSmallIcon(R.drawable.ic_notification) }
@@ -175,9 +185,11 @@ class PlaybackService : MediaLibraryService() {
                 if (!presence.isEnabled && !mediaForeground && !player.isPlaying) stopSelf(startId)
             }
             ACTION_RESUME -> {
+                ensurePlaybackHolder()
                 ResumeAlert.cancel(this)
                 resumeFromAlert()
             }
+            ACTION_LOCAL_PLAYBACK -> ensurePlaybackHolder()
         }
         // Any start may have been a startForegroundService (ours for ACTION_LOCAL_PLAYBACK, Media3's
         // media-button receiver, or any other app: the service is exported), and a service that
@@ -223,8 +235,11 @@ class PlaybackService : MediaLibraryService() {
             {
                 val succeeded = runCatching { future.get() }.isSuccess
                 if (!succeeded) return@addListener
-                mediaForeground = foregroundRequired
-                if (foregroundRequired) {
+                // With an empty timeline Media3 removes the notification and leaves the
+                // foreground, even when the foreground is still required.
+                mediaForeground = !idle
+                if (!idle) {
+                    ensurePlaybackHolder()
                     presence.onMediaForeground()
                     main.removeCallbacks(foregroundDeadline)
                     coordinator.onServiceForeground()
@@ -254,15 +269,49 @@ class PlaybackService : MediaLibraryService() {
         session?.release()
         session = null
         player.release()
-        playbackHolder?.release()
-        playbackHolder = null
+        main.removeCallbacks(releaseBrowseHolder)
+        synchronized(holderLock) {
+            playbackHolder?.release()
+            playbackHolder = null
+            browseHolder?.release()
+            browseHolder = null
+        }
         super.onDestroy()
+    }
+
+    // ---- engine holders -----------------------------------------------------------------------
+
+    /** The service has playback work: hold the engine (and Connect) until [onDestroy]. Any thread. */
+    private fun ensurePlaybackHolder() {
+        synchronized(holderLock) {
+            if (playbackHolder == null && isRunning) playbackHolder = graph.engine.acquire(HolderType.PLAYBACK)
+        }
+    }
+
+    /**
+     * A browser reads catalog content (Auto's tabs, search): the session runs while it keeps
+     * browsing, and [BROWSE_HOLD_MS] after its last request, so its next tap plays at once.
+     * Any thread; acquired before returning, so a following session wait sees it.
+     */
+    private fun holdForBrowsing() {
+        synchronized(holderLock) {
+            if (!isRunning) return
+            if (browseHolder == null) browseHolder = graph.engine.acquire(HolderType.PLAYBACK)
+            main.removeCallbacks(releaseBrowseHolder)
+            main.postDelayed(releaseBrowseHolder, BROWSE_HOLD_MS)
+        }
     }
 
     // ---- state observation ------------------------------------------------------------------
 
     private fun observeState() {
         val playback = graph.playback
+        lifecycleScope.launch {
+            // Local or mirrored playback (e.g. "play on this phone" from another device) keeps the
+            // engine; a browse-only bind (nothing loaded) does not start it.
+            playback.snapshot.map { it.source != PlaybackSource.NONE }.distinctUntilChanged().filter { it }
+                .collect { ensurePlaybackHolder() }
+        }
         lifecycleScope.launch {
             merge(
                 playback.snapshot.map { },
@@ -326,32 +375,15 @@ class PlaybackService : MediaLibraryService() {
             }
         }
         lifecycleScope.launch {
-            // Resume state: on every relevant change (pause, seek, track) and every 15 s while
-            // playing; the periodic part only exists while playing (transformLatest cancels it).
-            playback.snapshot
-                .filter { it.source == PlaybackSource.LOCAL && it.track != null }
-                .distinctUntilChanged { a, b ->
-                    a.track?.uri == b.track?.uri && a.context?.uri == b.context?.uri &&
-                        a.status == b.status && a.positionMs == b.positionMs &&
-                        // A mode change (also while paused) is saved too, and restarts the loop.
-                        a.shuffle == b.shuffle && a.smartShuffle == b.smartShuffle && a.repeat == b.repeat
+            // Resume state: the local session on every relevant change and every 15 s while it
+            // plays, frozen once playback leaves the phone; logging out forgets it. One collector,
+            // so a save in progress never lands after the clear.
+            ResumeSaver.actions(playback.snapshot, graph.engine.isLoggedIn, RESUME_SAVE_INTERVAL_MS).collect { action ->
+                when (action) {
+                    is ResumeSaver.Action.Save -> resumeStore.save(action.state)
+                    ResumeSaver.Action.Clear -> resumeStore.clear()
                 }
-                .transformLatest { s ->
-                    emit(ResumeState.from(s))
-                    if (s.isPlaying) {
-                        while (true) {
-                            delay(RESUME_SAVE_INTERVAL_MS)
-                            emit(ResumeState.from(s))
-                        }
-                    }
-                }
-                .filterNotNull()
-                .distinctUntilChanged()
-                .collect { resumeStore.save(it) }
-        }
-        lifecycleScope.launch {
-            // Logging out forgets what to resume.
-            graph.engine.isLoggedIn.drop(1).filter { !it }.collect { resumeStore.clear() }
+            }
         }
         lifecycleScope.launch {
             combine(
@@ -681,6 +713,7 @@ class PlaybackService : MediaLibraryService() {
             browser: ControllerInfo,
             mediaId: String,
         ): ListenableFuture<LibraryResult<MediaItem>> = lifecycleScope.future(Dispatchers.Default) {
+            if (LibraryTree.itemNeedsSession(mediaId)) holdForBrowsing()
             tree.item(mediaId)?.let { LibraryResult.ofItem(it, null) } ?: LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
         }
 
@@ -694,8 +727,12 @@ class PlaybackService : MediaLibraryService() {
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = lifecycleScope.future(Dispatchers.Default) {
             accountLibraryError()?.let { return@future LibraryResult.ofError(it) }
             // Auto browses right after connecting, often on a cold engine: let the session come up
-            // first instead of answering from an empty cache.
-            if (LibraryTree.needsSession(parentId)) coordinator.environment.awaitSessionStart()
+            // first instead of answering from an empty cache. The local parents (root, recent,
+            // downloads) never start the engine.
+            if (LibraryTree.needsSession(parentId)) {
+                holdForBrowsing()
+                coordinator.environment.awaitSessionStart()
+            }
             val children = tree.children(parentId, params)
                 ?: return@future LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
             LibraryResult.ofItemList(children.page(page, pageSize), params)
@@ -707,6 +744,7 @@ class PlaybackService : MediaLibraryService() {
             query: String,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<Void>> {
+            holdForBrowsing()
             lifecycleScope.launch(Dispatchers.Default) {
                 val results = try {
                     coordinator.environment.awaitSessionStart()
@@ -734,6 +772,7 @@ class PlaybackService : MediaLibraryService() {
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = lifecycleScope.future(Dispatchers.Default) {
             val results = searchCache[query] ?: try {
+                holdForBrowsing()
                 coordinator.environment.awaitSessionStart()
                 tree.search(query).also { cacheSearch(query, it) }
             } catch (e: CancellationException) {
@@ -760,6 +799,8 @@ class PlaybackService : MediaLibraryService() {
             startIndex: Int,
             startPositionMs: Long,
         ): ListenableFuture<MediaItemsWithStartPosition> = lifecycleScope.future(Dispatchers.Default) {
+            // A playback request (voice search needs the session too).
+            ensurePlaybackHolder()
             val first = mediaItems.firstOrNull()
             val query = first?.requestMetadata?.searchQuery
             if (mediaItems.size == 1 && query != null) {
@@ -786,6 +827,9 @@ class PlaybackService : MediaLibraryService() {
             controller: ControllerInfo,
             isForPlayback: Boolean,
         ): ListenableFuture<MediaItemsWithStartPosition> = lifecycleScope.future {
+            // A Bluetooth / headset play starts the engine at once; SysUI's resumption card
+            // (not for playback) only reads the stored session.
+            if (isForPlayback) ensurePlaybackHolder()
             val last = resumeStore.read()
             // Logged out: neither resume nor offer (SysUI resumption card) the previous session.
             // Once the stored credentials are read (awaitReady) isLoggedIn is accurate.
@@ -837,6 +881,8 @@ class PlaybackService : MediaLibraryService() {
         /** The momentary foreground of [satisfyForegroundContract] (not the media notification's id). */
         private const val CONTRACT_NOTIFICATION_ID = 1090
         private const val RESUME_SAVE_INTERVAL_MS = 15_000L
+        /** How long the session is held after a browser's last catalog request. */
+        private const val BROWSE_HOLD_MS = 60_000L
         private const val LOGIN_WAIT_MS = 3_000L
         private const val MAX_CACHED_SEARCHES = 8
 

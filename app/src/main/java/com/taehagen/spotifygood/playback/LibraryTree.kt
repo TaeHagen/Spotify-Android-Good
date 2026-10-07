@@ -541,6 +541,13 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
 
         private val LOCAL_PARENTS = setOf(ROOT, ROOT_OFFLINE, ROOT_RECENT, LIBRARY, DOWNLOADS)
 
+        /** Whether [item] of [mediaId] looks it up in the catalog (the plain folders do not). */
+        fun itemNeedsSession(mediaId: String): Boolean = mediaId !in FOLDER_ITEMS
+
+        private val FOLDER_ITEMS = setOf(
+            ROOT, ROOT_OFFLINE, ROOT_RECENT, HOME, LIBRARY, DOWNLOADS, BROWSE, PLAYLISTS, ALBUMS, ARTISTS, PODCASTS,
+        )
+
         private const val MAX_TABS = 4
         private const val MAX_ITEMS = 100
         private const val RECENT_LIMIT = 12
