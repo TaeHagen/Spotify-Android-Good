@@ -308,7 +308,8 @@ impl<'ct> ConnectState {
                 && self.next_tracks_mut().pop().is_some()
             {}
 
-            if let (Some(uid), Ok(ctx)) = (first_autoplay, self.get_context_mut(ContextType::Autoplay))
+            if let (Some(uid), Ok(ctx)) =
+                (first_autoplay, self.get_context_mut(ContextType::Autoplay))
             {
                 if let Some(position) = ctx.tracks.iter().position(|t| t.uid == uid) {
                     ctx.index.track = position as u32;
@@ -626,10 +627,7 @@ impl<'ct> ConnectState {
                 ctx.index.track = position as u32;
                 self.fill_up_context = ty;
             }
-            None => debug!(
-                "dropped next track <{}> isn't in the context",
-                dropped.uri
-            ),
+            None => debug!("dropped next track <{}> isn't in the context", dropped.uri),
         }
     }
 

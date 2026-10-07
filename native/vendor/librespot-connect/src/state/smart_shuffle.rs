@@ -116,7 +116,11 @@ impl ConnectState {
             .unwrap_or_default();
         // without repeat the context ends with this pass, later passes are never reached (and
         // would block new suggestions, they are assigned after the last one)
-        let last_pass = if self.repeat_context() { u32::MAX } else { pass };
+        let last_pass = if self.repeat_context() {
+            u32::MAX
+        } else {
+            pass
+        };
         let unavailable = &self.unavailable_uri;
         self.suggestions.retain(|(p, position), s| {
             *p <= last_pass && *position < len && !unavailable.contains(&s.uri)

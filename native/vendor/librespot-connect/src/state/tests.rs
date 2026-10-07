@@ -557,7 +557,11 @@ fn smart_shuffle_with_repeat_plays_each_suggestion_once() {
     let (_rt, mut state) = state(10);
     state.set_repeat_context(true);
     state.handle_smart_shuffle(true).unwrap();
-    assert_eq!(state.next_tracks().len(), 80, "the window covers several passes");
+    assert_eq!(
+        state.next_tracks().len(),
+        80,
+        "the window covers several passes"
+    );
     assert_unique_uids(&state);
 
     // one after every 3rd context track, continuing through the following passes
@@ -570,7 +574,11 @@ fn smart_shuffle_with_repeat_plays_each_suggestion_once() {
             .filter(|t| t.is_suggestion())
             .count()
     };
-    assert_eq!(in_window(&state), 10, "each one once, not again in every pass");
+    assert_eq!(
+        in_window(&state),
+        10,
+        "each one once, not again in every pass"
+    );
     assert_unique_uids(&state);
 
     // 10 suggestions and 30 context tracks (3 passes)
@@ -590,7 +598,10 @@ fn smart_shuffle_with_repeat_plays_each_suggestion_once() {
     assert_eq!(in_window(&state), added);
     assert_unique_uids(&state);
     let played = play_through(&mut state, 60);
-    assert_eq!(played.iter().filter(|uid| uid.starts_with('s')).count(), added);
+    assert_eq!(
+        played.iter().filter(|uid| uid.starts_with('s')).count(),
+        added
+    );
 
     // without repeat only the rest of the context gets suggestions
     let (_rt, mut state) = self::state(10);
@@ -663,7 +674,10 @@ fn smart_shuffle_suggestion_dropped_from_the_end_comes_back() {
     assert!(state.next_tracks().len() <= SPOTIFY_MAX_NEXT_TRACKS_SIZE);
     let played = play_through(&mut state, 100);
     assert_eq!(played[0], "q0");
-    assert_eq!(played.iter().filter(|uid| is_suggestion_uid(uid)).count(), 20);
+    assert_eq!(
+        played.iter().filter(|uid| is_suggestion_uid(uid)).count(),
+        20
+    );
 
     // so does a prev
     let (_rt, mut state) = self::state(200);
@@ -674,7 +688,10 @@ fn smart_shuffle_suggestion_dropped_from_the_end_comes_back() {
     state.prev_track().unwrap();
     assert!(state.next_tracks().len() <= SPOTIFY_MAX_NEXT_TRACKS_SIZE);
     let played = play_through(&mut state, 100);
-    assert_eq!(played.iter().filter(|uid| is_suggestion_uid(uid)).count(), 20);
+    assert_eq!(
+        played.iter().filter(|uid| is_suggestion_uid(uid)).count(),
+        20
+    );
 }
 
 fn suggestion_uids(tracks: &[ProvidedTrack]) -> Vec<String> {
@@ -701,7 +718,11 @@ fn assert_played_once(played: &[String]) {
         .filter(|uid| is_suggestion_uid(uid))
         .collect::<Vec<_>>();
     let unique = suggestions.iter().collect::<HashSet<_>>();
-    assert_eq!(unique.len(), suggestions.len(), "a suggestion was played twice");
+    assert_eq!(
+        unique.len(),
+        suggestions.len(),
+        "a suggestion was played twice"
+    );
 }
 
 #[test]
@@ -714,7 +735,10 @@ fn smart_shuffle_continues_after_repeat_is_turned_off_after_a_wrap() {
 
     // through the first pass (29 tracks and 9 suggestions) and 4 entries into the second
     let mut played = play_through(&mut state, 43);
-    assert_eq!(played.iter().filter(|uid| is_suggestion_uid(uid)).count(), 10);
+    assert_eq!(
+        played.iter().filter(|uid| is_suggestion_uid(uid)).count(),
+        10
+    );
     assert!(state.current_track(|t| !t.is_suggestion()));
 
     state.handle_set_repeat_context(false).unwrap();
@@ -895,10 +919,9 @@ fn update_same_context(state: &mut ConnectState, ctx: Context) {
     }
     let ctx = state.get_context(ContextType::Default).unwrap();
     if ctx.index.track == 0 {
-        let idx = ConnectState::find_index_in_context(ctx, |t| {
-            state.current_track(|c| t.uri == c.uri)
-        })
-        .ok();
+        let idx =
+            ConnectState::find_index_in_context(ctx, |t| state.current_track(|c| t.uri == c.uri))
+                .ok();
         state.reset_playback_to_position(idx).unwrap();
     } else {
         state.fill_up_next_tracks().unwrap();
@@ -926,7 +949,10 @@ fn playlist_update_continues_where_the_playback_is() {
         assert_eq!(state.current_track(|t| t.uid.clone()), "uid30");
 
         let played = play_through(&mut state, 100);
-        assert_eq!(played.iter().filter(|uid| uid.starts_with('q')).count(), queued);
+        assert_eq!(
+            played.iter().filter(|uid| uid.starts_with('q')).count(),
+            queued
+        );
         let played = context_uids(&played);
         assert_eq!(played, uids(31..31 + played.len()), "{queued} queued");
     }
@@ -1022,8 +1048,11 @@ fn repeat_toggle_keeps_the_autoplay_tracks_that_were_in_the_next_tracks() {
 
 #[test]
 fn previous_is_available_whenever_a_track_plays() {
-    let can_skip_prev =
-        |state: &ConnectState| state.snapshot(SnapshotPlayStatus::Playing, 0, None).can_skip_prev;
+    let can_skip_prev = |state: &ConnectState| {
+        state
+            .snapshot(SnapshotPlayStatus::Playing, 0, None)
+            .can_skip_prev
+    };
 
     // the first track of a load
     let (_rt, mut state) = state(20);

@@ -34,18 +34,14 @@ impl ConnectState {
             return self.shuffle_new();
         }
 
-        // SPOTIFYGOOD: where the playback continues is worked out before anything changes. A
-        // queued current track was looked up by uri: when it wasn't in the context the unshuffle
-        // failed half applied (the shuffled next tracks and suggestions stayed, the fill up
-        // started over at the first track), when it was the playback jumped there.
-        let anchor = self.playback_anchor();
         self.set_shuffle(false);
         // SPOTIFYGOOD: smart shuffle only exists on top of shuffle
         self.clear_smart_shuffle();
 
         if matches!(self.active_context, ContextType::Autoplay) {
             // SPOTIFYGOOD: the default context was played to its end, unshuffling it changes no
-            // next track (the reset below switched back to it and replaced the autoplay track)
+            // next track (resetting the playback switched back to the default context and
+            // replaced the playing autoplay track)
             if let Ok(ctx) = self.get_context_mut(ContextType::Default) {
                 ctx.remove_shuffle_seed();
                 ctx.remove_initial_track();
@@ -56,6 +52,12 @@ impl ConnectState {
             return Ok(());
         }
 
+        // SPOTIFYGOOD: where the playback continues is worked out before the context is
+        // unshuffled. A queued current track was looked up by uri after that: when it wasn't in
+        // the context the unshuffle failed half applied (the shuffled next tracks and suggestions
+        // stayed, the fill up started over at the first track), when it was the playback jumped
+        // there.
+        let anchor = self.playback_anchor();
         self.reset_context(ResetContext::DefaultIndex);
 
         match anchor {
