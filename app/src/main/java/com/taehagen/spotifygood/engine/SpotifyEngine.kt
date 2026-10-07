@@ -126,17 +126,17 @@ class SpotifyEngine(
      * Whether the phone may be a Spotify Connect target (`EngineSettings.connectVisible`): only
      * while it can actually play, i.e. the app is in the foreground (UI) or a PLAYBACK / PRESENCE
      * holder is held. A DOWNLOAD holder alone, or the idle grace, keeps the session without
-     * Spirc. Updated under [holderLock].
+     * Spirc. Hiding waits [CONNECT_HIDE_GRACE_MS] (a quick app switch must not cost a re-login).
      */
-    private val connectVisible = MutableStateFlow(false)
+    private val connectVisibility = ConnectVisibility(scope, CONNECT_HIDE_GRACE_MS)
 
     /** Caller holds [holderLock]. */
     private fun updateConnectVisibleLocked() {
-        connectVisible.value = connectVisibleFor(
+        connectVisibility.update(connectVisibleFor(
             ui = holderCounts[HolderType.UI.ordinal],
             playback = holderCounts[HolderType.PLAYBACK.ordinal],
             presence = holderCounts[HolderType.PRESENCE.ordinal],
-        )
+        ))
     }
 
     /** Number of holders currently held. */
@@ -515,8 +515,9 @@ class SpotifyEngine(
             it.copy(session = SessionState.CONNECTING, error = accountError, nextRetryMs = null, networkAvailable = network.available)
         }
         callQuietly("session.setNetworkAvailable", networkArgs(network))
+        // A fresh start uses the holders as they are now (no hide grace left over).
         val engineSettings = settings.awaitLoaded().toEngineSettings(network.metered, deviceName)
-            .copy(connectVisible = connectVisible.value)
+            .copy(connectVisible = connectVisibility.snap())
         lastSentSettings = engineSettings
         runningJob?.cancel()
         runningJob = launchRunningCollectors()
@@ -537,7 +538,7 @@ class SpotifyEngine(
         val gen = ++generation
         val network = networkMonitor.status.value
         val engineSettings = (lastSentSettings ?: settings.awaitLoaded().toEngineSettings(network.metered, deviceName))
-            .copy(connectVisible = connectVisible.value)
+            .copy(connectVisible = connectVisibility.visible.value)
         updateState { it.copy(session = SessionState.CONNECTING, error = accountError, nextRetryMs = null) }
         val args = SessionStartArgs(credentials = creds, settings = engineSettings, initialVolume = initialVolume())
         Log.i(TAG, "session.start (retry)")
@@ -600,7 +601,7 @@ class SpotifyEngine(
             networkMonitor.status.collect { onNetworkStatus(it) }
         }
         launchLogged("settings") {
-            combine(settings.persisted, networkMonitor.status, connectVisible) { prefs, network, visible ->
+            combine(settings.persisted, networkMonitor.status, connectVisibility.visible) { prefs, network, visible ->
                 prefs.toEngineSettings(network.metered, deviceName).copy(connectVisible = visible)
             }
                 .distinctUntilChanged()
@@ -876,6 +877,8 @@ class SpotifyEngine(
         /** `session.logout` = the stop plus deleting the streaming cache. */
         private const val LOGOUT_TIMEOUT_MS = 30_000L
         private const val OFFLINE_INDEX_TIMEOUT_MS = 30_000L
+        /** How long the phone stays a Connect target after the app left the foreground. */
+        private const val CONNECT_HIDE_GRACE_MS = 20_000L
         private const val CREDENTIALS_LOAD_ATTEMPTS = 4
         private const val CREDENTIALS_RETRY_DELAY_MS = 200L
         private const val OFFLINE_INDEX_RETRY_MS = 2_000L
