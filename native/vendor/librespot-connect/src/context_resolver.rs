@@ -375,7 +375,14 @@ impl ContextResolver {
         let active_ctx = state.get_context(state.active_context);
         let res = if let Some(transfer_state) = transfer_state.take() {
             state.finish_transfer(transfer_state)
-        } else if state.shuffling_context() && next.update == ContextType::Default {
+        } else if state.shuffling_context()
+            && next.update == ContextType::Default
+            // SPOTIFYGOOD: not after an update of the context that already played shuffled,
+            // update_context kept its shuffled order (with the added tracks shuffled in). The
+            // reshuffle cleared the prev tracks and brought back the songs played in this pass.
+            // A load (not shuffled yet) and further pages are still shuffled here.
+            && !(next.action == ContextAction::Replace && state.default_context_shuffled())
+        {
             state.shuffle_new()
         } else if matches!(active_ctx, Ok(ctx) if ctx.index.track == 0) {
             // has context, and context is not touched

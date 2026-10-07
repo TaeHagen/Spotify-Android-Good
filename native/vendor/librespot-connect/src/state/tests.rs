@@ -1390,6 +1390,80 @@ fn pages_appended_after_a_wrap_play_before_it() {
     assert_eq!(next[15..18], ["a0", "a1", "a2"]);
 }
 
+#[test]
+fn playlist_update_while_shuffled_keeps_the_pass() {
+    use crate::context_resolver::{ContextAction, ContextResolver, ResolveContext};
+
+    let (rt, mut state) = state(40);
+    let session = {
+        let _guard = rt.enter();
+        Session::new(SessionConfig::default(), None)
+    };
+    state.handle_shuffle(true).unwrap();
+    play_through(&mut state, 10);
+    let current = state.current_track(|t| t.uid.clone());
+    let prev = state
+        .prev_tracks()
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    let mut played = prev.clone();
+    played.push(current.clone());
+
+    // the playlist got a track, and lost an upcoming one and a played one
+    let removed_upcoming = next_uids(&state)[5].clone();
+    let removed_played = prev[3].clone();
+    let mut modified = context(40, 0);
+    modified.pages[0].tracks.retain(|t| {
+        t.uid.as_deref() != Some(&removed_upcoming) && t.uid.as_deref() != Some(&removed_played)
+    });
+    modified.pages[0].tracks.insert(
+        7,
+        ContextTrack {
+            uri: Some(track_uri(99, 3)),
+            uid: Some("new".to_string()),
+            ..Default::default()
+        },
+    );
+    let modified_order = modified.pages[0]
+        .tracks
+        .iter()
+        .map(|t| t.uid.clone().unwrap())
+        .collect::<Vec<_>>();
+
+    // a playlist modification resolves the playing context again
+    let mut resolver = ContextResolver::new(session);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Default,
+        ContextAction::Replace,
+    ));
+    resolver.apply_next_context(&mut state, modified).unwrap();
+    assert!(resolver.try_finish(&mut state, &mut None));
+
+    assert!(state.shuffling_context());
+    assert_eq!(state.current_track(|t| t.uid.clone()), current);
+    let prev_now = state
+        .prev_tracks()
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(prev_now, prev, "the prev tracks stay");
+
+    // the rest of the pass: no song played again, the new one once, the removed one never
+    let rest = play_through(&mut state, 100);
+    assert!(rest.iter().all(|uid| !played.contains(uid)), "{rest:?}");
+    assert_eq!(rest.iter().filter(|uid| *uid == "new").count(), 1);
+    assert!(!rest.contains(&removed_upcoming));
+    // 40 tracks, one added and two removed, 11 played
+    assert_eq!(rest.len(), 40 + 1 - 2 - 10);
+
+    // and shuffle off restores the order of the updated playlist
+    state.handle_shuffle(false).unwrap();
+    assert_eq!(default_uids(&state), modified_order);
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(
