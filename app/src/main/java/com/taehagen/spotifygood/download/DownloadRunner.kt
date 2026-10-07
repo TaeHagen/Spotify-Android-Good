@@ -14,6 +14,7 @@ import com.taehagen.spotifygood.data.callWith
 import com.taehagen.spotifygood.data.db.AppDatabase
 import com.taehagen.spotifygood.data.db.DownloadEntity
 import com.taehagen.spotifygood.data.rpcArgs
+import com.taehagen.spotifygood.data.settings.Settings
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.engine.SpotifyEngine
@@ -85,6 +86,13 @@ internal class KeyCache {
     operator fun set(uri: String, hex: String) {
         keys[uri] = hex
     }
+
+    /**
+     * Caches a key decrypted outside the mutation lock, unless one is cached already: that one came
+     * from a newer commit of [uri] (removed and downloaded again while this one was decrypted).
+     * Returns the cached key.
+     */
+    fun remember(uri: String, hex: String): String = keys.putIfAbsent(uri, hex) ?: hex
     fun remove(uris: Collection<String>) = uris.forEach { keys.remove(it) }
     fun clear() = keys.clear()
 }
@@ -216,14 +224,15 @@ internal class DownloadRunner(
         // bring the engine up only to find that out.
         val paused = pausedForMs(System.currentTimeMillis())
         if (paused != null && paused > MAX_INLINE_WAIT_MS) return RunOutcome.RESCHEDULE
-        if (meteredNotAllowed()) return RunOutcome.RESCHEDULE
+        // The settings as stored: a cold-started job must not act on the defaults shown before load.
+        if (meteredNotAllowed(settings.awaitLoaded())) return RunOutcome.RESCHEDULE
         val holder = engine.acquire(HolderType.DOWNLOAD)
         val receiver = notifications.registerCancelReceiver(::requestCancel)
         val stats = RunStats()
         _activity.value = DownloadActivity(running = true)
         try {
             host.updateNotification(notifications.progress(null, 0, 0, 0f))
-            if (settings.settings.value.offlineMode) return RunOutcome.STOPPED // resumed when offline mode ends
+            if (settings.awaitLoaded().offlineMode) return RunOutcome.STOPPED // resumed when offline mode ends
             if (!engine.awaitOnline(ONLINE_TIMEOUT_MS)) {
                 // Logged out: nothing will ever come online (logout wipes the queue anyway).
                 return if (engine.isLoggedIn.value) RunOutcome.RESCHEDULE else RunOutcome.STOPPED
@@ -241,7 +250,7 @@ internal class DownloadRunner(
                     delay(wait.coerceAtLeast(MIN_WAIT_MS))
                     continue
                 }
-                if (meteredNotAllowed()) {
+                if (meteredNotAllowed(settings.awaitLoaded())) {
                     // The host's network constraint is stale (it predates the setting): never use
                     // mobile data against the setting; the manager re-creates the work.
                     Log.i(TAG, "On a metered network with mobile data downloads off: rescheduling")
@@ -265,6 +274,7 @@ internal class DownloadRunner(
                         // Bounded: a flapping connection hands the retry over to the system backoff.
                         if (++networkWaits > MAX_NETWORK_WAITS || !engine.awaitOnline(ONLINE_TIMEOUT_MS)) return RunOutcome.RESCHEDULE
                     }
+                    ItemResult.Reschedule -> return RunOutcome.RESCHEDULE
                     is ItemResult.StopRun -> {
                         dao.failAllPending(result.message)
                         stats.stopMessage = result.message
@@ -286,8 +296,8 @@ internal class DownloadRunner(
     }
 
     /** Mobile data downloads are off and the default network is metered (no network: false). */
-    private fun meteredNotAllowed(): Boolean {
-        if (settings.settings.value.downloadOverCellular) return false
+    private fun meteredNotAllowed(prefs: Settings): Boolean {
+        if (prefs.downloadOverCellular) return false
         val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return false
         val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork) ?: return false
         return !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
@@ -304,6 +314,9 @@ internal class DownloadRunner(
         var failed = 0
         var transferredBytes = 0L
         var stopMessage: String? = null
+
+        /** Rate-limit pauses imposed in this run ([DownloadRules.throttleBudgetSpent]). */
+        var throttledMs = 0L
         val processed get() = completed + failed
     }
 
@@ -311,6 +324,9 @@ internal class DownloadRunner(
         data object Done : ItemResult
         data object WaitForNetwork : ItemResult
         data class StopRun(val message: String) : ItemResult
+
+        /** End the run with [RunOutcome.RESCHEDULE] (the queue stays paused on its rows). */
+        data object Reschedule : ItemResult
     }
 
     /** Runs one item as its own child so it can be cancelled alone (item removed meanwhile). */
@@ -328,7 +344,7 @@ internal class DownloadRunner(
     }
 
     private suspend fun downloadItem(item: DownloadEntity, host: DownloadHost, stats: RunStats): ItemResult = coroutineScope {
-        val quality = settings.settings.value.downloadQuality.kbps
+        val quality = settings.awaitLoaded().downloadQuality.kbps
         dao.markPreparing(item.uri, quality)
         val title = displayTitle(item.metadataJson)
         val total = stats.processed + dao.pendingCount()
@@ -525,9 +541,15 @@ internal class DownloadRunner(
             }
             DownloadRules.FailureAction.Throttled -> {
                 // Not an attempt: the item waits with the rest of the queue.
-                val until = now + (pauseMs ?: DownloadRules.rateLimitPauseMs(e.info.retryAfterMs, 1))
-                dao.scheduleRetry(item.uri, item.attempts, until, message)
-                ItemResult.Done
+                val pause = pauseMs ?: DownloadRules.rateLimitPauseMs(e.info.retryAfterMs, 1)
+                dao.scheduleRetry(item.uri, item.attempts, now + pause, message)
+                stats.throttledMs += pause
+                if (DownloadRules.throttleBudgetSpent(stats.throttledMs)) {
+                    Log.i(TAG, "Rate limited for ${stats.throttledMs} ms in this run: rescheduling")
+                    ItemResult.Reschedule
+                } else {
+                    ItemResult.Done
+                }
             }
         }
         if (pauseMs != null && result !is ItemResult.StopRun) {
