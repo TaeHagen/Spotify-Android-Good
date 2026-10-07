@@ -13,6 +13,14 @@ import java.io.File
  * Pure download policy (no Android, no I/O) so it can be unit tested: shared membership, removal,
  * shared files, collection status, retry/backoff and sizing rules.
  */
+/**
+ * Failed downloads, split the way "Retry failed" splits them ([DownloadRules.retryable]): the
+ * [retryable] ones go back into the queue, the [unavailable] ones (not playable here) stay failed.
+ */
+data class FailedCounts(val retryable: Int = 0, val unavailable: Int = 0) {
+    val total: Int get() = retryable + unavailable
+}
+
 internal object DownloadRules {
     /** An item is marked FAILED after this many failed attempts. */
     const val MAX_ATTEMPTS = 3
@@ -265,6 +273,13 @@ internal object DownloadRules {
         rows.filter { row ->
             row.uri !in unavailable && !(row.state == DownloadState.FAILED && row.error == unplayableReason)
         }.map { it.uri }
+
+    /** The FAILED rows among [rows], split like [retryable] (for "Retry N failed" buttons). */
+    fun failedCounts(rows: List<RetryRow>, unavailable: Set<String>, unplayableReason: String): FailedCounts {
+        val failed = rows.filter { it.state == DownloadState.FAILED }
+        val retryable = retryable(failed, unavailable, unplayableReason).size
+        return FailedCounts(retryable = retryable, unavailable = failed.size - retryable)
+    }
 
     /**
      * Members queued by a sync ([queued]) that must also leave a failed row: the ones that became

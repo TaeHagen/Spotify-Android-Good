@@ -23,6 +23,7 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.data.db.RetryRow
 import com.taehagen.spotifygood.auth.CredentialStore
 import com.taehagen.spotifygood.data.SpotifyUris
 import com.taehagen.spotifygood.data.db.AppDatabase
@@ -194,6 +195,21 @@ class DownloadManager(
         .flowOn(Dispatchers.Default)
     val usedBytes: Flow<Long> = dao.observeUsedBytes()
     val pendingCount: Flow<Int> = dao.observePendingCount()
+
+    /**
+     * Failed downloads split like [retryFailed] splits them (read-only): what a "Retry" button would
+     * put back into the queue, and what stays failed because it is not playable here.
+     */
+    val failedCounts: Flow<FailedCounts> = combine(
+        items,
+        collectionDao.observeAll().map { list -> list.flatMapTo(HashSet()) { decodeItems(it.unavailableUrisJson) } },
+    ) { rows, unavailable ->
+        DownloadRules.failedCounts(
+            rows.map { RetryRow(it.uri, it.state, it.error) },
+            unavailable,
+            appContext.getString(R.string.data_dl_error_unplayable),
+        )
+    }.distinctUntilChanged().flowOn(Dispatchers.Default)
 
     /** Downloaded collections, newest first (one shared database observer). */
     val collections: Flow<List<DownloadedCollection>> = collectionDao.observeAll()

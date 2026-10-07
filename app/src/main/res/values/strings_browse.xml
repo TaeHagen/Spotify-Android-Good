@@ -196,6 +196,10 @@
         <item quantity="one">%d download failed</item>
         <item quantity="other">%d downloads failed</item>
     </plurals>
+    <plurals name="browse_downloads_unavailable">
+        <item quantity="one">%d not available on Spotify here</item>
+        <item quantity="other">%d not available on Spotify here</item>
+    </plurals>
     <plurals name="browse_profile_playlist_count">
         <item quantity="one">%d playlist</item>
         <item quantity="other">%d playlists</item>

@@ -120,7 +120,7 @@ import com.taehagen.spotifygood.data.settings.Settings
 import com.taehagen.spotifygood.data.settings.ThemeMode
 import com.taehagen.spotifygood.engine.defaultDeviceName
 import com.taehagen.spotifygood.model.Bitrate
-import com.taehagen.spotifygood.model.DownloadState
+import com.taehagen.spotifygood.download.FailedCounts
 import com.taehagen.spotifygood.model.NormalizePregain
 import com.taehagen.spotifygood.model.User
 import com.taehagen.spotifygood.model.best
@@ -164,9 +164,9 @@ class SettingsViewModel(private val graph: AppGraph) : ViewModel() {
     val downloadedCount: StateFlow<Int> = graph.downloads.downloadedUris
         .map { it.size }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), graph.downloads.downloadedUris.value.size)
-    val failedCount: StateFlow<Int> = graph.downloads.items
-        .map { items -> items.count { it.state == DownloadState.FAILED } }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+    /** Failed downloads: the retryable ones (offered by "Retry") and those not playable here. */
+    val failedCounts: StateFlow<FailedCounts> = graph.downloads.failedCounts
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), FailedCounts())
 
     /** Audio session of the local player, for the system equalizer. */
     val audioSessionId: Int get() = graph.audioSink.audioSessionId
@@ -255,7 +255,7 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
     val user by vm.user.collectAsStateWithLifecycle()
     val usedBytes by vm.usedBytes.collectAsStateWithLifecycle()
     val downloadedCount by vm.downloadedCount.collectAsStateWithLifecycle()
-    val failedCount by vm.failedCount.collectAsStateWithLifecycle()
+    val failedCounts by vm.failedCounts.collectAsStateWithLifecycle()
     val sleepTimer by vm.sleepTimer.collectAsStateWithLifecycle()
     var dialog by remember { mutableStateOf<SettingsDialog?>(null) }
 
@@ -473,11 +473,12 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
                     onClick = { navigator.navigate(Route.Downloads) },
                 )
             }
-            if (failedCount > 0) {
+            // Only what "Retry" really puts back (not the downloads that aren't playable here).
+            if (failedCounts.retryable > 0) {
                 item(key = "retry_failed") {
                     PrefItem(
                         title = stringResource(R.string.shell_settings_retry_failed),
-                        summary = stringResource(R.string.shell_settings_retry_failed_summary, failedCount),
+                        summary = stringResource(R.string.shell_settings_retry_failed_summary, failedCounts.retryable),
                         icon = Icons.Rounded.Refresh,
                         onClick = { vm.retryFailed { navigator.showMessage(msgRetrying) } },
                     )
@@ -489,7 +490,7 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
                     summary = stringResource(R.string.shell_settings_remove_downloads_summary),
                     icon = Icons.Rounded.DeleteSweep,
                     // Failed rows can still own (partial) files, so they count too.
-                    enabled = downloadedCount > 0 || usedBytes > 0 || failedCount > 0,
+                    enabled = downloadedCount > 0 || usedBytes > 0 || failedCounts.total > 0,
                     onClick = { dialog = SettingsDialog.RemoveDownloads },
                     destructive = true,
                 )

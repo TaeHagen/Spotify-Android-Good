@@ -117,7 +117,7 @@ internal fun DownloadsContent(contentPadding: PaddingValues, modifier: Modifier 
                         Icon(Icons.Rounded.MoreVert, contentDescription = stringResource(R.string.browse_more_options))
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        if (state.content.failedCount > 0) {
+                        if (state.failed.retryable > 0) {
                             DropdownMenuItem(
                                 text = { Text(stringResource(R.string.browse_downloads_retry_failed)) },
                                 leadingIcon = { Icon(Icons.Rounded.Refresh, contentDescription = null) },
@@ -478,16 +478,27 @@ private fun StorageHeader(state: DownloadsUiState, onRetryFailed: () -> Unit) {
                 }
             }
         }
-        if (content.failedCount > 0) {
+        // "Retry" offers only what it really puts back; downloads that are not playable here stay
+        // failed (a sync picks them up once Spotify has them again) and are counted apart.
+        val failed = state.failed
+        if (failed.retryable > 0) {
             Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = pluralStringResource(R.plurals.browse_downloads_failed, content.failedCount, content.failedCount),
+                    text = pluralStringResource(R.plurals.browse_downloads_failed, failed.retryable, failed.retryable),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.weight(1f),
                 )
                 TextButton(onClick = onRetryFailed) { Text(stringResource(R.string.browse_retry)) }
             }
+        }
+        if (failed.unavailable > 0) {
+            Text(
+                text = pluralStringResource(R.plurals.browse_downloads_unavailable, failed.unavailable, failed.unavailable),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
         }
     }
 }
