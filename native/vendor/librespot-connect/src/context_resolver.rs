@@ -270,8 +270,9 @@ impl ContextResolver {
         let (next, _, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
         let remaining = match next.action {
+            // SPOTIFYGOOD: into the context of the resolve (it always went into the default one)
             ContextAction::Append if context.pages.len() == 1 => state
-                .fill_context_from_page(context.pages.remove(0))
+                .fill_context_from_page(context.pages.remove(0), next.update)
                 .map(|_| None),
             ContextAction::Replace => {
                 let remaining = state.update_context(context, next.update);
