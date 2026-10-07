@@ -561,7 +561,8 @@ impl<'ct> ConnectState {
     /// dropped tracks are filled in again later. Upstream only popped them, and because the fill
     /// up index already pointed past them, they were never played. A dropped smart shuffle
     /// suggestion takes the context track it follows along (so at most `max - 1` may be left).
-    fn truncate_next_tracks(&mut self, max: usize) {
+    // SPOTIFYGOOD: pub(super) for fill_context_from_page
+    pub(super) fn truncate_next_tracks(&mut self, max: usize) {
         while self.next_tracks().len() > max {
             let Some(dropped) = self.next_tracks_mut().pop() else {
                 break;

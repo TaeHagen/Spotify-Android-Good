@@ -1289,6 +1289,196 @@ fn pages_appended_while_shuffled_still_unshuffle() {
     assert_eq!(default_uids(&state), uids(0..35));
 }
 
+#[test]
+fn shuffled_transfer_keeps_a_queued_or_unknown_current_track() {
+    use crate::{protocol::transfer_state::TransferState, state::provider::Provider};
+
+    // a queued song, the same song that is also in the context, and a context track the context
+    // doesn't contain (e.g. a recommendation of the official smart shuffle)
+    for (provider, uri) in [
+        (Provider::Queue, track_uri(1, 9)),
+        (Provider::Queue, track_uri(5, 0)),
+        (Provider::Context, track_uri(2, 9)),
+    ] {
+        let (_rt, mut state) = state(30);
+        let mut track = ProvidedTrack {
+            uri: uri.clone(),
+            uid: "transferred".to_string(),
+            ..Default::default()
+        };
+        track.set_provider(provider);
+        state.set_track(track);
+        state.set_shuffle(true);
+
+        state.finish_transfer(TransferState::default()).unwrap();
+        assert!(state.shuffling_context());
+        assert_eq!(state.current_track(|t| t.uri.clone()), uri);
+        assert_eq!(state.current_track(|t| t.uid.clone()), "transferred");
+        // no context track is skipped in the first pass (nor goes to the prev tracks)
+        let mut next = next_uids(&state);
+        next.sort();
+        let mut all = uids(0..30);
+        all.sort();
+        assert_eq!(next, all);
+        assert!(state.prev_tracks().is_empty());
+    }
+}
+
+#[test]
+fn pages_appended_after_a_wrap_play_before_it() {
+    use crate::context_resolver::{ContextAction, ContextResolver, ResolveContext};
+
+    // repeat is on while only the first page (10 tracks) is there: the next tracks wrap it
+    let (rt, mut state) = state(10);
+    state.set_repeat_context(true);
+    state.reset_playback_to_position(Some(0)).unwrap();
+    assert_eq!(state.next_tracks().len(), 80);
+    assert!(next_uids(&state)[9].starts_with(IDENTIFIER_DELIMITER));
+
+    state
+        .fill_context_from_page(default_page(10..30), ContextType::Default)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    let next = next_uids(&state);
+    assert_eq!(next[..29], uids(1..30));
+    let wrap = &state.next_tracks()[29];
+    assert!(wrap.uid.starts_with(IDENTIFIER_DELIMITER));
+    assert_eq!(wrap.get_iteration().map(String::as_str), Some("0"));
+    assert_eq!(next[30], "uid0");
+    assert_unique_uids(&state);
+
+    // the further pages through the resolver, and the setup after the last one
+    let session = {
+        let _guard = rt.enter();
+        Session::new(SessionConfig::default(), None)
+    };
+    let (_rt, mut state) = self::state(10);
+    state.set_repeat_context(true);
+    state.reset_playback_to_position(Some(0)).unwrap();
+    let mut resolver = ContextResolver::new(session);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Default,
+        ContextAction::Append,
+    ));
+    let pages = Context {
+        uri: Some(CONTEXT_URI.to_string()),
+        pages: vec![default_page(10..20), default_page(20..30)],
+        ..Default::default()
+    };
+    resolver.apply_next_context(&mut state, pages).unwrap();
+    assert!(resolver.try_finish(&mut state, &mut None));
+    let next = next_uids(&state);
+    assert_eq!(next[..29], uids(1..30));
+    assert!(next[29].starts_with(IDENTIFIER_DELIMITER));
+
+    // without repeat, the transition to autoplay
+    let (_rt, mut state) = self::state(10);
+    state
+        .update_context(autoplay_context(100), ContextType::Autoplay)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    assert!(next_uids(&state)[9].starts_with(IDENTIFIER_DELIMITER));
+    state
+        .fill_context_from_page(default_page(10..15), ContextType::Default)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    let next = next_uids(&state);
+    assert_eq!(next[..14], uids(1..15));
+    assert!(next[14].starts_with(IDENTIFIER_DELIMITER));
+    assert_eq!(next[15..18], ["a0", "a1", "a2"]);
+}
+
+#[test]
+fn playlist_update_while_shuffled_keeps_the_pass() {
+    use crate::context_resolver::{ContextAction, ContextResolver, ResolveContext};
+
+    let (rt, mut state) = state(40);
+    let session = {
+        let _guard = rt.enter();
+        Session::new(SessionConfig::default(), None)
+    };
+    state.handle_shuffle(true).unwrap();
+    play_through(&mut state, 10);
+    let current = state.current_track(|t| t.uid.clone());
+    let prev = state
+        .prev_tracks()
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    let mut played = prev.clone();
+    played.push(current.clone());
+
+    // the playlist got a track, and lost an upcoming one and a played one
+    let removed_upcoming = next_uids(&state)[5].clone();
+    let removed_played = prev[3].clone();
+    let mut modified = context(40, 0);
+    modified.pages[0].tracks.retain(|t| {
+        t.uid.as_deref() != Some(&removed_upcoming) && t.uid.as_deref() != Some(&removed_played)
+    });
+    modified.pages[0].tracks.insert(
+        7,
+        ContextTrack {
+            uri: Some(track_uri(99, 3)),
+            uid: Some("new".to_string()),
+            ..Default::default()
+        },
+    );
+    let modified_order = modified.pages[0]
+        .tracks
+        .iter()
+        .map(|t| t.uid.clone().unwrap())
+        .collect::<Vec<_>>();
+
+    // a playlist modification resolves the playing context again
+    let mut resolver = ContextResolver::new(session);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Default,
+        ContextAction::Replace,
+    ));
+    resolver.apply_next_context(&mut state, modified).unwrap();
+    assert!(resolver.try_finish(&mut state, &mut None));
+
+    assert!(state.shuffling_context());
+    assert_eq!(state.current_track(|t| t.uid.clone()), current);
+    let prev_now = state
+        .prev_tracks()
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(prev_now, prev, "the prev tracks stay");
+
+    // the rest of the pass: no song played again, the new one once, the removed one never
+    let rest = play_through(&mut state, 100);
+    assert!(rest.iter().all(|uid| !played.contains(uid)), "{rest:?}");
+    assert_eq!(rest.iter().filter(|uid| *uid == "new").count(), 1);
+    assert!(!rest.contains(&removed_upcoming));
+    // 40 tracks, one added and two removed, 11 played
+    assert_eq!(rest.len(), 40 + 1 - 2 - 10);
+
+    // and shuffle off restores the order of the updated playlist
+    state.handle_shuffle(false).unwrap();
+    assert_eq!(default_uids(&state), modified_order);
+}
+
+#[test]
+fn reset_context_reports_a_complete_reset() {
+    // handle_load drops the pending resolves (and transfer) of the previous context then
+    let (_rt, mut state) = state(3);
+    assert!(!state.reset_context(ResetContext::WhenDifferent(CONTEXT_URI)));
+    assert!(state.get_context(ContextType::Default).is_ok());
+    assert!(!state.reset_context(ResetContext::DefaultIndex));
+    assert!(state.reset_context(ResetContext::WhenDifferent("spotify:album:0")));
+    assert!(state.get_context(ContextType::Default).is_err());
+
+    // a track list load
+    let (_rt, mut state) = self::state(3);
+    assert!(state.reset_context(ResetContext::Completely));
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(

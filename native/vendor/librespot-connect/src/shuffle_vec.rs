@@ -107,6 +107,48 @@ impl<T> ShuffleVec<T> {
         }
     }
 
+    // SPOTIFYGOOD: an update of a context that plays shuffled keeps its order, see
+    // ConnectState::update_context
+    /// Puts the items into the given order and records it as the shuffle, so that
+    /// [ShuffleVec::unshuffle] restores the original order
+    ///
+    /// `order[k]` is the position (in the original order) of the item that goes to position `k`.
+    /// The order is recorded as the swaps of the Fisher-Yates shuffle (see `shuffle_with_rng`)
+    /// that produce it. Returns false, and changes nothing, if `order` isn't a permutation of
+    /// the positions.
+    pub fn shuffle_to_order(&mut self, order: &[usize]) -> bool {
+        let len = self.vec.len();
+        let mut seen = vec![false; len];
+        if order.len() != len
+            || order
+                .iter()
+                .any(|&p| p >= len || std::mem::replace(&mut seen[p], true))
+        {
+            return false;
+        }
+
+        self.unshuffle();
+
+        // at[p]: the original position of the item now at p, pos: the inverse
+        let mut at = (0..len).collect::<Vec<_>>();
+        let mut pos = (0..len).collect::<Vec<_>>();
+        let mut indices = Vec::with_capacity(len.saturating_sub(1));
+        for i in (1..len).rev() {
+            // positions above i are final, the item for i is at or below it
+            let p = pos[order[i]];
+            indices.push(p);
+            self.vec.swap(i, p);
+            let (a, b) = (at[i], at[p]);
+            at.swap(i, p);
+            pos[a] = p;
+            pos[b] = i;
+        }
+
+        self.indices = Some(indices);
+        self.original_first_position = None;
+        true
+    }
+
     pub fn unshuffle(&mut self) {
         let indices = match self.indices.take() {
             Some(indices) => indices,
@@ -214,6 +256,35 @@ mod test {
         )
     }
 
+    // SPOTIFYGOOD: see ShuffleVec::shuffle_to_order
+    #[test]
+    fn test_shuffle_to_order() {
+        use rand::seq::SliceRandom;
+
+        for len in [0, 1, 2, 3, 10, 200] {
+            let mut order = (0..len).collect::<Vec<_>>();
+            order.shuffle(&mut rand::rng());
+            let items = (0..len).map(|i| i * 10).collect::<Vec<_>>();
+
+            // also from an already shuffled vec
+            let mut vec: ShuffleVec<usize> = items.clone().into();
+            vec.shuffle_with_seed(7, |i| *i == 0);
+            assert!(vec.shuffle_to_order(&order));
+            let expected = order.iter().map(|&p| items[p]).collect::<Vec<_>>();
+            assert_eq!(*vec, expected);
+
+            vec.unshuffle();
+            assert_eq!(*vec, items);
+        }
+
+        // not a permutation: unchanged
+        let mut vec: ShuffleVec<usize> = vec![0, 1, 2].into();
+        assert!(!vec.shuffle_to_order(&[0, 0, 1]));
+        assert!(!vec.shuffle_to_order(&[0, 1]));
+        assert!(!vec.shuffle_to_order(&[0, 1, 3]));
+        assert_eq!(*vec, vec![0, 1, 2]);
+    }
+
     // SPOTIFYGOOD: see ShuffleVec::extend_keep_shuffle
     #[test]
     fn test_extend_keeps_unshuffle_working() {
@@ -243,6 +314,13 @@ mod test {
             fresh.shuffle_with_seed(seed, |_| false);
             assert_eq!(reshuffled, fresh);
         }
+
+        // and after an order was set
+        let mut ordered: ShuffleVec<usize> = (0..10).collect::<Vec<_>>().into();
+        assert!(ordered.shuffle_to_order(&[3, 1, 4, 0, 9, 2, 6, 5, 8, 7]));
+        ordered.extend_keep_shuffle(10..12);
+        ordered.unshuffle();
+        assert_eq!(*ordered, (0..12).collect::<Vec<_>>());
 
         // nothing to keep for a vec that was never shuffled (or had a single item)
         let mut single: ShuffleVec<usize> = vec![0].into();

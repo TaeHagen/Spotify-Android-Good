@@ -15,6 +15,8 @@ use crate::{
     },
 };
 use protobuf::MessageField;
+// SPOTIFYGOOD: Rng for keep_shuffled_order
+use rand::Rng;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -64,7 +66,73 @@ fn page_url_to_uri(page_url: &str) -> String {
         .join(":")
 }
 
+// SPOTIFYGOOD: see ConnectState::keep_shuffled_order
+/// Matches tracks to the positions of a context, each position at most once
+struct TrackMatcher<'c> {
+    /// the positions of each uid and uri, the lowest last
+    by_uid: HashMap<&'c str, Vec<usize>>,
+    by_uri: HashMap<&'c str, Vec<usize>>,
+    taken: Vec<bool>,
+}
+
+impl<'c> TrackMatcher<'c> {
+    fn new(ctx: &'c StateContext) -> Self {
+        let mut by_uid = HashMap::<_, Vec<_>>::new();
+        let mut by_uri = HashMap::<_, Vec<_>>::new();
+        for (i, track) in ctx.tracks.iter().enumerate().rev() {
+            if !track.uid.is_empty() {
+                by_uid.entry(track.uid.as_str()).or_default().push(i);
+            }
+            by_uri.entry(track.uri.as_str()).or_default().push(i);
+        }
+        Self {
+            by_uid,
+            by_uri,
+            taken: vec![false; ctx.tracks.len()],
+        }
+    }
+
+    fn take(list: Option<&mut Vec<usize>>, taken: &mut [bool]) -> Option<usize> {
+        let list = list?;
+        while let Some(position) = list.pop() {
+            if !taken[position] {
+                taken[position] = true;
+                return Some(position);
+            }
+        }
+        None
+    }
+
+    fn take_by_uid(&mut self, track: &ProvidedTrack) -> Option<usize> {
+        if track.uid.is_empty() {
+            return None;
+        }
+        Self::take(self.by_uid.get_mut(track.uid.as_str()), &mut self.taken)
+    }
+
+    /// for contexts without stable uids (they are generated on every resolve)
+    fn take_by_uri(&mut self, track: &ProvidedTrack) -> Option<usize> {
+        Self::take(self.by_uri.get_mut(track.uri.as_str()), &mut self.taken)
+    }
+
+    /// the positions no track was matched to
+    fn untaken(&self) -> impl Iterator<Item = usize> + '_ {
+        self.taken
+            .iter()
+            .enumerate()
+            .filter(|(_, taken)| !**taken)
+            .map(|(i, _)| i)
+    }
+}
+
 impl ConnectState {
+    // SPOTIFYGOOD: for ContextResolver::try_finish
+    /// Whether the default context is in shuffled order
+    pub fn default_context_shuffled(&self) -> bool {
+        self.get_context(ContextType::Default)
+            .is_ok_and(|ctx| ctx.get_shuffle_seed().is_some())
+    }
+
     pub fn find_index_in_context<F: Fn(&ProvidedTrack) -> bool>(
         ctx: &StateContext,
         f: F,
@@ -110,7 +178,9 @@ impl ConnectState {
         self.context_uri() != uri || uri.starts_with(SEARCH_IDENTIFIER)
     }
 
-    pub fn reset_context(&mut self, mut reset_as: ResetContext) {
+    // SPOTIFYGOOD: returns whether the context was reset completely (handle_load drops the
+    // resolves and the transfer still pending for the previous context then)
+    pub fn reset_context(&mut self, mut reset_as: ResetContext) -> bool {
         if matches!(reset_as, ResetContext::WhenDifferent(ctx) if self.different_context_uri(ctx)) {
             reset_as = ResetContext::Completely
         }
@@ -148,7 +218,9 @@ impl ConnectState {
 
         self.fill_up_context = ContextType::Default;
         self.set_active_context(ContextType::Default);
-        self.update_restrictions()
+        self.update_restrictions();
+
+        matches!(reset_as, ResetContext::Completely)
     }
 
     pub fn valid_resolve_uri(uri: &str) -> Option<&str> {
@@ -256,6 +328,8 @@ impl ConnectState {
                         // context resolver only fills up again while the default context is
                         // active, the playback stopped after the current track.
                         new_context.index.track = new_context.tracks.len() as u32;
+                    } else if self.keep_shuffle_on_update(&mut new_context, &mut next_contexts) {
+                        debug!("kept the shuffled order of the updated context");
                     } else if let Some(new_index) =
                         self.find_last_index_in_new_context(&new_context)
                     {
@@ -311,7 +385,7 @@ impl ConnectState {
             .flat_map(|page| {
                 if !page.tracks.is_empty() {
                     // SPOTIFYGOOD: into the context that is updated
-                    self.fill_context_from_page(page, ty).ok()?;
+                    self.append_page(page, ty).ok()?;
                     None
                 } else if matches!(page.page_url, Some(ref url) if !url.is_empty()) {
                     Some(page_url_to_uri(
@@ -341,10 +415,84 @@ impl ConnectState {
     ) -> Option<Result<u32, u32>> {
         let ctx = self.context.as_ref()?;
 
-        let position = |track: &ProvidedTrack| Self::position_in_context(new_context, track);
+        let new_index = self.resume_position(new_context).map(|i| i as u32);
+
+        Some(new_index.ok_or_else(|| {
+            info!(
+                "couldn't distinguish index from current or previous tracks in the updated context"
+            );
+            // a guess: the old fill up position, minus the context tracks still waiting
+            let is_plain = |track: &&ProvidedTrack| Self::is_plain_context_track(track);
+            let waiting = self.next_tracks().iter().filter(is_plain).count();
+            let fallback_index = (ctx.index.track as usize)
+                .saturating_sub(waiting)
+                .min(new_context.tracks.len()) as u32;
+            info!("falling back to index {fallback_index}");
+            fallback_index
+        }))
+    }
+
+    // SPOTIFYGOOD: see keep_shuffled_order
+    /// For an update of the context that plays shuffled: puts the updated context into the
+    /// order that keeps the shuffled order (and its seed), and continues the next tracks after
+    /// the tracks played in this pass. The prev tracks stay. Returns false, without changing
+    /// anything, if that isn't possible.
+    ///
+    /// Further pages that carry their tracks are added before (`next_contexts` is emptied). With
+    /// pages that are resolved later, tracks not on the first pages can't be told apart from
+    /// removed ones, so the update is shuffled from scratch then (as before).
+    fn keep_shuffle_on_update(
+        &mut self,
+        new_context: &mut StateContext,
+        next_contexts: &mut Vec<ContextPage>,
+    ) -> bool {
+        if !self.shuffling_context()
+            || !self.default_context_shuffled()
+            || next_contexts.iter().any(|page| page.tracks.is_empty())
+        {
+            return false;
+        }
+
+        for page in next_contexts.drain(..) {
+            let len = new_context.tracks.len();
+            let more =
+                self.state_context_from_page(page, HashMap::new(), None, None, Some(len), None);
+            // new_context isn't shuffled yet
+            new_context.tracks.extend(more.tracks);
+        }
+
+        let Some((order, played)) = self.keep_shuffled_order(new_context) else {
+            return false;
+        };
+        if !new_context.tracks.shuffle_to_order(&order) {
+            return false;
+        }
+
+        let Some(old) = self.context.as_ref() else {
+            return false;
+        };
+        if let Some(seed) = old.get_shuffle_seed().cloned() {
+            new_context.set_shuffle_seed(seed);
+        }
+        if let Some(initial_track) = old.get_initial_track().cloned() {
+            new_context.set_initial_track(initial_track);
+        }
+        new_context.index.track = played as u32;
+        // the pass (it numbers the delimiters)
+        new_context.index.page = self.current_pass();
+
+        self.clear_next_tracks();
+        self.fill_up_context = ContextType::Default;
+        true
+    }
+
+    // SPOTIFYGOOD: see find_last_index_in_new_context, also used for the old (shuffled) order
+    /// The position in `ctx` at which the playback continues
+    fn resume_position(&self, ctx: &StateContext) -> Option<usize> {
+        let position = |track: &ProvidedTrack| Self::position_in_context(ctx, track);
         let is_plain = |track: &&ProvidedTrack| Self::is_plain_context_track(track);
 
-        let new_index = self
+        self
             // after the current track
             .current_track(|t| t.as_ref().filter(is_plain).and_then(position))
             .map(|i| i + 1)
@@ -368,23 +516,57 @@ impl ConnectState {
             })
             // the default context was already played to its end
             .or_else(|| {
-                matches!(self.fill_up_context, ContextType::Autoplay)
-                    .then_some(new_context.tracks.len())
+                matches!(self.fill_up_context, ContextType::Autoplay).then_some(ctx.tracks.len())
             })
-            .map(|i| i as u32);
+    }
 
-        Some(new_index.ok_or_else(|| {
-            info!(
-                "couldn't distinguish index from current or previous tracks in the updated context"
-            );
-            // a guess: the old fill up position, minus the context tracks still waiting
-            let waiting = self.next_tracks().iter().filter(is_plain).count();
-            let fallback_index = (ctx.index.track as usize)
-                .saturating_sub(waiting)
-                .min(new_context.tracks.len()) as u32;
-            info!("falling back to index {fallback_index}");
-            fallback_index
-        }))
+    // SPOTIFYGOOD: an update of the context that plays shuffled (a playlist modification) used
+    // to be shuffled again from scratch (ContextResolver::try_finish): the prev tracks were
+    // cleared and the songs already played in this pass came back
+    /// The order (positions in `new_context`) that keeps the shuffled order of the playing
+    /// context for the tracks the update still has, and how many of them were played in this
+    /// pass already
+    ///
+    /// The played ones come first, then the upcoming ones in their order, with the tracks the
+    /// update added at random places among them. `None` if the playing context isn't shuffled or
+    /// the playback position isn't known.
+    fn keep_shuffled_order(&self, new_context: &StateContext) -> Option<(Vec<usize>, usize)> {
+        let old = self.context.as_ref()?;
+        old.get_shuffle_seed()?;
+        let played_end = self.resume_position(old)?.min(old.tracks.len());
+
+        let mut matcher = TrackMatcher::new(new_context);
+        let mut mapped = old
+            .tracks
+            .iter()
+            .map(|t| matcher.take_by_uid(t))
+            .collect::<Vec<_>>();
+        for (to, track) in mapped.iter_mut().zip(old.tracks.iter()) {
+            if to.is_none() {
+                *to = matcher.take_by_uri(track);
+            }
+        }
+
+        let played = mapped[..played_end]
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut upcoming = mapped[played_end..]
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut rng = rand::rng();
+        for added in matcher.untaken() {
+            let at = rng.random_range(0..=upcoming.len());
+            upcoming.insert(at, added);
+        }
+
+        let played_len = played.len();
+        let mut order = played;
+        order.extend(upcoming);
+        Some((order, played_len))
     }
 
     fn state_context_from_page(
@@ -550,12 +732,35 @@ impl ConnectState {
     // default context, also the further pages of an autoplay resolve: the autoplay context never
     // grew, so autoplay stopped after its first batch, and the playlist got the autoplay tracks
     // as its own tracks.
-    /// Appends the tracks of a further page to the context of the given type
+    /// Appends the tracks of a further page (resolved after the first one) to the context of the
+    /// given type
     pub fn fill_context_from_page(
         &mut self,
         page: ContextPage,
         ty: ContextType,
     ) -> Result<(), Error> {
+        // SPOTIFYGOOD: the next tracks may already go past the end of the default context so
+        // far: wrapped (repeat), about 7 times for the 10 top tracks of an artist before the
+        // album pages arrived, or into autoplay. The new tracks were only reached after all of
+        // that. Drop it (the fill up rewinds to the end of the context so far, in the same pass)
+        // so that the next fill up continues with the new tracks.
+        if matches!(ty, ContextType::Default) && matches!(self.active_context, ContextType::Default)
+        {
+            if let Some(end) = self
+                .next_tracks()
+                .iter()
+                .position(|t| t.uid.starts_with(IDENTIFIER_DELIMITER))
+            {
+                self.truncate_next_tracks(end);
+            }
+        }
+
+        self.append_page(page, ty)
+    }
+
+    // SPOTIFYGOOD: see fill_context_from_page, update_context appends its further pages with it
+    // (the next tracks are still those of the previous context then)
+    fn append_page(&mut self, page: ContextPage, ty: ContextType) -> Result<(), Error> {
         match ty {
             ContextType::Default => {
                 let ctx_len = self.context.as_ref().map(|c| c.tracks.len());

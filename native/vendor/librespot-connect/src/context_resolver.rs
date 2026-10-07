@@ -148,6 +148,8 @@ pub struct ContextResolver {
 // time after which an unavailable context is retried
 // SPOTIFYGOOD: was 3600s, too long for flaky mobile networks
 const RETRY_UNAVAILABLE: Duration = Duration::from_secs(60);
+// SPOTIFYGOOD: upper bound for one context fetch, see get_next_context
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl ContextResolver {
     pub fn new(session: Session) -> Self {
@@ -265,33 +267,48 @@ impl ContextResolver {
     ) -> Result<Context, Error> {
         let (next, resolve_uri, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
-        match next.fetch_as() {
-            ContextType::Default => {
-                let mut ctx = self.session.spclient().get_context(resolve_uri).await;
-                if let Ok(ctx) = ctx.as_mut() {
-                    ctx.uri = Some(next.context_uri().to_string());
-                    ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
-                }
+        // SPOTIFYGOOD: bounded. spclient retries without a timeout of its own (and sleeps out a
+        // 429's Retry-After), so a load sent just before the network died hung the Spirc loop
+        // (Spirc::load awaits the first resolve), with pause and every other command waiting
+        // behind it. A timeout is transient: the context isn't marked unavailable.
+        let fetch = async {
+            match next.fetch_as() {
+                ContextType::Default => {
+                    let mut ctx = self.session.spclient().get_context(resolve_uri).await;
+                    if let Ok(ctx) = ctx.as_mut() {
+                        ctx.uri = Some(next.context_uri().to_string());
+                        ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
+                    }
 
-                ctx
-            }
-            ContextType::Autoplay => {
-                if resolve_uri.contains("spotify:show:") || resolve_uri.contains("spotify:episode:")
-                {
-                    // autoplay is not supported for podcasts
-                    Err(ContextResolverError::NotAllowedContext(
-                        resolve_uri.to_string(),
-                    ))?
+                    ctx
                 }
+                ContextType::Autoplay => {
+                    if resolve_uri.contains("spotify:show:")
+                        || resolve_uri.contains("spotify:episode:")
+                    {
+                        // autoplay is not supported for podcasts
+                        Err(ContextResolverError::NotAllowedContext(
+                            resolve_uri.to_string(),
+                        ))?
+                    }
 
-                let request = AutoplayContextRequest {
-                    context_uri: Some(resolve_uri.to_string()),
-                    recent_track_uri: recent_track_uri(),
-                    ..Default::default()
-                };
-                self.session.spclient().get_autoplay_context(&request).await
+                    let request = AutoplayContextRequest {
+                        context_uri: Some(resolve_uri.to_string()),
+                        recent_track_uri: recent_track_uri(),
+                        ..Default::default()
+                    };
+                    self.session.spclient().get_autoplay_context(&request).await
+                }
             }
-        }
+        };
+
+        tokio::time::timeout(RESOLVE_TIMEOUT, fetch)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::deadline_exceeded(format!(
+                    "resolving <{resolve_uri}> timed out"
+                )))
+            })
     }
 
     pub fn mark_next_unavailable(&mut self) {
@@ -375,7 +392,14 @@ impl ContextResolver {
         let active_ctx = state.get_context(state.active_context);
         let res = if let Some(transfer_state) = transfer_state.take() {
             state.finish_transfer(transfer_state)
-        } else if state.shuffling_context() && next.update == ContextType::Default {
+        } else if state.shuffling_context()
+            && next.update == ContextType::Default
+            // SPOTIFYGOOD: not after an update of the context that already played shuffled,
+            // update_context kept its shuffled order (with the added tracks shuffled in). The
+            // reshuffle cleared the prev tracks and brought back the songs played in this pass.
+            // A load (not shuffled yet) and further pages are still shuffled here.
+            && !(next.action == ContextAction::Replace && state.default_context_shuffled())
+        {
             state.shuffle_new()
         } else if matches!(active_ctx, Ok(ctx) if ctx.index.track == 0) {
             // has context, and context is not touched

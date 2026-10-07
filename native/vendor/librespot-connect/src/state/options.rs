@@ -94,7 +94,14 @@ impl ConnectState {
         self.validate_shuffle_allowed()?;
 
         let new_seed = rand::rng().random_range(100_000_000_000..1_000_000_000_000);
-        let current_track = self.current_track(|t| t.uri.clone());
+        // SPOTIFYGOOD: the shuffle puts the current track first and skips it in the first pass.
+        // A queued track (or one the context doesn't contain) isn't a context track, the same
+        // song elsewhere in the context was skipped instead; no context track goes first then.
+        let current_track = if self.keeps_current_track() {
+            String::new()
+        } else {
+            self.current_track(|t| t.uri.clone())
+        };
 
         self.shuffle(new_seed, &current_track)
     }
