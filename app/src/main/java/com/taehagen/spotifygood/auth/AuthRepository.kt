@@ -16,7 +16,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import java.io.File
@@ -72,7 +75,15 @@ object LoginErrorCode {
  * * [startZeroconfLogin]: "use another device" (Spotify Connect hand-over on the LAN).
  *
  * Only one flow runs at a time; starting one stops the others. Flows run in the app scope so they
- * survive configuration changes; the login screen calls [cancel] when it is left for good.
+ * survive configuration changes. The login screen reports its visibility:
+ * * [onLoginScreenHidden] (app in the background, screen left): zeroconf advertising stops, and
+ *   device-code polling pauses until [onLoginScreenShown] (the code stays persisted, so it
+ *   resumes where it was, e.g. after approving it in the browser). The PKCE flow keeps waiting:
+ *   the browser is in front of the app on purpose.
+ * * [onLoginScreenLeft] (activity finished): every flow that has no token yet is cancelled.
+ *
+ * [LoginState.Success] is reset to [LoginState.Idle] whenever the engine reports logged out
+ * (logout, rejected credentials), so the login screen always shows its options again.
  */
 class AuthRepository(
     context: Context,
@@ -101,6 +112,30 @@ class AuthRepository(
     private var flowJob: Job? = null
     private var loopback: LoopbackServer? = null
     private var zeroconf: ZeroconfLogin? = null
+    /** The flow got a token: its engine login finishes even without the screen. */
+    private var tokenObtained = false
+    /** The device flow was paused by [onLoginScreenHidden]; [onLoginScreenShown] resumes it. */
+    private var devicePaused = false
+
+    /** Held by [whileLoggingOut]; a flow waits for it before handing a login to the engine. */
+    private val logoutGate = Mutex()
+
+    init {
+        // A finished login is undone by a logout or by Spotify rejecting the credentials: show
+        // the options again instead of a "Connecting" card that never ends. (Success is only set
+        // after the engine reported logged in, so this can't race a login in progress.)
+        scope.launch {
+            combine(engine.isLoggedIn, _state) { loggedIn, state -> !loggedIn && state == LoginState.Success }
+                .collect { stale ->
+                    if (stale) synchronized(lock) {
+                        if (_state.value == LoginState.Success && !engine.isLoggedIn.value) {
+                            stopFlowLocked()
+                            _state.value = LoginState.Idle
+                        }
+                    }
+                }
+        }
+    }
 
     /** Starts the device authorization grant and polls until approved/expired/cancelled. */
     fun startDeviceLogin() {
@@ -146,6 +181,7 @@ class AuthRepository(
         val login = ZeroconfLogin(context.applicationContext, engine)
         synchronized(lock) {
             startFlowLocked(FlowKind.ZEROCONF) { id ->
+                logoutGate.withLock {}
                 setState(id, LoginState.WaitingForDevice)
                 login.run()
                 setState(id, LoginState.Success)
@@ -160,12 +196,80 @@ class AuthRepository(
             stopFlowLocked()
             _state.value = LoginState.Idle
         }
-        scope.launch(Dispatchers.IO) {
-            try {
-                pendingStore.clear()
-            } catch (e: Exception) {
-                Log.w(TAG, "Clearing the pending device login failed", e)
+        scope.launch(Dispatchers.IO) { clearPendingDeviceLogin() }
+    }
+
+    /**
+     * The login screen became visible (also on its first composition): resumes a device login
+     * that was paused, or one persisted before process death.
+     */
+    fun onLoginScreenShown() {
+        scope.launch {
+            val idle = synchronized(lock) {
+                if (devicePaused && flowJob?.isActive != true) {
+                    // Resumes the persisted code (or requests a new one if it never got one).
+                    startDeviceLogin()
+                    return@launch
+                }
+                _state.value == LoginState.Idle && flowJob?.isActive != true
             }
+            if (idle && hasPendingDeviceLogin()) {
+                synchronized(lock) {
+                    if (_state.value == LoginState.Idle && flowJob?.isActive != true) startDeviceLogin()
+                }
+            }
+        }
+    }
+
+    /**
+     * The login screen is no longer visible (app in the background, or the screen left
+     * composition): stops zeroconf advertising and pauses device-code polling. A flow that
+     * already has a token finishes its engine login.
+     */
+    fun onLoginScreenHidden() {
+        synchronized(lock) {
+            when (flowKind) {
+                FlowKind.ZEROCONF -> if (_state.value == LoginState.WaitingForDevice) {
+                    Log.i(TAG, "Login screen hidden: stopping zeroconf")
+                    stopFlowLocked()
+                    _state.value = LoginState.Idle
+                }
+                FlowKind.DEVICE -> if (!tokenObtained && flowJob?.isActive == true) {
+                    Log.i(TAG, "Login screen hidden: pausing the device login")
+                    stopFlowLocked()
+                    devicePaused = true
+                }
+                // The browser is in front of the app on purpose; the loopback server waits.
+                FlowKind.BROWSER, null -> Unit
+            }
+        }
+    }
+
+    /** The login screen is gone for good (activity finished): cancels flows without a token. */
+    fun onLoginScreenLeft() {
+        val abandon = synchronized(lock) { devicePaused || (flowKind != null && !tokenObtained) }
+        if (abandon) cancel()
+    }
+
+    /**
+     * Logout: runs [block] (the wipe) while no flow can hand a new login to the engine, after
+     * stopping every flow and forgetting the pending device code. A login started meanwhile
+     * waits until the wipe is done.
+     */
+    suspend fun <T> whileLoggingOut(block: suspend () -> T): T = logoutGate.withLock {
+        synchronized(lock) {
+            stopFlowLocked()
+            _state.value = LoginState.Idle
+        }
+        withContext(Dispatchers.IO) { clearPendingDeviceLogin() }
+        block()
+    }
+
+    private fun clearPendingDeviceLogin() {
+        try {
+            pendingStore.clear()
+        } catch (e: Exception) {
+            Log.w(TAG, "Clearing the pending device login failed", e)
         }
     }
 
@@ -175,6 +279,7 @@ class AuthRepository(
         stopFlowLocked()
         val id = ++flowId
         flowKind = kind
+        tokenObtained = false
         flowJob = scope.launch {
             try {
                 block(id)
@@ -197,6 +302,7 @@ class AuthRepository(
     private fun stopFlowLocked() {
         flowId++
         flowKind = null
+        devicePaused = false
         flowJob?.cancel()
         flowJob = null
         loopback?.close()
@@ -208,6 +314,12 @@ class AuthRepository(
     private fun setState(id: Long, state: LoginState) {
         synchronized(lock) {
             if (id == flowId) _state.value = state
+        }
+    }
+
+    private fun markTokenObtained(id: Long) {
+        synchronized(lock) {
+            if (id == flowId) tokenObtained = true
         }
     }
 
@@ -249,6 +361,7 @@ class AuthRepository(
             throw e
         }
         withContext(Dispatchers.IO) { pendingStore.clear() }
+        markTokenObtained(id)
         completeLogin(id, token)
     }
 
@@ -268,6 +381,7 @@ class AuthRepository(
             Log.i(TAG, "Refreshing the token failed: ${e.javaClass.simpleName}")
             return false
         }
+        markTokenObtained(id)
         return try {
             completeLogin(id, token)
             true
@@ -275,6 +389,9 @@ class AuthRepository(
             // Account problems are final; anything else falls back to the interactive login.
             if (e.code == NativeErrorCode.PREMIUM_REQUIRED || e.code == NativeErrorCode.PLAYBACK_REFUSED) throw e
             Log.i(TAG, "Login with refreshed token failed (${e.code}), falling back to device login")
+            synchronized(lock) {
+                if (id == flowId) tokenObtained = false
+            }
             false
         }
     }
@@ -305,6 +422,7 @@ class AuthRepository(
                 is LoopbackServer.Result.Code -> {
                     setState(id, LoginState.Connecting)
                     val token = accounts.exchangeAuthorizationCode(result.code, redirectUri, pkce.verifier)
+                    markTokenObtained(id)
                     completeLogin(id, token)
                 }
                 is LoopbackServer.Result.Error -> throw OAuthException(result.error)
@@ -325,6 +443,8 @@ class AuthRepository(
         setState(id, LoginState.Connecting)
         // Stored before the engine login so a transient engine failure can retry without
         // re-approving (startDeviceLogin tries the refresh token first).
+        // A logout still wiping the previous account finishes first.
+        logoutGate.withLock {}
         token.refreshToken?.let { refreshToken ->
             withContext(Dispatchers.IO) { credentialStore.saveRefreshToken(refreshToken) }
         }

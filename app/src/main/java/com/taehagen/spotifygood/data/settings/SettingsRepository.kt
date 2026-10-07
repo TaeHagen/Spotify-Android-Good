@@ -145,6 +145,11 @@ class SettingsRepository(context: Context, scope: CoroutineScope) {
         }
     }
 
+    /** Logout: back to the defaults. Throws when the settings file can't be written. */
+    suspend fun reset() {
+        dataStore.edit { it.clear() }
+    }
+
     /** Engine settings for the current network type. */
     fun engineSettings(metered: Boolean, defaultDeviceName: String): EngineSettings =
         settings.value.toEngineSettings(metered, defaultDeviceName)

@@ -495,8 +495,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `verification_uri_complete` in a Custom Tab (explicit browser package) and also show the
   code (for approving from another device); poll `POST https://accounts.spotify.com/api/token`
   (`grant_type=urn:ietf:params:oauth:grant-type:device_code`, honour `interval`/`slow_down`,
-  stop on `expired_token`/`access_denied`) only while the login screen is alive. The device
-  code is persisted (≤ expiry) so polling resumes after process death. No local server.
+  stop on `expired_token`/`access_denied`) only while the login screen is visible: polling
+  pauses when the app goes to the background or the screen leaves composition (e.g. while the
+  code is approved in the Custom Tab) and resumes when it is shown again, and stops when the
+  screen is left for good (activity finished) before a token arrived. The device code is
+  persisted (≤ expiry) so polling resumes after process death. No local server.
 * **Fallback:** OAuth Authorization Code + PKCE with the desktop client id
   `65b708073fc0480ea92a077233ca87bd`, redirect `http://127.0.0.1:5588/login` (fallback
   port 8898), desktop scope list, `state` verified. `LoopbackServer` binds 127.0.0.1 only,
@@ -506,11 +509,18 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `https://accounts.spotify.com/api/token` with OkHttp. The access token goes to
   `session.start {accessToken}`; the refresh token is stored encrypted as a fallback.
 * Alternative login: "Use another device" → `session.zeroconfLogin` (mDNS, MulticastLock
-  only while that screen is visible).
+  only while that screen is visible: hiding the screen cancels it).
+* A finished login (`LoginState.Success`) goes back to the options as soon as the engine
+  reports logged out (logout, rejected credentials).
 * `CredentialStore`: AES-256-GCM key in AndroidKeyStore; ciphertext in
-  `noBackupFilesDir/credentials.bin`. Also encrypts per-download audio keys.
-* Logout: `session.logout`, delete credentials, downloads, caches, DB, settings
-  (with confirmation).
+  `noBackupFilesDir/credentials.bin`. Also encrypts per-download audio keys. The key is only
+  replaced when it is permanently invalid (`KeyPermanentlyInvalidatedException`, a corrupted or
+  missing key); transient Keystore failures are retried and then reported as
+  `KeystoreUnavailableException` without deleting anything.
+* Logout (with confirmation): stops the login flows and deletes the pending device code, then
+  `session.logout`, credentials, downloads, the resume state, the response and image caches,
+  the DB and the settings. Every step runs even if an earlier one failed; no new login reaches
+  the engine until the wipe is done.
 
 ### 9.4 Playback service
 
