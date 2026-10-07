@@ -7,6 +7,7 @@ import android.media.audiofx.AudioEffect
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -23,6 +24,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -45,6 +48,14 @@ import kotlinx.coroutines.launch
  * It also makes sure the [PlaybackService] runs when playback is requested while the app is
  * visible, and starts the opt-in Connect presence while the app is visible.
  *
+ * Local audio never plays without the service's media foreground (docs §9.4, §10). When it starts
+ * while the app is in the background and the service is not running — a remote "play on this
+ * phone" during the idle grace or a download — the service is started with
+ * `startForegroundService` (allowed before Android 12, and later while another foreground service
+ * such as a download runs); audio focus waits until it is in the foreground (Android 15 refuses
+ * focus to background apps). If that start is refused or the foreground is not reached in time,
+ * playback is paused (Connect sees it) and a "Tap to resume" alert is posted ([ResumeAlert]).
+ *
  * Installed once ([install]) by the playback service, the UI connector or — as a last resort — the
  * audio sink itself. Holds only the application context.
  */
@@ -55,6 +66,14 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
 
     /** Connect volume ↔ STREAM_MUSIC. */
     val volumeSync = VolumeSync(app, graph.rpc, graph.playback)
+
+    /** Engine / downloads knowledge of [PlayerController] (cold starts, offline context loads). */
+    val environment: PlaybackEnvironment = AppPlaybackEnvironment(graph)
+
+    init {
+        // Right away (not in initOnMain): the first command may be queued before that runs.
+        graph.player.environment = environment
+    }
 
     private val focus = AudioFocusController(
         app,
@@ -73,6 +92,27 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
 
     @Volatile private var sinkActive = false
     private val foreground = MutableStateFlow(false)
+
+    /** Visibility of the app (ProcessLifecycleOwner STARTED). */
+    val appVisible: StateFlow<Boolean> = foreground.asStateFlow()
+
+    /**
+     * Main thread. A background start of the service for local audio is under way: no second one,
+     * and audio focus is requested only once it is in the foreground.
+     */
+    private var backgroundStart = false
+    /** Audio focus is held back until the service is in the foreground ([backgroundStart]). */
+    private var focusAfterForeground = false
+    /** Local playback of this activation was paused for want of a foreground service. */
+    private var refusedThisActivation = false
+    private val backgroundStartTimeout = Runnable {
+        if (backgroundStart && isPlayingLocally()) {
+            Log.w(TAG, "Playback service did not reach the foreground; pausing local playback")
+            refuseBackgroundPlayback()
+        }
+        backgroundStart = false
+        focusAfterForeground = false
+    }
 
     /** The system audio-effect (equalizer) control session is open. Main thread. */
     private var effectSessionOpen = false
@@ -174,15 +214,82 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
         }
     }
 
+    /**
+     * Makes sure local audio that is (about to be) audible runs under the playback service. Returns
+     * false when it must not play (paused, alert posted). Main thread.
+     */
+    private fun ensureServiceForLocalAudio(): Boolean {
+        if (refusedThisActivation) return false
+        if (PlaybackService.isRunning || backgroundStart) return true
+        if (isAppInForeground) {
+            startService(null)
+            return true
+        }
+        // In the background without the service: a plain start would be refused, and audio must
+        // not play without the media foreground anyway.
+        val started = try {
+            ContextCompat.startForegroundService(app, Intent(app, PlaybackService::class.java).setAction(PlaybackService.ACTION_LOCAL_PLAYBACK))
+            true
+        } catch (e: IllegalStateException) {
+            // ForegroundServiceStartNotAllowedException (API 31+) is an IllegalStateException.
+            Log.w(TAG, "Cannot start the playback service from the background", e)
+            false
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Cannot start the playback service", e)
+            false
+        }
+        if (!started) {
+            refuseBackgroundPlayback()
+            return false
+        }
+        Log.i(TAG, "Local playback started in the background; starting the playback service")
+        backgroundStart = true
+        main.removeCallbacks(backgroundStartTimeout)
+        main.postDelayed(backgroundStartTimeout, BACKGROUND_START_TIMEOUT_MS)
+        return true
+    }
+
+    /**
+     * Local playback cannot run here without the media foreground service: pause it (so Connect
+     * and the session stay consistent) and ask the user to resume. Main thread.
+     */
+    fun refuseBackgroundPlayback() {
+        if (refusedThisActivation) return
+        refusedThisActivation = true
+        graph.player.pause()
+        ResumeAlert.post(app, graph.playback.snapshot.value.track?.name)
+    }
+
+    /** Audio plays (or is about to) on this phone. */
+    fun isPlayingLocally(): Boolean = sinkActive || graph.playback.snapshot.value.isLocallyActive()
+
+    /** The playback service is in the media foreground. Main thread. */
+    fun onServiceForeground() {
+        main.removeCallbacks(backgroundStartTimeout)
+        backgroundStart = false
+        if (focusAfterForeground) {
+            focusAfterForeground = false
+            if (sinkActive) focus.request()
+        }
+    }
+
     // ---- local audio ------------------------------------------------------------------------
 
     private fun onLocalAudioStarted() {
         if (!sinkActive) return
         main.removeCallbacks(abandonFocus)
-        focus.request()
+        if (!ensureServiceForLocalAudio()) {
+            updateLocks()
+            return
+        }
+        if (backgroundStart) {
+            // Background apps without a foreground service get no focus (Android 15+).
+            focusAfterForeground = true
+        } else {
+            focus.request()
+        }
         noisy.register()
         updateLocks()
-        ensureServiceStarted()
         openEffectSession()
     }
 
@@ -204,10 +311,17 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
             focus.abandon()
             if (!sinkActive) noisy.unregister()
         }
-        if (s.isLocallyActive() && s.status == PlaybackStatus.PLAYING) ensureServiceStarted()
+        if (!s.isLocallyActive()) {
+            // A new activation may try again (e.g. after "Tap to resume").
+            refusedThisActivation = false
+            if (!sinkActive) focusAfterForeground = false
+        } else if (s.status == PlaybackStatus.PLAYING) {
+            ensureServiceForLocalAudio()
+        }
     }
 
     private fun onEngineStopped() {
+        focusAfterForeground = false
         main.removeCallbacks(abandonFocus)
         focus.abandon()
         noisy.unregister()
@@ -260,6 +374,8 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
 
     companion object {
         private const val TAG = "PlaybackCoordinator"
+        /** Time for a background-started service to reach the media foreground. */
+        private const val BACKGROUND_START_TIMEOUT_MS = 5_000L
 
         @Volatile private var instance: PlaybackCoordinator? = null
 

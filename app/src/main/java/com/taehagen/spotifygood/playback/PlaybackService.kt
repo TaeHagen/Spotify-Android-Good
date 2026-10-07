@@ -1,10 +1,13 @@
 package com.taehagen.spotifygood.playback
 
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
@@ -15,11 +18,14 @@ import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.C
 import androidx.media3.common.HeartRating
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Rating
 import androidx.media3.session.CacheBitmapLoader
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaConstants
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaNotification
 import androidx.media3.session.MediaSession
@@ -39,7 +45,9 @@ import com.taehagen.spotifygood.Notifications
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.engine.EngineHolder
 import com.taehagen.spotifygood.engine.HolderType
+import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.PlaybackSource
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -51,6 +59,7 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
@@ -88,8 +97,21 @@ class PlaybackService : MediaLibraryService() {
     /** Media3 currently keeps the service foreground with the media notification. */
     private var mediaForeground = false
     private var buttons: List<CommandButton> = emptyList()
-    private var resumeAlertPosted = false
+    /**
+     * The media foreground was refused while mirroring a remote device: until that changes (or the
+     * app is visible again) the mirroring notification is posted without asking for the foreground.
+     */
+    private var remoteForegroundRefused = false
+    private val main = Handler(Looper.getMainLooper())
+    /** A background start for local audio must reach the foreground in time (startForegroundService). */
+    private val foregroundDeadline = Runnable { onForegroundDeadline() }
     private val searchCache = ConcurrentHashMap<String, List<MediaItem>>()
+    /** uri → downloaded cover path of completed downloads (offline artwork). */
+    @Volatile private var downloadedImages: Map<String, String> = emptyMap()
+    /** The stored credentials were read: "logged out" is real from then on. */
+    @Volatile private var engineReady = false
+    /** Last published player error (the same instance while unchanged, so controllers see it once). */
+    private var publishedError: Pair<PlayerErrorInfo, PlaybackException>? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -108,14 +130,12 @@ class PlaybackService : MediaLibraryService() {
             volume = coordinator.volumeSync,
             audioSessionId = graph.audioSink.audioSessionId,
             downloadedUris = { graph.downloads.downloadedUris.value.toList() },
+            downloadedImage = { uri -> downloadedImages[uri] },
+            playerError = ::currentPlayerError,
+            onRetry = ::retryAfterError,
         )
 
-        val provider = DefaultMediaNotificationProvider.Builder(this)
-            .setChannelId(Notifications.CHANNEL_PLAYBACK)
-            .setChannelName(R.string.playback_channel_name)
-            .setNotificationId(Notifications.ID_PLAYBACK)
-            .build()
-            .apply { setSmallIcon(R.drawable.ic_notification) }
+        val provider = PlaybackNotificationProvider(this).apply { setSmallIcon(R.drawable.ic_notification) }
         setMediaNotificationProvider(PresenceAwareNotificationProvider(provider))
 
         session = MediaLibrarySession.Builder(this, player, LibraryCallback())
@@ -146,10 +166,17 @@ class PlaybackService : MediaLibraryService() {
                 if (presence.disable()) afterPresenceDisabled()
             }
             ACTION_RESUME -> {
-                cancelResumeAlert()
+                ResumeAlert.cancel(this)
                 // Through the session player, so Media3 goes foreground right away (the tap's
                 // temporary allowlist is short) instead of waiting for the engine's snapshot.
                 if (player.mediaItemCount > 0) player.play() else graph.player.resume()
+            }
+            ACTION_LOCAL_PLAYBACK -> {
+                // Started with startForegroundService for audio that began in the background (a
+                // remote "play on this phone"): Media3 goes foreground once the session player
+                // reports playing; startForeground is mandatory either way.
+                main.removeCallbacks(foregroundDeadline)
+                if (!mediaForeground && !presence.isForeground) main.postDelayed(foregroundDeadline, FOREGROUND_DEADLINE_MS)
             }
         }
         super.onStartCommand(intent, flags, startId)
@@ -167,19 +194,25 @@ class PlaybackService : MediaLibraryService() {
         session: MediaSession,
         startInForegroundRequired: Boolean,
     ): ListenableFuture<Void?> {
-        val idle = !startInForegroundRequired || session.player.currentTimeline.isEmpty
+        // Mirroring a remote device whose media foreground was refused: keep the controls as a
+        // normal notification instead of failing (and being told so) on every state change.
+        val foregroundRequired = startInForegroundRequired &&
+            !(remoteForegroundRefused && graph.playback.snapshot.value.source == PlaybackSource.REMOTE)
+        val idle = !foregroundRequired || session.player.currentTimeline.isEmpty
         if (presence.isEnabled && idle && (presence.isForeground || presence.showForeground())) {
             mediaForeground = false
             return Futures.immediateFuture(null)
         }
-        val future = super.onUpdateNotificationAsync(session, startInForegroundRequired)
+        val future = super.onUpdateNotificationAsync(session, foregroundRequired)
         future.addListener(
             {
                 val succeeded = runCatching { future.get() }.isSuccess
                 if (!succeeded) return@addListener
-                mediaForeground = startInForegroundRequired
-                if (startInForegroundRequired) {
+                mediaForeground = foregroundRequired
+                if (foregroundRequired) {
                     presence.onMediaForeground()
+                    main.removeCallbacks(foregroundDeadline)
+                    coordinator.onServiceForeground()
                 } else if (presence.isEnabled) {
                     // Media3 just left the foreground although presence is on: take it back.
                     presence.showForeground()
@@ -198,6 +231,7 @@ class PlaybackService : MediaLibraryService() {
 
     override fun onDestroy() {
         isRunning = false
+        main.removeCallbacks(foregroundDeadline)
         coordinator.closeEffectSession()
         presence.release()
         clearListener()
@@ -218,10 +252,51 @@ class PlaybackService : MediaLibraryService() {
                 playback.snapshot.map { },
                 graph.devices.devices.map { },
                 coordinator.volumeSync.streamIndex.map { },
+                // Inputs of the player error.
+                graph.engine.state.map { },
+                graph.player.failure.map { },
             ).collect { player.refresh() }
         }
         lifecycleScope.launch {
-            playback.isPlaying.filter { it }.collect { if (resumeAlertPosted) cancelResumeAlert() }
+            graph.engine.awaitReady()
+            engineReady = true
+            player.refresh()
+        }
+        lifecycleScope.launch {
+            // Asynchronous playback failures (e.g. nothing in the context could be played) reach
+            // the session as well, not only the in-app snackbar.
+            graph.events.errors
+                .filter { it.context == "playback" && it.code != NativeErrorCode.CANCELLED && it.code != NativeErrorCode.PLAYBACK_REFUSED }
+                .collect { e -> PlaybackErrorKind.fromCode(e.code)?.let { graph.player.noteFailure(it, e.message) } }
+        }
+        lifecycleScope.launch {
+            playback.isPlaying.filter { it }.collect { if (ResumeAlert.isPosted) ResumeAlert.cancel(this@PlaybackService) }
+        }
+        lifecycleScope.launch {
+            // A refused remote-mirroring foreground is retried once the situation changed.
+            combine(playback.snapshot.map { it.source }.distinctUntilChanged(), coordinator.appVisible) { source, visible ->
+                source != PlaybackSource.REMOTE || visible
+            }.filter { it }.collect {
+                if (remoteForegroundRefused) {
+                    remoteForegroundRefused = false
+                    triggerNotificationUpdate()
+                }
+            }
+        }
+        lifecycleScope.launch {
+            graph.downloads.items
+                .map { items ->
+                    items.asSequence()
+                        .filter { it.state == DownloadState.COMPLETED && it.imagePath != null }
+                        .associate { it.uri to it.imagePath!! }
+                }
+                .distinctUntilChanged()
+                .flowOn(Dispatchers.Default)
+                .catch { Log.w(TAG, "Downloaded artwork unavailable", it) }
+                .collect { images ->
+                    downloadedImages = images
+                    player.refresh()
+                }
         }
         lifecycleScope.launch {
             combine(playback.snapshot, likedState()) { s, liked ->
@@ -232,6 +307,8 @@ class PlaybackService : MediaLibraryService() {
                     smartShuffleAvailable = s.isSmartShuffleAvailable,
                     canShuffle = s.restrictions.canToggleShuffle,
                     repeat = s.repeat,
+                    isEpisode = s.track?.isEpisode == true,
+                    canSeek = s.restrictions.canSeek,
                 )
             }.distinctUntilChanged().collect { state ->
                 buttons = PlaybackSessionCommands.buttons(this@PlaybackService, state)
@@ -280,6 +357,66 @@ class PlaybackService : MediaLibraryService() {
         }
     }
 
+    // ---- player error ---------------------------------------------------------------------------
+
+    /** What controllers should be told while nothing plays (see [PlayerErrors]). Main thread. */
+    private fun currentPlayerError(): PlaybackException? {
+        val info = PlayerErrors.select(
+            ready = engineReady,
+            loggedIn = graph.engine.isLoggedIn.value,
+            accountErrorCode = graph.engine.state.value.error?.code,
+            snapshot = graph.playback.snapshot.value,
+            failure = graph.player.failure.value,
+            messages = graph.player.errorMessages,
+        )
+        if (info == null) {
+            publishedError = null
+            return null
+        }
+        publishedError?.takeIf { it.first == info }?.let { return it.second }
+        val error = PlaybackException(info.message, null, info.code, if (info.signIn) signInExtras() else Bundle.EMPTY)
+        publishedError = info to error
+        return error
+    }
+
+    /** A controller retried (`prepare()`): give account errors a fresh chance, like the app's "Try again". */
+    private fun retryAfterError() {
+        val code = graph.engine.state.value.error?.code
+        if (code == NativeErrorCode.PLAYBACK_REFUSED || code == NativeErrorCode.PREMIUM_REQUIRED) {
+            graph.engine.clearError()
+            graph.engine.retry()
+        }
+    }
+
+    /** "Sign in" resolution (Android Auto shows it with the error): opens the app's login. */
+    private fun signInExtras(): Bundle {
+        val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return Bundle.EMPTY
+        val intent = PendingIntent.getActivity(this, REQUEST_SIGN_IN, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        return Bundle().apply {
+            putString(MediaConstants.EXTRAS_KEY_ERROR_RESOLUTION_ACTION_LABEL_COMPAT, getString(R.string.playback_error_action_sign_in))
+            putParcelable(MediaConstants.EXTRAS_KEY_ERROR_RESOLUTION_ACTION_INTENT_COMPAT, intent)
+        }
+    }
+
+    /**
+     * Browsing while logged out or without Premium: an error (with "Sign in") instead of empty
+     * tabs; Media3 replicates these codes to the platform session for Auto.
+     */
+    private suspend fun accountLibraryError(): SessionError? {
+        if (!graph.engine.isLoggedIn.value) {
+            if (withTimeoutOrNull(LOGIN_WAIT_MS) { graph.engine.awaitReady() } == null) return null
+            if (!graph.engine.isLoggedIn.value) {
+                val message = graph.player.errorMessages.message(PlaybackErrorKind.NOT_LOGGED_IN, null)
+                return SessionError(SessionError.ERROR_SESSION_AUTHENTICATION_EXPIRED, message, withContext(Dispatchers.Main) { signInExtras() })
+            }
+        }
+        if (graph.engine.state.value.error?.code == NativeErrorCode.PREMIUM_REQUIRED) {
+            val message = graph.player.errorMessages.message(PlaybackErrorKind.PREMIUM_REQUIRED, null)
+            return SessionError(SessionError.ERROR_SESSION_PREMIUM_ACCOUNT_REQUIRED, message)
+        }
+        return null
+    }
+
     /** Liked state of the current track (null while unknown). */
     private fun likedState(): Flow<Boolean?> = graph.playback.currentTrack
         .map { it?.uri }
@@ -323,50 +460,32 @@ class PlaybackService : MediaLibraryService() {
 
     /** Media3 could not start the foreground service from the background (API 31+). */
     private fun onForegroundStartNotAllowed() {
+        val s = graph.playback.snapshot.value
+        if (s.source != PlaybackSource.LOCAL) {
+            // Mirroring another device: nothing plays here, so nothing to pause (a pause would go
+            // to that device). Show its controls as a normal notification instead.
+            Log.i(TAG, "Foreground start refused while mirroring ${s.source}; posting the notification without it")
+            remoteForegroundRefused = true
+            session?.let { onUpdateNotificationAsync(it, false) }
+            return
+        }
         Log.w(TAG, "Foreground service start not allowed; asking the user to resume")
-        // Keep Connect and the session consistent: we cannot play without a foreground service.
-        graph.player.pause()
-        postResumeAlert()
+        // Local audio never plays without the media foreground service: pause (Connect sees it).
+        coordinator.refuseBackgroundPlayback()
     }
 
-    private fun postResumeAlert() {
-        val notifications = NotificationManagerCompat.from(this)
-        if (!notifications.areNotificationsEnabled()) return
-        if (notifications.getNotificationChannelCompat(Notifications.CHANNEL_ALERTS) == null) {
-            notifications.createNotificationChannel(
-                NotificationChannelCompat.Builder(Notifications.CHANNEL_ALERTS, NotificationManagerCompat.IMPORTANCE_DEFAULT)
-                    .setName(getString(R.string.playback_alerts_channel_name))
-                    .build(),
-            )
+    /**
+     * A background [ACTION_LOCAL_PLAYBACK] start did not reach the media foreground in time (e.g.
+     * playback was paused meanwhile, so Media3 did not ask for it): satisfy the
+     * `startForegroundService` contract, and stop local audio that would play without it.
+     */
+    private fun onForegroundDeadline() {
+        if (mediaForeground || presence.isForeground) return
+        satisfyForegroundContract()
+        if (coordinator.isPlayingLocally()) {
+            Log.w(TAG, "Media foreground not reached in time; pausing local playback")
+            coordinator.refuseBackgroundPlayback()
         }
-        val resume = PendingIntent.getService(
-            this,
-            REQUEST_RESUME,
-            Intent(this, PlaybackService::class.java).setAction(ACTION_RESUME),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val track = graph.playback.snapshot.value.track
-        val notification = NotificationCompat.Builder(this, Notifications.CHANNEL_ALERTS)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(track?.name ?: getString(R.string.playback_resume_title))
-            .setContentText(getString(R.string.playback_resume_text))
-            .setContentIntent(resume)
-            .addAction(R.drawable.pb_ic_play, getString(R.string.playback_resume_text), resume)
-            .setAutoCancel(true)
-            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .build()
-        try {
-            notifications.notify(Notifications.ID_RESUME_ALERT, notification)
-            resumeAlertPosted = true
-        } catch (e: SecurityException) {
-            Log.w(TAG, "Cannot post the resume notification", e)
-        }
-    }
-
-    private fun cancelResumeAlert() {
-        resumeAlertPosted = false
-        NotificationManagerCompat.from(this).cancel(Notifications.ID_RESUME_ALERT)
     }
 
     /**
@@ -401,6 +520,22 @@ class PlaybackService : MediaLibraryService() {
         } catch (e: SecurityException) {
             Log.w(TAG, "Foreground refused", e)
         }
+    }
+
+    /**
+     * Media3's notification, whose text also says "Playing on <device>" for remote playback
+     * (docs §8): the default provider shows only title and artist, and the device line is the
+     * metadata subtitle. On API 30+ the artist already carries it (see [SpotifyPlayer]); it is never
+     * added twice.
+     */
+    private class PlaybackNotificationProvider(private val context: Context) : DefaultMediaNotificationProvider(
+        context,
+        { Notifications.ID_PLAYBACK },
+        Notifications.CHANNEL_PLAYBACK,
+        R.string.playback_channel_name,
+    ) {
+        override fun getNotificationContentText(metadata: MediaMetadata): CharSequence? =
+            DeviceLine.join(context, super.getNotificationContentText(metadata), metadata.subtitle)
     }
 
     /** Drops late (artwork) updates of the media notification while presence owns the foreground. */
@@ -505,6 +640,10 @@ class PlaybackService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = lifecycleScope.future(Dispatchers.Default) {
+            accountLibraryError()?.let { return@future LibraryResult.ofError(it) }
+            // Auto browses right after connecting, often on a cold engine: let the session come up
+            // first instead of answering from an empty cache.
+            if (LibraryTree.needsSession(parentId)) coordinator.environment.awaitSessionStart()
             val children = tree.children(parentId, params)
                 ?: return@future LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
             LibraryResult.ofItemList(children.page(page, pageSize), params)
@@ -518,6 +657,7 @@ class PlaybackService : MediaLibraryService() {
         ): ListenableFuture<LibraryResult<Void>> {
             lifecycleScope.launch(Dispatchers.Default) {
                 val results = try {
+                    coordinator.environment.awaitSessionStart()
                     tree.search(query)
                 } catch (e: CancellationException) {
                     throw e
@@ -542,6 +682,7 @@ class PlaybackService : MediaLibraryService() {
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = lifecycleScope.future(Dispatchers.Default) {
             val results = searchCache[query] ?: try {
+                coordinator.environment.awaitSessionStart()
                 tree.search(query).also { cacheSearch(query, it) }
             } catch (e: CancellationException) {
                 throw e
@@ -574,8 +715,10 @@ class PlaybackService : MediaLibraryService() {
                 if (query.isBlank()) {
                     val last = resumeStore.read()
                         ?: return@future MediaItemsWithStartPosition(emptyList(), C.INDEX_UNSET, C.TIME_UNSET)
-                    MediaItemsWithStartPosition(listOf(tree.resumeItem(last)), 0, last.positionMs)
+                    MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
                 } else {
+                    // "Play X" right after a cold start: search needs the session (NOT_CONNECTED otherwise).
+                    coordinator.environment.awaitSessionStart()
                     val item = runCatching { tree.resolveVoiceQuery(query, first.requestMetadata.extras) }
                         .onFailure { if (it is CancellationException) throw it }
                         .getOrNull()
@@ -600,7 +743,7 @@ class PlaybackService : MediaLibraryService() {
                 if (isForPlayback) satisfyForegroundContract()
                 throw UnsupportedOperationException("Nothing to resume")
             }
-            MediaItemsWithStartPosition(listOf(tree.resumeItem(last)), 0, last.positionMs)
+            MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
         }
     }
 
@@ -625,11 +768,18 @@ class PlaybackService : MediaLibraryService() {
         const val ACTION_STOP_PRESENCE = "com.taehagen.spotifygood.playback.STOP_PRESENCE"
         /** "Tap to resume" after a refused background start. */
         const val ACTION_RESUME = "com.taehagen.spotifygood.playback.RESUME"
+        /**
+         * Sent with `startForegroundService` by [PlaybackCoordinator] when local audio starts
+         * while the app is in the background and the service is not running.
+         */
+        const val ACTION_LOCAL_PLAYBACK = "com.taehagen.spotifygood.playback.LOCAL_PLAYBACK"
         /** Boolean extra on the session activity intent: open the Now Playing screen. */
         const val EXTRA_OPEN_PLAYER = "com.taehagen.spotifygood.extra.OPEN_PLAYER"
 
         private const val REQUEST_SESSION = 1
-        private const val REQUEST_RESUME = 2
+        private const val REQUEST_SIGN_IN = 3
+        /** Well inside the system's startForeground deadline (5–10 s). */
+        private const val FOREGROUND_DEADLINE_MS = 3_000L
         private const val RESUME_SAVE_INTERVAL_MS = 15_000L
         private const val LOGIN_WAIT_MS = 3_000L
         private const val MAX_CACHED_SEARCHES = 8

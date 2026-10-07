@@ -8,6 +8,8 @@
 
     <!-- Media session -->
     <string name="playback_playing_on">Playing on %1$s</string>
+    <!-- Artist line of a track playing on another Connect device: "<artists> • Playing on <device>". -->
+    <string name="playback_artist_on_device">%1$s • %2$s</string>
     <string name="playback_action_like">Add to Liked Songs</string>
     <string name="playback_action_unlike">Remove from Liked Songs</string>
     <string name="playback_action_shuffle_on">Turn on shuffle</string>
@@ -16,6 +18,8 @@
     <string name="playback_action_repeat_all">Repeat all</string>
     <string name="playback_action_repeat_one">Repeat current song</string>
     <string name="playback_action_repeat_off">Turn off repeat</string>
+    <string name="playback_action_seek_back">Back 15 seconds</string>
+    <string name="playback_action_seek_forward">Forward 15 seconds</string>
 
     <!-- Background start failure -->
     <string name="playback_resume_title">Playback paused</string>
@@ -32,11 +36,14 @@
     <string name="playback_error_premium_required">Spotify Premium is required to play music.</string>
     <string name="playback_error_refused">Spotify refused playback for this account.</string>
     <string name="playback_error_unavailable">That isn\'t available right now.</string>
+    <string name="playback_error_not_available_offline">That isn\'t downloaded. Download it to play it offline.</string>
     <string name="playback_error_not_found">Couldn\'t find that.</string>
     <string name="playback_error_rate_limited">Too many requests. Try again in a moment.</string>
     <string name="playback_error_not_logged_in">You\'re not logged in.</string>
     <string name="playback_error_timeout">The device didn\'t respond. Try again.</string>
     <string name="playback_error_generic">Something went wrong. Try again.</string>
+    <!-- Resolution action shown with the "not logged in" error (Android Auto). -->
+    <string name="playback_error_action_sign_in">Sign in</string>
 
     <!-- Android Auto browse tree -->
     <string name="playback_tab_home">Home</string>
