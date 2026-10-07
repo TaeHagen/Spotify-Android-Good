@@ -1,8 +1,10 @@
 package com.taehagen.spotifygood.playback
 
+import com.taehagen.spotifygood.model.SessionState
+
 /** How a playback command would be routed natively right now (docs/ARCHITECTURE.md §4.6, §6). */
 enum class EngineReach {
-    /** The session is Online: Spirc / the active remote device. */
+    /** The session is Online and there is a network: Spirc / the active remote device. */
     ONLINE,
 
     /**
@@ -11,8 +13,21 @@ enum class EngineReach {
      */
     CONNECTING,
 
-    /** Offline mode, no network, or the session reported offline: the native offline queue. */
+    /**
+     * Offline mode, no network, or the session reported offline: only downloads play. No network
+     * wins over an ONLINE session, which keeps reading Online until the access point keep-alive
+     * times out (~80 s) although nothing can stream any more.
+     */
     OFFLINE,
+    ;
+
+    companion object {
+        fun of(offlineMode: Boolean, session: SessionState, networkAvailable: Boolean): EngineReach = when {
+            offlineMode || !networkAvailable || session == SessionState.OFFLINE -> OFFLINE
+            session == SessionState.ONLINE -> ONLINE
+            else -> CONNECTING
+        }
+    }
 }
 
 /**
