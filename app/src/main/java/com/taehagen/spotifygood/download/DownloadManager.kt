@@ -45,6 +45,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -218,22 +219,19 @@ class DownloadManager(
             }
         }
         scope.launch {
-            // Network policy or offline mode changed: reschedule with the new constraints.
-            var previousCellular: Boolean? = null
-            settings.settings.map { it.downloadOverCellular to it.offlineMode }
-                .distinctUntilChanged()
-                .collect { (cellular, offline) ->
-                    val first = previousCellular == null
-                    val policyChanged = !first && previousCellular != cellular
-                    previousCellular = cellular
-                    if (first || offline) return@collect
-                    if (policyChanged && runner.isRunning) {
+            // Network policy or offline mode changed: reschedule with the new constraints. From the
+            // settings as stored (never the defaults shown before DataStore has loaded: on a cold start
+            // that step would look like a mobile-data change and stop the job that started us).
+            DownloadRules.policyChanges(settings.persisted.map { it.downloadOverCellular to it.offlineMode })
+                .collect { change ->
+                    if (change.offline) return@collect
+                    if (change.cellularChanged && runner.isRunning) {
                         // The running job / worker keeps the old network constraint (and downloads over
                         // the mobile data the user just turned off): stop it; its item resumes from the
                         // .part under the new constraint.
                         runner.stopAndAwaitIdle()
                     }
-                    scheduleExecution(replace = policyChanged)
+                    scheduleExecution(replace = change.cellularChanged)
                 }
         }
         scope.launch {
@@ -354,7 +352,7 @@ class DownloadManager(
         }
         mutex.withLock {
             val now = System.currentTimeMillis()
-            val quality = settings.settings.value.downloadQuality.kbps
+            val quality = settings.awaitLoaded().downloadQuality.kbps
             database.withTransaction {
                 insertRows(targets.map { CollectionResolver.Item(it, metadata[it]) }, quality, individual = true, now = now)
                 targets.chunked(SQL_CHUNK).forEach {
@@ -425,12 +423,17 @@ class DownloadManager(
         val undecryptable = ArrayList<String>()
         val missing = ArrayList<String>()
         val keystoreBusy = ArrayList<String>()
+        var keystoreDown = false
         for (row in rows) {
-            when (val result = offlineRecord(row)) {
+            when (val result = offlineRecord(row, skipKeystore = keystoreDown)) {
                 is RecordResult.Ready -> records += result.record
                 RecordResult.Unreadable -> undecryptable += row.uri
                 RecordResult.Missing -> missing += row.uri
-                RecordResult.KeystoreBusy -> keystoreBusy += row.uri
+                RecordResult.KeystoreBusy -> {
+                    keystoreBusy += row.uri
+                    // One retry cycle per pass, not one per row: the rest wait for registerLate.
+                    keystoreDown = true
+                }
             }
         }
         val now = System.currentTimeMillis()
@@ -457,13 +460,16 @@ class DownloadManager(
         data object KeystoreBusy : RecordResult
     }
 
-    /** The decrypted index record of a COMPLETED [row]. Blocking (file check, Keystore). */
-    private fun offlineRecord(row: DownloadEntity): RecordResult {
+    /**
+     * The decrypted index record of a COMPLETED [row]. Blocking (file check, Keystore). With
+     * [skipKeystore] (it was busy for an earlier row of this pass) only a cached key is used.
+     */
+    private fun offlineRecord(row: DownloadEntity, skipKeystore: Boolean): RecordResult {
         val record = row.recordJson?.let { runCatching { json.decodeFromString(OfflineTrackRecord.serializer(), it) }.getOrNull() }
             ?: return RecordResult.Unreadable
         val path = row.path ?: record.path
         if (!File(path).isFile) return RecordResult.Missing
-        val keyHex = keys[row.uri] ?: when (val key = decryptKey(row)) {
+        val keyHex = keys[row.uri] ?: if (skipKeystore) return RecordResult.KeystoreBusy else when (val key = decryptKey(row)) {
             is KeyResult.Key -> key.hex.also { keys[row.uri] = it }
             KeyResult.Unreadable -> return RecordResult.Unreadable
             KeyResult.KeystoreBusy -> return RecordResult.KeystoreBusy
@@ -474,8 +480,9 @@ class DownloadManager(
     /**
      * Registers the downloads [uris] that an index push left out because the Keystore could not
      * decrypt their keys right now, retrying with backoff (bounded; the next engine start pushes
-     * everything again). Each registration is a numbered change taken under [mutex] while the row is
-     * still COMPLETED, so a later removal wins over it.
+     * everything again). Only reading the rows and numbering the change happen under [mutex]: a
+     * removal after the read takes a later number and wins over the registration, so the Keystore
+     * (with its retry sleeps) is never called with the lock held.
      */
     private suspend fun registerLate(uris: List<String>) {
         var waiting = uris
@@ -484,24 +491,30 @@ class DownloadManager(
             delay(delayMs)
             delayMs *= 4
             waiting = withContext(Dispatchers.IO) {
+                val (seq, rows) = mutex.withLock {
+                    index.next() to waiting.chunked(SQL_CHUNK).flatMap { dao.getAll(it) }.filter { it.state == DownloadState.COMPLETED }
+                }
                 val stillBusy = ArrayList<String>()
                 val records = ArrayList<OfflineTrackRecord>()
-                val unreadable = ArrayList<String>()
-                val seq = mutex.withLock {
-                    waiting.chunked(SQL_CHUNK).flatMap { dao.getAll(it) }.filter { it.state == DownloadState.COMPLETED }.forEach { row ->
-                        when (val result = offlineRecord(row)) {
-                            is RecordResult.Ready -> records += result.record
-                            RecordResult.Unreadable -> unreadable += row.uri
-                            RecordResult.Missing -> Unit // the next push marks it
-                            RecordResult.KeystoreBusy -> stillBusy += row.uri
+                val unreadable = ArrayList<DownloadEntity>()
+                var keystoreDown = false
+                for (row in rows) {
+                    ensureActive() // a newer push supersedes this one
+                    when (val result = offlineRecord(row, skipKeystore = keystoreDown)) {
+                        is RecordResult.Ready -> records += result.record
+                        RecordResult.Unreadable -> unreadable += row
+                        RecordResult.Missing -> Unit // the next push marks it
+                        RecordResult.KeystoreBusy -> {
+                            stillBusy += row.uri
+                            keystoreDown = true
                         }
                     }
-                    unreadable.chunked(SQL_CHUNK).forEach {
-                        dao.markUnavailable(it, appContext.getString(R.string.data_dl_error_key), System.currentTimeMillis())
-                    }
-                    index.next()
                 }
                 index.add(records, seq)
+                val now = System.currentTimeMillis()
+                val error = appContext.getString(R.string.data_dl_error_key)
+                // Only the download that was read (not one removed and downloaded again meanwhile).
+                unreadable.forEach { row -> row.completedAt?.let { dao.markUnavailableIfUnchanged(row.uri, it, error, now) } }
                 stillBusy
             }
             if (waiting.isEmpty()) return
@@ -527,7 +540,7 @@ class DownloadManager(
     private suspend fun syncNow(onlyDue: Boolean): Boolean {
         if (!syncMutex.tryLock()) return true // another sync is running
         try {
-            if (settings.settings.value.offlineMode) return true
+            if (settings.awaitLoaded().offlineMode) return true
             val startedAt = System.currentTimeMillis()
             val all = collectionDao.getAll()
             if (all.isEmpty()) {
@@ -625,7 +638,7 @@ class DownloadManager(
             resolved.items.filter { it.uri in wanted && !it.unavailable }
         }
         val now = System.currentTimeMillis()
-        val quality = settings.settings.value.downloadQuality.kbps
+        val quality = settings.awaitLoaded().downloadQuality.kbps
         database.withTransaction {
             collectionDao.upsert(
                 entity.copy(
@@ -809,7 +822,8 @@ class DownloadManager(
             if (runner.isRunning) return@withContext
             val pending = dao.pendingCount()
             if (pending == 0) return@withContext
-            val current = settings.settings.value
+            // Loaded from disk: the defaults before that would give the wrong network constraint.
+            val current = settings.awaitLoaded()
             if (current.offlineMode) return@withContext
             val cellular = current.downloadOverCellular
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {

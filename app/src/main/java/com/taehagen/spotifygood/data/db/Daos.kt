@@ -207,6 +207,16 @@ interface DownloadDao {
     @Query("UPDATE downloads SET state = 'failed', error = :error, lastValidatedAt = :at WHERE uri IN (:uris) AND state = 'completed'")
     suspend fun markUnavailable(uris: List<String>, error: String, at: Long)
 
+    /**
+     * [markUnavailable] for one row, only while it is still the download completed at [completedAt]
+     * (not removed and downloaded again since it was read).
+     */
+    @Query(
+        "UPDATE downloads SET state = 'failed', error = :error, lastValidatedAt = :at " +
+            "WHERE uri = :uri AND state = 'completed' AND completedAt = :completedAt",
+    )
+    suspend fun markUnavailableIfUnchanged(uri: String, completedAt: Long, error: String, at: Long)
+
     /** Completed downloads whose file is gone: failed, and no longer counted as stored. */
     @Query(
         "UPDATE downloads SET state = 'failed', error = :error, lastValidatedAt = :at, path = NULL, sizeBytes = 0, bytesDone = 0 " +
