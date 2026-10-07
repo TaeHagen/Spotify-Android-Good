@@ -22,6 +22,7 @@ import com.taehagen.spotifygood.ui.screens.library.PagedLoader
 import com.taehagen.spotifygood.ui.screens.library.PagedState
 import com.taehagen.spotifygood.ui.screens.library.attempt
 import com.taehagen.spotifygood.ui.screens.library.debouncedInput
+import com.taehagen.spotifygood.ui.screens.library.explicitFilterChanges
 import com.taehagen.spotifygood.ui.screens.library.nowPlayingFlow
 import com.taehagen.spotifygood.ui.screens.library.offlineFlow
 import com.taehagen.spotifygood.ui.screens.library.playTrackInAlbum
@@ -37,9 +38,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
@@ -74,23 +73,6 @@ private data class SearchInput(val query: String, val filter: SearchFilter, val 
 internal fun retriesFailedPage(filter: SearchFilter, paged: PagedState<*>?): Boolean =
     filter.type != null && paged != null && paged.items.isNotEmpty() && paged.error != null
 
-/** Longest wait for the engine to apply a changed explicit filter (as Settings waits). */
-private const val EXPLICIT_APPLY_TIMEOUT_MS = 15_000L
-
-/**
- * Emits each time "Hide explicit content" changed and the engine applies it, so results fetched
- * under the old filter (their playable flags) can be dropped. Waiting for the engine keeps a
- * refetch from caching results with the old flags again.
- */
-private fun AppGraph.explicitFilterChanges(): Flow<Boolean> =
-    settings.settings
-        .map { it.hideExplicit }
-        .distinctUntilChanged()
-        .drop(1)
-        .mapLatest { hide ->
-            engine.awaitSettingsApplied(EXPLICIT_APPLY_TIMEOUT_MS) { it.filterExplicit == hide }
-            hide
-        }
 
 class SearchViewModel(private val graph: AppGraph) : ViewModel() {
     /** Text field content: Compose state, so typing never races the UI (debounced below). */

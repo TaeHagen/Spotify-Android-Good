@@ -3,6 +3,7 @@ package com.taehagen.spotifygood.ui.screens.library
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.DownloadState
+import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.playback.EngineReach
@@ -18,8 +19,10 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapLatest
 
 // AppGraph projections shared by the browse ViewModels.
 
@@ -44,6 +47,39 @@ internal fun AppGraph.downloadStatesFlow(): Flow<Map<String, DownloadState>> =
         .map { items -> items.associate { it.uri to it.state } }
         .distinctUntilChanged()
         .flowOn(Dispatchers.Default)
+
+/** Longest wait for the engine to apply a changed explicit filter (as Settings waits). */
+private const val EXPLICIT_APPLY_TIMEOUT_MS = 15_000L
+
+/**
+ * Emits each time "Hide explicit content" changed and the engine applies it, so lists fetched
+ * under the old filter (their playable flags) can be fetched again. Waiting for the engine keeps a
+ * refetch from getting (and caching) the old flags again.
+ */
+internal fun AppGraph.explicitFilterChanges(): Flow<Boolean> =
+    settings.settings
+        .map { it.hideExplicit }
+        .distinctUntilChanged()
+        .drop(1)
+        .mapLatest { hide ->
+            engine.awaitSettingsApplied(EXPLICIT_APPLY_TIMEOUT_MS) { it.filterExplicit == hide }
+            hide
+        }
+
+/**
+ * Whether explicit content is filtered: "Hide explicit content", or the account's own filter.
+ * The engine marks catalog results unplayable then; metadata stored with downloads isn't, so
+ * lists built from it apply [withExplicitFilter].
+ */
+internal fun AppGraph.explicitFilterFlow(): Flow<Boolean> =
+    combine(settings.settings.map { it.hideExplicit }, engine.user.map { it?.explicitFilter == true }) { hide, account ->
+        hide || account
+    }.distinctUntilChanged()
+
+/** [filter]ed explicit tracks are unplayable (the player refuses them and skips to the next). */
+internal fun Track.withExplicitFilter(filter: Boolean): Track = if (filter && explicit && playable) copy(playable = false) else this
+
+internal fun Episode.withExplicitFilter(filter: Boolean): Episode = if (filter && explicit && playable) copy(playable = false) else this
 
 /** Why a single track (tile, link, recent search, search result) can't be started. */
 internal enum class TrackStartBlock {

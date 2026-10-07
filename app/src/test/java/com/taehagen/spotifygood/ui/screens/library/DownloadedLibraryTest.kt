@@ -6,7 +6,9 @@ import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.ArtistRef
 import com.taehagen.spotifygood.model.SavedAlbum
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Locale
 
@@ -61,5 +63,20 @@ class DownloadedLibraryTest {
         assertNull(liked.toLibraryItem())
         // Online without the Downloaded chip, unsaved downloads are not mixed into the library.
         assertEquals(listOf("Saved album"), listing(LibraryQuery()).map { it.name })
+    }
+
+    @Test
+    fun downloadedLikedSongsShowOfflineBeforeTheUserIsKnown() {
+        // Cold start offline: the user (and so the Liked Songs URI) is only known once online.
+        assertTrue(likedSongsDownloaded(collections, username = null))
+        val pinned = pinnedEntries(
+            LibraryQuery(offline = true),
+            likedCount = null,
+            likedDownloaded = likedSongsDownloaded(collections, username = null),
+            downloadCount = 3,
+        )
+        assertEquals(listOf("pinned:liked", "pinned:downloads"), pinned.map { it.key })
+        assertFalse(likedSongsDownloaded(collections - liked, username = null))
+        assertTrue(likedSongsDownloaded(collections, username = "me"))
     }
 }
