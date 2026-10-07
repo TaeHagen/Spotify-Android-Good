@@ -303,13 +303,28 @@ impl ContextResolver {
         &self,
         recent_track_uri: impl Fn() -> Vec<String>,
     ) -> Result<Context, Error> {
-        let (next, resolve_uri, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
+        let (next, _, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
         // SPOTIFYGOOD: a retry waits for its time (absolute, so a future that the loop dropped
         // and created again doesn't start the delay over)
         if let Some((at, _)) = self.retry {
             tokio::time::sleep_until(at).await;
         }
+
+        self.fetch(next, recent_track_uri).await
+    }
+
+    // SPOTIFYGOOD: factored out of get_next_context, Spirc's load fetches its context with it
+    // before it tears down the playing one
+    /// Fetches the context of the given resolve (not necessarily a queued one)
+    pub async fn fetch(
+        &self,
+        next: &ResolveContext,
+        recent_track_uri: impl Fn() -> Vec<String>,
+    ) -> Result<Context, Error> {
+        let resolve_uri = next
+            .resolve_uri()
+            .ok_or_else(|| Error::invalid_argument(format!("no uri to resolve: {next}")))?;
 
         // SPOTIFYGOOD: bounded. spclient retries without a timeout of its own (and sleeps out a
         // 429's Retry-After), so a load sent just before the network died hung the Spirc loop
@@ -353,6 +368,27 @@ impl ContextResolver {
                     "resolving <{resolve_uri}> timed out"
                 )))
             })
+    }
+
+    // SPOTIFYGOOD: see fetch
+    /// Skips the given resolve for a while (see [ContextResolver::is_unavailable])
+    pub fn mark_unavailable(&mut self, resolve: &ResolveContext) {
+        self.unavailable_contexts
+            .insert(resolve.clone(), Instant::now());
+    }
+
+    // SPOTIFYGOOD: see Spirc's handle_load
+    /// Whether further pages of the context of the given type are still to be resolved
+    pub fn has_pending_pages(&self, ty: ContextType) -> bool {
+        self.queue
+            .iter()
+            .any(|resolve| resolve.page && resolve.update == ty)
+    }
+
+    /// Whether the next resolve is a further page of the context of the given type
+    pub fn next_is_page(&self, ty: ContextType) -> bool {
+        self.find_next()
+            .is_some_and(|(next, _, _)| next.page && next.update == ty)
     }
 
     pub fn mark_next_unavailable(&mut self) {
@@ -453,6 +489,18 @@ impl ContextResolver {
         } else if state.shuffling_context() && !state.default_context_shuffled() {
             // the shuffle a load deferred until its pages were resolved
             state.shuffle_new()
+        } else if matches!(state.get_context(state.active_context), Ok(ctx) if ctx.index.track == 0)
+        {
+            // like try_finish: e.g. a load whose start track was on a further page (it plays
+            // outside the context until then), placed if it is there, before the context if not
+            let ctx = state
+                .get_context(state.active_context)
+                .expect("checked by precondition");
+            let idx = ConnectState::find_index_in_context(ctx, |t| {
+                state.current_track(|c| t.uri == c.uri)
+            })
+            .ok();
+            state.reset_playback_to_position(idx)
         } else {
             state.fill_up_next_tracks()
         };

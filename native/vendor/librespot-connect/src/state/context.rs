@@ -291,17 +291,26 @@ impl ConnectState {
         }
     }
 
+    // SPOTIFYGOOD: factored out of update_context, Spirc's load checks a fetched context with
+    // it before it tears down the playing one
+    /// Whether the context can be played
+    pub fn check_context(context: &Context) -> Result<(), StateError> {
+        if context.pages.iter().all(|p| p.tracks.is_empty()) {
+            error!("context didn't have any tracks: {context:#?}");
+            Err(StateError::ContextHasNoTracks)
+        } else if matches!(context.uri, Some(ref uri) if uri.starts_with(LOCAL_FILES_IDENTIFIER)) {
+            Err(StateError::UnsupportedLocalPlayback)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn update_context(
         &mut self,
         mut context: Context,
         ty: ContextType,
     ) -> Result<Option<Vec<String>>, Error> {
-        if context.pages.iter().all(|p| p.tracks.is_empty()) {
-            error!("context didn't have any tracks: {context:#?}");
-            Err(StateError::ContextHasNoTracks)?;
-        } else if matches!(context.uri, Some(ref uri) if uri.starts_with(LOCAL_FILES_IDENTIFIER)) {
-            Err(StateError::UnsupportedLocalPlayback)?;
-        }
+        Self::check_context(&context)?;
 
         let mut next_contexts = Vec::new();
         let mut first_page = None;

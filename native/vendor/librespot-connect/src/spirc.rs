@@ -29,7 +29,10 @@ use crate::{
         // SPOTIFYGOOD: + PutStateReason
         connect::{Cluster, ClusterUpdate, LogoutCommand, PutStateReason, SetVolumeCommand},
         context::Context,
+        // SPOTIFYGOOD: ContextTrack, ProvidedTrack (the start track of a load)
+        context_track::ContextTrack,
         explicit_content_pubsub::UserAttributesUpdate,
+        player::ProvidedTrack,
         playlist4_external::PlaylistModificationInfo,
         social_connect_v2::SessionUpdate,
         transfer_state::TransferState,
@@ -65,7 +68,7 @@ use thiserror::Error;
 // smart shuffle backoff
 use tokio::{
     sync::{broadcast, mpsc, watch},
-    time::{Instant, error::Elapsed, sleep, sleep_until, timeout},
+    time::{Instant, error::Elapsed, sleep, sleep_until, timeout, timeout_at},
 };
 
 #[derive(Debug, Error)]
@@ -446,6 +449,9 @@ const DEALER_START_TIMEOUT: Duration = Duration::from_secs(30);
 const STATE_PUT_TIMEOUT: Duration = Duration::from_secs(5);
 // SPOTIFYGOOD: upper bound for a request a command waits for (the transfer to this device)
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// SPOTIFYGOOD: upper bound for resolving further pages in a load, see
+// SpircTask::resolve_pages_until
+const LOAD_PAGES_TIMEOUT: Duration = Duration::from_secs(20);
 // SPOTIFYGOOD: capacity of the command error broadcast, slow receivers lag (skip) old errors
 const ERROR_CHANNEL_CAPACITY: usize = 16;
 // SPOTIFYGOOD: smart shuffle fetch pacing
@@ -2221,6 +2227,21 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
+        let autoplay = matches!(cmd.context_options, Some(LoadContextOptions::Autoplay));
+
+        // SPOTIFYGOOD: the context is fetched before anything of the playing one is torn down. A
+        // failed (or timed out) fetch used to fail the load only after the context, the next
+        // tracks, shuffle and repeat were gone (the song played on, then the playback stopped),
+        // and with NoContext instead of the network error. Now it fails with that error, and
+        // the playback is left as it was.
+        let prefetched = match cmd.context {
+            PlayContext::Uri(ref uri) => {
+                self.prefetch_load_context(uri, page.as_ref(), autoplay)
+                    .await?
+            }
+            PlayContext::Tracks(_) => None,
+        };
+
         let reset_completely =
             self.connect_state
                 .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
@@ -2249,12 +2270,8 @@ impl SpircTask {
             Some(LoadContextOptions::Options(ref o)) if o.smart_shuffle
         );
 
-        let autoplay = matches!(cmd.context_options, Some(LoadContextOptions::Autoplay));
         match cmd.context {
-            PlayContext::Uri(uri) => {
-                self.load_context_from_uri(uri, page.as_ref(), autoplay)
-                    .await?
-            }
+            PlayContext::Uri(_) => self.apply_load_context(prefetched, autoplay),
             PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
         }
 
@@ -2272,29 +2289,70 @@ impl SpircTask {
 
         debug!("play track <{:?}>", cmd_options.playing_track);
 
-        let index = match cmd_options.playing_track {
-            None => None,
-            Some(ref playing_track) => Some(match playing_track {
-                PlayingTrack::Index(i) => Ok(*i as usize),
+        // SPOTIFYGOOD: the start track may be on a further page (an artist's albums), which is
+        // resolved later. A uid can't be played without its track: those pages are resolved
+        // here until it is found.
+        if let Some(PlayingTrack::Uid(ref uid)) = cmd_options.playing_track {
+            if fallback_index.is_none() {
+                self.resolve_pages_until(|t| &t.uid == uid).await;
+            }
+        }
+
+        let find = |playing_track: &PlayingTrack| -> Result<usize, Error> {
+            Ok(match playing_track {
+                PlayingTrack::Index(i) => *i as usize,
                 PlayingTrack::Uri(uri) => {
                     let ctx = self.connect_state.get_context(ContextType::Default)?;
-                    ConnectState::find_index_in_context(ctx, |t| &t.uri == uri)
+                    ConnectState::find_index_in_context(ctx, |t| &t.uri == uri)?
                 }
                 PlayingTrack::Uid(uid) => {
                     let ctx = self.connect_state.get_context(ContextType::Default)?;
-                    ConnectState::find_index_in_context(ctx, |t| &t.uid == uid)
+                    ConnectState::find_index_in_context(ctx, |t| &t.uid == uid)?
                 }
-            }),
-        }
-        .map(|i| {
-            i.unwrap_or_else(|why| {
-                warn!(
-                    "Failed to resolve index by {:?}, using fallback index: {:?} (Error: {why})",
-                    cmd_options.playing_track, fallback_index
-                );
-                fallback_index.unwrap_or_default()
             })
-        });
+        };
+        // SPOTIFYGOOD: a start uri that isn't (yet) in the context is played itself, as a track
+        // outside the context: the context goes on after it, and once the further pages are
+        // there it is placed in the context (ContextResolver::try_finish). It fell back to the
+        // first track, at the position of the requested one (a restore of an artist session).
+        let mut seek_to = cmd_options.seek_to;
+        let mut start_outside = None;
+        let index = match cmd_options.playing_track {
+            None => None,
+            Some(ref playing_track) => match find(playing_track) {
+                Ok(i) => Some(i),
+                Err(why) => {
+                    warn!(
+                        "Failed to resolve index by {:?}, using fallback index: {:?} (Error: {why})",
+                        cmd_options.playing_track, fallback_index
+                    );
+                    match (fallback_index, playing_track) {
+                        (Some(i), _) => Some(i),
+                        (None, PlayingTrack::Uri(uri)) => {
+                            start_outside = Some(self.connect_state.context_to_provided_track(
+                                &ContextTrack {
+                                    uri: Some(uri.clone()),
+                                    ..Default::default()
+                                },
+                                Some(self.connect_state.context_uri()),
+                                None,
+                                None,
+                                None,
+                            )?);
+                            None
+                        }
+                        (None, _) => {
+                            // SPOTIFYGOOD: never the position of the requested track in another one
+                            seek_to = 0;
+                            Some(0)
+                        }
+                    }
+                }
+            },
+        };
+        let pages_pending = self
+            .context_resolver
+            .has_pending_pages(ContextType::Default);
 
         if let Some(LoadContextOptions::Options(ref options)) = cmd_options.context_options {
             debug!(
@@ -2312,7 +2370,9 @@ impl SpircTask {
         // SPOTIFYGOOD: smart shuffle implies shuffle
         if matches!(cmd_options.context_options, Some(LoadContextOptions::Options(ref o)) if o.shuffle || o.smart_shuffle)
         {
-            if let Some(index) = index {
+            if let Some(track) = start_outside {
+                self.connect_state.set_track(track);
+            } else if let Some(index) = index {
                 self.connect_state.set_current_track(index)?;
             } else {
                 self.connect_state.set_current_track_random()?;
@@ -2324,6 +2384,18 @@ impl SpircTask {
                 self.connect_state.shuffle_new()?;
                 self.add_autoplay_resolving_when_required();
             }
+        } else if let Some(track) = start_outside {
+            self.connect_state.set_track(track);
+            if pages_pending {
+                // placed once the pages are there (try_finish looks it up while the fill up
+                // index is 0), the fill up waits for it
+                self.connect_state.reset_context(ResetContext::DefaultIndex);
+                self.connect_state.update_queue_revision()
+            } else {
+                // not in the context: played before it
+                self.connect_state.reset_playback_to_position(None)?;
+            }
+            self.add_autoplay_resolving_when_required();
         } else {
             self.connect_state
                 .set_current_track(index.unwrap_or_default())?;
@@ -2332,7 +2404,7 @@ impl SpircTask {
         }
 
         if self.connect_state.current_track(MessageField::is_some) {
-            self.load_track(cmd_options.start_playing, cmd_options.seek_to)?;
+            self.load_track(cmd_options.start_playing, seek_to)?;
         } else {
             info!("No active track, stopping");
             self.handle_stop()
@@ -2346,12 +2418,67 @@ impl SpircTask {
         Ok(())
     }
 
-    async fn load_context_from_uri(
+    // SPOTIFYGOOD: see handle_load
+    /// The context a load of `context_uri` resolves, fetched without changing anything; `None`
+    /// if it is the context that plays (resolved and all there)
+    async fn prefetch_load_context(
         &mut self,
-        context_uri: String,
+        context_uri: &str,
         page: Option<&ContextPage>,
         autoplay: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<(ResolveContext, Context)>, Error> {
+        let update_context = if autoplay {
+            ContextType::Autoplay
+        } else {
+            ContextType::Default
+        };
+
+        let fallback = match page {
+            // check that the uri is valid or the page has a valid uri that can be used
+            Some(page) => ConnectState::find_valid_uri(Some(context_uri), Some(page))
+                .ok_or_else(|| SpircError::InvalidUri(context_uri.to_string()))?,
+            // when there is no page, the uri should be valid
+            None => context_uri,
+        };
+
+        // SPOTIFYGOOD: only a context that was resolved, and is all there, is kept (see
+        // ConnectState::is_current_context): the same uri skipped the resolve also without a
+        // context (a transfer still resolving it) or with the stand-in of a failed transfer
+        if self.connect_state.is_current_context(context_uri)
+            && fallback == context_uri
+            && self.connect_state.get_context(update_context).is_ok()
+        {
+            debug!("context <{context_uri}> didn't change, no resolving required");
+            return Ok(None);
+        }
+
+        debug!("resolving context for load command");
+        let resolve = ResolveContext::from_uri(
+            context_uri,
+            fallback,
+            update_context,
+            ContextAction::Replace,
+        );
+        match self.context_resolver.fetch(&resolve, Vec::new).await {
+            Ok(context) => {
+                ConnectState::check_context(&context)?;
+                Ok(Some((resolve, context)))
+            }
+            Err(why) => {
+                if ContextResolver::is_unavailable(&why) {
+                    self.context_resolver.mark_unavailable(&resolve);
+                }
+                Err(why)
+            }
+        }
+    }
+
+    // SPOTIFYGOOD: see handle_load, the rest of the former load_context_from_uri
+    fn apply_load_context(
+        &mut self,
+        prefetched: Option<(ResolveContext, Context)>,
+        autoplay: bool,
+    ) {
         if !self.connect_state.is_active() {
             self.handle_activate();
         }
@@ -2361,47 +2488,59 @@ impl SpircTask {
         } else {
             ContextType::Default
         };
-
         self.connect_state.set_active_context(update_context);
 
-        let fallback = match page {
-            // check that the uri is valid or the page has a valid uri that can be used
-            Some(page) => match ConnectState::find_valid_uri(Some(&context_uri), Some(page)) {
-                Some(ctx_uri) => ctx_uri,
-                None => return Err(SpircError::InvalidUri(context_uri).into()),
-            },
-            // when there is no page, the uri should be valid
-            None => &context_uri,
-        };
-
-        // SPOTIFYGOOD: only a context that was resolved, and is all there, is kept (see
-        // ConnectState::is_current_context): the same uri skipped the resolve also without a
-        // context (a transfer still resolving it) or with the stand-in of a failed transfer
-        if self.connect_state.is_current_context(&context_uri)
-            && fallback == context_uri
-            && self.connect_state.get_context(update_context).is_ok()
-        {
-            debug!("context <{context_uri}> didn't change, no resolving required")
-        } else {
-            debug!("resolving context for load command");
+        if let Some((resolve, context)) = prefetched {
             self.context_resolver.clear();
             // SPOTIFYGOOD: a pending transfer was finished against the loaded context
             self.transfer_state = None;
-            let resolve = ResolveContext::from_uri(
-                &context_uri,
-                fallback,
-                update_context,
-                ContextAction::Replace,
-            );
             // SPOTIFYGOOD: an explicit load always asks again, a failure of the same context a
             // moment ago (e.g. a network hiccup) refused it without any request for a minute
             self.context_resolver.forget_unavailable(&resolve);
             self.context_resolver.add(resolve);
-            let context = self.context_resolver.get_next_context(Vec::new).await;
-            self.handle_next_context(context, false);
+            self.handle_next_context(Ok(context), false);
         }
+    }
 
-        Ok(())
+    // SPOTIFYGOOD: see handle_load
+    /// Resolves the further pages of the default context right away, until a track matches, a
+    /// fetch fails (it is left to the loop), or [LOAD_PAGES_TIMEOUT] is over
+    async fn resolve_pages_until(&mut self, matches: impl Fn(&ProvidedTrack) -> bool) {
+        let deadline = Instant::now() + LOAD_PAGES_TIMEOUT;
+        loop {
+            let found = self
+                .connect_state
+                .get_context(ContextType::Default)
+                .is_ok_and(|ctx| ctx.tracks.iter().any(&matches));
+            if found
+                || !self.context_resolver.next_is_page(ContextType::Default)
+                || Instant::now() >= deadline
+            {
+                return;
+            }
+
+            match timeout_at(deadline, self.context_resolver.get_next_context(Vec::new)).await {
+                Ok(Ok(context)) => {
+                    match self
+                        .context_resolver
+                        .apply_next_context(&mut self.connect_state, context)
+                    {
+                        Ok(Some(remaining)) => self.context_resolver.add_list(remaining),
+                        Ok(None) => (),
+                        Err(why) => error!("{why}"),
+                    }
+                    self.context_resolver.remove_used_and_invalid();
+                }
+                Ok(Err(why)) => {
+                    warn!("resolving the pages of the load failed: {why}");
+                    return;
+                }
+                Err(_) => {
+                    warn!("resolving the pages of the load took too long");
+                    return;
+                }
+            }
+        }
     }
 
     fn load_context_from_tracks(&mut self, tracks: impl Into<ContextPage>) -> Result<(), Error> {
