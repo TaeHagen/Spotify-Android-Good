@@ -120,7 +120,12 @@ internal object OfflineLoads {
         if (selected.isEmpty()) return if (reach == EngineReach.OFFLINE) Plan.NotDownloaded else Plan.Unchanged
         val hasStart = request.startUri != null || request.startIndex != null || request.startUid != null
         val startAt = start ?: 0
-        val exactStart = wanted == null || startOrderIndex == wanted
+        // The position belongs to the requested item only: any other start plays from the top.
+        val exactStart = when {
+            request.startUri != null -> selected[startAt] == request.startUri
+            wanted != null -> startOrderIndex == wanted
+            else -> true
+        }
         return Plan.Load(
             request.copy(
                 trackUris = selected,
