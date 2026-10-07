@@ -22,6 +22,9 @@ data class DownloadListRow(
     val error: String?,
 )
 
+/** A failed or cancelled download "Retry failed" may put back into the queue. */
+data class RetryRow(val uri: String, val state: DownloadState, val error: String?)
+
 /** Sync bookkeeping of a downloaded collection (without its member list). */
 data class CollectionSyncRow(
     val uri: String,
@@ -150,9 +153,8 @@ interface DownloadDao {
     @Query("UPDATE downloads SET state = 'cancelled', retryAt = NULL WHERE state IN ('queued','preparing','downloading')")
     suspend fun cancelAllPending()
 
-    /** Puts failed / cancelled items back into the queue with a fresh attempt budget. */
-    @Query("UPDATE downloads SET state = 'queued', attempts = 0, retryAt = NULL, error = NULL WHERE state IN ('failed','cancelled')")
-    suspend fun requeueFailed(): Int
+    @Query("SELECT uri, state, error FROM downloads WHERE state IN ('failed','cancelled')")
+    suspend fun retryRows(): List<RetryRow>
 
     @Query(
         "UPDATE downloads SET state = 'queued', attempts = 0, retryAt = NULL, error = NULL " +
@@ -211,6 +213,9 @@ interface DownloadDao {
     @Query("SELECT uri FROM downloads WHERE uri IN (:uris)")
     suspend fun existingUris(uris: List<String>): List<String>
 
+    @Query("SELECT uri, state FROM downloads WHERE uri IN (:uris)")
+    suspend fun statesOf(uris: List<String>): List<DownloadStateRow>
+
     /** Completed downloads not validated since [before] (re-validation of availability). */
     @Query("SELECT uri FROM downloads WHERE state = 'completed' AND COALESCE(lastValidatedAt, completedAt, addedAt) < :before")
     suspend fun completedUrisNotValidatedSince(before: Long): List<String>
@@ -267,6 +272,10 @@ interface DownloadCollectionDao {
 
     @Query("SELECT COUNT(*) FROM download_collections")
     suspend fun count(): Int
+
+    /** JSON arrays of the members each downloaded collection records as not playable here. */
+    @Query("SELECT unavailableUrisJson FROM download_collections")
+    suspend fun unavailableUrisJsons(): List<String>
 
     @Query("SELECT uri, type, lastSyncedAt, lastAttemptAt, syncFailures FROM download_collections")
     suspend fun syncStates(): List<CollectionSyncRow>

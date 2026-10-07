@@ -289,7 +289,7 @@ class DownloadManager(
             // collection that would show as downloaded.
             throw NativeException(NativeErrorInfo(NativeErrorCode.NETWORK, "Could not load the items of ${ref.name.ifBlank { ref.uri }}"))
         }
-        val resolved = withMetadata(found, known = emptySet())
+        val resolved = withCatalogInfo(found, known = emptySet())
         val removed = mutex.withLock {
             val existing = collectionDao.get(ref.uri)
             val now = System.currentTimeMillis()
@@ -405,12 +405,17 @@ class DownloadManager(
 
     /**
      * Puts failed and cancelled downloads back into the queue and (re)starts the queue, also when only
-     * pending items wait (a run stopped because storage was full).
+     * pending items wait (a run stopped because storage was full). Downloads that are not playable
+     * here ([DownloadRules.retryable]) stay failed: they would only fail again.
      */
     suspend fun retryFailed(): Unit = scope.detached { retryFailedNow() }
 
     private suspend fun retryFailedNow() {
-        dao.requeueFailed()
+        mutex.withLock {
+            val unavailable = collectionDao.unavailableUrisJsons().flatMapTo(HashSet()) { decodeItems(it) }
+            val uris = DownloadRules.retryable(dao.retryRows(), unavailable, appContext.getString(R.string.data_dl_error_unplayable))
+            uris.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+        }
         scheduleExecution(kick = true)
     }
 
@@ -561,7 +566,7 @@ class DownloadManager(
                     if (onlyDue && DownloadRules.nextSyncAt(collection.lastSyncedAt, collection.lastAttemptAt, collection.syncFailures) > startedAt) continue
                     val resolved = try {
                         resolver.resolve(type, collection.uri, collection.revision)
-                            ?.let { withMetadata(it, known = decodeItems(collection.itemUrisJson).toHashSet()) }
+                            ?.let { withCatalogInfo(it, known = decodeItems(collection.itemUrisJson).toHashSet()) }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -619,11 +624,14 @@ class DownloadManager(
     ): MembershipResult {
         val diff = DownloadRules.updateMembership(decodeItems(entity.itemUrisJson), resolved.items.map { it.uri }, resolved.complete)
         val newItems = diff.items
+        // Only members that came with catalog metadata say whether they are playable: an unchecked
+        // URI-only member keeps its previous availability (it is not "revived").
+        val (checked, availabilityComplete) = DownloadRules.availabilityOf(resolved.items, resolved.complete)
         val availability = DownloadRules.updateAvailability(
             old = decodeItems(entity.unavailableUrisJson).toHashSet(),
-            listed = resolved.items.mapTo(HashSet()) { it.uri },
-            listedUnavailable = resolved.items.filter { it.unavailable }.mapTo(HashSet()) { it.uri },
-            complete = resolved.complete,
+            listed = checked.mapTo(HashSet()) { it.uri },
+            listedUnavailable = checked.filter { it.unavailable }.mapTo(HashSet()) { it.uri },
+            complete = availabilityComplete,
         )
         val others = collectionDao.getAll().filter { it.uri != entity.uri }.map { decodeItems(it.itemUrisJson) }
         val toDelete = if (diff.dropped.isEmpty()) {
@@ -669,19 +677,30 @@ class DownloadManager(
     }
 
     /**
-     * [resolved] with display metadata for the items that lack it (Liked Songs list URIs only) and will
-     * get a new row: not in [known] (the stored membership; sync only queues new items) and without a
-     * row yet. Best effort: rows without metadata get it from the downloaded record.
+     * [resolved] with catalog metadata (display metadata and whether it is playable here) for the
+     * members that lack it (Liked Songs list URIs only; placeholders) and matter: those that will get
+     * a new row (not in [known], the stored membership, since sync only queues new members; no row
+     * yet) and those whose row FAILED (a greyed-out member is then recorded as unavailable instead of
+     * failing again). Completed and pending rows are not looked up again. Best effort, batched and
+     * bounded ([COLLECTION_METADATA_TIMEOUT_MS]): members not looked up keep their previous
+     * availability, rows without metadata get it from the downloaded record.
      */
-    private suspend fun withMetadata(resolved: CollectionResolver.Resolved, known: Set<String>): CollectionResolver.Resolved {
-        val candidates = resolved.items.filter { it.metadataJson == null && it.uri !in known }.map { it.uri }
-        if (candidates.isEmpty()) return resolved
-        val existing = candidates.chunked(SQL_CHUNK).flatMap { dao.existingUris(it) }.toHashSet()
-        val wanted = candidates.filter { it !in existing }
+    private suspend fun withCatalogInfo(resolved: CollectionResolver.Resolved, known: Set<String>): CollectionResolver.Resolved {
+        val lacking = resolved.items.filter { it.metadataJson == null }.map { it.uri }
+        if (lacking.isEmpty()) return resolved
+        val states = lacking.chunked(SQL_CHUNK).flatMap { dao.statesOf(it) }.associate { it.uri to it.state }
+        val wanted = lacking.filter { uri ->
+            when (states[uri]) {
+                null -> uri !in known
+                DownloadState.FAILED -> true
+                else -> false
+            }
+        }
         if (wanted.isEmpty()) return resolved
-        val metadata = resolver.metadataBestEffort(wanted, COLLECTION_METADATA_TIMEOUT_MS)
-        if (metadata.isEmpty()) return resolved
-        return resolved.copy(items = resolved.items.map { item -> metadata[item.uri]?.let { item.copy(metadataJson = it) } ?: item })
+        val fetched = resolver.itemsBestEffort(wanted, COLLECTION_METADATA_TIMEOUT_MS)
+        if (fetched.isEmpty()) return resolved
+        // A fetched placeholder (lookup failed) stays unknown.
+        return resolved.copy(items = resolved.items.map { item -> fetched[item.uri]?.takeIf { it.metadataJson != null } ?: item })
     }
 
     private suspend fun insertRows(items: List<CollectionResolver.Item>, quality: Int, individual: Boolean, now: Long) {
@@ -761,6 +780,9 @@ class DownloadManager(
             val seq = mutex.withLock {
                 gone.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, message, now) }
                 keys.remove(gone)
+                // So the collections containing them can still reach "Downloaded" (a URI-only listing
+                // or an unchanged playlist revision would never report them).
+                adjustUnavailableLocked(gone = gone.toHashSet(), playableAgain = emptySet())
                 index.next()
             }
             index.remove(gone, seq)
@@ -785,9 +807,23 @@ class DownloadManager(
         }
         val again = dormant.filter { playable[it] == true }
         if (again.isEmpty()) return 0
-        val requeued = mutex.withLock { again.chunked(SQL_CHUNK).sumOf { dao.requeueFailedOnly(it) } }
+        val requeued = mutex.withLock {
+            adjustUnavailableLocked(gone = emptySet(), playableAgain = again.toHashSet())
+            again.chunked(SQL_CHUNK).sumOf { dao.requeueFailedOnly(it) }
+        }
         if (requeued > 0) Log.i(TAG, "Queued $requeued failed downloads that are playable again")
         return requeued
+    }
+
+    /** Must hold [mutex]. Applies [DownloadRules.adjustUnavailable] to every downloaded collection. */
+    private suspend fun adjustUnavailableLocked(gone: Set<String>, playableAgain: Set<String>) {
+        if (gone.isEmpty() && playableAgain.isEmpty()) return
+        for (collection in collectionDao.getAll()) {
+            val members = decodeItems(collection.itemUrisJson)
+            val updated = DownloadRules.adjustUnavailable(members, decodeItems(collection.unavailableUrisJson).toHashSet(), gone, playableAgain)
+                ?: continue
+            collectionDao.upsert(collection.copy(unavailableUrisJson = json.encodeToString(itemsSerializer, members.filter { it in updated })))
+        }
     }
 
     /**
