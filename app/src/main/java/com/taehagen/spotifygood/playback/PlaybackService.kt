@@ -109,8 +109,10 @@ class PlaybackService : MediaLibraryService() {
      */
     private var remoteForegroundRefused = false
     private val main = Handler(Looper.getMainLooper())
-    /** A background start for local audio must reach the foreground in time (startForegroundService). */
+    /** A start that may have been a startForegroundService must reach the foreground in time. */
     private val foregroundDeadline = Runnable { onForegroundDeadline() }
+    /** Start id of a foreign start behind the pending [foregroundDeadline] (null: ours or Media3's). */
+    private var deadlineStartId: Int? = null
     private val searchCache = ConcurrentHashMap<String, List<MediaItem>>()
     /** uri → downloaded cover path of completed downloads (offline artwork). */
     @Volatile private var downloadedImages: Map<String, String> = emptyMap()
@@ -164,9 +166,10 @@ class PlaybackService : MediaLibraryService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
-        // The service is exported (controllers, Auto): our own actions only count with the
-        // in-process token, never from another app's explicit intent.
-        val internal = action in INTERNAL_ACTIONS && intent?.getStringExtra(EXTRA_TOKEN) == token
+        // The service is exported (controllers, Auto): our own starts carry the in-process token,
+        // and our own actions only count with it, never from another app's explicit intent.
+        val ours = intent?.getStringExtra(EXTRA_TOKEN) == token
+        val internal = action in INTERNAL_ACTIONS && ours
         if (action in INTERNAL_ACTIONS && !internal) Log.w(TAG, "Ignoring $action without the app's token")
         when (action.takeIf { internal }) {
             ACTION_START_PRESENCE -> {
@@ -177,13 +180,21 @@ class PlaybackService : MediaLibraryService() {
                 ResumeAlert.cancel(this)
                 resumeFromAlert()
             }
-            ACTION_LOCAL_PLAYBACK -> {
-                // Started with startForegroundService for audio that began in the background (a
-                // remote "play on this phone"): Media3 goes foreground once the session player
-                // reports playing; startForeground is mandatory either way.
-                main.removeCallbacks(foregroundDeadline)
-                if (!mediaForeground && !presence.isForeground) main.postDelayed(foregroundDeadline, FOREGROUND_DEADLINE_MS)
-            }
+        }
+        // Any start may have been a startForegroundService (ours for ACTION_LOCAL_PLAYBACK, Media3's
+        // media-button receiver, or any other app: the service is exported), and a service that
+        // does not call startForeground in time is killed with the app. Media3 calls it for its own
+        // start-self intents; our other starts are plain startService calls. For the rest, Media3
+        // goes foreground when the player plays; otherwise the deadline enters and leaves it.
+        val media3StartSelf = intent?.hasExtra(MEDIA3_START_SELF_EXTRA) == true
+        val ourPlainStart = ours && action != ACTION_LOCAL_PLAYBACK
+        if (intent != null && !media3StartSelf && !ourPlainStart && !mediaForeground && !presence.isForeground) {
+            // Only a start nothing in the app knows (not ours, not a Media3 media button or
+            // notification action) is stopped again when it left nothing to do.
+            val foreign = !ours && action != Intent.ACTION_MEDIA_BUTTON && action != MEDIA3_CUSTOM_ACTION
+            deadlineStartId = if (foreign) startId else null
+            main.removeCallbacks(foregroundDeadline)
+            main.postDelayed(foregroundDeadline, FOREGROUND_DEADLINE_MS)
         }
         super.onStartCommand(intent, flags, startId)
         // A sticky restart after process death would happen in the background, where the
@@ -504,22 +515,30 @@ class PlaybackService : MediaLibraryService() {
     }
 
     /**
-     * A background [ACTION_LOCAL_PLAYBACK] start did not reach the media foreground in time (e.g.
-     * playback was paused meanwhile, so Media3 did not ask for it): satisfy the
-     * `startForegroundService` contract, and stop local audio that would play without it.
+     * A start that may have been a `startForegroundService` did not reach the media foreground in
+     * time (e.g. playback was paused meanwhile so Media3 did not ask for it, or another app started
+     * the exported service): satisfy the contract by entering and leaving the foreground. Local
+     * audio must not keep playing in the background without it; a foreign start that left nothing
+     * to do stops again.
      */
     private fun onForegroundDeadline() {
+        val foreignStartId = deadlineStartId
+        deadlineStartId = null
         if (mediaForeground || presence.isForeground) return
         satisfyForegroundContract()
-        if (coordinator.isPlayingLocally()) {
-            Log.w(TAG, "Media foreground not reached in time; pausing local playback")
-            coordinator.refuseBackgroundPlayback()
+        when {
+            coordinator.isPlayingLocally() -> if (!coordinator.isAppInForeground) {
+                Log.w(TAG, "Media foreground not reached in time; pausing local playback")
+                coordinator.refuseBackgroundPlayback()
+            }
+            foreignStartId != null && !presence.isEnabled && !player.isPlaying -> stopSelf(foreignStartId)
         }
     }
 
     /**
-     * A media-button start (`startForegroundService`) must reach the foreground even when nothing
-     * can be resumed; enter and leave it immediately (like Media3's own shutdown path).
+     * A `startForegroundService` start (a media button, see [onForegroundDeadline]) must reach the
+     * foreground even when nothing plays; enter and leave it immediately (like Media3's own
+     * shutdown path), with a notification of its own so a (paused) media notification stays.
      */
     private fun satisfyForegroundContract() {
         if (mediaForeground || presence.isForeground) return
@@ -539,7 +558,7 @@ class PlaybackService : MediaLibraryService() {
                 .build()
             ServiceCompat.startForeground(
                 this,
-                Notifications.ID_PLAYBACK,
+                CONTRACT_NOTIFICATION_ID,
                 notification,
                 if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0,
             )
@@ -817,6 +836,12 @@ class PlaybackService : MediaLibraryService() {
         private const val REQUEST_SIGN_IN = 3
         /** Well inside the system's startForeground deadline (5–10 s). */
         private const val FOREGROUND_DEADLINE_MS = 3_000L
+        /** Media3's notification custom actions (`DefaultActionFactory`). */
+        private const val MEDIA3_CUSTOM_ACTION = "androidx.media3.session.CUSTOM_NOTIFICATION_ACTION"
+        /** Media3's start-self intent extra (Media3 calls startForeground right after that start). */
+        private const val MEDIA3_START_SELF_EXTRA = "androidx.media3.session.intent.uid"
+        /** The momentary foreground of [satisfyForegroundContract] (not the media notification's id). */
+        private const val CONTRACT_NOTIFICATION_ID = 1090
         private const val RESUME_SAVE_INTERVAL_MS = 15_000L
         private const val LOGIN_WAIT_MS = 3_000L
         private const val MAX_CACHED_SEARCHES = 8
@@ -844,7 +869,7 @@ class PlaybackService : MediaLibraryService() {
         private val token: String = ByteArray(16).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
 
         /** An intent for one of our own actions ([ACTION_START_PRESENCE], [ACTION_RESUME], [ACTION_LOCAL_PLAYBACK]). */
-        internal fun internalIntent(context: Context, action: String): Intent =
+        internal fun internalIntent(context: Context, action: String?): Intent =
             Intent(context, PlaybackService::class.java).setAction(action).putExtra(EXTRA_TOKEN, token)
 
         /** True while Media3 keeps the service in the foreground with the media notification. */
