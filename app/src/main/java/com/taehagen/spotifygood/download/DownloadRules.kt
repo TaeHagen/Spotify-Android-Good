@@ -139,6 +139,15 @@ internal object DownloadRules {
 
     data class MembershipDiff(val added: List<String>, val dropped: List<String>)
 
+    /**
+     * Whether a listing of [listed] items is the whole collection: not empty (a failed lookup and an
+     * emptied collection look the same), nothing failed ([partial]: some item metadata failed and
+     * those items are placeholders, or a page came back short) and, for sources that list every slot,
+     * all [total] slots.
+     */
+    fun listingComplete(listed: Int, partial: Boolean, total: Int? = null): Boolean =
+        listed > 0 && !partial && (total == null || listed >= total)
+
     /** New membership of a collection: its [items] and what joined / left it. */
     data class MembershipUpdate(val items: List<String>, val added: List<String>, val dropped: List<String>)
 
