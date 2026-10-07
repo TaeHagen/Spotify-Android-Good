@@ -96,6 +96,16 @@ pub(crate) fn stop() {
 }
 
 fn apply(action: Action) -> AppResult<()> {
+    let is_load = matches!(action, Action::Load { .. });
+    let result = apply_to_player(action);
+    if is_load && result.is_err() {
+        // No request id comes for it, the next one is someone else's (Spirc's).
+        QUEUE.lock().load_not_sent();
+    }
+    result
+}
+
+fn apply_to_player(action: Action) -> AppResult<()> {
     let player = engine::player_host::player().ok_or_else(|| AppError::unavailable("The player isn't running"))?;
     match action {
         Action::Load { uri, play, position_ms } => {
@@ -326,15 +336,15 @@ fn convert(event: &PlayerEvent) -> Option<Event> {
     })
 }
 
+/// A Player event for the queue, also while it is inactive: the request ids of its loads that
+/// arrive after a reset must still be counted, or a later foreign (Spirc) load is taken as its
+/// own. An inactive queue only does that bookkeeping (no action, nothing changed).
+fn feed(q: &mut OfflineQueue, event: &PlayerEvent, now_ms: i64) -> Option<super::offline_queue::Outcome> {
+    Some(q.on_event(convert(event)?, now_ms))
+}
+
 pub(crate) fn on_player_event(event: &PlayerEvent) {
-    let Some(event) = convert(event) else { return };
-    let outcome = {
-        let mut q = QUEUE.lock();
-        if !q.active {
-            return;
-        }
-        q.on_event(event, now_ms())
-    };
+    let Some(outcome) = feed(&mut QUEUE.lock(), event, now_ms()) else { return };
     if let Some(action) = outcome.action {
         if let Err(e) = apply(action) {
             log::warn!("offline playback: {e}");
@@ -398,6 +408,34 @@ mod tests {
             }),
             ..record(uri, "", "")
         }
+    }
+
+    #[test]
+    fn an_id_arriving_after_a_reset_is_still_counted() {
+        let spec = |start| LoadSpec {
+            context_uri: None,
+            uris: vec!["spotify:track:a".into(), "spotify:track:b".into()],
+            start: Some(start),
+            position_ms: 0,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            play: true,
+            seed: 1,
+        };
+        let id = |play_request_id| PlayerEvent::PlayRequestIdChanged { play_request_id };
+        let mut q = OfflineQueue::default();
+        // a next sent just before a stop (a load while the network returned): its id comes late
+        q.load(spec(0), 0);
+        q.reset();
+        let out = feed(&mut q, &id(1), 0).expect("converted");
+        assert!(!out.changed && out.action.is_none());
+        q.load(spec(1), 0);
+        feed(&mut q, &id(2), 0);
+        assert!(q.active);
+        // Spirc's load (a transfer to this phone) supersedes the queue
+        let out = feed(&mut q, &id(3), 0).expect("converted");
+        assert!(out.changed);
+        assert!(!q.active);
     }
 
     #[test]

@@ -367,8 +367,9 @@ A pending reconnect restore (§8) is this device's session: a play / pause decid
 comes back playing, other controls wait for it and then act on the restored session, a load
 replaces it only once the load goes through, a transfer to another device hands it over. A play
 without a session (no network, backoff) isn't answered by the restore: it fails or falls back as
-usual and leaves no intent behind. Once the new Spirc's first cluster is overdue (60 s),
-commands no longer wait for the restore and a play restores right away.
+usual and leaves no intent behind; a play reported as handled counts for that connection's
+restore decision. Once the new Spirc's first cluster is overdue (60 s), commands no longer wait
+for the restore and a play restores right away (one already answered restores then).
 
 ### 6.1 Session
 
@@ -590,13 +591,17 @@ For a remote active device, smart shuffle is not supported (the command reports
   connection), the last local playback is frozen and shown paused (for at most 30 min), and the
   Player is paused (Spirc also pauses it when its task ends by itself or is aborted, and an
   inactive Spirc never touches it; once the engine detached a Spirc, the connect layer pauses
-  it instead and the Spirc leaves the Player alone, the offline queue may already use it). Once
+  it instead, whatever the Spirc last published, and the Spirc leaves the Player alone, the
+  offline queue may already use it). Once
   the new Spirc is online and its first cluster (never without one, however late) shows no
   other active device, the device activates and reloads context, track, position, options and
   user queue: playing again if the gap was < 120 s, unless the user pressed pause meanwhile or
-  play within the last 30 s. Gaps count the time the phone slept (wall clock, never less than
-  the monotonic clock; a clock set back counts as a long gap). Without a first cluster after
-  60 s a play restores right away (the user asked for it here). A queued or suggested current
+  play (a play reported as handled counts for that connection's decision, any other for 30 s).
+  Gaps count the time the phone slept (wall clock, never less than the monotonic clock; a clock
+  set back counts as a long gap). Without a first cluster after 60 s a play restores right away
+  (the user asked for it here). Until the restored session is active with its track, the
+  restore point stays (shown as the paused placeholder): a connection lost meanwhile freezes it
+  again, and a play / pause meanwhile is recorded on it too. A queued or suggested current
   track keeps its context (the track is requeued, restarts, and gets repeat-one back; a full
   queue loses its tail, not the track); handed to another device it goes as the visible track
   window in play order instead. An explicit `player.load` (local, remote or offline) or running
