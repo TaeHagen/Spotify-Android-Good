@@ -863,7 +863,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   {urisOnly:true}`; members without a row and members whose row failed get metadata and their
   playability from `catalog.tracks` (batched, ≤ 60 s; completed and pending rows are not looked up
   again; placeholders are stored without metadata). Re-validation adds a member found not playable
-  to the unavailable set of every collection containing it (and removes it when playable again). Only a *complete* resolution removes items (not `partial`, not empty, and for
+  to the unavailable set of every collection containing it (and removes it when playable again).
+  Members in a collection's unavailable set are looked up again once a day during sync
+  (`unavailableCheckedAt`), so an unchanged playlist revision or a URI-only listing cannot keep them
+  out: playable ones leave the set and are queued. Removing a member removes it from the set. Only a *complete* resolution removes items (not `partial`, not empty, and for
   playlists / Liked Songs every slot listed): an empty, short or partial one only adds, and is
   retried. A collection whose sync fails or is incomplete is retried after 1 h,
   doubling up to 24 h (`lastAttemptAt`, `syncFailures`), instead of at every reconnect.

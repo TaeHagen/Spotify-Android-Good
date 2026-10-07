@@ -69,6 +69,8 @@ data class DownloadCollectionEntity(
      */
     @ColumnInfo(defaultValue = "'[]'")
     val unavailableUrisJson: String = "[]",
+    /** Last time the members in [unavailableUrisJson] were looked up again (null = never). */
+    val unavailableCheckedAt: Long? = null,
 )
 
 /** Recent searches: either a free-text query or a tapped result (MediaRef JSON). */
