@@ -24,13 +24,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 internal class AppPlaybackEnvironment(private val graph: AppGraph) : PlaybackEnvironment {
 
     override fun reach(): EngineReach {
-        if (graph.settings.settings.value.offlineMode) return EngineReach.OFFLINE
         val s = graph.engine.state.value
-        return when {
-            s.session == SessionState.ONLINE -> EngineReach.ONLINE
-            !s.networkAvailable || s.session == SessionState.OFFLINE -> EngineReach.OFFLINE
-            else -> EngineReach.CONNECTING
-        }
+        return EngineReach.of(graph.settings.settings.value.offlineMode, s.session, s.networkAvailable)
     }
 
     override suspend fun awaitSessionStart() {

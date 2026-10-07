@@ -5,19 +5,21 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import com.taehagen.spotifygood.App
 
 /**
- * [SleepWakeups] with AlarmManager (`ELAPSED_REALTIME_WAKEUP`, inexact: no exact-alarm
- * permission) and a short timed partial wake lock.
+ * [SleepWakeups] with AlarmManager (`ELAPSED_REALTIME_WAKEUP`, allow-while-idle so it also fires
+ * with network access in Doze) and a short timed partial wake lock.
  *
- * Two alarms target the [SleepTimerAlarmReceiver]: a window from [SleepSchedule.LEAD_MS] before the
- * end up to the end, after which the CPU stays awake until the end (so the pause is on time), and an
- * allow-while-idle alarm at the end, which still fires (with network access) in Doze, where windowed
- * alarms are deferred.
+ * Exact at the end where that needs no runtime grant (before Android 12, or when the user allowed
+ * exact alarms: SCHEDULE_EXACT_ALARM). Otherwise inexact, staged so that its heuristic window ends
+ * at the end ([SleepSchedule.stageTrigger]); [SleepTimer.onWakeupAlarm] re-arms after an early
+ * delivery. Allow-while-idle alarms have an idle quota (72 an hour for apps targeting Android 12+);
+ * a timer uses a handful of stages at most.
  */
 internal class AndroidSleepWakeups(context: Context) : SleepWakeups {
     private val app = context.applicationContext
@@ -29,25 +31,33 @@ internal class AndroidSleepWakeups(context: Context) : SleepWakeups {
     override fun schedule(endsAtElapsedMs: Long) {
         val alarms = alarms ?: return
         val now = SystemClock.elapsedRealtime()
+        val pending = pendingIntent(REQUEST_WAKE)
         try {
-            alarms.setWindow(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SleepSchedule.windowStart(endsAtElapsedMs, now),
-                SleepSchedule.windowLength(endsAtElapsedMs, now),
-                pendingIntent(REQUEST_WINDOW),
-            )
-            alarms.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, endsAtElapsedMs, pendingIntent(REQUEST_IDLE))
+            if (exactAllowed(alarms)) {
+                try {
+                    alarms.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, endsAtElapsedMs, pending)
+                    return
+                } catch (e: SecurityException) {
+                    // The exact-alarm grant was revoked meanwhile: fall back to the staged alarm.
+                    Log.i(TAG, "Exact alarm refused; using the staged inexact alarm")
+                }
+            }
+            alarms.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, SleepSchedule.stageTrigger(endsAtElapsedMs, now), pending)
         } catch (e: RuntimeException) {
             // SecurityException (alarm limits) or a dead system service: the timer still runs.
             Log.w(TAG, "Cannot schedule the sleep timer wake-up", e)
         }
     }
 
+    private fun exactAllowed(alarms: AlarmManager): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarms.canScheduleExactAlarms()
+
     override fun cancel() {
         val alarms = alarms ?: return
         runCatching {
-            alarms.cancel(pendingIntent(REQUEST_WINDOW))
-            alarms.cancel(pendingIntent(REQUEST_IDLE))
+            alarms.cancel(pendingIntent(REQUEST_WAKE))
+            // Windowed alarm of earlier versions.
+            alarms.cancel(pendingIntent(REQUEST_LEGACY_WINDOW))
         }
     }
 
@@ -69,8 +79,8 @@ internal class AndroidSleepWakeups(context: Context) : SleepWakeups {
     private companion object {
         const val TAG = "SleepTimerAlarms"
         const val ACTION_WAKE = "com.taehagen.spotifygood.playback.action.SLEEP_TIMER_WAKE"
-        const val REQUEST_WINDOW = 21
-        const val REQUEST_IDLE = 22
+        const val REQUEST_LEGACY_WINDOW = 21
+        const val REQUEST_WAKE = 22
     }
 }
 
