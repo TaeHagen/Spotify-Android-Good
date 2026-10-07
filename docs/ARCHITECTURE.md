@@ -319,8 +319,9 @@ them; a bare album / artist / show `contextUri` queues its downloads in context 
 and track number; newest episode first); a playlist / Liked Songs / other `contextUri`
 without `trackUris` fails with `UNAVAILABLE` "Not available offline" (never "all downloads").
 `positionMs` applies only when the requested start item itself is downloaded.
-The engine cannot know which downloads belong to a playlist or Liked Songs, so while the
-session is not Online Kotlin's `PlayerController` sends context loads of a playlist / Liked
+The engine cannot know which downloads belong to a playlist or Liked Songs, so whenever it
+cannot stream (offline mode, an offline session, or no network — also while the session still
+reads Online) Kotlin's `PlayerController` sends context loads of a playlist / Liked
 Songs / album / show with `trackUris` = that context's downloads in context order (Room
 collection membership; albums/shows not downloaded as a whole by metadata), keeping
 `contextUri`/`startUri`/`startUid` for Spirc. Nothing downloaded while offline → "not
