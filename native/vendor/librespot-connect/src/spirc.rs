@@ -75,6 +75,9 @@ enum SpircError {
     // SPOTIFYGOOD: see Spirc::set_autoplay
     #[error("autoplay is overridden by the session config")]
     AutoplayOverridden,
+    // SPOTIFYGOOD: see SpircTask::handle_play_stopped
+    #[error("there is no track to play")]
+    NothingToPlay,
 }
 
 impl From<SpircError> for Error {
@@ -85,7 +88,7 @@ impl From<SpircError> for Error {
             InvalidUri(_) | FailedDealerSetup => Error::aborted(err),
             UnknownEndpoint(_) => Error::unimplemented(err),
             // SPOTIFYGOOD
-            NotActive(_) | AutoplayOverridden => Error::failed_precondition(err),
+            NotActive(_) | AutoplayOverridden | NothingToPlay => Error::failed_precondition(err),
         }
     }
 }
@@ -1265,8 +1268,9 @@ impl SpircTask {
                 }
                 return self.handle_disconnect().await;
             }
-            SpircCommand::Play => self.handle_play(),
-            SpircCommand::PlayPause => self.handle_play_pause(),
+            // SPOTIFYGOOD: see play_action
+            SpircCommand::Play => self.handle_play_command(false)?,
+            SpircCommand::PlayPause => self.handle_play_command(true)?,
             SpircCommand::Pause => self.handle_pause(),
             SpircCommand::Prev => self.handle_prev()?,
             SpircCommand::Next => self.handle_next(None)?,
@@ -1799,10 +1803,8 @@ impl SpircTask {
             }
             SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri))?,
             SkipPrev(_) => self.handle_prev()?,
-            Resume(_) if matches!(self.play_status, SpircPlayStatus::Stopped) => {
-                self.load_track(true, 0)?
-            }
-            Resume(_) => self.handle_play(),
+            // SPOTIFYGOOD: shared with the local play (see play_action), fails without a track
+            Resume(_) => self.handle_play_command(false)?,
         }
 
         self.update_state = true;
@@ -2226,16 +2228,18 @@ impl SpircTask {
         self.set_volume(current_volume);
     }
 
-    fn handle_play_pause(&mut self) {
-        match self.play_status {
-            SpircPlayStatus::Paused { .. } | SpircPlayStatus::LoadingPause { .. } => {
-                self.handle_play()
-            }
-            SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. } => {
-                self.handle_pause()
-            }
-            _ => (),
+    // SPOTIFYGOOD: replaces handle_play_pause, see play_action
+    /// A local play (`toggle`: play/pause) or a remote resume
+    fn handle_play_command(&mut self, toggle: bool) -> Result<(), Error> {
+        let has_track = self.connect_state.current_track(MessageField::is_some);
+        match play_action(&self.play_status, toggle, has_track) {
+            PlayAction::Play => self.handle_play(),
+            PlayAction::Pause => self.handle_pause(),
+            PlayAction::Restart => self.load_track(true, 0)?,
+            PlayAction::NothingToPlay => Err(SpircError::NothingToPlay)?,
+            PlayAction::Nothing => (),
         }
+        Ok(())
     }
 
     fn handle_pause(&mut self) {
@@ -2929,6 +2933,37 @@ impl SpircTask {
 }
 
 // SPOTIFYGOOD: see Drop for SpircTask
+// SPOTIFYGOOD: what a play command does
+#[derive(Debug, PartialEq, Eq)]
+enum PlayAction {
+    Play,
+    Pause,
+    /// load the current track again from its start
+    Restart,
+    NothingToPlay,
+    Nothing,
+}
+
+/// What a play command (`toggle`: play/pause) does in the given status
+///
+/// Stopped but active (the context ended, or the player was halted after refused loads), the
+/// current track is played again from its start, like the remote resume already did. A local
+/// play was ignored and reported success without any audio, so the app never fell back to
+/// loading anything.
+fn play_action(status: &SpircPlayStatus, toggle: bool, has_track: bool) -> PlayAction {
+    match status {
+        SpircPlayStatus::Stopped if has_track => PlayAction::Restart,
+        SpircPlayStatus::Stopped => PlayAction::NothingToPlay,
+        SpircPlayStatus::Paused { .. } | SpircPlayStatus::LoadingPause { .. } => PlayAction::Play,
+        SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. } if toggle => {
+            PlayAction::Pause
+        }
+        SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. } => {
+            PlayAction::Nothing
+        }
+    }
+}
+
 fn pauses_on_drop(owns_player: bool, pause_on_drop: bool, stopped: bool) -> bool {
     owns_player && (pause_on_drop || !stopped)
 }
@@ -2956,7 +2991,35 @@ impl Drop for SpircTask {
 // SPOTIFYGOOD
 #[cfg(test)]
 mod tests {
-    use super::{SuggestionFetch, pauses_on_drop};
+    use super::{PlayAction, SpircPlayStatus, SuggestionFetch, play_action, pauses_on_drop};
+
+    #[test]
+    fn play_while_stopped_restarts_the_current_track() {
+        use PlayAction::*;
+        let stopped = SpircPlayStatus::Stopped;
+        let paused = SpircPlayStatus::Paused {
+            position_ms: 1,
+            preloading_of_next_track_triggered: false,
+        };
+        let playing = SpircPlayStatus::Playing {
+            nominal_start_time: 0,
+            preloading_of_next_track_triggered: false,
+        };
+        let loading = SpircPlayStatus::LoadingPlay { position_ms: 0 };
+
+        // the context ended (or the player was halted): play and toggle restart the track
+        assert_eq!(play_action(&stopped, false, true), Restart);
+        assert_eq!(play_action(&stopped, true, true), Restart);
+        // nothing to restart: an error instead of a silent success
+        assert_eq!(play_action(&stopped, false, false), NothingToPlay);
+        assert_eq!(play_action(&stopped, true, false), NothingToPlay);
+
+        assert_eq!(play_action(&paused, false, true), Play);
+        assert_eq!(play_action(&paused, true, true), Play);
+        assert_eq!(play_action(&playing, false, true), Nothing);
+        assert_eq!(play_action(&playing, true, true), Pause);
+        assert_eq!(play_action(&loading, true, true), Pause);
+    }
 
     #[test]
     fn a_released_player_is_left_alone_when_the_task_ends() {
