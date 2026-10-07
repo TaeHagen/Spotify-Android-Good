@@ -178,7 +178,9 @@ impl ConnectState {
         self.context_uri() != uri || uri.starts_with(SEARCH_IDENTIFIER)
     }
 
-    pub fn reset_context(&mut self, mut reset_as: ResetContext) {
+    // SPOTIFYGOOD: returns whether the context was reset completely (handle_load drops the
+    // resolves and the transfer still pending for the previous context then)
+    pub fn reset_context(&mut self, mut reset_as: ResetContext) -> bool {
         if matches!(reset_as, ResetContext::WhenDifferent(ctx) if self.different_context_uri(ctx)) {
             reset_as = ResetContext::Completely
         }
@@ -216,7 +218,9 @@ impl ConnectState {
 
         self.fill_up_context = ContextType::Default;
         self.set_active_context(ContextType::Default);
-        self.update_restrictions()
+        self.update_restrictions();
+
+        matches!(reset_as, ResetContext::Completely)
     }
 
     pub fn valid_resolve_uri(uri: &str) -> Option<&str> {

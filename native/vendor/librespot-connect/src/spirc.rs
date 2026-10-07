@@ -2014,12 +2014,21 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
-        self.connect_state
-            .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
-                ResetContext::WhenDifferent(uri)
-            } else {
-                ResetContext::Completely
-            });
+        let reset_completely =
+            self.connect_state
+                .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
+                    ResetContext::WhenDifferent(uri)
+                } else {
+                    ResetContext::Completely
+                });
+        // SPOTIFYGOOD: the resolves still queued for the previous context (e.g. the album pages
+        // of an artist, an autoplay or update resolve) and a pending transfer belong to it. Only
+        // a load of another uri cleared them: after a track list load they were applied to the
+        // new list (the artist's albums appended to it), and they deferred its shuffle.
+        if reset_completely {
+            self.context_resolver.clear();
+            self.transfer_state = None;
+        }
 
         self.connect_state.reset_options();
 
@@ -2165,6 +2174,8 @@ impl SpircTask {
         } else {
             debug!("resolving context for load command");
             self.context_resolver.clear();
+            // SPOTIFYGOOD: a pending transfer was finished against the loaded context
+            self.transfer_state = None;
             let resolve =
                 ResolveContext::from_uri(&context_uri, fallback, update_context, ContextAction::Replace);
             // SPOTIFYGOOD: an explicit load always asks again, a failure of the same context a

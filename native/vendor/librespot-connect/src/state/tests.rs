@@ -1464,6 +1464,21 @@ fn playlist_update_while_shuffled_keeps_the_pass() {
     assert_eq!(default_uids(&state), modified_order);
 }
 
+#[test]
+fn reset_context_reports_a_complete_reset() {
+    // handle_load drops the pending resolves (and transfer) of the previous context then
+    let (_rt, mut state) = state(3);
+    assert!(!state.reset_context(ResetContext::WhenDifferent(CONTEXT_URI)));
+    assert!(state.get_context(ContextType::Default).is_ok());
+    assert!(!state.reset_context(ResetContext::DefaultIndex));
+    assert!(state.reset_context(ResetContext::WhenDifferent("spotify:album:0")));
+    assert!(state.get_context(ContextType::Default).is_err());
+
+    // a track list load
+    let (_rt, mut state) = self::state(3);
+    assert!(state.reset_context(ResetContext::Completely));
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(
