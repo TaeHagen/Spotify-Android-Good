@@ -105,8 +105,13 @@ internal data class DownloadedPage(
     }
 }
 
-/** Playlist rows past the [loaded] ones (from a cached first page), from the downloaded copy. */
-internal fun DownloadedPage.remainingPlaylistItems(loaded: Int): List<PlaylistItem> = playlistItems().drop(loaded.coerceAtLeast(0))
+/**
+ * Downloaded playlist items whose uri is not [shown] yet (by a cached first page), in download
+ * order. Matched by uri, not by count: a server page may hold local files, duplicates or another
+ * revision, and the downloaded list is distinct.
+ */
+internal fun DownloadedPage.remainingPlaylistItems(shown: Set<String>): List<PlaylistItem> =
+    playlistItems().filter { it.uri !in shown }
 
 /**
  * [existing] episodes plus the downloaded ones not listed yet, in [newestFirst] order (or reversed
