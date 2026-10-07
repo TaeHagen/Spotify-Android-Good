@@ -119,6 +119,7 @@ fun ShowScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier = 
                 onSort = viewModel::setSort,
                 onRetryPage = viewModel::loadMore,
                 onRetryPartial = viewModel::retryPartial,
+                onRetry = viewModel::retry,
             )
         }
     }
@@ -139,6 +140,7 @@ private fun ShowList(
     onSort: (EpisodeSort) -> Unit,
     onRetryPage: () -> Unit,
     onRetryPartial: () -> Unit,
+    onRetry: () -> Unit,
 ) {
     val show = header.show
     LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
@@ -200,7 +202,10 @@ private fun ShowList(
         }
         if (state.downloadedCopy) {
             item(key = "downloaded", contentType = "notice") {
-                DownloadedCopyNotice(stringResource(R.string.detail_showing_downloaded_episodes))
+                DownloadedCopyNotice(
+                    stringResource(R.string.detail_showing_downloaded_episodes),
+                    onRetry = onRetry.takeUnless { state.offline },
+                )
             }
         }
         if (state.partial) {

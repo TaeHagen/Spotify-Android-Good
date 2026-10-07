@@ -231,6 +231,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     private suspend fun onFirstPage(resource: Resource<Playlist>) {
         val page = resource.dataOrNull
         if (page == null) {
+            val shown = data.value
+            if (shown is LoadState.Ready && shown.data.downloadedCopy) {
+                // Refetching while the download is shown: it stays, refreshing until the fetch ends.
+                data.value = shown.copy(refreshing = resource is Resource.Loading)
+            }
             if (data.value !is LoadState.Ready) {
                 // No page and no cached copy while the session can't reach the server (cache cleared
                 // or pruned), or the playlist is gone: a downloaded playlist still opens, read-only,

@@ -65,7 +65,7 @@ fun AlbumScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier =
                 onToggleSaved = { viewModel.toggleSaved(state.saved) },
                 onDownload = viewModel::download,
                 onRemoveDownload = { viewModel.removeCollectionDownload() },
-                onRetry = viewModel::retry,
+                onRetry = viewModel::refetch,
             )
         }
     }
@@ -104,7 +104,10 @@ private fun AlbumList(
         }
         if (content.downloadedCopy) {
             item(key = "downloaded", contentType = "notice") {
-                DownloadedCopyNotice(stringResource(R.string.detail_showing_downloaded_tracks))
+                DownloadedCopyNotice(
+                    stringResource(R.string.detail_showing_downloaded_tracks),
+                    onRetry = onRetry.takeUnless { state.offline },
+                )
             }
         }
         if (album.partial) {

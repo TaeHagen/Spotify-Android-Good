@@ -141,6 +141,11 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
     private suspend fun onShow(resource: Resource<Show>) {
         val show = resource.dataOrNull
         if (show == null) {
+            val shown = header.value
+            if (shown is LoadState.Ready && shown.data.downloadedCopy) {
+                // Refetching while the download is shown: it stays, refreshing until the fetch ends.
+                header.value = shown.copy(refreshing = resource is Resource.Loading)
+            }
             if (header.value !is LoadState.Ready) {
                 // No page and no cached copy (offline, cache cleared or pruned): a downloaded show
                 // still opens, from the download database.

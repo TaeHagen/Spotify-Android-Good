@@ -81,13 +81,13 @@ internal class AlbumViewModel(graph: AppGraph, private val uri: String) : Detail
 
     init {
         // Session back ONLINE while showing the download: fetch the album (it replaces the copy).
-        refetchWhenOnline(
-            showingDownload = { content.value.dataOrNull()?.downloadedCopy == true },
-            refetch = {
-                refetchingCopy = true
-                retry()
-            },
-        )
+        refetchWhenOnline(showingDownload = { content.value.dataOrNull()?.downloadedCopy == true }, refetch = ::refetch)
+    }
+
+    /** Fetches the album again; a downloaded copy stays on screen (refreshing) until the server answers. */
+    fun refetch() {
+        refetchingCopy = content.value.dataOrNull()?.downloadedCopy == true
+        retry()
     }
 
     private val primaryArtist: Flow<ArtistRef?> = content
