@@ -2,7 +2,6 @@ package com.taehagen.spotifygood.playback
 
 import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.util.Log
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
@@ -13,8 +12,8 @@ import com.taehagen.spotifygood.R
 /**
  * The "Tap to resume" alert (docs/ARCHITECTURE.md §9.4) shown when local playback had to be paused
  * because the app could not start its media foreground service from the background. Tapping it
- * starts [PlaybackService] with [PlaybackService.ACTION_RESUME]; the tap's temporary allowlist lets
- * the service go foreground. Posted by the service or by [PlaybackCoordinator] (also while the
+ * starts [PlaybackService] with [PlaybackService.ACTION_RESUME] (through [PlaybackActionReceiver]);
+ * the tap's temporary allowlist lets the service go foreground. Posted by the service or by [PlaybackCoordinator] (also while the
  * service does not exist); cancelled when playback runs again.
  */
 internal object ResumeAlert {
@@ -36,10 +35,11 @@ internal object ResumeAlert {
                     .build(),
             )
         }
-        val resume = PendingIntent.getService(
+        // Through the non-exported receiver: it may outlive the process (and its token).
+        val resume = PendingIntent.getBroadcast(
             app,
             REQUEST_RESUME,
-            Intent(app, PlaybackService::class.java).setAction(PlaybackService.ACTION_RESUME),
+            PlaybackActionReceiver.intent(app, PlaybackActionReceiver.ACTION_RESUME),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val notification = NotificationCompat.Builder(app, Notifications.CHANNEL_ALERTS)
