@@ -8,10 +8,10 @@ use crate::{
         restrictions::Restrictions,
     },
     shuffle_vec::ShuffleVec,
+    // SPOTIFYGOOD: IDENTIFIER_DELIMITER instead of SPOTIFY_MAX_NEXT_TRACKS_SIZE and IsProvider
     state::{
-        ConnectState, SPOTIFY_MAX_NEXT_TRACKS_SIZE, StateError,
-        metadata::Metadata,
-        provider::{IsProvider, Provider},
+        ConnectState, StateError, metadata::Metadata, provider::Provider,
+        tracks::IDENTIFIER_DELIMITER,
     },
 };
 use protobuf::MessageField;
@@ -248,7 +248,17 @@ impl ConnectState {
                 if !self.context_uri().starts_with(SEARCH_IDENTIFIER)
                     && matches!(context.uri, Some(ref uri) if uri == self.context_uri())
                 {
-                    if let Some(new_index) = self.find_last_index_in_new_context(&new_context) {
+                    if self.context.is_some()
+                        && matches!(self.active_context, ContextType::Autoplay)
+                    {
+                        // SPOTIFYGOOD: the default context was played to its end, the next
+                        // tracks are autoplay tracks and stay. They were cleared, and as the
+                        // context resolver only fills up again while the default context is
+                        // active, the playback stopped after the current track.
+                        new_context.index.track = new_context.tracks.len() as u32;
+                    } else if let Some(new_index) =
+                        self.find_last_index_in_new_context(&new_context)
+                    {
                         new_context.index.track = match new_index {
                             Ok(i) => i,
                             Err(i) => {
@@ -256,12 +266,17 @@ impl ConnectState {
                                 i
                             }
                         };
+                        // SPOTIFYGOOD: keep the pass (it numbers the delimiters)
+                        new_context.index.page = self.current_pass();
 
-                        // enforce reloading the context
-                        if let Ok(autoplay_ctx) = self.get_context_mut(ContextType::Autoplay) {
-                            autoplay_ctx.index.track = 0
-                        }
+                        // SPOTIFYGOOD: the autoplay index was set to 0 here ("enforce reloading
+                        // the context"), clear_next_tracks now rewinds it to the first dropped
+                        // autoplay track
                         self.clear_next_tracks();
+                        // SPOTIFYGOOD: the fill up continues in the default context, it may have
+                        // moved on to autoplay already (the default tracks after the resume
+                        // position were then lost)
+                        self.fill_up_context = ContextType::Default;
                     }
                 }
 
@@ -311,47 +326,61 @@ impl ConnectState {
         Ok(Some(next_contexts))
     }
 
-    fn find_first_prev_track_index(&self, ctx: &StateContext) -> Option<usize> {
-        let prev_tracks = self.prev_tracks();
-        for i in (0..prev_tracks.len()).rev() {
-            let prev_track = prev_tracks.get(i)?;
-            if let Ok(idx) = Self::find_index_in_context(ctx, |t| prev_track.uri == t.uri) {
-                return Some(idx);
-            }
-        }
-        None
-    }
-
+    // SPOTIFYGOOD: find_first_prev_track_index is replaced by the prev tracks step below.
+    // Works out the position from the playback itself. Upstream took
+    // `fill up index - 80` whenever that index was at least 80, which only holds while the next
+    // tracks are exactly 80 context tracks after the current one (and even then skipped the next
+    // track). Queued tracks (an add rewinds the fill up to the dropped context track), tracks
+    // removed from the next tracks and the transition to autoplay made the playback replay or
+    // skip tracks. The current track was also looked up by uri, not uid.
+    /// The position in the updated default context at which the fill up continues
     fn find_last_index_in_new_context(
         &self,
         new_context: &StateContext,
     ) -> Option<Result<u32, u32>> {
         let ctx = self.context.as_ref()?;
 
-        let is_queued_item = self.current_track(|t| t.is_queue() || t.is_from_queue());
+        let position = |track: &ProvidedTrack| Self::position_in_context(new_context, track);
+        let is_plain = |track: &&ProvidedTrack| Self::is_plain_context_track(track);
 
-        let new_index = if ctx.index.track as usize >= SPOTIFY_MAX_NEXT_TRACKS_SIZE {
-            Some(ctx.index.track as usize - SPOTIFY_MAX_NEXT_TRACKS_SIZE)
-        } else if is_queued_item {
-            self.find_first_prev_track_index(new_context)
-        } else {
-            Self::find_index_in_context(new_context, |current| {
-                self.current_track(|t| t.uri == current.uri)
+        let new_index = self
+            // after the current track
+            .current_track(|t| t.as_ref().filter(is_plain).and_then(position))
+            .map(|i| i + 1)
+            // at the first upcoming context track of this pass: after queued tracks, a playing
+            // suggestion, or a current track the update removed
+            .or_else(|| {
+                self.next_tracks()
+                    .iter()
+                    .take_while(|t| !t.uid.starts_with(IDENTIFIER_DELIMITER))
+                    .filter(is_plain)
+                    .find_map(position)
             })
-            .ok()
-        }
-        .map(|i| i as u32 + 1);
+            // after the last played context track
+            .or_else(|| {
+                self.prev_tracks()
+                    .iter()
+                    .rev()
+                    .filter(is_plain)
+                    .find_map(position)
+                    .map(|i| i + 1)
+            })
+            // the default context was already played to its end
+            .or_else(|| {
+                matches!(self.fill_up_context, ContextType::Autoplay)
+                    .then_some(new_context.tracks.len())
+            })
+            .map(|i| i as u32);
 
         Some(new_index.ok_or_else(|| {
             info!(
                 "couldn't distinguish index from current or previous tracks in the updated context"
             );
-            let fallback_index = self
-                .player()
-                .index
-                .as_ref()
-                .map(|i| i.track)
-                .unwrap_or_default();
+            // a guess: the old fill up position, minus the context tracks still waiting
+            let waiting = self.next_tracks().iter().filter(is_plain).count();
+            let fallback_index = (ctx.index.track as usize)
+                .saturating_sub(waiting)
+                .min(new_context.tracks.len()) as u32;
             info!("falling back to index {fallback_index}");
             fallback_index
         }))

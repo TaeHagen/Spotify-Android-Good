@@ -883,6 +883,141 @@ fn shuffle_and_repeat_toggles_while_autoplay_plays() {
     assert!(state.handle_set_repeat_context(true).is_err());
 }
 
+/// a playlist modification: the same context is resolved again, then the state is set up like
+/// `ContextResolver::try_finish` does it (without shuffle)
+fn update_same_context(state: &mut ConnectState, ctx: Context) {
+    state.update_context(ctx, ContextType::Default).unwrap();
+    if !matches!(state.active_context, ContextType::Default) {
+        // try_finish skips the default context while it isn't the active one
+        return;
+    }
+    let ctx = state.get_context(ContextType::Default).unwrap();
+    if ctx.index.track == 0 {
+        let idx = ConnectState::find_index_in_context(ctx, |t| {
+            state.current_track(|c| t.uri == c.uri)
+        })
+        .ok();
+        state.reset_playback_to_position(idx).unwrap();
+    } else {
+        state.fill_up_next_tracks().unwrap();
+    }
+}
+
+fn context_uids(played: &[String]) -> Vec<String> {
+    played
+        .iter()
+        .filter(|uid| uid.starts_with("uid"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn playlist_update_continues_where_the_playback_is() {
+    // with 0, 1 and 5 queued tracks (each one rewinds the fill up)
+    for queued in [0, 1, 5] {
+        let (_rt, mut state) = state(200);
+        play_through(&mut state, 30);
+        for i in 0..queued {
+            state.queue_add_uri(&track_uri(i, 9)).unwrap();
+        }
+        update_same_context(&mut state, context(200, 0));
+        assert_eq!(state.current_track(|t| t.uid.clone()), "uid30");
+
+        let played = play_through(&mut state, 100);
+        assert_eq!(played.iter().filter(|uid| uid.starts_with('q')).count(), queued);
+        let played = context_uids(&played);
+        assert_eq!(played, uids(31..31 + played.len()), "{queued} queued");
+    }
+
+    // while a queued track plays
+    let (_rt, mut state) = state(200);
+    play_through(&mut state, 30);
+    for i in 0..5 {
+        state.queue_add_uri(&track_uri(i, 9)).unwrap();
+    }
+    play_through(&mut state, 2);
+    update_same_context(&mut state, context(200, 0));
+    assert_eq!(state.current_track(|t| t.uid.clone()), "q1");
+    let played = play_through(&mut state, 100);
+    assert_eq!(played[..3], ["q2", "q3", "q4"]);
+    assert_eq!(played[3..], uids(31..128));
+
+    // with a track removed from the next tracks
+    let (_rt, mut state) = self::state(200);
+    play_through(&mut state, 30);
+    state.queue_remove("uid32").unwrap();
+    update_same_context(&mut state, context(200, 0));
+    assert_eq!(play_through(&mut state, 3), ["uid31", "uid33", "uid34"]);
+
+    // the update removed the current track and added one after the next one
+    let (_rt, mut state) = self::state(50);
+    play_through(&mut state, 10);
+    let mut modified = context(50, 0);
+    modified.pages[0].tracks.remove(10);
+    modified.pages[0].tracks.insert(
+        11,
+        ContextTrack {
+            uri: Some(track_uri(99, 3)),
+            uid: Some("new".to_string()),
+            ..Default::default()
+        },
+    );
+    update_same_context(&mut state, modified);
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid10");
+    assert_eq!(play_through(&mut state, 3), ["uid11", "new", "uid12"]);
+}
+
+/// an autoplay context with the uids `a0`, `a1`, ...
+fn autoplay_context(len: usize) -> Context {
+    let mut ctx = context(len, 5);
+    for (i, track) in ctx.pages[0].tracks.iter_mut().enumerate() {
+        track.uid = Some(format!("a{i}"));
+    }
+    ctx
+}
+
+#[test]
+fn playlist_update_while_the_fill_up_is_in_autoplay() {
+    // the default context ends within the next tracks
+    let (_rt, mut state) = state(3);
+    state
+        .update_context(autoplay_context(20), ContextType::Autoplay)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    assert!(next_uids(&state)[2].starts_with(IDENTIFIER_DELIMITER));
+    update_same_context(&mut state, context(3, 0));
+    let played = play_through(&mut state, 6);
+    assert_eq!(played, ["uid1", "uid2", "a0", "a1", "a2", "a3"]);
+
+    // autoplay plays
+    let (_rt, mut state) = self::state(3);
+    state
+        .update_context(autoplay_context(20), ContextType::Autoplay)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    play_through(&mut state, 4);
+    assert_eq!(state.current_track(|t| t.uid.clone()), "a1");
+    let next = next_uids(&state);
+    update_same_context(&mut state, context(3, 0));
+    assert_eq!(next_uids(&state), next);
+    assert_eq!(play_through(&mut state, 3), ["a2", "a3", "a4"]);
+}
+
+#[test]
+fn repeat_toggle_keeps_the_autoplay_tracks_that_were_in_the_next_tracks() {
+    let (_rt, mut state) = state(3);
+    state
+        .update_context(autoplay_context(20), ContextType::Autoplay)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    // the next tracks covered autoplay up to a77, repeat replaces them with the wraps
+    state.handle_set_repeat_context(true).unwrap();
+    assert!(state.next_tracks().iter().all(|t| !t.is_autoplay()));
+    state.handle_set_repeat_context(false).unwrap();
+    let played = play_through(&mut state, 4);
+    assert_eq!(played, ["uid1", "uid2", "a0", "a1"]);
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(

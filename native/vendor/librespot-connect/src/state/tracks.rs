@@ -286,9 +286,23 @@ impl<'ct> ConnectState {
             .find(|(_, track)| !track.is_queue());
 
         if let Some((non_queued_track, _)) = first_non_queued_track {
+            // SPOTIFYGOOD: the autoplay fill up continues at the first dropped autoplay track,
+            // a later transition to autoplay skipped the dropped ones
+            let first_autoplay = self.next_tracks()[non_queued_track..]
+                .iter()
+                .find(|t| t.is_autoplay())
+                .map(|t| t.uid.clone());
+
             while self.next_tracks().len() > non_queued_track
                 && self.next_tracks_mut().pop().is_some()
             {}
+
+            if let (Some(uid), Ok(ctx)) = (first_autoplay, self.get_context_mut(ContextType::Autoplay))
+            {
+                if let Some(position) = ctx.tracks.iter().position(|t| t.uid == uid) {
+                    ctx.index.track = position as u32;
+                }
+            }
         }
     }
 
