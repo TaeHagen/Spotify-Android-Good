@@ -25,7 +25,7 @@ import com.taehagen.spotifygood.ui.screens.library.debouncedInput
 import com.taehagen.spotifygood.ui.screens.library.nowPlayingFlow
 import com.taehagen.spotifygood.ui.screens.library.offlineFlow
 import com.taehagen.spotifygood.ui.screens.library.playTrackInAlbum
-import com.taehagen.spotifygood.ui.screens.library.startTrack
+import com.taehagen.spotifygood.ui.screens.library.launchTrackStart
 import com.taehagen.spotifygood.ui.screens.library.toBrowseError
 import com.taehagen.spotifygood.ui.screens.library.toMediaRef
 import kotlinx.coroutines.flow.Flow
@@ -268,7 +268,7 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         onOpened(ref)
         when (ref.type) {
             MediaType.TRACK -> (sections.byUri[ref.uri] as? SearchItem.Song)?.let { graph.playTrackInAlbum(it.track) }
-                ?: graph.appScope.launch { graph.startTrack(ref.uri, track = null) }
+                ?: graph.launchTrackStart(ref.uri, track = null)
             MediaType.EPISODE -> graph.player.playTracks(listOf(ref.uri))
             else -> graph.player.playContext(ref.uri)
         }
