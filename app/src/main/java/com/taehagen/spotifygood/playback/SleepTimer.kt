@@ -286,7 +286,7 @@ class SleepTimer(
     private suspend fun pauseAndRestore() {
         // A remote device's pause is a network request: keep the CPU up until it went out.
         if (playback.snapshot.value.source == PlaybackSource.REMOTE) wakeups?.holdAwake(PAUSE_AWAKE_MS)
-        withTimeoutOrNull(PAUSE_AWAKE_MS) { player.pauseAsync().await() }
+        withTimeoutOrNull(PAUSE_AWAKE_MS) { player.pauseAsync(user = false).await() }
         // Keep the output silent until the pause has taken effect, then restore the gain.
         withTimeoutOrNull(RESTORE_TIMEOUT_MS) { playback.snapshot.first { !it.isPlaying } }
         setFade(1f)

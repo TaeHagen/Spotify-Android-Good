@@ -4,8 +4,6 @@ import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
-import com.taehagen.spotifygood.model.PlaybackSnapshot
-import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.ui.components.SessionMessenger
@@ -121,7 +119,7 @@ internal sealed interface TrackStartPlan {
     data class Play(val trackUri: String, val albumUri: String?) : TrackStartPlan
     data class Blocked(val reason: TrackStartBlock) : TrackStartPlan
 
-    /** Something else was started (or playback paused) while this one waited: it is dropped. */
+    /** The user did something else (play, pause, skip, ...) while this one waited: it is dropped. */
     data object Superseded : TrackStartPlan
 }
 
@@ -155,35 +153,19 @@ internal suspend fun planTrackStart(
 }
 
 /**
- * Whether playback changed since [start] in a way that means the user started something else on
- * this phone meanwhile: another local track (not just the next song of [start]).
- *
- * Changes the session makes by itself while coming online are not that, and are ignored: the
- * first cluster after a reconnect (another device's REMOTE playback replacing the empty snapshot),
- * the restore of the reconnect placeholder (same track, playing again), anything from an empty
- * snapshot. So is the load a previous single-track start already sent landing ([ownTargets]):
- * this newer tap replaces it anyway. Pausing or resuming doesn't drop the tap either.
+ * Whether the user issued a playback command since the start was tapped ([at]: the value of
+ * `PlayerController.userCommands` then, [now]: its current value). That covers a play or load
+ * from the app or the media session (also from an empty snapshot), a pause, a skip or a seek,
+ * and nothing the session does by itself while coming online (the first cluster, a restored
+ * reconnect placeholder, a hand-back to Spirc), which a comparison of snapshots could not tell
+ * apart.
  */
-internal fun startSuperseded(start: PlaybackSnapshot, now: PlaybackSnapshot, ownTargets: Set<String> = emptySet()): Boolean {
-    // Nothing (or only a placeholder without a track) to compare with: can't tell who changed it.
-    if (start.track == null || start.source == PlaybackSource.NONE) return false
-    // Only a load on this phone; what other devices play is the cluster, not this user's taps here.
-    if (now.source != PlaybackSource.LOCAL) return false
-    // Another track, not the next one (the song ending). The same track in another context is a
-    // hand-back or restore of the session (e.g. offline queue to Spirc), not a new start.
-    val after = now.track?.uri
-    val trackChanged = start.track.uri != after && after != start.nextTracks.firstOrNull()?.uri
-    if (!trackChanged) return false
-    return now.context?.uri !in ownTargets && after !in ownTargets
-}
+internal fun startSuperseded(at: Long, now: Long): Boolean = now != at
 
 /** The single-track start in flight: a newer one replaces it (it would otherwise land later). */
 private object TrackStarts {
     private val lock = Any()
     private var job: Job? = null
-
-    /** Album and track of the last load a single-track start sent (see [startSuperseded]). */
-    @Volatile var lastSent: Set<String> = emptySet()
 
     fun launch(scope: CoroutineScope, block: suspend () -> Unit) {
         synchronized(lock) {
@@ -196,17 +178,19 @@ private object TrackStarts {
 /**
  * Starts [trackUri] within its album (so playback continues naturally), else on its own, unless
  * [planTrackStart] says it can't: then shows why instead of letting a different track play. Runs
- * in the app scope; a newer single-track start cancels this one, and a play started elsewhere
- * meanwhile wins.
+ * in the app scope; a newer single-track start cancels this one, and any playback command the
+ * user issues meanwhile (in the app or through the media session: play, pause, skip, ...) wins
+ * ([startSuperseded]).
  */
 internal fun AppGraph.launchTrackStart(trackUri: String, track: Track?) {
-    TrackStarts.launch(appScope) { startTrack(trackUri, track) }
+    // Read at the tap, before the start runs: any command the user issues after it drops it.
+    val commands = player.userCommands.value
+    TrackStarts.launch(appScope) { startTrack(trackUri, track, commands) }
 }
 
-private suspend fun AppGraph.startTrack(trackUri: String, track: Track?) {
+private suspend fun AppGraph.startTrack(trackUri: String, track: Track?, commandsAtTap: Long) {
     val downloaded = trackUri in downloads.downloadedUris.value
     val reach = engineReach()
-    val start = playback.snapshot.value
     val messenger = SessionMessenger(app)
     if (reach == EngineReach.CONNECTING && !downloaded && !track.isUnplayable) {
         // The tap registered: the song starts once the session is back.
@@ -229,7 +213,7 @@ private suspend fun AppGraph.startTrack(trackUri: String, track: Track?) {
                 }
             }
         },
-        superseded = { startSuperseded(start, playback.snapshot.value, TrackStarts.lastSent) },
+        superseded = { startSuperseded(commandsAtTap, player.userCommands.value) },
     )
     when (plan) {
         is TrackStartPlan.Blocked -> messenger.post(
@@ -239,7 +223,6 @@ private suspend fun AppGraph.startTrack(trackUri: String, track: Track?) {
             },
         )
         is TrackStartPlan.Play -> {
-            TrackStarts.lastSent = setOfNotNull(plan.albumUri, plan.trackUri)
             if (plan.albumUri != null) {
                 player.playContext(plan.albumUri, startUri = plan.trackUri)
             } else {

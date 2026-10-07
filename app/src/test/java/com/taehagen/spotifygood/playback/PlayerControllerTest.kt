@@ -513,4 +513,41 @@ class PlayerControllerTest {
         assertEquals("speaker", h.calls[1].second.deviceId())
         assertEquals("spotify:playlist:radio", h.calls[1].second["contextUri"]?.jsonPrimitive?.content)
     }
+
+    @Test
+    fun userCommandsCountWhatTheUserIssuedNotWhatTheAppSendsByItself() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE), resume = resumeState(playlist))
+        val c = h.controller
+        var expected = c.userCommands.value
+        fun issued(what: String, block: () -> Unit) {
+            block()
+            expected++
+            assertEquals(what, expected, c.userCommands.value)
+        }
+        issued("play") { c.play(PlayRequest(contextUri = playlist)) }
+        issued("media-session load") { c.playAsync(PlayRequest(trackUris = listOf(t(1))), onThisPhone = true) }
+        issued("pause") { c.pause() }
+        issued("resume") { c.resume() }
+        issued("toggle") { c.togglePlayPause() }
+        issued("next") { c.next() }
+        issued("previous") { c.previous() }
+        issued("seek") { c.seekTo(5_000) }
+        issued("skip to") { c.skipTo("u1") }
+        issued("radio") { c.startRadio(t(1)) }
+        // Audio focus, headphones unplugged, the sleep timer, a refused background start.
+        c.pause(user = false)
+        c.resume(user = false)
+        c.pauseAsync(user = false)
+        // Queue edits and modes are not playback commands.
+        c.addToQueue(t(2))
+        c.setRepeat(com.taehagen.spotifygood.model.RepeatMode.TRACK)
+        runCurrent()
+        assertEquals(expected, c.userCommands.value)
+        // The Play fallback to the stored session is part of the play, not another command.
+        h.fail = { if (it == "player.play") NativeException(NativeErrorInfo(NativeErrorCode.NOT_ACTIVE_DEVICE, "none")) else null }
+        issued("play with fallback") { c.resume() }
+        runCurrent()
+        assertEquals(listOf("player.play", "player.load"), h.methods().takeLast(2))
+        assertEquals(expected, c.userCommands.value)
+    }
 }
