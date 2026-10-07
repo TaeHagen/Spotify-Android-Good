@@ -1,6 +1,11 @@
 package com.taehagen.spotifygood.playback
 
 import com.taehagen.spotifygood.model.NativeErrorInfo
+import com.taehagen.spotifygood.model.PlaybackContext
+import com.taehagen.spotifygood.model.PlaybackSnapshot
+import com.taehagen.spotifygood.model.PlaybackStatus
+import com.taehagen.spotifygood.model.PlaybackTrack
+import com.taehagen.spotifygood.model.RepeatMode
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import kotlinx.coroutines.test.runTest
@@ -147,5 +152,44 @@ class ResumeFallbackTest {
         assertSame(album, PlayerController.withLoadableContext(album))
         val single = PlayRequest(contextUri = "spotify:track:x")
         assertSame(single, PlayerController.withLoadableContext(single))
+    }
+
+    @Test
+    fun theLastSessionComesBackWithItsShuffleAndRepeat() = runTest {
+        val snapshot = PlaybackSnapshot(
+            status = PlaybackStatus.PAUSED,
+            positionMs = 9_000,
+            context = PlaybackContext("spotify:playlist:p"),
+            track = PlaybackTrack(uri = "spotify:track:t"),
+            shuffle = false, // smart shuffle implies shuffle, even when a snapshot says otherwise
+            smartShuffle = true,
+            repeat = RepeatMode.TRACK,
+        )
+        val saved = checkNotNull(ResumeState.from(snapshot))
+        assertTrue(saved.shuffle)
+        assertTrue(saved.smartShuffle)
+        assertEquals(RepeatMode.TRACK, saved.repeat)
+
+        val rpc = FakeRpc { if (it == "player.play") notActive else null }
+        PlayerController.resumeOrLoadLast("player.play", rpc::call) { saved }
+        val load = rpc.calls[1].second
+        assertEquals(JsonPrimitive(true), load["shuffle"])
+        assertEquals(JsonPrimitive(true), load["smartShuffle"])
+        assertEquals(JsonPrimitive("track"), load["repeat"])
+
+        // Shuffle and repeat-all.
+        val args = PlayerController.loadArgs(state("spotify:album:a").copy(shuffle = true, repeat = RepeatMode.CONTEXT).toPlayRequest())
+        assertEquals(JsonPrimitive(true), args["shuffle"])
+        assertEquals(JsonPrimitive(false), args["smartShuffle"])
+        assertEquals(JsonPrimitive("context"), args["repeat"])
+    }
+
+    @Test
+    fun aStateWithoutModesResumesWithThemOff() {
+        // States stored by older versions read with the defaults; the load still names the modes.
+        val args = PlayerController.loadArgs(state("spotify:album:a").toPlayRequest())
+        assertEquals(JsonPrimitive(false), args["shuffle"])
+        assertEquals(JsonPrimitive(false), args["smartShuffle"])
+        assertEquals(JsonPrimitive("off"), args["repeat"])
     }
 }

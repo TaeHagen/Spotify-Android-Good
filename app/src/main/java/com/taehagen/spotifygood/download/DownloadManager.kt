@@ -834,18 +834,25 @@ class DownloadManager(
         val checked = sets.filter { it.collection in recheck.collections && (it.members intersect recheck.members).all { m -> m in fetched } }
         val again = fetched.values.filter { it.metadataJson != null && !it.unavailable }
         return mutex.withLock {
-            if (checked.isNotEmpty()) collectionDao.markUnavailableChecked(checked.map { it.collection }, now)
-            if (again.isEmpty()) return@withLock 0
-            adjustUnavailableLocked(gone = emptySet(), playableAgain = again.mapTo(HashSet()) { it.uri })
-            val current = again.map { it.uri }.chunked(SQL_CHUNK).flatMap { dao.statesOf(it) }.associate { it.uri to it.state }
-            val fresh = again.filter { current[it.uri] == null }
+            // The lookup ran without the lock: re-read what the collections record now, before
+            // adjustUnavailableLocked takes these members out of the sets.
+            val live = collectionDao.getAll()
+            val liveUris = live.mapTo(HashSet()) { it.uri }
+            val stillChecked = checked.map { it.collection }.filter { it in liveUris }
+            if (stillChecked.isNotEmpty()) collectionDao.markUnavailableChecked(stillChecked, now)
+            val confirmed = DownloadRules.confirmRecheck(again.map { it.uri }, live.map { decodeItems(it.unavailableUrisJson) }).toHashSet()
+            val queue = again.filter { it.uri in confirmed }
+            if (queue.isEmpty()) return@withLock 0
+            adjustUnavailableLocked(gone = emptySet(), playableAgain = confirmed)
+            val current = queue.map { it.uri }.chunked(SQL_CHUNK).flatMap { dao.statesOf(it) }.associate { it.uri to it.state }
+            val fresh = queue.filter { current[it.uri] == null }
             val quality = settings.awaitLoaded().downloadQuality.kbps
             database.withTransaction {
                 insertRows(fresh, quality, individual = false, now = now)
-                again.filter { current[it.uri] == DownloadState.FAILED }.map { it.uri }.chunked(SQL_CHUNK).forEach { dao.requeueFailedOnly(it) }
+                queue.filter { current[it.uri] == DownloadState.FAILED }.map { it.uri }.chunked(SQL_CHUNK).forEach { dao.requeueFailedOnly(it) }
             }
-            Log.i(TAG, "${again.size} members recorded as unavailable are playable again: queued")
-            again.size
+            Log.i(TAG, "${queue.size} members recorded as unavailable are playable again: queued")
+            queue.size
         }
     }
 
