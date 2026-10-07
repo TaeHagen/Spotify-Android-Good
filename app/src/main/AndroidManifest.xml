@@ -128,6 +128,11 @@
             android:name=".playback.PlaybackActionReceiver"
             android:exported="false" />
 
+        <!-- Sleep timer wake-up alarm (counts time while the CPU sleeps); not exported -->
+        <receiver
+            android:name=".playback.SleepTimerAlarmReceiver"
+            android:exported="false" />
+
         <!-- Artwork for Android Auto / notification (content:// URIs) -->
         <provider
             android:name=".playback.ArtworkProvider"
