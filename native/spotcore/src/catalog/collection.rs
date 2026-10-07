@@ -266,17 +266,25 @@ pub(crate) fn sort_items(items: &mut Vec<CollItem>) {
 }
 
 fn patch_snapshot(set: Set, uris: &[String], removed: bool) {
-    let mut snaps = SNAPSHOTS.lock();
-    if let Some(s) = snaps.get_mut(&set) {
-        let mut items: Vec<CollItem> = s.items.iter().filter(|i| !uris.contains(&i.uri)).cloned().collect();
-        if !removed {
-            let now = now_ms() / 1000;
-            let mut added: Vec<CollItem> = uris.iter().map(|u| CollItem { uri: u.clone(), added_at: now }).collect();
-            added.extend(items);
-            items = added;
-        }
-        s.items = Arc::new(items);
+    if let Some(s) = SNAPSHOTS.lock().get_mut(&set) {
+        s.items = Arc::new(patched(&s.items, uris, removed));
     }
+    if set == Set::Collection {
+        let tracks: Vec<String> = uris.iter().filter(|u| parse_kind(u, UriKind::Track).is_some()).cloned().collect();
+        if let Some(s) = LIKED_FALLBACK.lock().as_mut().filter(|_| !tracks.is_empty()) {
+            s.items = Arc::new(patched(&s.items, &tracks, removed));
+        }
+    }
+}
+
+/// `items` with `uris` removed, or moved/added to the front (newest) when saved.
+fn patched(items: &[CollItem], uris: &[String], removed: bool) -> Vec<CollItem> {
+    let rest = items.iter().filter(|i| !uris.contains(&i.uri)).cloned();
+    if removed {
+        return rest.collect();
+    }
+    let now = now_ms() / 1000;
+    uris.iter().map(|u| CollItem { uri: u.clone(), added_at: now }).chain(rest).collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -301,7 +309,8 @@ async fn contains_set(session: &Session, user: &str, set: Set, uris: &[String]) 
                 log::info!("collection contains failed ({e}); using the set snapshot");
                 let snap = match cached(set, CONTAINS_FALLBACK_AGE) {
                     Some(s) => s,
-                    None if e.code == ErrorCode::Network => return Err(e),
+                    // Throttled or offline: downloading the whole set would only make it worse.
+                    None if stops_fallback(&e) => return Err(e),
                     None => snapshot(session, set, CONTAINS_FALLBACK_AGE).await?,
                 };
                 let have: HashSet<&str> = snap.iter().map(|i| i.uri.as_str()).collect();
@@ -506,34 +515,77 @@ fn window_uris(page: &[CollItem]) -> Vec<String> {
     page.iter().map(|i| i.uri.clone()).collect()
 }
 
-async fn liked_from_context(session: &Session, offset: u32, limit: u32) -> AppResult<(u32, Vec<CollItem>)> {
-    let user = username(session)?;
-    let items = context::resolve(session, &format!("spotify:user:{user}:collection"), 20_000, 200).await?;
+/// Errors after which trying another source is pointless or harmful (offline, throttled,
+/// cancelled, logged out): they are returned instead of starting a fallback.
+fn stops_fallback(e: &AppError) -> bool {
+    matches!(e.code, ErrorCode::NotLoggedIn | ErrorCode::Network | ErrorCode::RateLimited | ErrorCode::Cancelled)
+}
+
+/// Liked Songs from context-resolve while `collection/v2/paging` fails. Tracks only, so it is
+/// kept apart from the `collection` snapshot (which also holds the saved albums); same TTL.
+static LIKED_FALLBACK: LazyLock<Mutex<Option<Snapshot>>> = LazyLock::new(|| Mutex::new(None));
+static LIKED_FALLBACK_LOAD: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+const LIKED_CONTEXT_MAX_ITEMS: usize = 20_000;
+const LIKED_CONTEXT_MAX_PAGES: usize = 200;
+
+fn cached_liked_fallback() -> Option<Arc<Vec<CollItem>>> {
+    LIKED_FALLBACK.lock().as_ref().filter(|s| s.at.elapsed() < LIST_MAX_AGE).map(|s| s.items.clone())
+}
+
+/// Liked Songs (newest first) from context items: tracks only, deduplicated.
+pub(crate) fn liked_items(items: Vec<context::ContextItem>) -> Vec<CollItem> {
     let mut list: Vec<CollItem> = items
         .into_iter()
         .filter(|i| i.uri.starts_with("spotify:track:"))
-        .map(|i| CollItem {
-            added_at: i.metadata.get("added_at").and_then(|s| s.parse().ok()).unwrap_or(0),
-            uri: i.uri,
-        })
+        .map(|i| CollItem { added_at: i.metadata.get("added_at").and_then(|s| s.parse().ok()).unwrap_or(0), uri: i.uri })
         .collect();
-    let mut seen = HashSet::new();
-    list.retain(|i| seen.insert(i.uri.clone()));
-    Ok(window(&list, UriKind::Track, offset, limit))
+    sort_items(&mut list);
+    list
+}
+
+/// The whole Liked Songs list from context-resolve, resolved once per [`LIST_MAX_AGE`] (loads
+/// coalesced) so paging does not re-resolve it for every page.
+async fn liked_from_context(session: &Session) -> AppResult<Arc<Vec<CollItem>>> {
+    if let Some(s) = cached_liked_fallback() {
+        return Ok(s);
+    }
+    let _guard = LIKED_FALLBACK_LOAD.lock().await;
+    if let Some(s) = cached_liked_fallback() {
+        return Ok(s);
+    }
+    let user = username(session)?;
+    // Fails when a page fails: a truncated list would read as songs that are no longer liked.
+    let context_uri = format!("spotify:user:{user}:collection");
+    let items = context::resolve(session, &context_uri, LIKED_CONTEXT_MAX_ITEMS, LIKED_CONTEXT_MAX_PAGES).await?;
+    let list = Arc::new(liked_items(items));
+    *LIKED_FALLBACK.lock() = Some(Snapshot { items: list.clone(), at: Instant::now() });
+    Ok(list)
+}
+
+/// Liked Songs: the `collection` snapshot, or the context-resolve fallback when paging fails
+/// (not for transport errors). While a fallback list is fresh, the failing request is skipped.
+async fn liked_songs(session: &Session) -> AppResult<Arc<Vec<CollItem>>> {
+    if let Some(s) = cached(Set::Collection, LIST_MAX_AGE) {
+        return Ok(s);
+    }
+    if let Some(s) = cached_liked_fallback() {
+        return Ok(s);
+    }
+    match snapshot(session, Set::Collection, LIST_MAX_AGE).await {
+        Ok(s) => Ok(s),
+        Err(e) if stops_fallback(&e) => Err(e),
+        Err(e) => {
+            log::warn!("collection paging failed ({e}); falling back to context-resolve");
+            liked_from_context(session).await
+        }
+    }
 }
 
 pub(crate) async fn tracks(args: Value) -> AppResult<Value> {
     let a: PageArgs = parse_args(args)?;
     let limit = a.limit.clamp(1, MAX_LIMIT);
     let session = engine::session()?;
-    let (total, page) = match snapshot(&session, Set::Collection, LIST_MAX_AGE).await {
-        Ok(s) => window(&s, UriKind::Track, a.offset, limit),
-        Err(e) if e.code == ErrorCode::NotLoggedIn || e.code == ErrorCode::Network => return Err(e),
-        Err(e) => {
-            log::warn!("collection paging failed ({e}); falling back to context-resolve");
-            liked_from_context(&session, a.offset, limit).await?
-        }
-    };
+    let (total, page) = window(&liked_songs(&session).await?, UriKind::Track, a.offset, limit);
     if a.uris_only {
         let uris: Vec<&str> = page.iter().map(|i| i.uri.as_str()).collect();
         return Ok(json!({ "total": total, "items": [], "uris": uris }));
@@ -739,6 +791,32 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v["items"][0]["album"]["uri"], album);
+    }
+
+    #[test]
+    fn liked_songs_fallback_is_cached_patched_and_skipped_on_transport_errors() {
+        let item = |uri: &str, at: &str| context::ContextItem {
+            uri: uri.into(),
+            uid: None,
+            metadata: [("added_at".to_string(), at.to_string())].into_iter().collect(),
+        };
+        let (a, b) = ("spotify:track:4uLU6hMCjMI75M1A2tKUQC", "spotify:track:7GhIk7Il098yCjg4BQjzvb");
+        let list = liked_items(vec![item(a, "10"), item("spotify:episode:512ojhOuo1ktJprKbVcKyQ", "30"), item(b, "20"), item(a, "10")]);
+        assert_eq!(list.iter().map(|i| i.uri.as_str()).collect::<Vec<_>>(), [b, a], "tracks only, deduplicated, newest first");
+
+        *LIKED_FALLBACK.lock() = Some(Snapshot { items: Arc::new(list), at: Instant::now() });
+        assert_eq!(cached_liked_fallback().map(|s| s.len()), Some(2));
+        // Likes and unlikes show up in the fallback list too (albums do not).
+        patch_snapshot(Set::Collection, &[b.to_string(), "spotify:album:6XhjNHCyCDyyGJRM5mg40G".into()], true);
+        assert_eq!(cached_liked_fallback().unwrap().iter().map(|i| i.uri.as_str()).collect::<Vec<_>>(), [a]);
+        patch_snapshot(Set::Collection, &[b.to_string()], false);
+        assert_eq!(cached_liked_fallback().unwrap()[0].uri, b);
+        *LIKED_FALLBACK.lock() = None;
+
+        for code in [ErrorCode::Network, ErrorCode::RateLimited, ErrorCode::Cancelled, ErrorCode::NotLoggedIn] {
+            assert!(stops_fallback(&AppError::new(code, "x")), "{code:?}");
+        }
+        assert!(!stops_fallback(&AppError::unavailable("403")));
     }
 
     #[test]
