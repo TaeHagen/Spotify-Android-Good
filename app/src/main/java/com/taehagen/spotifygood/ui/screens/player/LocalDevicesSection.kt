@@ -41,6 +41,7 @@ import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.connect.LocalConnectDevice
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.ui.appViewModel
 import kotlinx.coroutines.CancellationException
@@ -66,8 +67,54 @@ internal data class LocalDevicesUiState(
 internal sealed interface LocalConnectEvent {
     val sheet: String
 
+    /** Logged in and playing there (the sheet closes). */
     data class Connected(override val sheet: String) : LocalConnectEvent
+
+    /** Logged in, but nothing was playing and there was no saved session to start there. */
+    data class Ready(override val sheet: String, val deviceName: String) : LocalConnectEvent
+
+    /** `connect.localLogin` failed: the device did not join the account. */
     data class Failed(override val sheet: String, val deviceName: String, val network: Boolean) : LocalConnectEvent
+
+    /** The device joined the account, but moving playback to it failed. */
+    data class TransferFailed(override val sheet: String, val deviceName: String, val network: Boolean) : LocalConnectEvent
+}
+
+/**
+ * Logs a LAN device in ([login], returning its Connect id), then moves playback there
+ * ([transfer], which starts the saved session when nothing is active). The two steps are judged
+ * separately: a transfer with nothing to play or resume (NOT_ACTIVE_DEVICE) still means the
+ * device was added, so it is [LocalConnectEvent.Ready], not a failure.
+ */
+internal suspend fun connectLocalDevice(
+    sheet: String,
+    deviceName: String,
+    login: suspend () -> String,
+    transfer: suspend (String) -> Unit,
+): LocalConnectEvent {
+    val deviceId = try {
+        login()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: NativeException) {
+        return LocalConnectEvent.Failed(sheet, deviceName, e.isNetwork)
+    } catch (e: Exception) {
+        return LocalConnectEvent.Failed(sheet, deviceName, network = false)
+    }
+    return try {
+        transfer(deviceId)
+        LocalConnectEvent.Connected(sheet)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: NativeException) {
+        if (e.code == NativeErrorCode.NOT_ACTIVE_DEVICE) {
+            LocalConnectEvent.Ready(sheet, deviceName)
+        } else {
+            LocalConnectEvent.TransferFailed(sheet, deviceName, e.isNetwork)
+        }
+    } catch (e: Exception) {
+        LocalConnectEvent.TransferFailed(sheet, deviceName, network = false)
+    }
 }
 
 internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
@@ -119,15 +166,15 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
         viewModelScope.launch {
             connecting.value = device.deviceId
             try {
-                val deviceId = discovery.login(device)
-                devicesRepository.transferTo(deviceId)
-                eventChannel.trySend(LocalConnectEvent.Connected(sheet))
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: NativeException) {
-                eventChannel.trySend(LocalConnectEvent.Failed(sheet, device.name, e.isNetwork))
-            } catch (e: Exception) {
-                eventChannel.trySend(LocalConnectEvent.Failed(sheet, device.name, network = false))
+                // transferTo sends the saved session as `resume`, so it starts on the device
+                // when nothing is playing anywhere.
+                val event = connectLocalDevice(
+                    sheet = sheet,
+                    deviceName = device.name,
+                    login = { discovery.login(device) },
+                    transfer = { id -> devicesRepository.transferTo(id) },
+                )
+                eventChannel.trySend(event)
             } finally {
                 connecting.value = null
             }
@@ -147,12 +194,16 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
 internal class LocalDevicesHolder(
     private val stateValue: State<LocalDevicesUiState>,
     private val errorValue: State<String?>,
+    private val noticeValue: State<String?>,
     private val onConnect: (LocalConnectDevice) -> Unit,
 ) {
     val state: LocalDevicesUiState get() = stateValue.value
 
-    /** The last login failure of this sheet, if any. */
+    /** The last login or transfer failure of this sheet, if any. */
     val error: String? get() = errorValue.value
+
+    /** A non-error outcome to show (a device added with nothing to play yet). */
+    val notice: String? get() = noticeValue.value
 
     fun connect(device: LocalConnectDevice) = onConnect(device)
 }
@@ -170,6 +221,7 @@ internal fun rememberLocalDevices(sheet: String, onConnected: () -> Unit): Local
     val state = viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val error = remember(sheet) { mutableStateOf<String?>(null) }
+    val notice = remember(sheet) { mutableStateOf<String?>(null) }
     val currentOnConnected by rememberUpdatedState(onConnected)
 
     LifecycleStartEffect(viewModel, sheet) {
@@ -181,9 +233,17 @@ internal fun rememberLocalDevices(sheet: String, onConnected: () -> Unit): Local
         viewModel.events.filter { it.sheet == sheet }.collect { event ->
             when (event) {
                 is LocalConnectEvent.Connected -> currentOnConnected()
+                // The device is in the account now (listed under Connect devices): not a failure.
+                is LocalConnectEvent.Ready -> notice.value = context.getString(R.string.local_connect_ready, event.deviceName)
                 is LocalConnectEvent.Failed -> {
                     error.value = context.getString(
                         if (event.network) R.string.local_connect_login_failed_network else R.string.local_connect_login_failed,
+                        event.deviceName,
+                    )
+                }
+                is LocalConnectEvent.TransferFailed -> {
+                    error.value = context.getString(
+                        if (event.network) R.string.player_devices_transfer_failed_network else R.string.player_devices_transfer_failed,
                         event.deviceName,
                     )
                 }
@@ -192,8 +252,9 @@ internal fun rememberLocalDevices(sheet: String, onConnected: () -> Unit): Local
     }
 
     return remember(viewModel, sheet, state) {
-        LocalDevicesHolder(state, error) { device ->
+        LocalDevicesHolder(state, error, notice) { device ->
             error.value = null
+            notice.value = null
             viewModel.connect(device, sheet)
         }
     }
@@ -208,7 +269,8 @@ internal fun rememberLocalDevices(sheet: String, onConnected: () -> Unit): Local
 internal fun LocalDevicesSection(local: LocalDevicesHolder) {
     val state = local.state
     val error = local.error
-    if (state.devices.isEmpty() && error == null && !state.discovering) return
+    val notice = local.notice
+    if (state.devices.isEmpty() && error == null && notice == null && !state.discovering) return
 
     Column {
         Text(
@@ -241,6 +303,14 @@ internal fun LocalDevicesSection(local: LocalDevicesHolder) {
                     onClick = { local.connect(device) },
                 )
             }
+        }
+        notice?.let { message ->
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+            )
         }
         error?.let { message ->
             Text(
