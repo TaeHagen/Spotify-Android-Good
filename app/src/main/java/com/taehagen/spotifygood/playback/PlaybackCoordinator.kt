@@ -78,15 +78,15 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
     private val focus = AudioFocusController(
         app,
         object : AudioFocusController.Callbacks {
-            override fun pauseForFocus() = graph.player.pause()
-            override fun resumeAfterFocus() = graph.player.resume()
+            override fun pauseForFocus() = graph.player.pause(user = false)
+            override fun resumeAfterFocus() = graph.player.resume(user = false)
             override fun setDuck(ducked: Boolean) =
                 graph.audioSink.setDuckVolume(if (ducked) AudioFocusController.DUCK_VOLUME else 1f)
             override fun isSpeech(): Boolean = graph.playback.snapshot.value.track?.isEpisode == true
             override fun isPlayingLocally(): Boolean = sinkActive || graph.playback.snapshot.value.isLocallyActive()
         },
     )
-    private val noisy = BecomingNoisyReceiver(app) { graph.player.pause() }
+    private val noisy = BecomingNoisyReceiver(app) { graph.player.pause(user = false) }
     private val wakeLock = WakeLockManager(app, Looper.getMainLooper(), Clock.DEFAULT).apply { setEnabled(true) }
     private val wifiLock = WifiLockManager(app, Looper.getMainLooper(), Clock.DEFAULT).apply { setEnabled(true) }
 
@@ -271,7 +271,7 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
     fun refuseBackgroundPlayback() {
         if (refusedThisActivation) return
         refusedThisActivation = true
-        graph.player.pause()
+        graph.player.pause(user = false)
         ResumeAlert.post(app, graph.playback.snapshot.value.track?.name)
     }
 

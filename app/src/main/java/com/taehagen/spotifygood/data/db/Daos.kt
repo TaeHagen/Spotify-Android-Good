@@ -34,6 +34,19 @@ data class CollectionSyncRow(
     val syncFailures: Int,
 )
 
+/** What the offline index needs of a completed download (no metadata JSON). */
+data class IndexRow(
+    val uri: String,
+    val path: String?,
+    val recordJson: String?,
+    val encryptedKey: ByteArray?,
+    val keyVersion: Int,
+    val completedAt: Long?,
+) {
+    override fun equals(other: Any?) = other is IndexRow && other.uri == uri && other.completedAt == completedAt
+    override fun hashCode() = uri.hashCode()
+}
+
 /** Cover of a completed download. */
 data class UriImage(val uri: String, val imagePath: String)
 
@@ -218,6 +231,22 @@ interface DownloadDao {
 
     @Query("SELECT uri, state FROM downloads WHERE uri IN (:uris)")
     suspend fun statesOf(uris: List<String>): List<DownloadStateRow>
+
+    @Query("SELECT uri, path, recordJson, encryptedKey, keyVersion, completedAt FROM downloads WHERE state = 'completed' ORDER BY addedAt")
+    suspend fun completedIndexRows(): List<IndexRow>
+
+    @Query("SELECT uri, path, recordJson, encryptedKey, keyVersion, completedAt FROM downloads WHERE uri IN (:uris) AND state = 'completed'")
+    suspend fun completedIndexRows(uris: List<String>): List<IndexRow>
+
+    /**
+     * Moves a Keystore-sealed key (version 0) to the data key, only while the row is still the
+     * download that was read (not removed and downloaded again meanwhile).
+     */
+    @Query(
+        "UPDATE downloads SET encryptedKey = :key, keyVersion = 1 " +
+            "WHERE uri = :uri AND state = 'completed' AND completedAt = :completedAt AND keyVersion = 0",
+    )
+    suspend fun resealKey(uri: String, completedAt: Long, key: ByteArray)
 
     @Query("SELECT uri, imagePath FROM downloads WHERE state = 'completed' AND imagePath IS NOT NULL")
     suspend fun completedImages(): List<UriImage>

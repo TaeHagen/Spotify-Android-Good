@@ -33,11 +33,12 @@ class Converters {
 
 @Database(
     entities = [DownloadEntity::class, DownloadCollectionEntity::class, RecentSearchEntity::class, ResponseCacheEntity::class],
-    version = 4,
+    version = 5,
     exportSchema = true,
     // 3: download_collections gained lastAttemptAt, syncFailures and unavailableUrisJson.
     // 4: download_collections gained unavailableCheckedAt.
-    autoMigrations = [AutoMigration(from = 2, to = 3), AutoMigration(from = 3, to = 4)],
+    // 5: downloads gained keyVersion (audio keys sealed with the downloads' data key).
+    autoMigrations = [AutoMigration(from = 2, to = 3), AutoMigration(from = 3, to = 4), AutoMigration(from = 4, to = 5)],
 )
 @TypeConverters(Converters::class)
 abstract class AppDatabase : RoomDatabase() {
