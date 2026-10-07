@@ -120,6 +120,18 @@ class OfflineLoadsTest {
     }
 
     @Test
+    fun positionIsDroppedWhenTheRequestedTrackIsNotAmongTheDownloads() {
+        // Resume of album track 7 at 2:13; only tracks 1 and 2 are downloaded (7 was streamed).
+        val members = OfflineMembers(listOf(t(1), t(2)), setOf(t(1), t(2)))
+        val converted = load(OfflineLoads.plan(PlayRequest(contextUri = "spotify:album:a", startUri = t(7), positionMs = 133_000), members, EngineReach.OFFLINE))
+        assertEquals(0, converted.startIndex)
+        assertEquals(0L, converted.positionMs)
+        // A load without any start keeps its position (it applies to the first item it asked for).
+        val noStart = load(OfflineLoads.plan(PlayRequest(contextUri = playlist, positionMs = 5_000), members, EngineReach.OFFLINE))
+        assertEquals(5_000L, noStart.positionMs)
+    }
+
+    @Test
     fun indexOnlyStartNamesTheStartTrackForSpirc() {
         val members = OfflineMembers(listOf(t(1), t(2), t(3)), setOf(t(2), t(3)))
         val converted = load(OfflineLoads.plan(PlayRequest(contextUri = playlist, startIndex = 2), members, EngineReach.CONNECTING))

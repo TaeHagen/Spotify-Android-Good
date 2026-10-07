@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import android.util.Log
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
@@ -69,6 +70,7 @@ import kotlinx.coroutines.guava.future
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -96,6 +98,10 @@ class PlaybackService : MediaLibraryService() {
 
     /** Media3 currently keeps the service foreground with the media notification. */
     private var mediaForeground = false
+        set(value) {
+            field = value
+            isMediaForeground = value
+        }
     private var buttons: List<CommandButton> = emptyList()
     /**
      * The media foreground was refused while mirroring a remote device: until that changes (or the
@@ -142,6 +148,10 @@ class PlaybackService : MediaLibraryService() {
             .apply { sessionActivity()?.let(::setSessionActivity) }
             .setBitmapLoader(CacheBitmapLoader(CoilBitmapLoader(this, lifecycleScope)))
             .build()
+            // Media3 adds a session only when a controller binds (or for a media button). Our own
+            // starts (Tap to resume, background local audio) have no controller, and only an added
+            // session gets the media notification and the foreground promotion.
+            .also(::addSession)
 
         setListener(object : MediaSessionService.Listener {
             override fun onForegroundServiceStartNotAllowedException() = onForegroundStartNotAllowed()
@@ -153,23 +163,19 @@ class PlaybackService : MediaLibraryService() {
     override fun onGetSession(controllerInfo: ControllerInfo): MediaLibrarySession? = session
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
+        val action = intent?.action
+        // The service is exported (controllers, Auto): our own actions only count with the
+        // in-process token, never from another app's explicit intent.
+        val internal = action in INTERNAL_ACTIONS && intent?.getStringExtra(EXTRA_TOKEN) == token
+        if (action in INTERNAL_ACTIONS && !internal) Log.w(TAG, "Ignoring $action without the app's token")
+        when (action.takeIf { internal }) {
             ACTION_START_PRESENCE -> {
                 if (isPresenceWanted()) presence.enable(showNow = !mediaForeground)
                 if (!presence.isEnabled && !mediaForeground && !player.isPlaying) stopSelf(startId)
             }
-            ACTION_STOP_PRESENCE -> {
-                lifecycleScope.launch {
-                    runCatching { graph.settings.update { it.copy(connectPresence = false) } }
-                        .onFailure { Log.w(TAG, "Cannot turn off Connect presence", it) }
-                }
-                if (presence.disable()) afterPresenceDisabled()
-            }
             ACTION_RESUME -> {
                 ResumeAlert.cancel(this)
-                // Through the session player, so Media3 goes foreground right away (the tap's
-                // temporary allowlist is short) instead of waiting for the engine's snapshot.
-                if (player.mediaItemCount > 0) player.play() else graph.player.resume()
+                resumeFromAlert()
             }
             ACTION_LOCAL_PLAYBACK -> {
                 // Started with startForegroundService for audio that began in the background (a
@@ -231,6 +237,7 @@ class PlaybackService : MediaLibraryService() {
 
     override fun onDestroy() {
         isRunning = false
+        mediaForeground = false
         main.removeCallbacks(foregroundDeadline)
         coordinator.closeEffectSession()
         presence.release()
@@ -458,6 +465,28 @@ class PlaybackService : MediaLibraryService() {
         return PendingIntent.getActivity(this, REQUEST_SESSION, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
 
+    /**
+     * "Tap to resume". Through the session player so Media3 asks for the foreground right away
+     * (BUFFERING + play-when-ready), inside the tap's short allowlist, instead of after a cold
+     * engine start: the current items when there are some, else the stored session.
+     */
+    private fun resumeFromAlert() {
+        if (player.mediaItemCount > 0) {
+            player.play()
+            return
+        }
+        lifecycleScope.launch {
+            val last = resumeStore.read()
+            if (last == null) {
+                graph.player.resume()
+                return@launch
+            }
+            player.setMediaItem(tree.resumeItem(last, downloadedImages[last.trackUri]), last.positionMs)
+            player.prepare()
+            player.play()
+        }
+    }
+
     /** Media3 could not start the foreground service from the background (API 31+). */
     private fun onForegroundStartNotAllowed() {
         val s = graph.playback.snapshot.value
@@ -561,26 +590,36 @@ class PlaybackService : MediaLibraryService() {
     private inner class LibraryCallback : MediaLibrarySession.Callback {
 
         override fun onConnectAsync(session: MediaSession, controller: ControllerInfo): ListenableFuture<ConnectionResult> {
-            val builder = ConnectionResult.AcceptedResultBuilder(session, controller)
+            val builder = ConnectionResult.AcceptedResultBuilder(session)
             if (isTrusted(session, controller)) {
                 val commands = ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon()
                 PlaybackSessionCommands.ALL.forEach { commands.add(it) }
                 builder.setAvailableSessionCommands(commands.build())
                     .setAvailablePlayerCommands(ConnectionResult.DEFAULT_PLAYER_COMMANDS)
                     .setMediaButtonPreferences(buttons)
+            } else {
+                // Unknown apps: read-only player state, no library (the user's playlists, Liked
+                // Songs and recent searches are not for any installed app to read).
+                builder.setAvailableSessionCommands(ConnectionResult.DEFAULT_UNTRUSTED_SESSION_COMMANDS)
+                    .setAvailablePlayerCommands(ConnectionResult.DEFAULT_UNTRUSTED_PLAYER_COMMANDS)
             }
-            // Others (unknown third-party apps) get Media3's read-only defaults.
             return Futures.immediateFuture(builder.build())
         }
 
+        /**
+         * SysUI / notification-listener apps (Media3's `isTrusted`: MEDIA_CONTENT_CONTROL or an
+         * enabled notification listener), the media notification, Auto / Automotive, our own process
+         * (the app's controller, media buttons dispatched through the legacy session) and the known
+         * system packages — by package name only when Media3 verified it against the caller's uid.
+         * Connection hints are never trusted: any app can set them.
+         */
         private fun isTrusted(session: MediaSession, controller: ControllerInfo): Boolean =
             controller.isTrusted ||
                 session.isMediaNotificationController(controller) ||
                 session.isAutomotiveController(controller) ||
                 session.isAutoCompanionController(controller) ||
-                controller.packageName in TRUSTED_PACKAGES ||
-                controller.connectionHints.getString(MediaSessionService.CONNECTION_HINT_KEY_CONTROLLER_INFO_TYPE) ==
-                Intent.ACTION_MEDIA_BUTTON
+                controller.uid == Process.myUid() ||
+                (controller.isPackageNameVerified && controller.packageName in TRUSTED_PACKAGES)
 
         override fun onCustomCommand(
             session: MediaSession,
@@ -764,9 +803,7 @@ class PlaybackService : MediaLibraryService() {
 
         /** Start (while the app is visible) to bring up the opt-in Connect presence. */
         const val ACTION_START_PRESENCE = "com.taehagen.spotifygood.playback.START_PRESENCE"
-        /** "Stop" action of the presence notification: turns the setting off. */
-        const val ACTION_STOP_PRESENCE = "com.taehagen.spotifygood.playback.STOP_PRESENCE"
-        /** "Tap to resume" after a refused background start. */
+        /** "Tap to resume" after a refused background start (forwarded by [PlaybackActionReceiver]). */
         const val ACTION_RESUME = "com.taehagen.spotifygood.playback.RESUME"
         /**
          * Sent with `startForegroundService` by [PlaybackCoordinator] when local audio starts
@@ -795,6 +832,24 @@ class PlaybackService : MediaLibraryService() {
             "com.google.android.apps.wear.companion",
             "com.google.android.apps.automotive.media",
         )
+
+        private const val EXTRA_TOKEN = "com.taehagen.spotifygood.playback.extra.TOKEN"
+        private val INTERNAL_ACTIONS = setOf(ACTION_START_PRESENCE, ACTION_RESUME, ACTION_LOCAL_PLAYBACK)
+
+        /**
+         * Unguessable per-process proof that an intent comes from this app: the service must be
+         * exported, and a service cannot see who started it. Intents that outlive the process
+         * (notification actions) go through the non-exported [PlaybackActionReceiver] instead.
+         */
+        private val token: String = ByteArray(16).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
+
+        /** An intent for one of our own actions ([ACTION_START_PRESENCE], [ACTION_RESUME], [ACTION_LOCAL_PLAYBACK]). */
+        internal fun internalIntent(context: Context, action: String): Intent =
+            Intent(context, PlaybackService::class.java).setAction(action).putExtra(EXTRA_TOKEN, token)
+
+        /** True while Media3 keeps the service in the foreground with the media notification. */
+        @Volatile var isMediaForeground: Boolean = false
+            private set
 
         /** True between [onCreate] and [onDestroy]. */
         @Volatile var isRunning: Boolean = false

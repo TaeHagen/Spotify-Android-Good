@@ -669,19 +669,32 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `playback` error events). `prepare()` clears it. Browsing logged out / without Premium
   returns the matching `SessionError`.
 * Cold start: commands that start playback wait (≤ 15 s, outside their timeout; a pause cancels
-  the wait) while the session is starting with a network; play/resume fall back to the
-  `ResumeStore` session on NOT_ACTIVE_DEVICE, NOT_CONNECTED (not while mirroring a remote
-  device) and UNAVAILABLE while connecting. Auto browse/search/voice wait the same way.
-* `onConnectAsync` grants commands to the notification, SysUI, Auto/AAOS, Wear and the
-  app's own controller; others get read-only.
+  every start queued before it while the session is starting) while the session is starting
+  with a network; play/resume fall back to the `ResumeStore` session on NOT_ACTIVE_DEVICE,
+  NOT_CONNECTED (not while mirroring a remote device) and UNAVAILABLE while connecting — but
+  never right after a load: a play following a paused `player.load` (Media3 setMediaItems +
+  play) is merged into it, or waits ≤ 3 s for the activation, and is dropped if the load failed.
+  Plain track-list contexts (`spotify:web-api`) are never resumed or loaded as a context.
+  Auto browse/search/voice wait the same way.
+* `onConnectAsync` grants full commands to Media3-trusted controllers (MEDIA_CONTENT_CONTROL /
+  notification listener: SysUI, Bluetooth, watch apps), the media notification, Auto/AAOS, our
+  own uid and known system packages (package name verified by Media3); connection hints are not
+  trusted. Others get read-only player state and no library commands.
+* The session is added to the service in `onCreate` (Media3 adds it only on a controller bind),
+  so our own starts get the notification and the foreground. The exported service accepts its
+  internal actions (START_PRESENCE, RESUME, LOCAL_PLAYBACK) only with a per-process token;
+  notification actions (Tap to resume, presence Stop) go through the non-exported
+  `PlaybackActionReceiver`.
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata) persisted on pause and every 15 s while playing.
 * Foreground: Media3 default (10 min after pause, then notification becomes dismissable).
   Local audio never plays without it: local audio starting in the background with no service
   (remote "play on this phone" during the idle grace or a download) starts the service with
-  `startForegroundService` (focus waits for the foreground); refused, or not foreground within
-  5 s → pause + "Tap to resume" (`ResumeAlert`). `onForegroundServiceStartNotAllowedException`
+  `startForegroundService` (focus waits for the foreground, also when a running service is not in
+  the foreground while the app is in the background); refused, or not foreground within 5 s →
+  pause + "Tap to resume" (`ResumeAlert`; the tap starts the stored session through the session
+  player so Media3 goes foreground at once). `onForegroundServiceStartNotAllowedException`
   → for local playback pause + "Tap to resume"; while mirroring a remote device the notification
   is posted without the foreground (the remote device is never paused).
   `onTaskRemoved` default behaviour. Engine holder released when the service is destroyed.

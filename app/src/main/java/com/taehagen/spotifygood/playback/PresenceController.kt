@@ -115,10 +115,10 @@ internal class PresenceController(private val service: Service, private val grap
     }
 
     private fun buildNotification(): Notification {
-        val stop = PendingIntent.getService(
+        val stop = PendingIntent.getBroadcast(
             service,
             REQUEST_STOP,
-            Intent(service, PlaybackService::class.java).setAction(PlaybackService.ACTION_STOP_PRESENCE),
+            PlaybackActionReceiver.intent(service, PlaybackActionReceiver.ACTION_STOP_PRESENCE),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val open = service.packageManager.getLaunchIntentForPackage(service.packageName)?.let { launch ->

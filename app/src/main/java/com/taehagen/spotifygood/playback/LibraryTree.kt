@@ -101,9 +101,9 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
                 .mapNotNull { entry ->
                     entry.uri?.let { contextItem(it, entry.name, entry.owner?.displayName ?: entry.owner?.username, entry.images, MediaMetadata.MEDIA_TYPE_PLAYLIST) }
                 }
-            ALBUMS -> graph.library.albums().settle().orEmpty().map { albumItem(it.album) }
-            ARTISTS -> graph.library.artists().settle().orEmpty().map { artistItem(it.artist) }
-            PODCASTS -> graph.library.shows().settle().orEmpty().map { showItem(it.show) }
+            ALBUMS -> graph.library.albums().settle().orEmpty().mapNotNull { albumItem(it.album) }
+            ARTISTS -> graph.library.artists().settle().orEmpty().mapNotNull { artistItem(it.artist) }
+            PODCASTS -> graph.library.shows().settle().orEmpty().mapNotNull { showItem(it.show) }
             DOWNLOADS -> downloads()
             BROWSE -> browse()
             else -> contextChildren(parentId)
@@ -128,7 +128,7 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
 
     private suspend fun likedSongs(): List<MediaItem> {
         val likedUri = likedContextUri()
-        return graph.library.likedTracks(0, MAX_ITEMS).items.map { saved -> trackItem(saved.track, likedUri) }
+        return graph.library.likedTracks(0, MAX_ITEMS).items.mapNotNull { saved -> trackItem(saved.track, likedUri) }
     }
 
     /** Newest download first, the order [com.taehagen.spotifygood.download.DownloadManager.downloadedUris] plays them in. */
@@ -162,7 +162,7 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
             .filterIsInstance<RecentSearch.Item>()
             .mapNotNull { mediaRefItem(it.ref, recentTitle) }
         val artistsTitle = context.getString(R.string.playback_artists)
-        val artists = graph.library.artists().settle().orEmpty().take(BROWSE_ARTISTS).map { artistItem(it.artist, artistsTitle) }
+        val artists = graph.library.artists().settle().orEmpty().take(BROWSE_ARTISTS).mapNotNull { artistItem(it.artist, artistsTitle) }
         return (recent + artists).distinctBy { it.mediaId }
     }
 
@@ -172,16 +172,16 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
             item.track?.let { trackItem(it, uri) } ?: item.episode?.let { episodeItem(it, uri) }
         }
         uri.startsWith("spotify:album:") -> graph.catalog.album(uri).settle()?.let { album ->
-            album.tracks.map { trackItem(it, uri, fallbackImages = album.images) }
+            album.tracks.mapNotNull { trackItem(it, uri, fallbackImages = album.images) }
         }
         uri.startsWith("spotify:artist:") -> graph.catalog.artist(uri).settle()?.let { artist ->
             val popular = context.getString(R.string.playback_popular)
             val albums = context.getString(R.string.playback_albums)
-            artist.topTracks.map { trackItem(it, uri, group = popular) } +
-                (artist.albums + artist.singles).map { albumItem(it, albums) }
+            artist.topTracks.mapNotNull { trackItem(it, uri, group = popular) } +
+                (artist.albums + artist.singles).mapNotNull { albumItem(it, albums) }
         }
         uri.startsWith("spotify:show:") -> graph.catalog.show(uri).settle()?.let { show ->
-            show.episodes.map { episodeItem(it, uri, fallbackImages = show.images) }
+            show.episodes.mapNotNull { episodeItem(it, uri, fallbackImages = show.images) }
         }
         uri.endsWith(":collection") -> likedSongs()
         else -> null
@@ -273,12 +273,12 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         val top = r.topResult?.let { mediaRefItem(it, context.getString(R.string.playback_top_result)) }
         return (
             listOfNotNull(top) +
-                r.tracks.map { trackItem(it, it.album?.uri, group = songs) } +
-                r.artists.map { artistItem(it, artists) } +
-                r.albums.map { albumItem(it, albums) } +
-                r.playlists.map { playlistItem(it, playlists) } +
-                r.shows.map { showItem(it, podcasts) } +
-                r.episodes.map { episodeItem(it, null, group = podcasts) }
+                r.tracks.mapNotNull { trackItem(it, it.album?.uri, group = songs) } +
+                r.artists.mapNotNull { artistItem(it, artists) } +
+                r.albums.mapNotNull { albumItem(it, albums) } +
+                r.playlists.mapNotNull { playlistItem(it, playlists) } +
+                r.shows.mapNotNull { showItem(it, podcasts) } +
+                r.episodes.mapNotNull { episodeItem(it, null, group = podcasts) }
             ).distinctBy { it.mediaId }
     }
 
@@ -382,7 +382,10 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
     private fun showItem(show: ShowRef, group: String? = null) =
         contextItem(show.uri, show.name, show.publisher, show.images, MediaMetadata.MEDIA_TYPE_PODCAST, group)
 
-    /** A Spotify context: browsable (its tracks) and playable ("play all"). */
+    /**
+     * A Spotify context: browsable (its tracks) and playable ("play all"). Null for a uri-only
+     * placeholder (its metadata could not be loaded: no name), which would be an empty row.
+     */
     private fun contextItem(
         uri: String,
         title: String,
@@ -390,7 +393,7 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         images: List<Image>,
         mediaType: Int,
         group: String? = null,
-    ): MediaItem = MediaItem.Builder()
+    ): MediaItem? = if (isPlaceholder(title)) null else MediaItem.Builder()
         .setMediaId(uri)
         .setMediaMetadata(
             MediaMetadata.Builder()
@@ -406,7 +409,8 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         )
         .build()
 
-    private fun trackItem(track: Track, contextUri: String?, group: String? = null, fallbackImages: List<Image> = emptyList()): MediaItem =
+    /** Null for a placeholder (see [playable]); an unplayable track is listed but not playable. */
+    private fun trackItem(track: Track, contextUri: String?, group: String? = null, fallbackImages: List<Image> = emptyList()): MediaItem? =
         playable(
             mediaId = contextUri?.let { MediaIds.inContext(it, track.uri) } ?: track.uri,
             title = track.name,
@@ -417,9 +421,10 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
             group = group,
             album = track.album?.name,
             durationMs = track.durationMs.takeIf { it > 0 },
+            isPlayable = track.playable,
         )
 
-    private fun episodeItem(episode: Episode, contextUri: String?, group: String? = null, fallbackImages: List<Image> = emptyList()): MediaItem =
+    private fun episodeItem(episode: Episode, contextUri: String?, group: String? = null, fallbackImages: List<Image> = emptyList()): MediaItem? =
         playable(
             mediaId = contextUri?.let { MediaIds.inContext(it, episode.uri) } ?: episode.uri,
             title = episode.name,
@@ -430,8 +435,14 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
             group = group,
             album = episode.show?.name,
             durationMs = episode.durationMs.takeIf { it > 0 },
+            isPlayable = episode.playable,
         )
 
+    /**
+     * A track / episode row. Null for a uri-only placeholder (partial catalog page: its metadata
+     * could not be loaded, so it has no name) — the phone shows those as "Unavailable"; a row with
+     * no title in the car would only be confusing.
+     */
     private fun playable(
         mediaId: String,
         title: String?,
@@ -443,7 +454,9 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         album: String? = null,
         durationMs: Long? = null,
         extras: Bundle? = null,
-    ): MediaItem {
+        isPlayable: Boolean = true,
+    ): MediaItem? {
+        if (isPlaceholder(title)) return null
         val bundle = (extras ?: Bundle()).apply {
             if (explicit) putLong(MediaConstants.EXTRAS_KEY_IS_EXPLICIT, MediaConstants.EXTRAS_VALUE_ATTRIBUTE_PRESENT)
             group?.let { putString(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_GROUP_TITLE, it) }
@@ -459,7 +472,7 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
                     .setArtworkUri(artwork)
                     .setDurationMs(durationMs)
                     .setIsBrowsable(false)
-                    .setIsPlayable(true)
+                    .setIsPlayable(isPlayable)
                     .setMediaType(mediaType)
                     .setExtras(bundle.takeUnless { it.isEmpty })
                     .build(),
@@ -510,6 +523,9 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
          * cached it.
          */
         fun likedMediaId(likedContextUri: String?): String = likedContextUri ?: LIKED
+
+        /** A catalog item whose metadata failed to load is a uri-only placeholder without a name. */
+        fun isPlaceholder(name: String?): Boolean = name.isNullOrBlank()
 
         /** Whether the children of [parentId] come from the catalog (worth waiting for a starting session). */
         fun needsSession(parentId: String): Boolean = parentId !in LOCAL_PARENTS

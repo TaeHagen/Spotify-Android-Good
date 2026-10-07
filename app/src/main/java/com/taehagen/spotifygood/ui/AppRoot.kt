@@ -14,6 +14,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
@@ -152,8 +153,22 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
         BackgroundMessages.clear()
     }
 
+    /** The signed-in UI is composed ([exitMainSession] when it leaves, also on configuration changes). */
+    fun enterMainSession() = mainSessions.enter()
+
+    fun exitMainSession() = mainSessions.exit()
+
+    /**
+     * The root shows Login / Premium: releases a session that nothing shows any more. Covers a
+     * signed-in UI disposed by a configuration change while it was fading out (no release then).
+     */
+    fun releaseIdleMainSession() {
+        if (mainSessions.releaseIfIdle()) BackgroundMessages.clear()
+    }
+
     override fun onCleared() {
         mainSessions.clear()
+        BackgroundMessages.clear()
     }
 
     fun openLink(uri: String) {
@@ -314,6 +329,11 @@ fun AppRoot(modifier: Modifier = Modifier) {
             premiumRequired -> RootScreen.PREMIUM_REQUIRED
             else -> RootScreen.MAIN
         }
+        // Away from MAIN: a session that is no longer composed is released here. One still fading
+        // out is in use and releases itself when it leaves (MainSessionScope).
+        LaunchedEffect(screen) {
+            if (screen != RootScreen.MAIN) shell.releaseIdleMainSession()
+        }
         AnimatedContent(
             targetState = screen,
             transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(200)) },
@@ -343,8 +363,11 @@ private fun MainSessionScope(shell: ShellViewModel, content: @Composable () -> U
     val owner = remember(shell) { shell.mainSessionOwner() }
     val activity = LocalActivity.current
     DisposableEffect(owner) {
+        shell.enterMainSession()
         onDispose {
-            // A configuration change recomposes this content with the same (retained) session.
+            shell.exitMainSession()
+            // A configuration change recomposes this content with the same (retained) session; if
+            // the root left MAIN meanwhile, AppRoot releases it instead (releaseIdleMainSession).
             if (activity?.isChangingConfigurations != true) shell.releaseMainSession(owner)
         }
     }
