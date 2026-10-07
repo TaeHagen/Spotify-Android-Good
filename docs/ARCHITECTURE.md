@@ -356,7 +356,8 @@ active** → connect-state command to that device.
 
 `EngineSettings`: `{"bitrate":96|160|320,"normalize":true,"normalizePregain":"quiet|normal|loud",
 "autoplay":true,"gapless":true,"deviceName":"…","streamingCacheMb":1024,"offline":false,
-"filterExplicit":false}`. `filterExplicit` ("Hide explicit content") is OR-ed into the account's
+"filterExplicit":false,"connectVisible":true}`. `connectVisible`: listed as a Spotify Connect
+target (Spirc runs), see §8. `filterExplicit` ("Hide explicit content") is OR-ed into the account's
 own explicit filter (see §4.3); it can never turn the account's filter off.
 
 ### 6.2 Player (routed local/remote)
@@ -487,8 +488,21 @@ For a remote active device, smart shuffle is not supported (the command reports
 ## 8. Spotify Connect
 
 * **This phone as a target**: Spirc registers the device via the dealer; other devices see
-  it while the engine is Online. Remote commands, transfers and volume arrive through
-  Spirc. `auto_takeover` is off: the phone never starts audio on its own at launch.
+  it while the engine is Online **and** `EngineSettings.connectVisible` is true. Remote
+  commands, transfers and volume arrive through Spirc. `auto_takeover` is off: the phone never
+  starts audio on its own at launch.
+* **Visibility**: the phone is listed only while it can play. Kotlin sets `connectVisible`
+  while a UI (app in the foreground), PLAYBACK or PRESENCE holder is held; a DOWNLOAD holder
+  alone and the idle grace keep it hidden. Hidden, the supervisor connects the Session without
+  Spirc (catalog, downloads and tokens keep working, `connect` routes as if not online).
+  Becoming hidden shuts Spirc down (it disconnects, deletes its connect state and closes the
+  dealer, so the device leaves the cluster) and keeps the Session. Becoming visible reconnects
+  with a new Session + Spirc: `Spirc::new` performs the login itself and a Session's dealer
+  can be launched only once, so Spirc can't be added to a connected Session. These reconnects
+  don't count against the reconnect limit.
+* **Device name**: a rename (`EngineSettings.deviceName`) reconnects Session + Spirc so other
+  devices see the new name, at once unless this phone is the active device and playing (then
+  as soon as it isn't); a hidden session uses the new name when it becomes visible.
 * **Controlling others**: device list and remote player state come from
   `Spirc::subscribe_cluster()`. Commands go to
   `POST /connect-state/v1/player/command/from/{me}/to/{target}` with bodies
@@ -766,16 +780,16 @@ current track is cached in memory (LRU) and refreshed via `library.contains`.
 
 ## 10. Lifecycle & battery policy (summary)
 
-| Situation | Native session | FGS | Locks |
-|---|---|---|---|
-| App visible | Online | none unless playing | none |
-| Playing locally | Online (or offline mode) | mediaPlayback | wake + Wi-Fi |
-| Paused < 10 min | Online | mediaPlayback (Media3 timeout) | none |
-| Paused ≥ 10 min, app background | stopped 60 s after release | none | none |
-| Remote device playing, our session mirrors | Online | mediaPlayback | none |
-| Downloading | Online | dataSync (WorkManager) | Worker's |
-| Presence opt-in, idle | Online | connectedDevice (low-importance) | none |
-| Nothing | stopped | none | none |
+| Situation | Native session | Connect target | FGS | Locks |
+|---|---|---|---|---|
+| App visible | Online | yes | none unless playing | none |
+| Playing locally | Online (or offline mode) | yes | mediaPlayback | wake + Wi-Fi |
+| Paused < 10 min | Online | yes | mediaPlayback (Media3 timeout) | none |
+| Paused ≥ 10 min, app background | hidden, stopped 60 s after release | no | none | none |
+| Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
+| Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
+| Presence opt-in, idle | Online | yes | connectedDevice (low-importance) | none |
+| Nothing | stopped | no | none | none |
 
 ## 11. Feature checklist
 

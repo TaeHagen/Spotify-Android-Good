@@ -13,13 +13,14 @@
 //! new supervisor counts too, so Kotlin restarting the session can't undo the throttle.
 
 use super::backoff::{Backoff, RateLimiter};
-use super::connector::{self, Live};
+use super::connector::{self, Device, Live};
 use super::state::{self, shared, update_status};
 use super::{config, player_host};
 use crate::error::{AppError, ErrorCode};
 use crate::{connect, events};
 use crate::models::{EngineSettings, SessionState, User};
 use futures_util::FutureExt;
+use librespot_connect::SnapshotPlayStatus;
 use librespot_core::authentication::Credentials;
 use librespot_core::Session;
 use std::panic::AssertUnwindSafe;
@@ -111,6 +112,7 @@ pub(crate) fn spawn() -> SupervisorHandle {
         rx,
         backoff: Backoff::default(),
         first: true,
+        intentional: false,
         prefer_token: false,
         login_generation: state::login_generation(),
     };
@@ -149,10 +151,23 @@ struct Supervisor {
     backoff: Backoff,
     /// No attempt finished yet (state `connecting` instead of `reconnecting`).
     first: bool,
+    /// The next attempt is a deliberate reconnect (becoming visible to Spotify Connect, a device
+    /// rename): it isn't counted by the reconnect limit.
+    intentional: bool,
     /// Stored credentials were rejected: try the OAuth access token.
     prefer_token: bool,
     /// The login this supervisor was started with (`state::Login::generation`).
     login_generation: u64,
+}
+
+/// Resolves when the Spirc task of `device` ended; never for a hidden session.
+async fn spirc_ended(device: &mut Option<Device>) {
+    match device {
+        Some(device) => {
+            let _ = (&mut device.task).await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn no_network() -> AppError {
@@ -254,10 +269,13 @@ impl Supervisor {
         if super::settings().offline || !state::network_available() {
             return Phase::Gate;
         }
+        let intentional = std::mem::take(&mut self.intentional);
         let allowed = {
             let mut limiter = shared().reconnects.lock();
             let now = std::time::Instant::now();
-            if self.first {
+            if intentional {
+                true
+            } else if self.first {
                 // Always allowed (an explicit start), but counted.
                 limiter.record(now);
                 true
@@ -288,8 +306,15 @@ impl Supervisor {
                 return self.retry_after(e);
             }
         };
+        let visible = settings.connect_visible;
         let end = {
-            let attempt = connector::connect(&session, credentials, &settings);
+            let attempt = async {
+                if visible {
+                    connector::connect(&session, credentials, &settings).await
+                } else {
+                    connector::connect_hidden(&session, credentials).await
+                }
+            };
             tokio::pin!(attempt);
             loop {
                 tokio::select! {
@@ -370,15 +395,54 @@ impl Supervisor {
             }
             s.epoch += 1;
         });
-        log::info!("session online");
-        connect::after_online(live.generation);
+        log::info!("session online{}", if live.device.is_some() { "" } else { " (hidden from Spotify Connect)" });
+        if live.device.is_some() {
+            connect::after_online(live.generation);
+        }
     }
 
-    /// Intentional teardown followed by an immediate attempt (playback is restored).
+    /// Intentional teardown followed by an immediate attempt (local playback is restored).
     async fn reconnect(&mut self, live: Live) -> Phase {
         log::info!("reconnecting");
-        connector::teardown(live, true).await;
+        let restore = live.device.is_some();
+        connector::teardown(live, restore).await;
         Phase::Connect
+    }
+
+    /// Brings the Spotify Connect side in line with the settings: hides (Spirc shut down, the
+    /// Session kept) or asks for a reconnect (returns true) to become visible, or to apply a
+    /// device rename once this device isn't the active one playing.
+    async fn sync_device(&mut self, live: &mut Live, rename_pending: &mut bool) -> bool {
+        let visible = super::settings().connect_visible;
+        let Some(device) = live.device.as_ref() else {
+            // A hidden session gets the current name when it becomes visible.
+            *rename_pending = false;
+            if visible {
+                log::info!("becoming visible to Spotify Connect");
+                self.intentional = true;
+            }
+            return visible;
+        };
+        if !visible {
+            log::info!("hiding from Spotify Connect");
+            *rename_pending = false;
+            connector::hide(live).await;
+            return false;
+        }
+        if !*rename_pending {
+            return false;
+        }
+        let busy = {
+            let state = device.spirc.subscribe_state();
+            let snapshot = state.borrow();
+            snapshot.is_active && !matches!(snapshot.status, SnapshotPlayStatus::Stopped)
+        };
+        if busy {
+            return false; // applied once this device stops playing or isn't active any more
+        }
+        log::info!("reconnecting to apply the new device name");
+        self.intentional = true;
+        true
     }
 
     async fn online(&mut self, mut live: Live) -> Phase {
@@ -389,6 +453,7 @@ impl Supervisor {
         }
         let connected_at = std::time::Instant::now();
         let mut stable = false;
+        let mut rename_pending = false;
         let mut declared = false;
         let mut user_known = false;
         let mut verify_ticks = 0u32;
@@ -398,7 +463,7 @@ impl Supervisor {
         health.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = &mut live.task => {
+                _ = spirc_ended(&mut live.device) => {
                     self.backoff.note_uptime(connected_at, std::time::Instant::now());
                     let premium = connector::premium_error(&live.session);
                     log::warn!("spirc task ended (session invalid: {})", live.session.is_invalid());
@@ -419,6 +484,10 @@ impl Supervisor {
                         declared = true;
                         user_known = user.is_some();
                         self.declare_online(&live, user);
+                        // The visibility may have changed while connecting.
+                        if self.sync_device(&mut live, &mut rename_pending).await {
+                            return self.reconnect(live).await;
+                        }
                     }
                 }
                 _ = health.tick(), if declared => {
@@ -429,7 +498,7 @@ impl Supervisor {
                     if !stable {
                         stable = self.backoff.note_uptime(connected_at, std::time::Instant::now());
                     }
-                    if player_host::dead_generation().is_some() {
+                    if live.device.is_some() && player_host::dead_generation().is_some() {
                         return self.reconnect(live).await;
                     }
                     if live.session.is_invalid() {
@@ -442,6 +511,9 @@ impl Supervisor {
                     }
                     // Spirc may have overwritten the forced filter (a server attribute push).
                     super::sync_explicit_filter();
+                    if self.sync_device(&mut live, &mut rename_pending).await {
+                        return self.reconnect(live).await;
+                    }
                     if !user_known {
                         if let Some(user) = user_of(&live.session) {
                             user_known = true;
@@ -473,13 +545,21 @@ impl Supervisor {
                             return Phase::Gate;
                         }
                         if old.autoplay != new.autoplay {
-                            if let Err(e) = live.spirc.set_autoplay(new.autoplay) {
-                                log::warn!("autoplay setting not applied: {e}");
+                            if let Some(device) = &live.device {
+                                if let Err(e) = device.spirc.set_autoplay(new.autoplay) {
+                                    log::warn!("autoplay setting not applied: {e}");
+                                }
                             }
+                        }
+                        if old.device_name != new.device_name && live.device.is_some() {
+                            rename_pending = true;
+                        }
+                        if declared && self.sync_device(&mut live, &mut rename_pending).await {
+                            return self.reconnect(live).await;
                         }
                     }
                     Some(Msg::PlayerDead(generation)) => {
-                        if player_host::dead_generation() == Some(generation) {
+                        if live.device.is_some() && player_host::dead_generation() == Some(generation) {
                             return self.reconnect(live).await;
                         }
                     }

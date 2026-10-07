@@ -666,6 +666,10 @@ pub struct EngineSettings {
     pub offline: bool,
     /// "Hide explicit content": OR-ed into the account's own filter (`engine::explicit`).
     pub filter_explicit: bool,
+    /// Listed as a Spotify Connect target (Spirc runs). Kotlin sets it while the app is in the
+    /// foreground or a PLAYBACK / PRESENCE holder is held; otherwise the session runs without
+    /// Spirc (catalog and downloads keep working).
+    pub connect_visible: bool,
 }
 
 impl Default for EngineSettings {
@@ -681,6 +685,7 @@ impl Default for EngineSettings {
             streaming_cache_mb: 1024,
             offline: false,
             filter_explicit: false,
+            connect_visible: true,
         }
     }
 }

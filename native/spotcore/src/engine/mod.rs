@@ -459,11 +459,16 @@ fn apply_settings(new: EngineSettings) {
         return;
     }
     player_host::apply_settings(&old, &new);
-    if old.offline != new.offline || old.autoplay != new.autoplay {
+    if old.offline != new.offline
+        || old.autoplay != new.autoplay
+        || old.device_name != new.device_name
+        || old.connect_visible != new.connect_visible
+    {
+        // The supervisor applies them: offline mode, autoplay, Connect visibility (hide / show)
+        // and a rename (reconnects once this device isn't the active one playing).
         state::send_to_supervisor(Msg::Settings { old: old.clone() });
     }
     if old.device_name != new.device_name {
-        log::info!("device name change applies at the next connect");
         connect::on_engine_state_changed();
     }
     if old.filter_explicit != new.filter_explicit {

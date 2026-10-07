@@ -6,6 +6,11 @@
 //! * `Spirc::new` is bounded (30 s): DNS / TCP connect inside librespot have no timeout.
 //! * The `Spirc` handle is kept until its task ended ([`teardown`]); the task join is bounded and
 //!   on timeout the task is aborted and the dealer closed by hand (it holds a Session cycle).
+//! * Connect visibility (`EngineSettings::connect_visible`): a hidden session is connected
+//!   without Spirc ([`connect_hidden`]), so the phone is no Connect target, while catalog and
+//!   downloads keep working. [`hide`] shuts Spirc down (the device leaves the cluster) and keeps
+//!   the Session. Spirc can't be added to a connected Session again (`Spirc::new` performs the
+//!   login, and a Session's dealer can only be launched once), so becoming visible reconnects.
 
 use super::{config, player_host, state};
 use crate::error::{AppError, AppResult, ErrorCode};
@@ -33,12 +38,21 @@ pub(crate) const TEARDOWN_BOUND: Duration = TASK_JOIN_TIMEOUT.saturating_add(DEA
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// A connected Session with its Spirc.
+/// A connected Session, with its Spirc while the device is visible to Spotify Connect.
 pub(crate) struct Live {
     pub generation: u64,
     pub session: Session,
+    pub device: Option<Device>,
+}
+
+/// The Spotify Connect side of a [`Live`] session.
+pub(crate) struct Device {
     pub spirc: Arc<Spirc>,
     pub task: JoinHandle<()>,
+}
+
+fn next_generation() -> u64 {
+    GENERATION.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 /// Creates the Session for an attempt (not connected yet).
@@ -116,10 +130,11 @@ pub(crate) async fn connect(
         // Keep the handle alive until the task ends (it ends quickly on an invalid session).
         let spirc = Arc::new(spirc);
         let task = tokio::spawn(task);
-        teardown_parts(session, &spirc, task).await;
+        stop_spirc(session, &spirc, task).await;
+        session.shutdown();
         return Err(e);
     }
-    let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let generation = next_generation();
     let attachment = connect::Attachment {
         generation,
         session: session.clone(),
@@ -134,7 +149,39 @@ pub(crate) async fn connect(
     }
     let task = tokio::spawn(task);
     connect::attach(attachment);
-    Ok(Live { generation, session: session.clone(), spirc, task })
+    Ok(Live { generation, session: session.clone(), device: Some(Device { spirc, task }) })
+}
+
+/// Connects `session` without Spirc (not visible to Spotify Connect): the same login steps
+/// `Spirc::new` performs. Does not clean up on failure (the caller calls [`abandon`]).
+pub(crate) async fn connect_hidden(session: &Session, credentials: Credentials) -> AppResult<Live> {
+    let login = async {
+        let _ = session.spclient().client_token().await?;
+        session.connect(credentials, true).await?;
+        let _ = session.login5().auth_token().await?;
+        Ok::<(), librespot_core::Error>(())
+    };
+    match tokio::time::timeout(CONNECT_TIMEOUT, login).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(classify(session, e)),
+        Err(_) => return Err(AppError::new(ErrorCode::Network, "Timed out connecting to Spotify")),
+    }
+    if let Some(e) = premium_error(session) {
+        return Err(e);
+    }
+    Ok(Live { generation: next_generation(), session: session.clone(), device: None })
+}
+
+/// Leaves Spotify Connect but keeps the Session: Spirc shuts down (it disconnects, deletes its
+/// connect state and closes the dealer, so the device leaves the cluster) and the Player is
+/// released from the session. Bounded like a teardown.
+pub(crate) async fn hide(live: &mut Live) {
+    let Some(Device { spirc, task }) = live.device.take() else { return };
+    connect::clear_restore();
+    connect::detach(live.generation);
+    stop_spirc(&live.session, &spirc, task).await;
+    drop(spirc);
+    player_host::detach_session();
 }
 
 /// Cleans up a Session whose attempt failed or was abandoned.
@@ -146,7 +193,8 @@ pub(crate) async fn abandon(session: Session) {
     player_host::detach_session();
 }
 
-async fn teardown_parts(session: &Session, spirc: &Arc<Spirc>, mut task: JoinHandle<()>) {
+/// Shuts Spirc down and waits (bounded) for its task; the Session stays connected.
+async fn stop_spirc(session: &Session, spirc: &Arc<Spirc>, mut task: JoinHandle<()>) {
     if let Err(e) = spirc.shutdown() {
         log::debug!("spirc already gone: {e}");
     }
@@ -157,7 +205,6 @@ async fn teardown_parts(session: &Session, spirc: &Arc<Spirc>, mut task: JoinHan
             log::warn!("dealer close timed out");
         }
     }
-    session.shutdown();
 }
 
 /// Shuts a live connection down. `restore`: remember the local playback for after the
@@ -170,10 +217,13 @@ pub(crate) async fn teardown(live: Live, restore: bool) {
     }
     state::set_online(None);
     connect::detach(live.generation);
-    let Live { session, spirc, task, .. } = live;
-    teardown_parts(&session, &spirc, task).await;
-    // The Spirc task has ended (or was aborted): now the handle may go.
-    drop(spirc);
+    let Live { session, device, .. } = live;
+    if let Some(Device { spirc, task }) = device {
+        stop_spirc(&session, &spirc, task).await;
+        // The Spirc task has ended (or was aborted): now the handle may go.
+        drop(spirc);
+    }
+    session.shutdown();
     player_host::detach_session();
     drop(session);
 }
@@ -187,14 +237,13 @@ pub(crate) async fn teardown_finished(live: Live, restore: bool) {
     }
     state::set_online(None);
     connect::detach(live.generation);
-    let Live { session, spirc, task, .. } = live;
-    drop(task);
+    let Live { session, device, .. } = live;
     session.shutdown();
     // The task's epilogue normally closed the dealer already; closing twice is a no-op.
     if tokio::time::timeout(DEALER_CLOSE_TIMEOUT, session.dealer().close()).await.is_err() {
         log::warn!("dealer close timed out");
     }
-    drop(spirc);
+    drop(device);
     player_host::detach_session();
 }
 

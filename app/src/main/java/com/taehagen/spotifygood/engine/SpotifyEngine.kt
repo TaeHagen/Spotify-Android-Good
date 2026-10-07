@@ -122,6 +122,23 @@ class SpotifyEngine(
     private val holderCounts = IntArray(HolderType.entries.size)
     private var holderTotal = 0
 
+    /**
+     * Whether the phone may be a Spotify Connect target (`EngineSettings.connectVisible`): only
+     * while it can actually play, i.e. the app is in the foreground (UI) or a PLAYBACK / PRESENCE
+     * holder is held. A DOWNLOAD holder alone, or the idle grace, keeps the session without
+     * Spirc. Updated under [holderLock].
+     */
+    private val connectVisible = MutableStateFlow(false)
+
+    /** Caller holds [holderLock]. */
+    private fun updateConnectVisibleLocked() {
+        connectVisible.value = connectVisibleFor(
+            ui = holderCounts[HolderType.UI.ordinal],
+            playback = holderCounts[HolderType.PLAYBACK.ordinal],
+            presence = holderCounts[HolderType.PRESENCE.ordinal],
+        )
+    }
+
     /** Number of holders currently held. */
     val holderCount: Int get() = synchronized(holderLock) { holderTotal }
 
@@ -206,6 +223,7 @@ class SpotifyEngine(
         synchronized(holderLock) {
             holderCounts[type.ordinal]++
             holderTotal++
+            updateConnectVisibleLocked()
         }
         Log.d(TAG, "acquire $type")
         requestReconcile(acquired = true)
@@ -436,6 +454,7 @@ class SpotifyEngine(
             synchronized(holderLock) {
                 holderCounts[type.ordinal]--
                 holderTotal--
+                updateConnectVisibleLocked()
             }
             Log.d(TAG, "release $type")
             requestReconcile(acquired = false)
@@ -497,6 +516,7 @@ class SpotifyEngine(
         }
         callQuietly("session.setNetworkAvailable", networkArgs(network))
         val engineSettings = settings.awaitLoaded().toEngineSettings(network.metered, deviceName)
+            .copy(connectVisible = connectVisible.value)
         lastSentSettings = engineSettings
         runningJob?.cancel()
         runningJob = launchRunningCollectors()
@@ -516,7 +536,8 @@ class SpotifyEngine(
         startCall?.cancel()
         val gen = ++generation
         val network = networkMonitor.status.value
-        val engineSettings = lastSentSettings ?: settings.awaitLoaded().toEngineSettings(network.metered, deviceName)
+        val engineSettings = (lastSentSettings ?: settings.awaitLoaded().toEngineSettings(network.metered, deviceName))
+            .copy(connectVisible = connectVisible.value)
         updateState { it.copy(session = SessionState.CONNECTING, error = accountError, nextRetryMs = null) }
         val args = SessionStartArgs(credentials = creds, settings = engineSettings, initialVolume = initialVolume())
         Log.i(TAG, "session.start (retry)")
@@ -579,7 +600,9 @@ class SpotifyEngine(
             networkMonitor.status.collect { onNetworkStatus(it) }
         }
         launchLogged("settings") {
-            combine(settings.persisted, networkMonitor.status) { prefs, network -> prefs.toEngineSettings(network.metered, deviceName) }
+            combine(settings.persisted, networkMonitor.status, connectVisible) { prefs, network, visible ->
+                prefs.toEngineSettings(network.metered, deviceName).copy(connectVisible = visible)
+            }
                 .distinctUntilChanged()
                 .collect { engineSettings ->
                     if (engineSettings == lastSentSettings) return@collect
@@ -863,6 +886,12 @@ class SpotifyEngine(
             NativeErrorInfo(NativeErrorCode.INTERNAL, "The playback engine could not be loaded", context = "session")
     }
 }
+
+/**
+ * Spotify Connect visibility for the held holders: listed as a target only while the phone can
+ * play (foreground UI, playback, or the opt-in presence), never for downloads alone.
+ */
+internal fun connectVisibleFor(ui: Int, playback: Int, presence: Int): Boolean = ui > 0 || playback > 0 || presence > 0
 
 /** Largest Spotify Connect / mixer volume. */
 internal const val CONNECT_VOLUME_MAX = 65_535
