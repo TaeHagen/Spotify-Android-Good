@@ -4,8 +4,9 @@
 // `Spirc` from the autoplay endpoint) are interleaved into the next tracks while the default
 // context is shuffled: one suggestion after every [SMART_SHUFFLE_INTERVAL]th context track.
 //
-// - suggestions live in `ConnectState::suggestions`, keyed by the position in the shuffled
-//   default context after which they are inserted. They are never added to the context itself
+// - suggestions live in `ConnectState::suggestions`, keyed by the pass through the context
+//   (with repeat, the context wraps) and the position in the shuffled default context after which
+//   they are inserted, so each one is played once and only in the pass it was fetched for. They are never added to the context itself
 //   (`StateContext::tracks`), because that would break unshuffling (see `ShuffleVec`)
 // - they keep the `context` provider (a `queue` provider would survive `clear_next_tracks`,
 //   an `autoplay` provider switches the active context and disallows toggling shuffle), are
@@ -92,26 +93,53 @@ impl ConnectState {
             && self.suggestions_in_next_tracks() < SMART_SHUFFLE_LOW_WATER_MARK
     }
 
-    /// Forgets suggestions for already passed positions, returns whether there is room for more
+    /// Forgets suggestions for already passed positions (and earlier passes), returns whether
+    /// there is room for more
     ///
     /// Costs a scan of the context, only call it right before a fetch.
     pub fn prune_suggestions(&mut self) -> bool {
-        if let Some(first_upcoming) = self.first_upcoming_position() {
-            self.suggestions = self
-                .suggestions
-                .split_off(&first_upcoming.saturating_sub(1));
+        if let Some((pass, first_upcoming)) = self.first_upcoming_position() {
+            self.forget_suggestions_before(pass, first_upcoming);
         }
         self.suggestions.len() < SMART_SHUFFLE_MAX_SUGGESTIONS
     }
 
-    /// The position of the first upcoming plain context track in the (shuffled) default context
-    fn first_upcoming_position(&self) -> Option<usize> {
+    /// Drops the suggestions before the position `first_upcoming` of the pass `pass` (the one
+    /// after the context track right before it stays), and unusable ones
+    fn forget_suggestions_before(&mut self, pass: u32, first_upcoming: usize) {
+        self.suggestions = self
+            .suggestions
+            .split_off(&(pass, first_upcoming.saturating_sub(1)));
+        let len = self
+            .get_context(ContextType::Default)
+            .map(|c| c.tracks.len())
+            .unwrap_or_default();
+        let unavailable = &self.unavailable_uri;
+        self.suggestions
+            .retain(|(_, position), s| *position < len && !unavailable.contains(&s.uri));
+    }
+
+    /// The pass and position (in the shuffled default context) of the first upcoming plain
+    /// context track, while the default context fills the next tracks
+    fn first_upcoming_position(&self) -> Option<(u32, usize)> {
+        if !matches!(self.fill_up_context, ContextType::Default) {
+            return None;
+        }
         let ctx = self.get_context(ContextType::Default).ok()?;
-        let next = self
-            .next_tracks()
+        let next_tracks = self.next_tracks();
+        let first = next_tracks
             .iter()
-            .find(|t| Self::is_plain_context_track(t))?;
-        ctx.tracks.iter().position(|t| t.uid == next.uid)
+            .position(|t| Self::is_plain_context_track(t))?;
+        let position = ctx
+            .tracks
+            .iter()
+            .position(|t| t.uid == next_tracks[first].uid)?;
+        // the fill up is in pass `index.page`, each delimiter after the track is a wrap
+        let wraps = next_tracks[first..]
+            .iter()
+            .filter(|t| t.uid.starts_with(IDENTIFIER_DELIMITER))
+            .count() as u32;
+        Some((ctx.index.page.saturating_sub(wraps), position))
     }
 
     /// Forgets all suggestions, but keeps smart shuffle enabled (for a new fetch)
@@ -124,9 +152,10 @@ impl ConnectState {
         self.suggestions.retain(|_, s| s.uid != uid)
     }
 
-    /// The suggestion to insert after the default context track at `position`
+    /// The suggestion to insert after the default context track at `position` of the pass `pass`
     pub(super) fn suggestion_after(
         &self,
+        pass: u32,
         position: usize,
         anchor: &ProvidedTrack,
     ) -> Option<ProvidedTrack> {
@@ -134,7 +163,7 @@ impl ConnectState {
             return None;
         }
 
-        let suggestion = self.suggestions.get(&position)?;
+        let suggestion = self.suggestions.get(&(pass, position))?;
         if self.unavailable_uri.contains(&suggestion.uri) {
             return None;
         }
@@ -198,17 +227,20 @@ impl ConnectState {
     ///
     /// Tracks that are part of the default context, or were already suggested, are ignored. The
     /// suggestions are assigned to every [SMART_SHUFFLE_INTERVAL]th position after the upcoming
-    /// context tracks (continuing after already assigned suggestions). The next tracks are
-    /// rebuilt afterward, see [ConnectState::refill_next_tracks].
+    /// context tracks (continuing after already assigned suggestions), with repeat on through the
+    /// following passes, without repeat up to the end of the context (the rest is dropped and may
+    /// be suggested again). The next tracks are rebuilt afterward, see
+    /// [ConnectState::refill_next_tracks].
     pub fn add_suggestions(&mut self, suggestions: Context) -> Result<usize, Error> {
         let ctx_uri = self.context_uri().clone();
         let ctx = self.get_context(ContextType::Default)?;
 
         // the position of the first upcoming context track in the (shuffled) context
-        let Some(first_upcoming) = self.first_upcoming_position() else {
+        let Some((pass, first_upcoming)) = self.first_upcoming_position() else {
             debug!("no upcoming context track, ignoring suggestions");
             return Ok(0);
         };
+        let len = ctx.tracks.len();
 
         let context_uris = ctx
             .tracks
@@ -258,23 +290,34 @@ impl ConnectState {
             }
         }
 
-        self.used_suggestion_uris
-            .extend(new_suggestions.iter().map(|t| t.uri.clone()));
+        // forget suggestions for positions (and passes) that were already passed
+        self.forget_suggestions_before(pass, first_upcoming);
 
-        // forget suggestions for positions that were already passed
-        let first_key = first_upcoming.saturating_sub(1);
-        self.suggestions = self.suggestions.split_off(&first_key);
-
+        // positions count on through the following passes (`pass * len + position`)
+        let linear = |(pass, position): (u32, usize)| pass as usize * len + position;
         let start = self
             .suggestions
             .last_key_value()
-            .map(|(k, _)| *k)
-            .unwrap_or(first_key);
+            .map(|(key, _)| linear(*key))
+            .unwrap_or(linear((pass, first_upcoming)).saturating_sub(1));
+        // without repeat the context ends with this pass
+        let end = if self.repeat_context() {
+            usize::MAX
+        } else {
+            linear((pass + 1, 0))
+        };
 
-        let added = new_suggestions.len();
+        let mut added = 0;
         for (i, suggestion) in new_suggestions.into_iter().enumerate() {
             let key = start + SMART_SHUFFLE_INTERVAL * (i + 1);
-            self.suggestions.insert(key, suggestion);
+            if key >= end || len == 0 {
+                // the rest would never be inserted (and may be suggested again)
+                break;
+            }
+            self.used_suggestion_uris.insert(suggestion.uri.clone());
+            self.suggestions
+                .insert(((key / len) as u32, key % len), suggestion);
+            added += 1;
         }
 
         if added > 0 {

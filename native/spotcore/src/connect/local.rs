@@ -17,6 +17,17 @@ pub(crate) fn sent(result: Result<(), librespot_core::Error>) -> AppResult<()> {
     })
 }
 
+/// `queue.add`: Spirc rejects an add right away when the queue already fills the 80 next
+/// tracks (instead of dropping the track later), so a batch of adds stops at the first one.
+pub(crate) fn queue_add(spirc: &Spirc, uri: &str) -> AppResult<()> {
+    match spirc.add_to_queue(uri.to_string()) {
+        Err(e) if e.kind == librespot_core::error::ErrorKind::FailedPrecondition => {
+            Err(AppError::unavailable("The queue is full"))
+        }
+        result => sent(result),
+    }
+}
+
 fn context_options(args: &LoadArgs) -> Option<LoadContextOptions> {
     if args.shuffle.is_none() && args.smart_shuffle.is_none() && args.repeat.is_none() {
         return None;

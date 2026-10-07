@@ -52,7 +52,8 @@ use thiserror::Error;
 
 // these limitations are essential, otherwise to many tracks will overload the web-player
 const SPOTIFY_MAX_PREV_TRACKS_SIZE: usize = 10;
-const SPOTIFY_MAX_NEXT_TRACKS_SIZE: usize = 80;
+// SPOTIFYGOOD: pub(crate) for the queue limit of Spirc::add_to_queue
+pub(crate) const SPOTIFY_MAX_NEXT_TRACKS_SIZE: usize = 80;
 
 #[derive(Debug, Error)]
 pub(super) enum StateError {
@@ -76,6 +77,9 @@ pub(super) enum StateError {
     // SPOTIFYGOOD: local queue commands
     #[error("no track with uid <{0}> in the next tracks")]
     CanNotFindTrackInQueue(String),
+    // SPOTIFYGOOD: the queued tracks fill the (capped) next tracks
+    #[error("the queue is full ({0} tracks)")]
+    QueueFull(usize),
 }
 
 impl From<StateError> for Error {
@@ -88,7 +92,8 @@ impl From<StateError> for Error {
             | ContextHasNoTracks
             | InvalidTrackUri(_)
             // SPOTIFYGOOD
-            | CanNotFindTrackInQueue(_) => Error::failed_precondition(err),
+            | CanNotFindTrackInQueue(_)
+            | QueueFull(_) => Error::failed_precondition(err),
             CurrentlyDisallowed { .. } | UnsupportedLocalPlayback => Error::unavailable(err),
         }
     }
@@ -165,10 +170,11 @@ pub(super) struct ConnectState {
     skipped_uids: HashSet<String>,
     // SPOTIFYGOOD: local smart shuffle, see state/smart_shuffle.rs
     smart_shuffle: bool,
-    /// smart shuffle suggestions, keyed by the position in the (shuffled) default context
-    /// after which they are inserted. Never part of [StateContext::tracks], so that
+    /// smart shuffle suggestions, keyed by the pass through the default context (its fill up
+    /// `index.page`, counting the wraps with repeat) and the position in the (shuffled) default
+    /// context after which they are inserted. Never part of [StateContext::tracks], so that
     /// unshuffling is unaffected.
-    suggestions: BTreeMap<usize, ProvidedTrack>,
+    suggestions: BTreeMap<(u32, usize), ProvidedTrack>,
     /// uris that were already suggested for the current context
     used_suggestion_uris: HashSet<String>,
 }
@@ -461,6 +467,8 @@ impl ConnectState {
         let new_index = new_index.unwrap_or(0);
         self.update_current_index(|i| i.track = new_index as u32);
         self.update_context_index(self.active_context, new_index + 1)?;
+        // SPOTIFYGOOD: the next tracks start over, in the first pass (see fill_up_next_tracks)
+        self.get_context_mut(self.active_context)?.index.page = 0;
         self.fill_up_context = self.active_context;
 
         // SPOTIFYGOOD: a playing smart shuffle suggestion is not part of the context, keep it

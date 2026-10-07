@@ -19,7 +19,7 @@ use librespot_core::Session;
 use librespot_protocol::connect::Cluster;
 use parking_lot::Mutex;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{broadcast, watch, Notify};
 
 /// A placeholder of the last local playback is shown while reconnecting, for at most this long.
@@ -39,11 +39,20 @@ pub(crate) struct HubState {
     /// Last `player.setAudioOutput` (re-applied to every new Spirc).
     pub audio_output: Option<AudioOutputInfo>,
     /// Last snapshot while this device was active (reconnect restore point).
-    pub last_active: Option<(ConnectSnapshot, Instant)>,
+    pub last_active: Option<LastActive>,
     /// A reconnect with a pending restore is in progress (frozen playback state).
     pub reconnect: Option<restore::Frozen>,
-    /// `lastError` override after Spotify refused audio keys.
+    /// `lastError` override after the load brake stopped playback (see `player_events`).
     pub refused_error: Option<String>,
+}
+
+/// The reconnect restore point while the attached Spirc is not active (anymore).
+#[derive(Debug, Clone)]
+pub(crate) struct LastActive {
+    pub snap: ConnectSnapshot,
+    /// Local epoch ms at which the device stopped being active (`None`: it still is). The
+    /// position is extrapolated up to this point only.
+    pub ended_at_ms: Option<i64>,
 }
 
 pub(crate) static HUB: LazyLock<Mutex<HubState>> = LazyLock::new(|| Mutex::new(HubState::default()));
@@ -52,7 +61,7 @@ pub(crate) static HUB: LazyLock<Mutex<HubState>> = LazyLock::new(|| Mutex::new(H
 pub(crate) static CLUSTER_CHANGED: Notify = Notify::const_new();
 
 #[derive(Default)]
-struct EmitState {
+pub(crate) struct EmitState {
     playback: String,
     devices: String,
 }
@@ -120,14 +129,19 @@ pub(crate) fn attach(a: Attachment) {
     runtime::handle().spawn(observe(generation, session, state, cluster, errors));
 }
 
-/// Called by the engine when a Spirc goes away (teardown or death).
+/// Called by the engine when a Spirc goes away (teardown or death, or hiding from Spotify
+/// Connect while the session stays online).
 pub(crate) fn detach(generation: u64) {
+    // Hidden (the session stays online): keep the last cluster for the remote player state.
+    let hiding = engine::is_online();
     {
         let mut hub = HUB.lock();
         if hub.link.as_ref().is_some_and(|l| l.generation == generation) {
             hub.link = None;
             hub.snapshot = None;
-            hub.cluster = None;
+            if !hiding {
+                hub.cluster = None;
+            }
         }
     }
     publish();
@@ -188,21 +202,15 @@ async fn observe(
 }
 
 fn on_snapshot(generation: u64, snap: ConnectSnapshot, session: &Session) {
-    let became_active;
-    {
+    let became_active = {
         let mut hub = HUB.lock();
         if hub.link.as_ref().map(|l| l.generation) != Some(generation) {
             return;
         }
-        let was_active = hub.snapshot.as_ref().is_some_and(|s| s.is_active);
-        became_active = snap.is_active && !was_active;
-        if snap.is_active && snap.track.is_some() {
-            hub.last_active = Some((snap.clone(), Instant::now()));
-        } else if !snap.is_active && hub.reconnect.is_none() && !session.is_invalid() {
-            // Deliberately inactive (another device took over, user stop): nothing to restore.
-            hub.last_active = None;
-        }
-        hub.snapshot = Some(snap.clone());
+        apply_snapshot(&mut hub, snap.clone(), session.is_invalid(), super::now_ms())
+    };
+    if snap.ending {
+        log::debug!("spirc {generation} ended (active: {}, {:?})", snap.is_active, snap.status);
     }
     if became_active {
         // Spirc owns the Player now.
@@ -210,6 +218,26 @@ fn on_snapshot(generation: u64, snap: ConnectSnapshot, session: &Session) {
     }
     player_events::check_exhausted(&snap);
     publish();
+}
+
+/// Records a snapshot of the attached Spirc; returns whether this device became active.
+/// `session_invalid`: the session is gone, so an inactive snapshot is not a deliberate stop.
+pub(crate) fn apply_snapshot(hub: &mut HubState, snap: ConnectSnapshot, session_invalid: bool, now_ms: i64) -> bool {
+    let was_active = hub.snapshot.as_ref().is_some_and(|s| s.is_active);
+    let became_active = snap.is_active && !was_active;
+    if snap.is_active && snap.track.is_some() {
+        hub.last_active = Some(LastActive { snap: snap.clone(), ended_at_ms: None });
+    } else if !snap.is_active {
+        if hub.reconnect.is_none() && !session_invalid {
+            // Deliberately inactive (another device took over, user stop): nothing to restore.
+            hub.last_active = None;
+        } else if let Some(last) = hub.last_active.as_mut() {
+            // Spirc stops the Player when it becomes inactive.
+            last.ended_at_ms.get_or_insert(now_ms);
+        }
+    }
+    hub.snapshot = Some(snap);
+    became_active
 }
 
 fn on_cluster(generation: u64, cluster: Arc<Cluster>) {
@@ -299,14 +327,19 @@ pub(crate) fn publish() {
     }
 }
 
-/// The current device list.
+/// The current device list. While the online session is hidden from Spotify Connect, this
+/// device isn't listed (it can't be controlled or transferred to).
 pub(crate) fn device_list() -> DeviceList {
-    let (cluster, audio_output) = {
+    let (cluster, audio_output, attached) = {
         let hub = HUB.lock();
-        (hub.cluster.clone(), hub.audio_output.clone())
+        (hub.cluster.clone(), hub.audio_output.clone(), hub.link.is_some())
     };
     let me = ThisDevice { id: me(), name: engine::device_name(), volume: mixer_volume(), audio_output };
-    devices::device_list(cluster.as_deref(), &me)
+    let mut list = devices::device_list(cluster.as_deref(), &me);
+    if !attached && engine::is_online() {
+        list.devices.retain(|d| !d.is_this_device);
+    }
+    list
 }
 
 /// Emits a `devices` event if the list changed; returns the list.
@@ -314,8 +347,13 @@ pub(crate) fn publish_devices() -> DeviceList {
     if !runtime::is_initialized() {
         return DeviceList::default();
     }
+    publish_devices_locked(&mut EMIT.lock())
+}
+
+/// Composes under `EMIT` (like `publish`), so that a caller holding an older hub state can't
+/// emit its list after a newer one.
+fn publish_devices_locked(emit: &mut EmitState) -> DeviceList {
     let list = device_list();
-    let mut emit = EMIT.lock();
     match serde_json::to_string(&list) {
         Ok(json) if json != emit.devices => {
             bridge::post_event(events::DEVICES, &json);
@@ -327,8 +365,67 @@ pub(crate) fn publish_devices() -> DeviceList {
     list
 }
 
-/// Re-emits the device list even if unchanged (`connect.refreshDevices`).
+/// Re-emits the device list even if unchanged.
 pub(crate) fn force_publish_devices() -> DeviceList {
-    EMIT.lock().devices.clear();
-    publish_devices()
+    if !runtime::is_initialized() {
+        return DeviceList::default();
+    }
+    let mut emit = EMIT.lock();
+    emit.devices.clear();
+    publish_devices_locked(&mut emit)
+}
+
+/// At most one cluster refresh from Spotify per this interval (`connect.refreshDevices`).
+const REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(2500);
+/// How long `connect.refreshDevices` waits for the refreshed cluster.
+const REFRESH_WAIT: Duration = Duration::from_secs(3);
+
+static LAST_REFRESH: Mutex<Option<std::time::Instant>> = parking_lot::const_mutex(None);
+
+/// Whether a refresh may be sent now (records it).
+fn refresh_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    let due = last.is_none_or(|at| now.saturating_duration_since(at) >= REFRESH_MIN_INTERVAL);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+/// `connect.refreshDevices`: fetches the cluster (device list) from Spotify again, debounced, and
+/// emits and returns the new list (the cached one if the refresh is debounced, fails or times out).
+pub(crate) async fn refresh_devices() -> DeviceList {
+    let spirc = if engine::is_online() { spirc() } else { None };
+    if let Some(spirc) = spirc {
+        if refresh_due(&mut LAST_REFRESH.lock(), std::time::Instant::now()) {
+            let notified = CLUSTER_CHANGED.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match spirc.refresh_cluster() {
+                Ok(()) => {
+                    if tokio::time::timeout(REFRESH_WAIT, notified).await.is_err() {
+                        log::debug!("no cluster after the device refresh");
+                    }
+                }
+                Err(e) => log::debug!("device refresh not sent: {e}"),
+            }
+        }
+    }
+    force_publish_devices()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn device_refresh_is_debounced() {
+        let mut last = None;
+        let t0 = Instant::now();
+        assert!(refresh_due(&mut last, t0));
+        assert!(!refresh_due(&mut last, t0 + Duration::from_millis(1000)));
+        assert!(!refresh_due(&mut last, t0 + Duration::from_millis(2400)));
+        assert!(refresh_due(&mut last, t0 + Duration::from_millis(2600)));
+        assert!(!refresh_due(&mut last, t0 + Duration::from_millis(3000)));
+    }
 }

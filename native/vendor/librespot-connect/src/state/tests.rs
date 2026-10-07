@@ -415,6 +415,180 @@ fn prev_without_track_index_doesnt_underflow() {
     assert_eq!(state.current_track(|t| t.uid.clone()), "uid0");
 }
 
+/// steps `n` times through the next tracks, returns the uids of the played tracks
+fn play_through(state: &mut ConnectState, n: usize) -> Vec<String> {
+    (0..n)
+        .map_while(|_| {
+            state.next_track().unwrap()?;
+            Some(state.current_track(|t| t.uid.clone()))
+        })
+        .collect()
+}
+
+fn uids(range: std::ops::Range<usize>) -> Vec<String> {
+    range.map(|i| format!("uid{i}")).collect()
+}
+
+#[test]
+fn queue_add_keeps_the_dropped_context_track() {
+    let (_rt, mut state) = state(200);
+    assert_eq!(state.next_tracks().len(), 80);
+
+    state.queue_add_uri(&track_uri(1, 9)).unwrap();
+    assert_eq!(state.next_tracks().len(), 80);
+    assert_queue_contiguous(&state);
+
+    // the context track that made room for the queued one is played after uid79
+    let played = play_through(&mut state, 101);
+    assert_eq!(played[0], "q0");
+    assert_eq!(played[1..], uids(1..101));
+}
+
+#[test]
+fn full_queue_rejects_adds_and_the_context_continues() {
+    let (_rt, mut state) = state(200);
+    for i in 0..80 {
+        state.queue_add_uri(&track_uri(i, 9)).unwrap();
+    }
+    assert_eq!(state.queued_count(), 80);
+    assert!(state.next_tracks().iter().all(|t| t.is_queue()));
+
+    // the 81st add fails instead of being dropped right away
+    assert!(state.queue_add_uri(&track_uri(80, 9)).is_err());
+    assert_eq!(state.queued_count(), 80);
+
+    let played = play_through(&mut state, 130);
+    let queued = (0..80).map(|i| format!("q{i}")).collect::<Vec<_>>();
+    assert_eq!(played[..80], queued);
+    // no context track was skipped while the queue filled the next tracks
+    assert_eq!(played[80..], uids(1..51));
+}
+
+#[test]
+fn prev_puts_the_track_back_after_the_queue_without_losing_one() {
+    let (_rt, mut state) = state(200);
+    play_through(&mut state, 2);
+    state.queue_add_uri(&track_uri(1, 9)).unwrap();
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid2");
+
+    state.prev_track().unwrap();
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid1");
+    assert_eq!(next_uids(&state)[..3], ["q0", "uid2", "uid3"]);
+    assert_eq!(state.next_tracks().len(), 80);
+    assert_queue_contiguous(&state);
+
+    let played = play_through(&mut state, 100);
+    assert_eq!(played[0], "q0");
+    assert_eq!(played[1..], uids(2..101));
+}
+
+#[test]
+fn queue_add_with_repeat_context_wraps_without_skipping() {
+    let (_rt, mut state) = state(5);
+    state.set_repeat_context(true);
+    state.reset_playback_to_position(Some(0)).unwrap();
+    assert_eq!(state.next_tracks().len(), 80);
+
+    for i in 0..3 {
+        state.queue_add_uri(&track_uri(i, 9)).unwrap();
+        assert_eq!(state.next_tracks().len(), 80);
+    }
+
+    let played = play_through(&mut state, 200)
+        .into_iter()
+        .filter(|uid| !uid.starts_with('q'))
+        .collect::<Vec<_>>();
+    assert!(played.len() > 150);
+    for (n, uid) in played.iter().enumerate() {
+        assert_eq!(*uid, format!("uid{}", (n + 1) % 5), "{played:?}");
+    }
+}
+
+#[test]
+fn queue_add_while_filling_up_from_autoplay_keeps_autoplay_order() {
+    let (_rt, mut state) = state(3);
+    state
+        .update_context(
+            Context {
+                uri: Some(CONTEXT_URI.to_string()),
+                ..context(150, 5)
+            },
+            ContextType::Autoplay,
+        )
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    assert_eq!(state.next_tracks().len(), 80);
+
+    for i in 0..2 {
+        state.queue_add_uri(&track_uri(i, 9)).unwrap();
+    }
+
+    let played = play_through(&mut state, 120);
+    assert_eq!(played[..4], ["q0", "q1", "uid1", "uid2"]);
+    // the autoplay tracks follow without a gap
+    assert_eq!(played[4..], uids(0..116));
+    assert!(state.current_track(|t| t.is_autoplay()));
+}
+
+/// suggestions and delimiters are unique in the next tracks (context tracks of later passes of a
+/// repeated context share their uids)
+fn assert_unique_uids(state: &ConnectState) {
+    let uids = state
+        .next_tracks()
+        .iter()
+        .filter(|t| t.is_suggestion() || t.uid.starts_with(IDENTIFIER_DELIMITER))
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    let unique = uids.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique.len(), uids.len(), "duplicate uids: {uids:?}");
+}
+
+#[test]
+fn smart_shuffle_with_repeat_plays_each_suggestion_once() {
+    let (_rt, mut state) = state(10);
+    state.set_repeat_context(true);
+    state.handle_smart_shuffle(true).unwrap();
+    assert_eq!(state.next_tracks().len(), 80, "the window covers several passes");
+    assert_unique_uids(&state);
+
+    // one after every 3rd context track, continuing through the following passes
+    let added = state.add_suggestions(suggestions(10)).unwrap();
+    assert_eq!(added, 10);
+    let in_window = |state: &ConnectState| {
+        state
+            .next_tracks()
+            .iter()
+            .filter(|t| t.is_suggestion())
+            .count()
+    };
+    assert_eq!(in_window(&state), 10, "each one once, not again in every pass");
+    assert_unique_uids(&state);
+
+    // 10 suggestions and 30 context tracks (3 passes)
+    let played = play_through(&mut state, 40);
+    let played_suggestions = played
+        .iter()
+        .filter(|uid| uid.starts_with('s'))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(played_suggestions.len(), 10);
+    assert_eq!(played.iter().filter(|uid| uid.starts_with('s')).count(), 10);
+    assert_eq!(in_window(&state), 0, "played suggestions don't come back");
+
+    // there is room for new suggestions again, they go into the passes ahead
+    assert!(state.prune_suggestions());
+    let added = state.add_suggestions(context(10, 8)).unwrap();
+    assert_eq!(added, 10);
+    assert_eq!(in_window(&state), added);
+    assert_unique_uids(&state);
+    let played = play_through(&mut state, 60);
+    assert_eq!(played.iter().filter(|uid| uid.starts_with('s')).count(), added);
+
+    // without repeat only the rest of the context gets suggestions
+    let (_rt, mut state) = self::state(10);
+    state.handle_smart_shuffle(true).unwrap();
+    assert_eq!(state.add_suggestions(suggestions(10)).unwrap(), 3);
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(

@@ -16,7 +16,8 @@ use crate::{
     model::{AudioOutputKind, LoadRequest, PlayingTrack, SpircPlayStatus},
     playback::{
         mixer::Mixer,
-        player::{Player, PlayerEvent, PlayerEventChannel},
+        // SPOTIFYGOOD: + UnavailableReason
+        player::{Player, PlayerEvent, PlayerEventChannel, UnavailableReason},
     },
     protocol::{
         autoplay_context_request::AutoplayContextRequest,
@@ -33,6 +34,8 @@ use crate::{
         context::{ContextType, ResetContext},
         provider::IsProvider,
         {ConnectConfig, ConnectState},
+        // SPOTIFYGOOD: queue limit of Spirc::add_to_queue
+        SPOTIFY_MAX_NEXT_TRACKS_SIZE, StateError,
     },
 };
 use futures_util::StreamExt;
@@ -144,6 +147,28 @@ struct SpircTask {
     suggestions_tx: mpsc::UnboundedSender<SuggestionResponse>,
     suggestions_rx: mpsc::UnboundedReceiver<SuggestionResponse>,
     suggestion_fetch: SuggestionFetch,
+    queue_gauge: Arc<QueueGauge>,
+    /// the local autoplay value set with Spirc::set_autoplay, it wins over the account value
+    autoplay_override: Option<bool>,
+}
+
+// SPOTIFYGOOD: lets Spirc::add_to_queue reject an add right away when the queue is full, the
+// command itself is only handled later by the task
+#[derive(Default)]
+struct QueueGauge {
+    /// queued tracks in the next tracks, as of the last handled event
+    queued: AtomicUsize,
+    /// add_to_queue commands sent but not handled yet
+    pending: AtomicUsize,
+}
+
+impl QueueGauge {
+    fn add_handled(&self, queued: usize) {
+        self.queued.store(queued, Ordering::Release);
+        let _ = self
+            .pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
 }
 
 // SPOTIFYGOOD: the result of a smart shuffle suggestion fetch, sent back into the loop
@@ -164,14 +189,25 @@ struct SuggestionFetch {
     retry_at: Option<Instant>,
     /// consecutive failures, for the backoff
     failures: u32,
+    /// the request in flight, it holds a strong session
+    task: Option<tokio::task::AbortHandle>,
 }
 
 impl SuggestionFetch {
     /// invalidates outstanding results and allows an immediate fetch
     fn restart(&mut self) {
+        self.cancel();
         self.generation += 1;
         self.retry_at = None;
         self.failures = 0;
+    }
+
+    /// aborts the request in flight
+    fn cancel(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.in_flight = false;
     }
 }
 
@@ -207,6 +243,7 @@ enum SpircCommand {
     // SPOTIFYGOOD: allowed while inactive
     SetAudioOutput(AudioOutputKind, Option<String>),
     SetAutoplay(bool),
+    RefreshCluster,
 }
 
 // SPOTIFYGOOD: names used in the reported command errors
@@ -239,6 +276,7 @@ impl SpircCommand {
             SmartShuffle(_) => "smart_shuffle",
             SetAudioOutput(..) => "set_audio_output",
             SetAutoplay(_) => "set_autoplay",
+            RefreshCluster => "refresh_cluster",
         }
     }
 }
@@ -247,6 +285,8 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
 
 // SPOTIFYGOOD: upper bound for the network calls during shutdown
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+// SPOTIFYGOOD: upper bound for starting the dealer, the task ends after it
+const DEALER_START_TIMEOUT: Duration = Duration::from_secs(30);
 // SPOTIFYGOOD: capacity of the command error broadcast, slow receivers lag (skip) old errors
 const ERROR_CHANNEL_CAPACITY: usize = 16;
 // SPOTIFYGOOD: smart shuffle fetch pacing
@@ -254,6 +294,7 @@ const SUGGESTION_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const SUGGESTION_EMPTY_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const SUGGESTION_ERROR_BACKOFF: Duration = Duration::from_secs(30);
 const SUGGESTION_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+const SUGGESTION_TIMEOUT: Duration = Duration::from_secs(20);
 
 // delay to update volume after a certain amount of time, instead on each update request
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
@@ -267,6 +308,7 @@ pub struct Spirc {
     snapshot_rx: watch::Receiver<ConnectSnapshot>,
     cluster_rx: watch::Receiver<Option<Arc<Cluster>>>,
     errors_rx: broadcast::Receiver<SpircCommandError>,
+    queue_gauge: Arc<QueueGauge>,
 }
 
 impl Spirc {
@@ -353,6 +395,8 @@ impl Spirc {
         let (suggestions_tx, suggestions_rx) = mpsc::unbounded_channel();
 
         let player_events = player.get_player_event_channel();
+        // SPOTIFYGOOD
+        let queue_gauge = Arc::new(QueueGauge::default());
 
         let mut task = SpircTask {
             player,
@@ -398,6 +442,8 @@ impl Spirc {
             suggestions_tx,
             suggestions_rx,
             suggestion_fetch: SuggestionFetch::default(),
+            queue_gauge: queue_gauge.clone(),
+            autoplay_override: None,
         };
 
         let spirc = Spirc {
@@ -406,6 +452,7 @@ impl Spirc {
             snapshot_rx,
             cluster_rx,
             errors_rx,
+            queue_gauge,
         };
 
         let initial_volume = task.connect_state.device_info().volume;
@@ -565,6 +612,14 @@ impl Spirc {
 
     // SPOTIFYGOOD: everything below in this impl is an addition
 
+    /// Whether the spirc task still handles commands
+    ///
+    /// False once the task ended (by itself, for example after the connection was lost, or
+    /// after [Spirc::shutdown]), or while it is shutting down. Commands then fail to send.
+    pub fn is_running(&self) -> bool {
+        !self.commands.is_closed()
+    }
+
     /// Subscribes to snapshots of the local connect state
     ///
     /// The receiver always holds the latest snapshot (no backlog), use
@@ -596,9 +651,24 @@ impl Spirc {
 
     /// Adds the track or episode `uri` to the end of the user queue
     ///
+    /// Fails right away (with [ErrorKind::FailedPrecondition](crate::core::error::ErrorKind))
+    /// when the queued tracks, including the adds that weren't handled yet, already fill the
+    /// next tracks (80 entries). The task checks again when it handles the command and reports
+    /// a full queue as a command error.
+    ///
     /// Does nothing if we are not the active device.
     pub fn add_to_queue(&self, uri: String) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::AddToQueue(uri))?)
+        let gauge = &self.queue_gauge;
+        let in_flight = gauge.pending.fetch_add(1, Ordering::AcqRel);
+        if gauge.queued.load(Ordering::Acquire) + in_flight >= SPOTIFY_MAX_NEXT_TRACKS_SIZE {
+            gauge.pending.fetch_sub(1, Ordering::AcqRel);
+            return Err(StateError::QueueFull(SPOTIFY_MAX_NEXT_TRACKS_SIZE).into());
+        }
+        if let Err(why) = self.commands.send(SpircCommand::AddToQueue(uri)) {
+            gauge.pending.fetch_sub(1, Ordering::AcqRel);
+            return Err(why.into());
+        }
+        Ok(())
     }
 
     /// Removes the entry with the given `uid` from the next tracks
@@ -670,11 +740,22 @@ impl Spirc {
 
     /// Enables or disables autoplay (continuing with similar tracks after the context ended)
     ///
-    /// This sets the local `autoplay` user attribute, it isn't synced to the account. Fails if
+    /// This sets the local `autoplay` user attribute, it isn't synced to the account. From then
+    /// on, autoplay changes made elsewhere (attribute mutations and updates pushed by spotify)
+    /// are ignored for this spirc. Fails if
     /// [SessionConfig::autoplay](librespot_core::SessionConfig) overrides the attribute. Also
     /// works while we are not the active device.
     pub fn set_autoplay(&self, autoplay: bool) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::SetAutoplay(autoplay))?)
+    }
+
+    /// Fetches the connect cluster (the devices of the account) from spotify again
+    ///
+    /// Puts the current state, the cluster in the response is published like any other (see
+    /// [Spirc::subscribe_cluster]), also when it didn't change. Also works while we are not the
+    /// active device.
+    pub fn refresh_cluster(&self) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::RefreshCluster)?)
     }
 }
 
@@ -699,9 +780,41 @@ impl SpircTask {
             };
         }
 
-        if let Err(why) = self.session.dealer().start().await {
-            error!("starting dealer failed: {why}");
-            return;
+        // SPOTIFYGOOD: the dealer start (apresolve, token, connect, handshake) has no timeout of
+        // its own, and the commands weren't read meanwhile, so a shutdown waited for it (minutes
+        // on a black-holed network). It is raced against shutdown and bounded; dropping the start
+        // cancels it cleanly, nothing was put to spotify yet.
+        let session = self.session.clone();
+        let start = session.dealer().start();
+        tokio::pin!(start);
+        let deadline = sleep(DEALER_START_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut start => match result {
+                    Ok(()) => break,
+                    Err(why) => {
+                        error!("starting dealer failed: {why}");
+                        return;
+                    }
+                },
+                _ = &mut deadline => {
+                    error!("starting dealer timed out");
+                    return;
+                },
+                cmd = async { self.commands.as_mut()?.recv().await }, if self.commands.is_some() => match cmd {
+                    Some(SpircCommand::Shutdown) | None => {
+                        info!("shutdown while starting the dealer");
+                        self.shutdown = true;
+                        if let Some(rx) = self.commands.as_mut() {
+                            rx.close()
+                        }
+                        return;
+                    }
+                    Some(cmd) => self.pending_commands.push_back(cmd),
+                },
+            }
         }
 
         while !self.session.is_invalid() && !self.shutdown {
@@ -861,7 +974,20 @@ impl SpircTask {
             // SPOTIFYGOOD: covers every path above without touching each handler
             self.maybe_fetch_suggestions();
             self.publish_snapshot();
+            self.queue_gauge
+                .queued
+                .store(self.connect_state.queued_count(), Ordering::Release);
         }
+
+        // SPOTIFYGOOD: the final snapshot is the state when the loop ended (see
+        // ConnectSnapshot::ending), the disconnect below only describes the teardown (stopped,
+        // inactive) and would hide what was playing when the connection was lost
+        let mut final_snapshot = self.connect_state.snapshot(
+            self.snapshot_status(),
+            1000 * self.session.time_delta(),
+            self.last_error.clone(),
+        );
+        final_snapshot.ending = true;
 
         // SPOTIFYGOOD: every network call of the epilogue is bounded, so that the task ends
         // even while offline
@@ -893,8 +1019,8 @@ impl SpircTask {
             error!("timeout while closing the dealer")
         }
 
-        // SPOTIFYGOOD: the final state
-        self.publish_snapshot();
+        // SPOTIFYGOOD: the final state, always sent (it differs by `ending`)
+        self.snapshot_tx.send_replace(final_snapshot);
     }
 
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
@@ -967,7 +1093,13 @@ impl SpircTask {
     // SPOTIFYGOOD: handles a command and reports its outcome (snapshot + error stream)
     async fn dispatch_command(&mut self, cmd: SpircCommand) {
         let name = cmd.name();
-        match self.handle_command(cmd).await {
+        let is_add = matches!(cmd, SpircCommand::AddToQueue(_));
+        let result = self.handle_command(cmd).await;
+        if is_add {
+            self.queue_gauge
+                .add_handled(self.connect_state.queued_count());
+        }
+        match result {
             Ok(()) => self.last_error = None,
             Err(e) => {
                 debug!("could not dispatch command: {e}");
@@ -1036,6 +1168,14 @@ impl SpircTask {
             }
             // SPOTIFYGOOD: allowed while not active
             SpircCommand::SetAutoplay(autoplay) => self.handle_set_autoplay(autoplay)?,
+            // SPOTIFYGOOD: allowed while not active, the response of the state put contains the
+            // cluster. A failure isn't reported, the refresh is a background request.
+            SpircCommand::RefreshCluster => {
+                if let Err(why) = self.notify().await {
+                    debug!("cluster refresh failed: {why}")
+                }
+                return Ok(());
+            }
             SpircCommand::Transfer(..) | SpircCommand::Activate => {
                 warn!("SpircCommand::{cmd:?} will be ignored while already active")
             }
@@ -1213,10 +1353,30 @@ impl SpircTask {
                 self.handle_preload_next_track();
                 return Ok(());
             }
-            PlayerEvent::Unavailable { track_id, .. } => {
-                self.handle_unavailable(&track_id)?;
-                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()? {
+            // SPOTIFYGOOD: transient failures (audio key timeout or rate limit, network) no longer
+            // mark the track unavailable for the rest of the session. A failed preload only
+            // preloads the track after it when the failure was specific to that track: after a
+            // key denial or a transient failure the next preload most likely fails the same way,
+            // and the chain walked the whole queue (one key request each) while a track played.
+            // The next track is then loaded (and a failure handled like any other) when the
+            // current one ends.
+            PlayerEvent::Unavailable {
+                track_id, reason, ..
+            } => {
+                let transient = matches!(
+                    reason,
+                    UnavailableReason::KeyTemporarilyDenied | UnavailableReason::NetworkError
+                );
+                let is_current =
+                    self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()?;
+                if !transient {
+                    self.connect_state.mark_unavailable(&track_id)?;
+                }
+                if is_current {
+                    self.handle_preload_next_track();
                     self.handle_next(None)?
+                } else if !transient && reason != UnavailableReason::KeyDenied {
+                    self.handle_preload_next_track();
                 }
             }
             _ => return Ok(()),
@@ -1292,6 +1452,8 @@ impl SpircTask {
         let attributes: UserAttributes = update
             .pairs
             .iter()
+            // SPOTIFYGOOD: keep the local autoplay value, see Spirc::set_autoplay
+            .filter(|(key, _)| !(self.autoplay_override.is_some() && key.as_str() == "autoplay"))
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
         self.session.set_user_attributes(attributes)
@@ -1301,7 +1463,11 @@ impl SpircTask {
         for attribute in mutation.fields.iter() {
             let key = &attribute.name;
 
-            if key == "autoplay" && self.session.config().autoplay.is_some() {
+            // SPOTIFYGOOD: also for the local value of Spirc::set_autoplay. The mutation only
+            // names the field, flipping the local value assumed it mirrors the account.
+            if key == "autoplay"
+                && (self.session.config().autoplay.is_some() || self.autoplay_override.is_some())
+            {
                 trace!("Autoplay override active. Ignoring mutation.");
                 continue;
             }
@@ -1355,8 +1521,11 @@ impl SpircTask {
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
                 info!("device became inactive");
-                self.handle_disconnect().await?;
+                // SPOTIFYGOOD: always stop the local player, even if the requests fail (it kept
+                // playing next to the device that took over), like below
+                let res = self.handle_disconnect().await;
                 self.handle_stop();
+                res?;
             } else if self.connect_state.is_active() {
                 // fixme: workaround fix, because of missing information why it behaves like it does
                 //  background: when another device sends a connect-state update, some player's position de-syncs
@@ -1503,7 +1672,9 @@ impl SpircTask {
             SetRepeatingTrack(repeat_track) => self.handle_repeat_track(repeat_track.value),
             // SPOTIFYGOOD: preload the new next track after queue changes
             AddToQueue(add_to_queue) => {
-                self.connect_state.add_to_queue(add_to_queue.track, true);
+                // SPOTIFYGOOD: fails (instead of dropping the track) when the queue is full
+                self.connect_state
+                    .add_to_queue(add_to_queue.track, true)?;
                 self.handle_next_tracks_changed();
             }
             SetQueue(set_queue) => {
@@ -1670,13 +1841,17 @@ impl SpircTask {
         self.play_status = SpircPlayStatus::Stopped {};
         self.connect_state
             .update_position_in_relation(self.now_ms());
-        self.notify().await?;
+        // SPOTIFYGOOD: become inactive (locally) even if the state update fails, it used to
+        // return early and the device kept reporting itself as active
+        let notified = self.notify().await;
 
-        self.connect_state.became_inactive(&self.session).await?;
+        let inactive = self.connect_state.became_inactive(&self.session).await;
 
         self.player
             .emit_session_disconnected_event(self.session.connection_id(), self.session.username());
 
+        notified?;
+        inactive?;
         Ok(())
     }
 
@@ -1704,8 +1879,8 @@ impl SpircTask {
         self.player
             .emit_volume_changed_event(self.connect_state.device_info().volume as u16);
 
-        self.player
-            .emit_auto_play_changed_event(self.session.autoplay());
+        // SPOTIFYGOOD: Spirc::set_autoplay
+        self.player.emit_auto_play_changed_event(self.autoplay());
 
         self.player
             .emit_filter_explicit_content_changed_event(self.session.filter_explicit_content());
@@ -2074,13 +2249,21 @@ impl SpircTask {
         Ok(())
     }
 
+    // SPOTIFYGOOD: see Spirc::set_autoplay, the local value also survives a replacement of all
+    // user attributes (product info)
+    fn autoplay(&self) -> bool {
+        self.autoplay_override
+            .unwrap_or_else(|| self.session.autoplay())
+    }
+
     // SPOTIFYGOOD: see Spirc::set_autoplay
     fn handle_set_autoplay(&mut self, autoplay: bool) -> Result<(), Error> {
         if self.session.config().autoplay.is_some() {
             Err(SpircError::AutoplayOverridden)?
         }
 
-        let old_value = self.session.autoplay();
+        let old_value = self.autoplay();
+        self.autoplay_override = Some(autoplay);
         self.session
             .set_user_attribute("autoplay", if autoplay { "1" } else { "0" });
 
@@ -2148,8 +2331,24 @@ impl SpircTask {
         let session = self.session.clone();
         let tx = self.suggestions_tx.clone();
 
-        tokio::spawn(async move {
-            let result = session.spclient().get_autoplay_context(&request).await;
+        // the handle aborts it when the results become invalid and when the task ends (it holds
+        // a strong session, and spclient retries without an overall timeout)
+        let task = tokio::spawn(async move {
+            let result = if session.is_invalid() {
+                Err(Error::unavailable("the session is invalid"))
+            } else {
+                timeout(
+                    SUGGESTION_TIMEOUT,
+                    session.spclient().get_autoplay_context(&request),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Error::deadline_exceeded(
+                        "smart shuffle suggestions timed out",
+                    ))
+                })
+            };
+            drop(session);
             // fails only if the spirc task already ended
             let _ = tx.send(SuggestionResponse {
                 generation,
@@ -2157,14 +2356,21 @@ impl SpircTask {
                 result,
             });
         });
+        self.suggestion_fetch.task = Some(task.abort_handle());
     }
 
     // SPOTIFYGOOD: smart shuffle, applies fetched suggestions
     fn handle_suggestions(&mut self, response: SuggestionResponse) {
+        // SPOTIFYGOOD: a result of an earlier generation (sent before its task was aborted)
+        // doesn't end the current fetch
+        if response.generation != self.suggestion_fetch.generation {
+            debug!("smart shuffle: discarding outdated suggestions");
+            return;
+        }
         self.suggestion_fetch.in_flight = false;
+        self.suggestion_fetch.task = None;
 
-        if response.generation != self.suggestion_fetch.generation
-            || &response.context_uri != self.connect_state.context_uri()
+        if &response.context_uri != self.connect_state.context_uri()
             || !self.connect_state.smart_shuffle()
         {
             debug!("smart shuffle: discarding outdated suggestions");
@@ -2287,19 +2493,15 @@ impl SpircTask {
         }
     }
 
-    // Mark unavailable tracks so we can skip them later
-    fn handle_unavailable(&mut self, track_id: &SpotifyUri) -> Result<(), Error> {
-        self.connect_state.mark_unavailable(track_id)?;
-        self.handle_preload_next_track();
-
-        Ok(())
-    }
+    // SPOTIFYGOOD: handle_unavailable (mark + preload the next track) is inlined into the
+    // PlayerEvent::Unavailable handling, which now depends on the reason
 
     fn add_autoplay_resolving_when_required(&mut self) {
         let require_load_new = !self
             .connect_state
             .has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
-            && self.session.autoplay()
+            // SPOTIFYGOOD: Spirc::set_autoplay
+            && self.autoplay()
             && !self.connect_state.context_uri().is_empty();
 
         if !require_load_new {
@@ -2569,5 +2771,31 @@ impl SpircTask {
 impl Drop for SpircTask {
     fn drop(&mut self) {
         debug!("drop Spirc[{}]", self.spirc_id);
+        // SPOTIFYGOOD: covers every end of the task (also an abort of its future)
+        self.suggestion_fetch.cancel();
+    }
+}
+
+// SPOTIFYGOOD
+#[cfg(test)]
+mod tests {
+    use super::SuggestionFetch;
+
+    #[test]
+    fn restart_aborts_the_suggestion_fetch_in_flight() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut fetch = SuggestionFetch::default();
+            let task = tokio::spawn(std::future::pending::<()>());
+            fetch.in_flight = true;
+            fetch.task = Some(task.abort_handle());
+
+            fetch.restart();
+            assert!(!fetch.in_flight && fetch.task.is_none());
+            assert_eq!(fetch.generation, 1);
+            assert!(task.await.unwrap_err().is_cancelled());
+        });
     }
 }

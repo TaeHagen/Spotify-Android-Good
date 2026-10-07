@@ -23,7 +23,7 @@ mod route;
 mod snapshot;
 mod uri;
 
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::RepeatMode;
 use crate::rpc::{ok, parse_args, to_value};
 use crate::engine;
@@ -33,7 +33,11 @@ use librespot_core::spclient::TransferRequest;
 use librespot_playback::mixer::Mixer;
 use route::{CommandKind, RouteInput, Target};
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// How long a playback command waits for a connect attempt in flight (below Kotlin's 15 s
+/// command timeout).
+const CONNECTING_WAIT: Duration = Duration::from_secs(10);
 
 pub(crate) use hub::Attachment;
 pub(crate) use player_events::on_player_event;
@@ -97,7 +101,7 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
         "queue.clear" => control(Ctl::QueueClear).await,
         "queue.skipTo" => control(Ctl::SkipTo(parse_args::<UidArgs>(args)?.uid)).await,
         "connect.transfer" => transfer(parse_args(args)?).await,
-        "connect.refreshDevices" => to_value(&hub::force_publish_devices()),
+        "connect.refreshDevices" => to_value(&hub::refresh_devices().await),
         _ => Err(AppError::invalid(format!("unknown method {method}"))),
     }
 }
@@ -106,7 +110,8 @@ fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     let me = hub::me();
     let active = hub::active_device_id();
     let input = RouteInput {
-        online: engine::is_online() && hub::spirc().is_some(),
+        online: engine::is_online(),
+        spirc: hub::spirc().is_some(),
         local_active: hub::local_active(),
         offline_active: offline::is_active(),
         active_device: active.as_deref(),
@@ -115,14 +120,77 @@ fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     route::route(&input, kind, downloaded)
 }
 
+/// What [`should_wait`] looks at.
+#[derive(Debug, Clone, Copy)]
+struct WaitInput {
+    online: bool,
+    /// A Spirc is attached (visible to Spotify Connect).
+    spirc: bool,
+    /// A connect attempt is in flight (`engine::is_connecting`).
+    connecting: bool,
+    /// The settings want this device visible to Spotify Connect.
+    visible: bool,
+    offline_active: bool,
+}
+
+impl WaitInput {
+    fn now() -> Self {
+        WaitInput {
+            online: engine::is_online(),
+            spirc: hub::spirc().is_some(),
+            connecting: engine::is_connecting(),
+            visible: engine::settings().connect_visible,
+            offline_active: offline::is_active(),
+        }
+    }
+}
+
+/// Whether a command waits for the session: a connect attempt is in flight (cold start,
+/// reconnect, or the engine logging in again to become visible to Spotify Connect) and the
+/// command would otherwise fail or be routed offline. A running offline queue answers controls
+/// right away; a load replaces it, so it waits too.
+fn should_wait(kind: CommandKind, i: WaitInput) -> bool {
+    if kind != CommandKind::Load && i.offline_active {
+        return false;
+    }
+    if i.online {
+        // Online but hidden while the settings already want it visible: Spirc is on its way.
+        !i.spirc && i.visible
+    } else {
+        i.connecting
+    }
+}
+
+/// Holds a command for at most [`CONNECTING_WAIT`] while the session is connecting; stops early
+/// once it is online or the attempt ended (error, offline, stop, backoff).
+async fn await_online_if_connecting(kind: CommandKind) {
+    let mut status = engine::status_watch();
+    let mut online = engine::online_watch();
+    let wait = async {
+        while should_wait(kind, WaitInput::now()) {
+            tokio::select! {
+                r = online.changed() => if r.is_err() { break },
+                r = status.changed() => if r.is_err() { break },
+            }
+        }
+    };
+    if tokio::time::timeout(CONNECTING_WAIT, wait).await.is_err() {
+        log::info!("the session is still connecting, routing the command anyway");
+    }
+}
+
 fn spirc() -> AppResult<std::sync::Arc<librespot_connect::Spirc>> {
     hub::spirc().ok_or_else(AppError::not_connected)
 }
 
 async fn load(args: LoadArgs) -> AppResult<Value> {
     player_events::on_user_load();
+    await_online_if_connecting(CommandKind::Load).await;
     let downloaded = !engine::is_online() && offline::has_downloaded(&args);
-    match decide(CommandKind::Load, downloaded)? {
+    let target = decide(CommandKind::Load, downloaded)?;
+    // An explicit load replaces whatever a reconnect would have restored.
+    restore::clear();
+    match target {
         Target::Local { activate } => {
             let spirc = spirc()?;
             let request = local::load_request(&args)?;
@@ -142,6 +210,12 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
 }
 
 async fn control(cmd: Ctl) -> AppResult<Value> {
+    await_online_if_connecting(cmd.kind()).await;
+    if engine::is_online() {
+        // The user took over before a pending reconnect restore ran (it waits for the first
+        // cluster); while offline the restore point stays for when the session is back.
+        restore::cancel();
+    }
     match decide(cmd.kind(), false)? {
         Target::Local { activate } => local_control(&cmd, activate)?,
         Target::Remote(device) => remote_control(&cmd, &device).await.map_err(remote::remote_error)?,
@@ -165,7 +239,7 @@ fn local_control(cmd: &Ctl, activate: bool) -> AppResult<()> {
         Ctl::Shuffle(enabled) => local::sent(spirc.shuffle(*enabled)),
         Ctl::SmartShuffle(enabled) => local::sent(spirc.smart_shuffle(*enabled)),
         Ctl::Repeat(mode) => local::set_repeat(&spirc, *mode),
-        Ctl::QueueAdd(u) => local::sent(spirc.add_to_queue(u.clone())),
+        Ctl::QueueAdd(u) => local::queue_add(&spirc, u),
         Ctl::QueueRemove(uid) => local::sent(spirc.remove_from_queue(uid.clone())),
         Ctl::QueueMove(uid, to) => {
             let raw = hub::local_snapshot()
@@ -283,18 +357,30 @@ fn set_audio_output(args: AudioOutputArgs) -> AppResult<Value> {
     ok()
 }
 
+fn nothing_active() -> AppError {
+    AppError::new(ErrorCode::NotActiveDevice, "Nothing is playing on any device")
+}
+
 async fn transfer(args: TransferArgs) -> AppResult<Value> {
+    await_online_if_connecting(CommandKind::Load).await;
     if !engine::is_online() {
         return Err(AppError::not_connected());
     }
+    if hub::spirc().is_none() {
+        // Online but hidden from Spotify Connect: no cluster to tell what is active.
+        return Err(route::hidden());
+    }
+    // An explicit choice of the device: a pending reconnect restore doesn't run anymore.
+    restore::cancel();
     let me = hub::me();
+    let other_active = hub::active_device_id().is_some_and(|id| id != me);
     if args.device_id == me {
         let spirc = spirc()?;
         if hub::local_active() {
             if args.play {
                 local::sent(spirc.play())?;
             }
-        } else if hub::active_device_id().is_some_and(|id| id != me) {
+        } else if other_active {
             let request = TransferRequest {
                 transfer_options: TransferOptions {
                     restore_paused: Some(if args.play { "restore" } else { "pause" }.to_string()),
@@ -302,22 +388,27 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
                 },
             };
             local::sent(spirc.transfer(Some(request)))?;
+        } else if offline::is_active() {
+            // Already playing here (downloads).
+            if args.play {
+                offline::control(&Ctl::Play)?;
+            }
         } else {
-            local::sent(spirc.activate())?;
+            // Nothing is active anywhere: start the given session here.
+            let resume = args.resume.as_ref().and_then(|r| r.load_args(args.play)).ok_or_else(nothing_active)?;
+            return load(resume).await;
         }
         return ok();
     }
     if offline::is_active() {
         // The offline queue has no Connect state to transfer: hand its tracks over as a play
         // command, then stop locally.
-        if let Some(snap) = offline::snapshot(hub::this_device_ref(), 0) {
-            let mut uris: Vec<String> = snap.track.iter().map(|t| t.uri.clone()).collect();
-            uris.extend(snap.next_tracks.iter().take(50).map(|t| t.uri.clone()));
+        if let Some((uris, position_ms)) = offline::handover(50) {
             if !uris.is_empty() {
                 let load = LoadArgs {
                     track_uris: Some(uris),
                     start_index: Some(0),
-                    position_ms: snap.position_ms,
+                    position_ms,
                     play: args.play,
                     ..Default::default()
                 };
@@ -328,6 +419,15 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
                 return ok();
             }
         }
+    }
+    if !hub::local_active() && !other_active {
+        // Nothing to transfer: start the given session on the target.
+        let resume = args.resume.as_ref().and_then(|r| r.load_args(args.play)).ok_or_else(nothing_active)?;
+        player_events::on_user_load();
+        remote::send(&args.device_id, remote::play(&resume, &uri::random_command_id()))
+            .await
+            .map_err(remote::remote_error)?;
+        return ok();
     }
     remote::transfer(&args.device_id, args.play).await.map_err(remote::remote_error)?;
     ok()
@@ -369,6 +469,14 @@ pub(crate) fn clear_restore() {
 
 /// The engine's session state changed (online / offline …): recompute what is shown.
 pub(crate) fn on_engine_state_changed() {
+    if engine::is_online() {
+        metadata::on_online();
+        if hub::spirc().is_none() {
+            // Online but hidden from Spotify Connect: nothing to restore into (the engine only
+            // restores into a visible Spirc), so the frozen state goes.
+            restore::clear();
+        }
+    }
     hub::publish();
     hub::publish_devices();
 }
@@ -416,4 +524,41 @@ pub(crate) fn reset() {
         hub.audio_output = None;
     }
     on_engine_state_changed();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_wait_only_for_an_attempt_in_flight() {
+        use CommandKind::*;
+        let connecting = WaitInput { online: false, spirc: false, connecting: true, visible: true, offline_active: false };
+        assert!(should_wait(Load, connecting));
+        assert!(should_wait(Control, connecting));
+        assert!(should_wait(Queue, connecting));
+        // a running offline queue answers controls, a load replaces it
+        let offline_queue = WaitInput { offline_active: true, ..connecting };
+        assert!(!should_wait(Control, offline_queue));
+        assert!(should_wait(Load, offline_queue));
+        // online, or no attempt in flight (offline mode, no network, backoff, error)
+        let online = WaitInput { online: true, spirc: true, connecting: false, ..connecting };
+        assert!(!should_wait(Load, online));
+        let idle = WaitInput { connecting: false, ..connecting };
+        assert!(!should_wait(Load, idle));
+        assert!(!should_wait(Control, idle));
+    }
+
+    #[test]
+    fn commands_wait_while_the_engine_becomes_visible() {
+        use CommandKind::*;
+        // online and hidden, the settings want it visible: the engine logs in again with Spirc
+        let becoming_visible = WaitInput { online: true, spirc: false, connecting: false, visible: true, offline_active: false };
+        assert!(should_wait(Load, becoming_visible));
+        assert!(should_wait(Control, becoming_visible));
+        // staying hidden: no wait, the command fails right away
+        assert!(!should_wait(Load, WaitInput { visible: false, ..becoming_visible }));
+        // the re-login itself is an attempt in flight
+        assert!(should_wait(Load, WaitInput { online: false, connecting: true, ..becoming_visible }));
+    }
 }

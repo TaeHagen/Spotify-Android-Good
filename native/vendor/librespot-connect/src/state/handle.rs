@@ -80,7 +80,7 @@ impl ConnectState {
             uri,
             ..Default::default()
         };
-        self.add_to_queue(track, true);
+        self.add_to_queue(track, true)?;
         Ok(())
     }
 

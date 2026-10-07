@@ -72,6 +72,30 @@ pub fn online_watch() -> watch::Receiver<bool> {
     shared().online.subscribe()
 }
 
+/// Whether a connect attempt is in flight: `Connecting`, `Reconnecting` outside a backoff wait,
+/// or still `Online` while the session was already taken down for a reconnect (becoming visible
+/// to Spotify Connect, a network switch); not stopping, with the network up and offline mode off,
+/// so the session may be Online within seconds. `connect` holds playback commands briefly
+/// meanwhile instead of routing them offline.
+pub(crate) fn is_connecting() -> bool {
+    let (session_state, retry_pending, stopping) = {
+        let s = shared().status.borrow();
+        (s.state, s.next_retry_ms.is_some(), s.stopping)
+    };
+    let attempt = match session_state {
+        SessionState::Connecting => true,
+        SessionState::Reconnecting => !retry_pending,
+        SessionState::Online => !is_online(),
+        _ => false,
+    };
+    attempt && !stopping && !settings().offline && state::network_available()
+}
+
+/// Changes with every session state change (subscribe before checking [`is_connecting`]).
+pub(crate) fn status_watch() -> watch::Receiver<impl Send + Sync> {
+    shared().status.subscribe()
+}
+
 pub fn settings() -> EngineSettings {
     shared().settings.read().clone()
 }

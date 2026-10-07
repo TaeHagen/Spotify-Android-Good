@@ -141,8 +141,11 @@ INTERNAL`. `BAD_CREDENTIALS` = the access point refused the login credentials (A
 `LoginFailed` "Bad credentials" / "Could not validate credentials"); Kotlin then deletes the
 stored credentials. An HTTP 401/407/511 (rejected bearer token, proxy authentication) is
 `NETWORK` and retried. `PLAYBACK_REFUSED` = Spotify permanently refused audio keys for this account
-(librespot #1649; AesKeyError 0x0001). The engine stops after 3 consecutive refusals instead
-of skipping through the queue, and the app shows a dedicated explanation screen.
+(librespot #1649; AesKeyError 0x0001). The engine stops after 3 consecutive refused loads
+instead of skipping through the queue, and the app shows a dedicated explanation screen. Only
+loads count: a refused preload never stops the playing track. 3 loads failing transiently
+(audio key timeout or rate limit, network) also stop playback, with `RATE_LIMITED`
+(`retryAfterMs` 60000) or `NETWORK`. A track plays or a new `player.load` resets the count.
 Kotlin maps them to `NativeException(code, message)`.
 
 ### 3.4 JSON conventions
@@ -274,6 +277,10 @@ prev/next semantics identical to Spirc (prev restarts if position > 3 s). It dri
 same Player and emits the same `playback` snapshots with `source:"local"`,
 `isActiveDevice:true`, `offline:true`. When the session comes back Online, the offline
 queue keeps playing; the next `player.load` goes through Spirc again.
+Native resolution of an offline `player.load`: `trackUris` queues the downloaded ones among
+them; a bare album / artist / show `contextUri` queues its downloads in context order (disc
+and track number; newest episode first); a playlist / Liked Songs / other `contextUri`
+without `trackUris` fails with `UNAVAILABLE` "Not available offline" (never "all downloads").
 The engine cannot know which downloads belong to a playlist or Liked Songs, so while the
 session is not Online Kotlin's `PlayerController` sends context loads of a playlist / Liked
 Songs / album / show with `trackUris` = that context's downloads in context order (Room
@@ -290,7 +297,7 @@ snapshots.
 | `credentials` | `{"username","authType","authData"}` — store encrypted, replaces previous |
 | `playback` | `PlaybackSnapshot` (full snapshot, only on change) |
 | `devices` | `DeviceList` |
-| `queueMetadata` | `{"tracks":[Track…],"episodes":[Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri) |
+| `queueMetadata` | `{"tracks":[Track…],"episodes":[Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri). Filled / fetched for the current track, the next 50 (the Media3 queue window) and the last 10 prev |
 | `download` | `DownloadProgress` |
 | `error` | `{"code","message","context":"playback|connect|session|…"}` user-visible, transient |
 | `log` | not used (logs go to logcat via android_logger, tag `spotcore`) |
@@ -339,7 +346,12 @@ snapshots.
 All results are JSON objects (`{}` when nothing to return). Commands that act on
 playback are routed by the engine: **if this device is active (or nothing is active)**
 → local Spirc (activating first when needed) / OfflineController; **if another device is
-active** → connect-state command to that device.
+active** → connect-state command to that device. While a connect attempt is in flight
+(`connecting`, or `reconnecting` outside a backoff wait, with the network up and offline mode
+off) `player.load` and the control / queue commands first wait up to 10 s for `online`
+(controls don't wait while offline playback runs), so a command right after a cold start or
+during a reconnect isn't routed offline. A control after `online` drops a pending reconnect
+restore (§8).
 
 ### 6.1 Session
 
@@ -374,13 +386,13 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `player.setVolume` | `{"volume":0..65535,"fromSystem":false}` |
 | `player.setAudioOutput` | `{"type":"speaker|bluetooth|line_out|car|unknown","name":"…"}` (local only; reported to Connect) |
 | `player.applySettings` | `EngineSettings` subset (`bitrate`, `normalize`, `normalizePregain`, `gapless`), applied to the running Player (§4.3) |
-| `queue.add` | `{"uri":"spotify:track:…"}` |
+| `queue.add` | `{"uri":"spotify:track:…"}` — on this device at most 80 tracks can be queued (Connect's next-tracks window); a further add fails with `UNAVAILABLE` "The queue is full" |
 | `queue.remove` | `{"uid":"…"}` |
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
-| `connect.transfer` | `{"deviceId":"…","play":true?}` (self = pull, other = push) |
-| `connect.refreshDevices` | `{}` → `DeviceList` |
+| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs"}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE`. Pushing offline playback hands over its tracks and current position |
+| `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>"}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…"}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
 
@@ -516,7 +528,12 @@ For a remote active device, smart shuffle is not supported (the command reports
 * **Visibility**: the phone is listed only while it can play. Kotlin sets `connectVisible`
   while a UI (app in the foreground), PLAYBACK or PRESENCE holder is held; a DOWNLOAD holder
   alone and the idle grace keep it hidden. Hidden, the supervisor connects the Session without
-  Spirc (catalog, downloads and tokens keep working, `connect` routes as if not online).
+  Spirc (catalog, downloads and tokens keep working). `connect` then never starts offline
+  playback: `player.load`, control, queue and `connect.transfer` fail with `NOT_CONNECTED`
+  (controls still reach a running offline queue, volume the local mixer), except while
+  `connectVisible` is already true (Spirc is on its way), when they wait up to 10 s like during
+  a connect attempt. The device list omits this phone, the playback snapshot shows the remote
+  player state of the last cluster (never a local one), and no reconnect restore runs.
   Becoming hidden shuts Spirc down (it disconnects, deletes its connect state and closes the
   dealer, so the device leaves the cluster) and keeps the Session. Becoming visible reconnects
   with a new Session + Spirc: `Spirc::new` performs the login itself and a Session's dealer
@@ -538,6 +555,13 @@ For a remote active device, smart shuffle is not supported (the command reports
   control the remote device; the notification says "Playing on <device>".
 * **Audio output reporting**: Kotlin reports the current local output (speaker /
   Bluetooth "<name>" / wired / USB / car) with `player.setAudioOutput`.
+* **Reconnect restore**: when the engine rebuilds Session + Spirc (network switch, lost AP
+  connection), the last local playback is frozen and shown paused; a Spirc that ended by
+  itself has its Player paused at that point. Once the new Spirc is online and its first
+  cluster shows no other active device, the device activates and reloads context, track,
+  position, options and user queue (playing again if the gap was < 120 s). An explicit
+  `player.load` (local, remote or offline) or running offline playback replaces the restore
+  point; a dropped restore point stops the paused track nobody owns anymore.
 * **Local-network discovery (the "send" side)**: speakers and receivers on the LAN that are not
   yet in the account's cluster (a librespot/spotifyd box, an idle speaker) advertise a ZeroConf
   HTTP service `_spotify-connect._tcp`. The app lists them and logs the tapped one into this

@@ -171,10 +171,14 @@ impl<'ct> ConnectState {
     pub fn prev_track(&mut self) -> Result<Option<&MessageField<ProvidedTrack>>, Error> {
         let old_track = self.player_mut().track.take();
 
+        // SPOTIFYGOOD: entries go back in after the queued tracks (they were inserted in front
+        // of them, so the old track played before the queue and the queue wasn't contiguous)
+        let after_queue = self.queue_end();
+
         if let Some(old_track) = old_track {
             if old_track.is_context() || old_track.is_autoplay() {
                 // todo: O(n)
-                self.next_tracks_mut().insert(0, old_track);
+                self.next_tracks_mut().insert(after_queue, old_track);
             }
         }
 
@@ -186,17 +190,12 @@ impl<'ct> ConnectState {
                 .pop()
                 .expect("item that was prechecked");
 
-            let next_tracks = self.next_tracks_mut();
-            if next_tracks.len() >= SPOTIFY_MAX_NEXT_TRACKS_SIZE {
-                let _ = next_tracks.pop();
-            }
             // todo: O(n)
-            next_tracks.insert(0, delimiter)
+            self.next_tracks_mut().insert(after_queue, delimiter)
         }
 
-        while self.next_tracks().len() > SPOTIFY_MAX_NEXT_TRACKS_SIZE {
-            let _ = self.next_tracks_mut().pop();
-        }
+        // SPOTIFYGOOD: the dropped end is filled in again later (it used to be lost)
+        self.truncate_next_tracks(SPOTIFY_MAX_NEXT_TRACKS_SIZE);
 
         let new_track = match self.prev_tracks_mut().pop() {
             None => return Ok(None),
@@ -315,6 +314,9 @@ impl<'ct> ConnectState {
                 {
                     self.update_context_index(self.fill_up_context, new_index)?;
 
+                    // SPOTIFYGOOD: keep the pass, see below
+                    self.get_context_mut(self.fill_up_context)?.index.page = iteration;
+
                     // transition to autoplay as fill up context
                     self.fill_up_context = ContextType::Autoplay;
                     new_index = self.get_context(ContextType::Autoplay)?.index.track as usize;
@@ -336,11 +338,14 @@ impl<'ct> ConnectState {
                     }
                 }
                 None => break,
-                // SPOTIFYGOOD: also skip tracks the user removed from the next tracks
+                // SPOTIFYGOOD: also skip tracks the user removed from the next tracks, and tracks
+                // marked unavailable after the context was loaded (mark_unavailable only
+                // removes them from the next tracks, a rewind of the fill up would add them again)
                 Some(ct)
                     if ct.is_unavailable()
                         || self.is_skip_track(ct, Some(iteration))
-                        || self.skipped_uids.contains(&ct.uid) =>
+                        || self.skipped_uids.contains(&ct.uid)
+                        || self.unavailable_uri.contains(&ct.uri) =>
                 {
                     debug!(
                         "skipped track {} during fillup as it's unavailable or should be skipped",
@@ -351,7 +356,7 @@ impl<'ct> ConnectState {
                 }
                 Some(ct) => {
                     // SPOTIFYGOOD: smart shuffle
-                    suggestion = self.suggestion_after(new_index, ct);
+                    suggestion = self.suggestion_after(iteration, new_index, ct);
                     new_index += 1;
                     ct.clone()
                 }
@@ -373,6 +378,10 @@ impl<'ct> ConnectState {
         );
 
         self.update_context_index(self.fill_up_context, new_index)?;
+        // SPOTIFYGOOD: keep the pass (wraps with repeat) of the fill up position, it only started
+        // at the persisted page and was never stored: every later fill up counted from 0 again,
+        // so delimiter uids repeated and smart shuffle suggestions came back in every pass
+        self.get_context_mut(self.fill_up_context)?.index.page = iteration;
 
         // the web-player needs a revision update, otherwise the queue isn't updated in the ui
         self.update_queue_revision();
@@ -439,7 +448,18 @@ impl<'ct> ConnectState {
         Ok(())
     }
 
-    pub fn add_to_queue(&mut self, mut track: ProvidedTrack, rev_update: bool) {
+    // SPOTIFYGOOD: returns an error when the queue is full
+    pub fn add_to_queue(
+        &mut self,
+        mut track: ProvidedTrack,
+        rev_update: bool,
+    ) -> Result<(), StateError> {
+        // SPOTIFYGOOD: the next tracks are capped, a queue that fills them can't take another
+        // track (it was dropped right away, while the add reported success)
+        if self.queued_count() >= SPOTIFY_MAX_NEXT_TRACKS_SIZE {
+            return Err(StateError::QueueFull(SPOTIFY_MAX_NEXT_TRACKS_SIZE));
+        }
+
         track.uid = format!("q{}", self.queue_count);
         self.queue_count += 1;
 
@@ -455,14 +475,88 @@ impl<'ct> ConnectState {
             next_tracks.push(track)
         }
 
-        while next_tracks.len() > SPOTIFY_MAX_NEXT_TRACKS_SIZE {
-            next_tracks.pop();
-        }
+        // SPOTIFYGOOD: the dropped context track is filled in again later (it was skipped)
+        self.truncate_next_tracks(SPOTIFY_MAX_NEXT_TRACKS_SIZE);
 
         if rev_update {
             self.update_queue_revision();
         }
         self.update_restrictions();
+        Ok(())
+    }
+
+    // SPOTIFYGOOD: helpers for the capped next tracks
+    /// The amount of queued tracks in the next tracks
+    pub fn queued_count(&self) -> usize {
+        self.next_tracks().iter().filter(|t| t.is_queue()).count()
+    }
+
+    /// The index of the first not queued entry of the next tracks
+    fn queue_end(&self) -> usize {
+        self.next_tracks()
+            .iter()
+            .position(|t| !t.is_queue())
+            .unwrap_or(self.next_tracks().len())
+    }
+
+    /// Drops entries from the end of the next tracks until at most `max` are left
+    ///
+    /// The fill up continues at the earliest dropped context (or autoplay) track, so that the
+    /// dropped tracks are filled in again later. Upstream only popped them, and because the fill
+    /// up index already pointed past them, they were never played.
+    fn truncate_next_tracks(&mut self, max: usize) {
+        while self.next_tracks().len() > max {
+            let Some(dropped) = self.next_tracks_mut().pop() else {
+                break;
+            };
+            self.rewind_fill_up(&dropped);
+        }
+    }
+
+    fn rewind_fill_up(&mut self, dropped: &ProvidedTrack) {
+        if dropped.uid.starts_with(IDENTIFIER_DELIMITER) {
+            if matches!(self.fill_up_context, ContextType::Autoplay) {
+                // the transition to autoplay (see fill_up_next_tracks), the index of the default
+                // context still points at its end, so the transition happens again
+                self.fill_up_context = ContextType::Default;
+            } else if let Ok(ctx) = self.get_context_mut(ContextType::Default) {
+                // a wrap of the context (repeat), the next fill up wraps again
+                ctx.index.track = ctx.tracks.len() as u32;
+                ctx.index.page = ctx.index.page.saturating_sub(1);
+            }
+            return;
+        }
+
+        if dropped.is_queue() {
+            warn!(
+                "dropped the queued track <{}> from the next tracks",
+                dropped.uri
+            );
+            return;
+        }
+        if dropped.is_suggestion() {
+            // injected again by the fill up after the (dropped) context track it follows
+            return;
+        }
+
+        let ty = if dropped.is_autoplay() {
+            ContextType::Autoplay
+        } else {
+            ContextType::Default
+        };
+        let Ok(ctx) = self.get_context_mut(ty) else {
+            return;
+        };
+        match ctx.tracks.iter().position(|t| t.uid == dropped.uid) {
+            Some(position) => {
+                ctx.index.track = position as u32;
+                self.fill_up_context = ty;
+            }
+            None => debug!(
+                "dropped next track <{}> isn't in the context",
+                dropped.uri
+            ),
+        }
     }
 
     // SPOTIFYGOOD: local "skip to" (tap on an entry of the next tracks)
