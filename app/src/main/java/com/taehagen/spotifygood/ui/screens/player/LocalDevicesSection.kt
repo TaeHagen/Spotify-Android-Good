@@ -20,6 +20,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,6 +49,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -59,8 +61,12 @@ internal data class LocalDevicesUiState(
     val connectingId: String? = null,
 )
 
+/** Results for one open devices sheet ([sheet], see [DevicesEvent]); other sheets ignore them. */
 internal sealed interface LocalConnectEvent {
-    data class Failed(val deviceName: String, val network: Boolean) : LocalConnectEvent
+    val sheet: String
+
+    data class Connected(override val sheet: String) : LocalConnectEvent
+    data class Failed(override val sheet: String, val deviceName: String, val network: Boolean) : LocalConnectEvent
 }
 
 internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
@@ -89,21 +95,24 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
 
     fun stopDiscovery() = discovery.stop()
 
-    /** Logs the device into the account, transfers playback to it, then invokes [onConnected]. */
-    fun connect(device: LocalConnectDevice, onConnected: () -> Unit) {
+    /**
+     * Logs the device into the account and transfers playback to it; the result goes to [sheet]
+     * only (no UI callback is held here: the sheet may be gone by then).
+     */
+    fun connect(device: LocalConnectDevice, sheet: String) {
         if (connecting.value != null) return
         viewModelScope.launch {
             connecting.value = device.deviceId
             try {
                 val deviceId = discovery.login(device)
                 devicesRepository.transferTo(deviceId)
-                onConnected()
+                eventChannel.trySend(LocalConnectEvent.Connected(sheet))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: NativeException) {
-                eventChannel.trySend(LocalConnectEvent.Failed(device.name, e.isNetwork))
+                eventChannel.trySend(LocalConnectEvent.Failed(sheet, device.name, e.isNetwork))
             } catch (e: Exception) {
-                eventChannel.trySend(LocalConnectEvent.Failed(device.name, network = false))
+                eventChannel.trySend(LocalConnectEvent.Failed(sheet, device.name, network = false))
             } finally {
                 connecting.value = null
             }
@@ -121,11 +130,12 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
  * sheet. Tapping a device logs it in, transfers playback and closes the sheet via [onConnected].
  */
 @Composable
-internal fun LocalDevicesSection(onConnected: () -> Unit) {
+internal fun LocalDevicesSection(sheet: String, onConnected: () -> Unit) {
     val viewModel = appViewModel { graph -> LocalDevicesViewModel(graph) }
     val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var error by remember { mutableStateOf<String?>(null) }
+    val currentOnConnected by rememberUpdatedState(onConnected)
 
     // Discovery (and the Wi-Fi multicast lock) live only while the sheet is STARTED.
     LifecycleStartEffect(viewModel) {
@@ -133,9 +143,10 @@ internal fun LocalDevicesSection(onConnected: () -> Unit) {
         onStopOrDispose { viewModel.stopDiscovery() }
     }
 
-    LaunchedEffect(viewModel) {
-        viewModel.events.collect { event ->
+    LaunchedEffect(viewModel, sheet) {
+        viewModel.events.filter { it.sheet == sheet }.collect { event ->
             when (event) {
+                is LocalConnectEvent.Connected -> currentOnConnected()
                 is LocalConnectEvent.Failed -> {
                     error = context.getString(
                         if (event.network) R.string.local_connect_login_failed_network else R.string.local_connect_login_failed,
@@ -180,7 +191,7 @@ internal fun LocalDevicesSection(onConnected: () -> Unit) {
                     enabled = state.connectingId == null,
                     onClick = {
                         error = null
-                        viewModel.connect(device, onConnected)
+                        viewModel.connect(device, sheet)
                     },
                 )
             }
