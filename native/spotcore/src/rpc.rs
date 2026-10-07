@@ -5,7 +5,7 @@
 //! whoever removes the id from the registry first (the finishing task or the canceller) posts it.
 
 use crate::error::{AppError, AppResult};
-use crate::{bridge, catalog, connect, engine, offline, runtime};
+use crate::{bridge, catalog, connect, engine, offline, runtime, zeroconf_client};
 use futures_util::FutureExt;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -79,6 +79,11 @@ pub fn cancel(request_id: i64) {
 }
 
 async fn route(method: &str, args: Value) -> AppResult<Value> {
+    // ZeroConf local-network login (connect.localInfo / connect.localLogin) before the generic
+    // connect route; see docs/ARCHITECTURE.md §6.2, §8.
+    if method.starts_with("connect.local") {
+        return zeroconf_client::handle(method, args).await;
+    }
     let namespace = method.split('.').next().unwrap_or_default();
     match namespace {
         "session" => engine::handle(method, args).await,

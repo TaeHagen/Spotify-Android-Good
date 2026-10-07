@@ -209,6 +209,7 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
             Box {
                 DevicesList(
                     state = state,
+                    onConnectedLocal = { scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() } },
                     onRefresh = { viewModel.refresh(userInitiated = true) },
                     onTransfer = viewModel::transferTo,
                     onSelectOutput = viewModel::selectOutput,
@@ -228,6 +229,7 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
 @Composable
 private fun DevicesList(
     state: DevicesUiState,
+    onConnectedLocal: () -> Unit,
     onRefresh: () -> Unit,
     onTransfer: (id: String, name: String) -> Unit,
     onSelectOutput: (AudioOutput?) -> Unit,
@@ -351,6 +353,8 @@ private fun DevicesList(
                 )
             }
         }
+        // Spotify Connect receivers on the local network that aren't in the account yet (§8).
+        item(key = "local") { LocalDevicesSection(onConnected = onConnectedLocal) }
         item(key = "hint") {
             Text(
                 text = stringResource(R.string.player_devices_hint),

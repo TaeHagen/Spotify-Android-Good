@@ -333,6 +333,14 @@ active** → connect-state command to that device.
 | `queue.skipTo` | `{"uid":"…"}` |
 | `connect.transfer` | `{"deviceId":"…","play":true?}` (self = pull, other = push) |
 | `connect.refreshDevices` | `{}` → `DeviceList` |
+| `connect.localInfo` | `{"url":"http://host:port/<CPath>"}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
+| `connect.localLogin` | `{"url":"…","deviceId"?:"…"}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
+
+`LocalDeviceInfo`: `{"deviceId","remoteName","deviceType":<DeviceList type>,"activeUser"?,"tokenTypes":[…],"supportsAccessToken":bool,"version","brand"?,"model"?,"isGroup":bool,"availability"?}`.
+Key material (the device's DH public key, client id) never crosses the JNI boundary; Rust keeps it
+for the `addUser` call. `connect.localInfo`/`connect.localLogin` are routed by `rpc.rs` to the
+`zeroconf_client` module (a `connect.local` prefix match ahead of the generic `connect.` route),
+not to the `connect` playback module. `connect.localLogin` requires an online session.
 
 ### 6.3 Catalog (Spotify internal APIs, JSON shaped for the UI)
 
@@ -447,6 +455,32 @@ For a remote active device, smart shuffle is not supported (the command reports
   control the remote device; the notification says "Playing on <device>".
 * **Audio output reporting**: Kotlin reports the current local output (speaker /
   Bluetooth "<name>" / wired / USB / car) with `player.setAudioOutput`.
+* **Local-network discovery (the "send" side)**: speakers and receivers on the LAN that are not
+  yet in the account's cluster (a librespot/spotifyd box, an idle speaker) advertise a ZeroConf
+  HTTP service `_spotify-connect._tcp`. The app lists them and logs the tapped one into this
+  account, so it joins the cluster and playback can be transferred to it.
+  * **Kotlin (`connect/LocalDeviceDiscovery.kt`)** browses mDNS with `NsdManager`
+    (`registerServiceInfoCallback` on API 34+, `resolveService` below, one resolve at a time),
+    reads the `CPath` TXT record (default `/`), and holds a Wi-Fi `MulticastLock` **only while the
+    devices sheet is visible**. Discovery runs only while the sheet is open and stops on dispose,
+    background or logout (battery). Each resolved service is probed with `connect.localInfo`, then
+    deduped by `deviceId` and dropped if it is already in the cluster `DeviceList`.
+  * **Rust (`zeroconf_client/`)** is the exact inverse of `librespot-discovery` 0.8.0's device
+    side. `connect.localInfo` GETs `?action=getInfo`. `connect.localLogin` POSTs `?action=addUser`
+    with the credentials blob: Diffie-Hellman with the device's `publicKey` (librespot's DH group),
+    `baseKey = SHA1(shared)[..16]`, `encryptionKey = HMAC-SHA1(baseKey,"encryption")[..16]`,
+    `checksumKey = HMAC-SHA1(baseKey,"checksum")`; AES-128-CTR with a random IV and an HMAC-SHA1
+    checksum over the ciphertext, sent as `base64(iv‖ciphertext‖mac)` with our DH public key as
+    `clientKey`. The inner blob is the inverse of `Credentials::with_blob`
+    (`0x49,bytes(user),0x50,int(authType),0x51,bytes(authData)`, block-padded, the XOR-with-prior-
+    block step, AES-192-ECB under a PBKDF2 key from `SHA1(deviceId)` and the username, then base64).
+    When `getInfo` advertises `tokenType` `accesstoken`, a fresh login5 access token (keymaster,
+    `streaming` scope) is sent as the blob with the device's client id as `clientKey`; otherwise the
+    stored reusable credentials blob is used. After a successful `addUser` the engine waits up to
+    10 s for the device to appear in the cluster and returns its Connect device id for
+    `connect.transfer`. Only local-network hosts (loopback / private / link-local / `.local`) over
+    plain HTTP are accepted; all timeouts are bounded. mDNS browsing is Kotlin's `NsdManager`, so
+    Rust only ever sees the URL.
 
 ## 9. Android app
 

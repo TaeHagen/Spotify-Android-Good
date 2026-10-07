@@ -382,6 +382,29 @@ pub(crate) fn on_engine_stopped(release_player: bool) {
     on_engine_state_changed();
 }
 
+/// The Connect device ids currently in the cluster (the devices in the account's cluster).
+/// Used by the ZeroConf client to tell whether a freshly logged-in device has joined, and to
+/// hide devices that are already in the cluster from the local-network list.
+pub(crate) fn cluster_device_ids() -> Vec<String> {
+    hub::cluster().map(|c| c.device.keys().cloned().collect()).unwrap_or_default()
+}
+
+/// Looks for `device_id` among the cluster devices (exact match, then case-insensitive),
+/// returning the cluster's own id for it. The ZeroConf `deviceID` is normally the same string
+/// the device registers as on the dealer, so an exact match is the common case.
+pub(crate) fn find_cluster_device(device_id: &str) -> Option<String> {
+    let ids = cluster_device_ids();
+    ids.iter()
+        .find(|id| id.as_str() == device_id)
+        .or_else(|| ids.iter().find(|id| id.eq_ignore_ascii_case(device_id)))
+        .cloned()
+}
+
+/// Woken on every cluster update (a new device joining pushes a cluster update to us).
+pub(crate) fn cluster_changed() -> &'static tokio::sync::Notify {
+    &hub::CLUSTER_CHANGED
+}
+
 /// Logout: forget everything user-specific.
 pub(crate) fn reset() {
     offline::stop();
