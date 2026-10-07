@@ -9,12 +9,16 @@
 //!   tasks (bounded by the HTTP timeout) so a cancelled RPC never strands other waiters.
 //! * Raw protobufs are converted leniently: an entity that fails to convert is skipped, it never
 //!   fails the batch.
+//! * Lookups tell "the server has no data for this URI" (omitted) apart from "the request for it
+//!   failed" ([`Fetched::failed`]), so pages can mark themselves partial instead of presenting a
+//!   network blip as missing items. A lookup fails as a whole only when nothing resolved.
 
+use super::context;
 use super::http;
 use super::util::{
     format_date, image_from_file_id, normalize_images, parse_kind, strip_html, uri_from_gid, UriKind,
 };
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{AlbumRef, AlbumType, ArtistRef, Episode, Image, ShowRef, Track};
 use futures_util::future::{join_all, BoxFuture, FutureExt, Shared};
 use futures_util::stream::{self, StreamExt};
@@ -41,6 +45,11 @@ const CONCURRENCY: usize = 3;
 const MAX_AGE: Duration = Duration::from_secs(12 * 3600);
 /// Artist pages change (top tracks, new releases) more often.
 const ARTIST_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+/// Show episode lists resolved without `SHOW_V4` (kept as long as the show metadata).
+const SHOW_EPISODES_MAX_AGE: Duration = ARTIST_MAX_AGE;
+/// Episodes of a show read from context-resolve when `SHOW_V4_EPISODES_ASSOC` has none.
+const SHOW_CONTEXT_MAX_ITEMS: usize = 2000;
+const SHOW_CONTEXT_MAX_PAGES: usize = 20;
 
 // ---------------------------------------------------------------------------------------------
 // Public API (stable contract, used by `connect`)
@@ -49,14 +58,14 @@ const ARTIST_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 /// Returns metadata for `uris` (track URIs), from the cache where possible, fetching the rest in
 /// batches. Unknown/unavailable URIs are omitted. Order follows `uris`.
 pub async fn tracks(session: &Session, uris: &[String]) -> AppResult<Vec<Track>> {
-    let (order, map) = lookup(&TRACKS, session, uris, UriKind::Track, fetch_tracks).await?;
-    Ok(order.iter().filter_map(|u| map.get(u)).map(|t| (**t).clone()).collect())
+    let (order, f) = lookup(&TRACKS, session, uris, UriKind::Track, fetch_tracks).await?;
+    Ok(order.iter().filter_map(|u| f.map.get(u)).map(|t| (**t).clone()).collect())
 }
 
 /// Same as [`tracks`] for episode URIs.
 pub async fn episodes(session: &Session, uris: &[String]) -> AppResult<Vec<Episode>> {
-    let (order, map) = lookup(&EPISODES, session, uris, UriKind::Episode, fetch_episodes).await?;
-    Ok(order.iter().filter_map(|u| map.get(u)).map(|e| (**e).clone()).collect())
+    let (order, f) = lookup(&EPISODES, session, uris, UriKind::Episode, fetch_episodes).await?;
+    Ok(order.iter().filter_map(|u| f.map.get(u)).map(|e| (**e).clone()).collect())
 }
 
 /// Cached track metadata without network access.
@@ -111,24 +120,120 @@ pub(crate) struct ShowMeta {
     pub episode_uris: Vec<String>,
 }
 
-pub(crate) async fn track_map(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<Track>>> {
+/// Outcome of a batched lookup.
+#[derive(Debug)]
+pub(crate) struct Fetched<T> {
+    /// Resolved entities by canonical URI.
+    pub map: HashMap<String, Arc<T>>,
+    /// Requested URIs whose request failed (network, rate limit, server error): their data is
+    /// unknown right now. URIs in neither `map` nor `failed` have no data on the server.
+    pub failed: HashSet<String>,
+    /// First fetch error; set whenever `failed` is non-empty.
+    pub error: Option<AppError>,
+}
+
+impl<T> Default for Fetched<T> {
+    fn default() -> Self {
+        Self { map: HashMap::new(), failed: HashSet::new(), error: None }
+    }
+}
+
+impl<T> Fetched<T> {
+    /// True when `uri` is unresolved because its request failed.
+    pub(crate) fn is_failed(&self, uri: &str) -> bool {
+        !self.map.contains_key(uri) && self.failed.contains(uri)
+    }
+
+    /// Whether some of `uris` are unresolved because their request failed.
+    pub(crate) fn any_failed<'a>(&self, mut uris: impl Iterator<Item = &'a String>) -> bool {
+        !self.failed.is_empty() && uris.any(|u| self.is_failed(u))
+    }
+
+    /// The outcome of a lookup, with a lookup that failed as a whole turned into one in which
+    /// every one of `uris` failed.
+    pub(crate) fn or_all_failed(r: AppResult<Self>, uris: &[String]) -> Self {
+        r.unwrap_or_else(|e| Self { map: HashMap::new(), failed: uris.iter().cloned().collect(), error: Some(e) })
+    }
+}
+
+impl<T: Clone> Fetched<T> {
+    /// Entities for `uris` in order. Unresolved URIs become `placeholder(uri)`: every one when
+    /// `keep_missing` (lists whose slots must stay aligned), else only those whose request failed
+    /// (URIs the server has no data for are dropped).
+    pub(crate) fn ordered(&self, uris: &[String], keep_missing: bool, placeholder: impl Fn(&str) -> T) -> Vec<T> {
+        uris.iter()
+            .filter_map(|u| match self.map.get(u) {
+                Some(v) => Some((**v).clone()),
+                None if keep_missing || self.failed.contains(u) => Some(placeholder(u)),
+                None => None,
+            })
+            .collect()
+    }
+}
+
+/// Stand-in for a track without metadata: only the URI, `playable:false` (docs §6.5).
+pub(crate) fn placeholder_track(uri: &str) -> Track {
+    Track { uri: uri.to_string(), playable: false, ..Default::default() }
+}
+
+/// Stand-in for an episode without metadata: only the URI, `playable:false` (docs §6.5).
+pub(crate) fn placeholder_episode(uri: &str) -> Episode {
+    Episode { uri: uri.to_string(), playable: false, ..Default::default() }
+}
+
+/// An item-metadata failure reported for a whole page: transport and session codes are kept,
+/// anything else (e.g. NOT_FOUND for the batch request itself) becomes UNAVAILABLE, so callers
+/// never mistake "item metadata unavailable right now" for "this page does not exist".
+pub(crate) fn page_error(e: AppError) -> AppError {
+    match e.code {
+        ErrorCode::Network
+        | ErrorCode::RateLimited
+        | ErrorCode::Unavailable
+        | ErrorCode::Cancelled
+        | ErrorCode::NotLoggedIn
+        | ErrorCode::NotConnected => e,
+        _ => AppError { code: ErrorCode::Unavailable, ..e },
+    }
+}
+
+pub(crate) async fn track_lookup(session: &Session, uris: &[String]) -> AppResult<Fetched<Track>> {
     Ok(lookup(&TRACKS, session, uris, UriKind::Track, fetch_tracks).await?.1)
 }
 
-pub(crate) async fn episode_map(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<Episode>>> {
+pub(crate) async fn episode_lookup(session: &Session, uris: &[String]) -> AppResult<Fetched<Episode>> {
     Ok(lookup(&EPISODES, session, uris, UriKind::Episode, fetch_episodes).await?.1)
 }
 
-pub(crate) async fn albums(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<AlbumMeta>>> {
+pub(crate) async fn album_lookup(session: &Session, uris: &[String]) -> AppResult<Fetched<AlbumMeta>> {
     Ok(lookup(&ALBUMS, session, uris, UriKind::Album, fetch_albums).await?.1)
 }
 
-pub(crate) async fn artists(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<ArtistMeta>>> {
+pub(crate) async fn artist_lookup(session: &Session, uris: &[String]) -> AppResult<Fetched<ArtistMeta>> {
     Ok(lookup(&ARTISTS, session, uris, UriKind::Artist, fetch_artists).await?.1)
 }
 
-pub(crate) async fn shows(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<ShowMeta>>> {
+pub(crate) async fn show_lookup(session: &Session, uris: &[String]) -> AppResult<Fetched<ShowMeta>> {
     Ok(lookup(&SHOWS, session, uris, UriKind::Show, fetch_shows).await?.1)
+}
+
+pub(crate) async fn track_map(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<Track>>> {
+    Ok(track_lookup(session, uris).await?.map)
+}
+
+pub(crate) async fn episode_map(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<Episode>>> {
+    Ok(episode_lookup(session, uris).await?.map)
+}
+
+pub(crate) async fn albums(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<AlbumMeta>>> {
+    Ok(album_lookup(session, uris).await?.map)
+}
+
+pub(crate) async fn artists(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<ArtistMeta>>> {
+    Ok(artist_lookup(session, uris).await?.map)
+}
+
+pub(crate) async fn shows(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<ShowMeta>>> {
+    Ok(show_lookup(session, uris).await?.map)
 }
 
 /// Single album (NOT_FOUND when the server has no data).
@@ -152,9 +257,77 @@ fn single<T>(mut map: HashMap<String, Arc<T>>, uri: &str, what: &str) -> AppResu
 /// carries no episode list).
 pub(crate) async fn show_episode_assoc(session: &Session, show_uri: &str) -> AppResult<Vec<String>> {
     let raw = fetch_extended(session, ExtensionKind::SHOW_V4_EPISODES_ASSOC, &[show_uri.to_string()]).await?;
-    let Some(bytes) = raw.into_values().next() else { return Ok(Vec::new()) };
+    if let Some(e) = raw.error {
+        return Err(e);
+    }
+    let Some(bytes) = raw.found.into_values().next() else { return Ok(Vec::new()) };
     let assoc: librespot_protocol::entity_extension_data::Assoc = http::proto(&bytes)?;
     Ok(assoc.plain_list.entity_uri.iter().filter_map(|u| parse_kind(u, UriKind::Episode)).map(|p| p.uri()).collect())
+}
+
+/// Episode URIs (newest first) of a show whose `SHOW_V4` carries no episode list:
+/// `SHOW_V4_EPISODES_ASSOC`, else context-resolve. Cached and shared between pages, so paging a
+/// show costs one resolution. Fails (instead of returning an empty list) when the lookups failed.
+pub(crate) async fn show_episode_uris(session: &Session, show_uri: &str) -> AppResult<Arc<Vec<String>>> {
+    let (_, f) = lookup(&SHOW_EPISODES, session, &[show_uri.to_string()], UriKind::Show, fetch_show_episodes).await?;
+    match f.map.into_values().next() {
+        Some(list) => Ok(list),
+        None => match f.error {
+            Some(e) => Err(e),
+            // Both sources answered and the show has no episodes (empty lists are not cached).
+            None => Ok(Arc::new(Vec::new())),
+        },
+    }
+}
+
+fn fetch_show_episodes(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<Vec<String>>>> {
+    async move {
+        let mut out = Partial::default();
+        for uri in uris {
+            match resolve_show_episodes(&session, &uri).await {
+                Ok(list) if !list.is_empty() => {
+                    out.found.insert(uri, list);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    out.failed.push(uri);
+                    out.error.get_or_insert(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+    .boxed()
+}
+
+async fn resolve_show_episodes(session: &Session, show_uri: &str) -> AppResult<Vec<String>> {
+    let assoc = show_episode_assoc(session, show_uri).await;
+    if let Ok(list) = &assoc {
+        if !list.is_empty() {
+            return Ok(list.clone());
+        }
+    }
+    let ctx = context::resolve(session, show_uri, SHOW_CONTEXT_MAX_ITEMS, SHOW_CONTEXT_MAX_PAGES).await;
+    show_episodes_outcome(assoc, ctx.map(|items| items.into_iter().map(|i| i.uri).collect()))
+}
+
+/// Combines the two episode-list sources: a list from either wins; "no episodes" needs both to
+/// agree (context-resolve answers NOT_FOUND for an empty context); otherwise the most telling
+/// error is returned, never an empty list.
+pub(crate) fn show_episodes_outcome(assoc: AppResult<Vec<String>>, ctx: AppResult<Vec<String>>) -> AppResult<Vec<String>> {
+    let episodes = |uris: Vec<String>| -> Vec<String> {
+        uris.iter().filter_map(|u| parse_kind(u, UriKind::Episode)).map(|p| p.uri()).collect()
+    };
+    match (assoc, ctx) {
+        (Ok(a), _) if !a.is_empty() => Ok(a),
+        (_, Ok(c)) => Ok(episodes(c)),
+        (Ok(_), Err(c)) if c.code == ErrorCode::NotFound => Ok(Vec::new()),
+        (Ok(_), Err(c)) => Err(c),
+        (Err(a), Err(c)) => {
+            let transport = |e: &AppError| matches!(e.code, ErrorCode::Network | ErrorCode::RateLimited);
+            Err(if !transport(&a) && transport(&c) { c } else { a })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -185,48 +358,66 @@ impl Ctx {
 // Raw batched fetch
 // ---------------------------------------------------------------------------------------------
 
+/// What a fetch returned: decoded entities plus the requested URIs whose request failed.
+#[derive(Debug)]
+pub(crate) struct Partial<T> {
+    pub found: HashMap<String, T>,
+    pub failed: Vec<String>,
+    /// First error; set whenever `failed` is non-empty.
+    pub error: Option<AppError>,
+}
+
+impl<T> Default for Partial<T> {
+    fn default() -> Self {
+        Self { found: HashMap::new(), failed: Vec::new(), error: None }
+    }
+}
+
+impl<T> Partial<T> {
+    fn map_found<U>(self, f: impl FnOnce(HashMap<String, T>) -> HashMap<String, U>) -> Partial<U> {
+        Partial { found: f(self.found), failed: self.failed, error: self.error }
+    }
+}
+
 /// Fetches one extension kind for `uris` in batches. Returns `entity_uri → Any.value` for the
-/// entities the server answered; fails only if every batch failed.
-pub(crate) async fn fetch_extended(
-    session: &Session,
-    kind: ExtensionKind,
-    uris: &[String],
-) -> AppResult<HashMap<String, Vec<u8>>> {
+/// entities the server answered and the URIs of failed batches; fails only if every batch failed.
+pub(crate) async fn fetch_extended(session: &Session, kind: ExtensionKind, uris: &[String]) -> AppResult<Partial<Vec<u8>>> {
     let mut seen = HashSet::new();
     let uniq: Vec<String> = uris.iter().filter(|u| seen.insert(u.as_str())).cloned().collect();
     if uniq.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(Partial::default());
     }
     let ctx = Ctx::new(session);
     let batches: Vec<Vec<String>> = uniq.chunks(BATCH_SIZE).map(|c| c.to_vec()).collect();
-    let results: Vec<AppResult<HashMap<String, Vec<u8>>>> = stream::iter(batches)
+    type Reply = (Vec<String>, AppResult<HashMap<String, Vec<u8>>>);
+    let results: Vec<Reply> = stream::iter(batches)
         .map(|batch| {
             let ctx = &ctx;
             async move {
                 let req = build_request(kind, &batch, ctx);
-                let resp = http::timed(session.spclient().get_extended_metadata(req)).await?;
-                Ok(parse_response(resp))
+                let resp = http::timed(session.spclient().get_extended_metadata(req)).await;
+                (batch, resp.map(parse_response).map_err(AppError::from))
             }
         })
         .buffer_unordered(CONCURRENCY)
         .collect()
         .await;
-    let mut out = HashMap::new();
-    let mut first_err = None;
+    let mut out = Partial::default();
     let mut any_ok = false;
-    for r in results {
+    for (batch, r) in results {
         match r {
             Ok(m) => {
                 any_ok = true;
-                out.extend(m);
+                out.found.extend(m);
             }
             Err(e) => {
                 log::warn!("extended-metadata {kind:?} batch failed: {e}");
-                first_err.get_or_insert(e);
+                out.failed.extend(batch);
+                out.error.get_or_insert(e);
             }
         }
     }
-    match first_err {
+    match out.error {
         Some(e) if !any_ok => Err(e),
         _ => Ok(out),
     }
@@ -276,9 +467,16 @@ fn parse_response(resp: BatchedExtensionResponse) -> HashMap<String, Vec<u8>> {
 // Caches with in-flight coalescing
 // ---------------------------------------------------------------------------------------------
 
-type BatchResult<T> = Result<Arc<HashMap<String, Arc<T>>>, AppError>;
+/// Result of one shared fetch: what resolved and which of its URIs failed.
+struct Batch<T> {
+    map: HashMap<String, Arc<T>>,
+    failed: HashSet<String>,
+    error: Option<AppError>,
+}
+
+type BatchResult<T> = Result<Arc<Batch<T>>, AppError>;
 type BatchFuture<T> = Shared<BoxFuture<'static, BatchResult<T>>>;
-type Fetcher<T> = fn(Session, Vec<String>) -> BoxFuture<'static, AppResult<HashMap<String, T>>>;
+type Fetcher<T> = fn(Session, Vec<String>) -> BoxFuture<'static, AppResult<Partial<T>>>;
 
 struct Entry<T> {
     at: Instant,
@@ -323,32 +521,37 @@ impl<T: Send + Sync + 'static> Store<T> {
         (e.at.elapsed() < self.max_age).then(|| e.value.clone())
     }
 
-    async fn get_many(&'static self, session: &Session, uris: &[String], fetch: Fetcher<T>) -> BatchResult<T> {
-        let mut found: HashMap<String, Arc<T>> = HashMap::new();
+    /// Looks `uris` up (fresh cache entries, joined in-flight fetches, one new fetch for the
+    /// rest). Fails only when nothing resolved and a fetch failed.
+    async fn get_many(&'static self, session: &Session, uris: &[String], fetch: Fetcher<T>) -> AppResult<Fetched<T>> {
+        let mut out = Fetched::default();
         let mut pending = Vec::new();
         for uri in uris {
             match self.fresh(uri) {
                 Some(v) => {
-                    found.insert(uri.clone(), v);
+                    out.map.insert(uri.clone(), v);
                 }
                 None => pending.push(uri.clone()),
             }
         }
         if pending.is_empty() {
-            return Ok(Arc::new(found));
+            return Ok(out);
         }
-        let mut waits: Vec<BatchFuture<T>> = Vec::new();
+        // Each awaited fetch with the pending URIs it answers for us.
+        let mut waits: Vec<(BatchFuture<T>, Vec<String>)> = Vec::new();
         {
             let mut inflight = self.inflight.lock();
-            let mut joined = HashSet::new();
+            let mut joined: HashMap<u64, usize> = HashMap::new();
             let mut missing = Vec::new();
             for uri in &pending {
                 match inflight.get(uri) {
                     // Entries older than two timeouts belong to a stuck/abandoned fetch.
                     Some(f) if f.started.elapsed() < http::TIMEOUT * 2 => {
-                        if joined.insert(f.id) {
-                            waits.push(f.fut.clone());
-                        }
+                        let i = *joined.entry(f.id).or_insert_with(|| {
+                            waits.push((f.fut.clone(), Vec::new()));
+                            waits.len() - 1
+                        });
+                        waits[i].1.push(uri.clone());
                     }
                     _ => missing.push(uri.clone()),
                 }
@@ -357,41 +560,53 @@ impl<T: Send + Sync + 'static> Store<T> {
                 let id = self.seq.fetch_add(1, Ordering::Relaxed);
                 let fut = self.spawn_fetch(session.clone(), missing.clone(), fetch, id);
                 let started = Instant::now();
-                for uri in missing {
-                    inflight.insert(uri, Inflight { id, started, fut: fut.clone() });
+                for uri in &missing {
+                    inflight.insert(uri.clone(), Inflight { id, started, fut: fut.clone() });
                 }
-                waits.push(fut);
+                waits.push((fut, missing));
             }
         }
-        let mut first_err = None;
-        for r in join_all(waits).await {
+        let results = join_all(waits.iter().map(|(f, _)| f.clone())).await;
+        for ((_, covered), r) in waits.into_iter().zip(results) {
             match r {
-                Ok(map) => {
-                    for uri in &pending {
-                        if let Some(v) = map.get(uri) {
-                            found.insert(uri.clone(), v.clone());
+                Ok(batch) => {
+                    for uri in covered {
+                        if let Some(v) = batch.map.get(&uri) {
+                            out.map.insert(uri, v.clone());
+                        } else if batch.failed.contains(&uri) {
+                            if out.error.is_none() {
+                                out.error = batch.error.clone();
+                            }
+                            out.failed.insert(uri);
                         }
                     }
                 }
                 Err(e) => {
-                    first_err.get_or_insert(e);
+                    out.failed.extend(covered);
+                    out.error.get_or_insert(e);
                 }
             }
         }
-        match first_err {
-            Some(e) if found.is_empty() => Err(e),
-            _ => Ok(Arc::new(found)),
+        if !out.failed.is_empty() && out.error.is_none() {
+            out.error = Some(AppError::unavailable("metadata fetch failed"));
         }
+        if out.map.is_empty() {
+            if let Some(e) = out.error.take() {
+                return Err(e);
+            }
+        }
+        Ok(out)
     }
 
     fn spawn_fetch(&'static self, session: Session, uris: Vec<String>, fetch: Fetcher<T>, id: u64) -> BatchFuture<T> {
         let handle = tokio::spawn(async move {
             let result = fetch(session, uris.clone()).await;
             let out: BatchResult<T> = match result {
-                Ok(map) => {
+                Ok(partial) => {
                     let now = Instant::now();
                     let mut lru = self.lru.lock();
-                    let arcs = map
+                    let map = partial
+                        .found
                         .into_iter()
                         .map(|(k, v)| {
                             let a = Arc::new(v);
@@ -399,7 +614,8 @@ impl<T: Send + Sync + 'static> Store<T> {
                             (k, a)
                         })
                         .collect();
-                    Ok(Arc::new(arcs))
+                    drop(lru);
+                    Ok(Arc::new(Batch { map, failed: partial.failed.into_iter().collect(), error: partial.error }))
                 }
                 Err(e) => Err(e),
             };
@@ -437,6 +653,7 @@ static EPISODES: LazyLock<Store<Episode>> = LazyLock::new(|| Store::new(1024, MA
 static ALBUMS: LazyLock<Store<AlbumMeta>> = LazyLock::new(|| Store::new(512, MAX_AGE));
 static ARTISTS: LazyLock<Store<ArtistMeta>> = LazyLock::new(|| Store::new(256, ARTIST_MAX_AGE));
 static SHOWS: LazyLock<Store<ShowMeta>> = LazyLock::new(|| Store::new(256, ARTIST_MAX_AGE));
+static SHOW_EPISODES: LazyLock<Store<Vec<String>>> = LazyLock::new(|| Store::new(64, SHOW_EPISODES_MAX_AGE));
 
 /// Normalises `uris` to canonical URIs of `kind` (invalid ones dropped, order kept) and looks
 /// them up.
@@ -446,23 +663,23 @@ async fn lookup<T: Send + Sync + 'static>(
     uris: &[String],
     kind: UriKind,
     fetch: Fetcher<T>,
-) -> AppResult<(Vec<String>, HashMap<String, Arc<T>>)> {
+) -> AppResult<(Vec<String>, Fetched<T>)> {
     let order: Vec<String> = uris.iter().filter_map(|u| parse_kind(u, kind)).map(|p| p.uri()).collect();
     let mut seen = HashSet::new();
     let uniq: Vec<String> = order.iter().filter(|u| seen.insert(u.as_str())).cloned().collect();
     if uniq.is_empty() {
-        return Ok((order, HashMap::new()));
+        return Ok((order, Fetched::default()));
     }
     let store: &'static Store<T> = store;
-    let map = store.get_many(session, &uniq, fetch).await?;
-    Ok((order, (*map).clone()))
+    let fetched = store.get_many(session, &uniq, fetch).await?;
+    Ok((order, fetched))
 }
 
-fn fetch_tracks(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<HashMap<String, Track>>> {
+fn fetch_tracks(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<Track>>> {
     async move {
         let raw = fetch_extended(&session, ExtensionKind::TRACK_V4, &uris).await?;
         let ctx = Ctx::new(&session);
-        Ok(tracks_from_raw(raw, &uris, &ctx))
+        Ok(raw.map_found(|found| tracks_from_raw(found, &uris, &ctx)))
     }
     .boxed()
 }
@@ -497,35 +714,37 @@ pub(crate) fn tracks_from_raw(raw: HashMap<String, Vec<u8>>, requested: &[String
     out
 }
 
-fn fetch_episodes(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<HashMap<String, Episode>>> {
+fn fetch_episodes(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<Episode>>> {
     async move {
         let raw = fetch_extended(&session, ExtensionKind::EPISODE_V4, &uris).await?;
         let ctx = Ctx::new(&session);
-        Ok(raw.into_iter().filter_map(|(uri, b)| decode_episode(&b, &uri, &ctx).map(|e| (uri, e))).collect())
+        Ok(raw.map_found(|found| {
+            found.into_iter().filter_map(|(uri, b)| decode_episode(&b, &uri, &ctx).map(|e| (uri, e))).collect()
+        }))
     }
     .boxed()
 }
 
-fn fetch_albums(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<HashMap<String, AlbumMeta>>> {
+fn fetch_albums(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<AlbumMeta>>> {
     async move {
         let raw = fetch_extended(&session, ExtensionKind::ALBUM_V4, &uris).await?;
-        Ok(raw.into_iter().filter_map(|(uri, b)| decode_album(&b, &uri).map(|a| (uri, a))).collect())
+        Ok(raw.map_found(|found| found.into_iter().filter_map(|(uri, b)| decode_album(&b, &uri).map(|a| (uri, a))).collect()))
     }
     .boxed()
 }
 
-fn fetch_artists(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<HashMap<String, ArtistMeta>>> {
+fn fetch_artists(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<ArtistMeta>>> {
     async move {
         let raw = fetch_extended(&session, ExtensionKind::ARTIST_V4, &uris).await?;
-        Ok(raw.into_iter().filter_map(|(uri, b)| decode_artist(&b, &uri).map(|a| (uri, a))).collect())
+        Ok(raw.map_found(|found| found.into_iter().filter_map(|(uri, b)| decode_artist(&b, &uri).map(|a| (uri, a))).collect()))
     }
     .boxed()
 }
 
-fn fetch_shows(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<HashMap<String, ShowMeta>>> {
+fn fetch_shows(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<ShowMeta>>> {
     async move {
         let raw = fetch_extended(&session, ExtensionKind::SHOW_V4, &uris).await?;
-        Ok(raw.into_iter().filter_map(|(uri, b)| decode_show(&b, &uri).map(|s| (uri, s))).collect())
+        Ok(raw.map_found(|found| found.into_iter().filter_map(|(uri, b)| decode_show(&b, &uri).map(|s| (uri, s))).collect()))
     }
     .boxed()
 }
@@ -1170,11 +1389,11 @@ pub(crate) mod tests {
         use std::sync::atomic::AtomicUsize;
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         static STORE: LazyLock<Store<String>> = LazyLock::new(|| Store::new(16, MAX_AGE));
-        fn fetch(_s: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<HashMap<String, String>>> {
+        fn fetch(_s: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<String>>> {
             async move {
                 CALLS.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                Ok(uris.into_iter().map(|u| (u.clone(), format!("v:{u}"))).collect())
+                Ok(Partial { found: uris.into_iter().map(|u| (u.clone(), format!("v:{u}"))).collect(), ..Default::default() })
             }
             .boxed()
         }
@@ -1184,13 +1403,92 @@ pub(crate) mod tests {
         let a = vec!["a".to_string(), "b".to_string()];
         let b = vec!["b".to_string()];
         let (r1, r2) = tokio::join!(store.get_many(&session, &a, fetch), store.get_many(&session, &b, fetch));
-        assert_eq!(r1.unwrap().len(), 2);
-        assert_eq!(r2.unwrap().get("b").map(|v| v.as_str()), Some("v:b"));
+        assert_eq!(r1.unwrap().map.len(), 2);
+        assert_eq!(r2.unwrap().map.get("b").map(|v| v.as_str()), Some("v:b"));
         assert_eq!(CALLS.load(Ordering::SeqCst), 1, "second lookup joined the in-flight fetch");
         // Now cached.
         let r3 = store.get_many(&session, &b, fetch).await.unwrap();
-        assert_eq!(r3.len(), 1);
+        assert_eq!(r3.map.len(), 1);
         assert_eq!(CALLS.load(Ordering::SeqCst), 1);
         assert!(store.inflight.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reports_failed_uris_apart_from_missing_ones() {
+        static STORE: LazyLock<Store<String>> = LazyLock::new(|| Store::new(16, MAX_AGE));
+        // "ok*" resolve, "gone*" have no data, "fail*" sit in a batch that failed.
+        fn fetch(_s: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<String>>> {
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let mut out = Partial::default();
+                for u in uris {
+                    if u.starts_with("ok") {
+                        out.found.insert(u.clone(), format!("v:{u}"));
+                    } else if u.starts_with("fail") {
+                        out.failed.push(u);
+                        out.error.get_or_insert(AppError::new(ErrorCode::RateLimited, "429"));
+                    }
+                }
+                if out.found.is_empty() {
+                    if let Some(e) = out.error.take() {
+                        return Err(e);
+                    }
+                }
+                Ok(out)
+            }
+            .boxed()
+        }
+        let session = Session::new(Default::default(), None);
+        let store: &'static Store<String> = &STORE;
+        let first = vec!["ok1".to_string(), "fail1".to_string(), "gone1".to_string()];
+        let joiner = vec!["fail1".to_string(), "ok2".to_string()];
+        let (r1, r2) = tokio::join!(store.get_many(&session, &first, fetch), store.get_many(&session, &joiner, fetch));
+        let r1 = r1.unwrap();
+        assert_eq!(r1.map.len(), 1);
+        assert!(r1.is_failed("fail1") && !r1.is_failed("gone1") && !r1.is_failed("ok1"));
+        assert!(r1.any_failed(first.iter()));
+        assert!(!r1.any_failed(["ok1".to_string(), "gone1".to_string()].iter()));
+        assert_eq!(r1.error.as_ref().map(|e| e.code), Some(ErrorCode::RateLimited));
+        // The second lookup joined the first fetch for "fail1" and sees its failure too.
+        let r2 = r2.unwrap();
+        assert!(r2.is_failed("fail1") && r2.map.contains_key("ok2"));
+        // Nothing resolved and a fetch failed: the lookup fails as a whole.
+        let err = store.get_many(&session, &["fail2".to_string()], fetch).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::RateLimited);
+        // Only missing (no failure): an empty, successful lookup.
+        let none = store.get_many(&session, &["gone2".to_string()], fetch).await.unwrap();
+        assert!(none.map.is_empty() && none.failed.is_empty() && none.error.is_none());
+        // Failures are not cached: the next lookup retries.
+        assert!(store.peek("fail1").is_none());
+    }
+
+    #[test]
+    fn page_errors_are_retryable() {
+        assert_eq!(page_error(AppError::not_found("batch 404")).code, ErrorCode::Unavailable);
+        assert_eq!(page_error(AppError::internal("x")).code, ErrorCode::Unavailable);
+        assert_eq!(page_error(AppError::new(ErrorCode::Network, "x")).code, ErrorCode::Network);
+        assert_eq!(page_error(AppError::new(ErrorCode::RateLimited, "x")).code, ErrorCode::RateLimited);
+    }
+
+    #[test]
+    fn show_episode_sources_never_turn_failures_into_empty_lists() {
+        let ep = |id: &str| format!("spotify:episode:{id}");
+        let list = vec![ep("512ojhOuo1ktJprKbVcKyQ")];
+        let net = || AppError::new(ErrorCode::Network, "offline");
+        let unavailable = || AppError::unavailable("bad");
+        assert_eq!(show_episodes_outcome(Ok(list.clone()), Err(net())).unwrap(), list);
+        assert_eq!(show_episodes_outcome(Err(net()), Ok(list.clone())).unwrap(), list);
+        assert_eq!(
+            show_episodes_outcome(Ok(vec![]), Ok(vec![ep("512ojhOuo1ktJprKbVcKyQ"), "spotify:track:x".into()])).unwrap(),
+            list,
+            "context items that are not episodes are dropped"
+        );
+        assert!(show_episodes_outcome(Ok(vec![]), Err(AppError::not_found("empty context"))).unwrap().is_empty());
+        assert_eq!(show_episodes_outcome(Ok(vec![]), Err(net())).unwrap_err().code, ErrorCode::Network);
+        assert_eq!(show_episodes_outcome(Err(unavailable()), Err(net())).unwrap_err().code, ErrorCode::Network);
+        assert_eq!(
+            show_episodes_outcome(Err(net()), Err(AppError::not_found("empty context"))).unwrap_err().code,
+            ErrorCode::Network
+        );
     }
 }

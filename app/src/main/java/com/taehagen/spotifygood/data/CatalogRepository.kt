@@ -18,22 +18,25 @@ import kotlinx.serialization.json.put
  * Read-only catalog pages (native `catalog.*`). Flows are cached (stale-while-revalidate): album and
  * artist 24 h, playlist first page 10 min, show 1 h. They reload by themselves when their cache entry
  * is invalidated (playlist edits, follow/unfollow) and therefore never complete.
+ *
+ * A page the engine marks `partial` (some item metadata failed, docs §6.3) is shown but not cached as
+ * fresh, and is refetched while on screen ([ResponseCache.resourceOf]).
  */
 class CatalogRepository(private val rpc: NativeRpc, private val cache: ResponseCache) {
     fun album(uri: String): Flow<Resource<Album>> =
-        cache.live(CacheKeys.album(uri), Album.serializer(), CacheKeys.TTL_ALBUM) {
-            rpc.callOffMain<Album>("catalog.album", rpcArgs { put("uri", uri) })
+        cache.liveOf(CacheKeys.album(uri), Album.serializer(), CacheKeys.TTL_ALBUM) {
+            rpc.callOffMain<Album>("catalog.album", rpcArgs { put("uri", uri) }).let { CacheFill(it, it.partial) }
         }
 
     fun artist(uri: String): Flow<Resource<Artist>> =
-        cache.live(CacheKeys.artist(uri), Artist.serializer(), CacheKeys.TTL_ARTIST) {
-            rpc.callOffMain<Artist>("catalog.artist", rpcArgs { put("uri", uri) })
+        cache.liveOf(CacheKeys.artist(uri), Artist.serializer(), CacheKeys.TTL_ARTIST) {
+            rpc.callOffMain<Artist>("catalog.artist", rpcArgs { put("uri", uri) }).let { CacheFill(it, it.partial) }
         }
 
     /** First page of a playlist (items 0..[pageSize]). */
     fun playlist(uri: String, pageSize: Int = 100): Flow<Resource<Playlist>> =
-        cache.live(CacheKeys.playlist(uri, pageSize), Playlist.serializer(), CacheKeys.TTL_PLAYLIST) {
-            playlistPage(uri, 0, pageSize)
+        cache.liveOf(CacheKeys.playlist(uri, pageSize), Playlist.serializer(), CacheKeys.TTL_PLAYLIST) {
+            playlistPage(uri, 0, pageSize).let { CacheFill(it, it.partial) }
         }
 
     /** Further playlist pages (not cached). */
@@ -45,7 +48,7 @@ class CatalogRepository(private val rpc: NativeRpc, private val cache: ResponseC
         playlistItems(uri, ::playlistPage).mapNotNull { it.uri }.filter(SpotifyUris::isPlayableItem)
 
     fun show(uri: String): Flow<Resource<Show>> =
-        cache.live(CacheKeys.show(uri), Show.serializer(), CacheKeys.TTL_SHOW) { showPage(uri, 0) }
+        cache.liveOf(CacheKeys.show(uri), Show.serializer(), CacheKeys.TTL_SHOW) { showPage(uri, 0).let { CacheFill(it, it.partial) } }
 
     suspend fun showPage(uri: String, offset: Int, limit: Int = 50): Show =
         rpc.callOffMain("catalog.show", rpcArgs { put("uri", uri); put("offset", offset); put("limit", limit) })

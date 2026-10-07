@@ -1,6 +1,7 @@
 //! `catalog.search`: pathfinder `searchDesktop` → spclient `searchview/km/v4` → context-resolve
 //! `spotify:search:<q>` (tracks only). A source that answers (even with no hits) wins; only
-//! errors fall through to the next one.
+//! errors fall through to the next one, and a transport error (offline, rate limited) of
+//! searchview ends the chain: context-resolve would hit the same spclient.
 
 use super::context;
 use super::http::{self, JSON};
@@ -9,7 +10,7 @@ use super::pathfinder;
 use super::pfparse;
 use super::util::{encode_component, encode_search_query, parse_kind, UriKind};
 use crate::engine;
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{AlbumRef, ArtistRef, Episode, Image, MediaRef, MediaType, PlaylistOwner, PlaylistRef, SearchResults, ShowRef, Track};
 use crate::rpc::{parse_args, to_value};
 use librespot_core::Session;
@@ -281,7 +282,8 @@ async fn via_searchview(session: &Session, query: &str, offset: u32, limit: u32)
 
 async fn via_context(session: &Session, query: &str, offset: u32, limit: u32) -> AppResult<SearchResults> {
     let uri = format!("spotify:search:{}", encode_search_query(query));
-    let items = context::resolve(session, &uri, (offset + limit) as usize, 3).await?;
+    // A failed follow-up page only shortens the hit list.
+    let items = context::resolve_prefix(session, &uri, (offset + limit) as usize, 3).await?.items;
     let uris: Vec<String> = items
         .into_iter()
         .filter_map(|i| parse_kind(&i.uri, UriKind::Track))
@@ -301,29 +303,42 @@ pub(crate) async fn rpc(args: Value) -> AppResult<Value> {
     let types = Types::from_list(&a.types);
     let limit = a.limit.clamp(1, 50);
     let session = engine::session()?;
-    let mut errors: Vec<AppError> = Vec::new();
-    match pathfinder::query(&session, "searchDesktop", variables(query, a.offset, limit)).await {
+    let first = match pathfinder::query(&session, "searchDesktop", variables(query, a.offset, limit)).await {
         Ok(data) => return to_value(&types.apply(parse_pathfinder(&data, limit as usize))),
         Err(e) => {
             let e: AppError = e.into();
             log::info!("pathfinder search failed: {e}");
-            errors.push(e);
+            // Pathfinder runs on another host with its own limits, so searchview is still worth
+            // trying when it was offline or throttled; not when the call was cancelled.
+            if e.code == ErrorCode::Cancelled {
+                return Err(e);
+            }
+            e
         }
-    }
+    };
     match via_searchview(&session, query, a.offset, limit).await {
         Ok(r) => return to_value(&types.apply(r)),
         Err(e) => {
             log::info!("searchview failed: {e}");
-            errors.push(e);
+            // context-resolve uses the same spclient, which has just retried with access-point
+            // failover: another request would only wait out its timeout or burn rate limit.
+            if stops_chain(&e) {
+                return Err(e);
+            }
         }
     }
     match via_context(&session, query, a.offset, limit).await {
         Ok(r) => to_value(&types.apply(r)),
         Err(e) => {
             log::info!("context-resolve search failed: {e}");
-            Err(errors.into_iter().next().unwrap_or(e))
+            Err(first)
         }
     }
+}
+
+/// Errors after which the next spclient-based source is not tried.
+fn stops_chain(e: &AppError) -> bool {
+    matches!(e.code, ErrorCode::Network | ErrorCode::RateLimited | ErrorCode::Cancelled)
 }
 
 #[cfg(test)]
@@ -371,6 +386,15 @@ mod tests {
         assert_eq!(r.playlists[0].owner.as_ref().unwrap().username, "spotify");
         assert_eq!(r.episodes.len(), 1);
         assert_eq!(r.top_result.unwrap().kind, MediaType::Artist);
+    }
+
+    #[test]
+    fn transport_errors_end_the_spclient_fallbacks() {
+        for code in [ErrorCode::Network, ErrorCode::RateLimited, ErrorCode::Cancelled] {
+            assert!(stops_chain(&AppError::new(code, "x")), "{code:?}");
+        }
+        assert!(!stops_chain(&AppError::unavailable("searchview: bad response")));
+        assert!(!stops_chain(&AppError::not_found("404")));
     }
 
     #[test]

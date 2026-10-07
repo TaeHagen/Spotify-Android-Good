@@ -213,6 +213,20 @@ data class PagedState<T>(
     val canLoadMore: Boolean get() = !endReached && !isLoading && error == null
 }
 
+/**
+ * Offset and end-of-list after a page of [received] items requested at [offset] with [pageSize].
+ *
+ * With a known [total] (`library.*`, docs §6.3) pages are whole windows, so the next request starts
+ * one window further and the list ends at [total]; a short page in the middle is not the end. Without
+ * a total (search), the next request continues after what arrived and a short page ends the list.
+ * An empty page always ends it.
+ */
+internal fun pageStep(offset: Int, pageSize: Int, received: Int, total: Int?): Pair<Int, Boolean> {
+    if (total == null) return (offset + received) to (received == 0 || received < pageSize)
+    val next = offset + maxOf(received, pageSize)
+    return next to (received == 0 || next >= total)
+}
+
 /** Appends [page] to [existing], dropping items whose key is already present. */
 fun <T> mergeUnique(existing: List<T>, page: List<T>, keyOf: (T) -> String): List<T> {
     if (page.isEmpty()) return existing
@@ -236,7 +250,7 @@ class PagedLoader<T>(
     val state: StateFlow<PagedState<T>> = _state.asStateFlow()
 
     private var job: Job? = null
-    /** Server offset of the next page (raw items received so far, duplicates included). */
+    /** Server offset of the next page ([pageStep]). */
     private var nextOffset = 0
 
     /** Loads the next page unless the end was reached or a request is running. Clears errors. */
@@ -259,7 +273,8 @@ class PagedLoader<T>(
         job = scope.launch {
             try {
                 val page = fetch(offset, pageSize)
-                nextOffset = offset + page.items.size
+                val (next, ended) = pageStep(offset, pageSize, page.items.size, page.total)
+                nextOffset = next
                 _state.update { current ->
                     val base = if (replace) emptyList() else current.items
                     val total = page.total ?: if (replace) null else current.total
@@ -267,8 +282,7 @@ class PagedLoader<T>(
                         items = mergeUnique(base, page.items, keyOf),
                         total = total,
                         isLoading = false,
-                        endReached = page.items.isEmpty() || page.items.size < pageSize ||
-                            (total != null && nextOffset >= total),
+                        endReached = ended,
                         error = null,
                     )
                 }

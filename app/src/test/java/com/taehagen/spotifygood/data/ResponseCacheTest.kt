@@ -73,6 +73,51 @@ class ResponseCacheTest {
     }
 
     @Test
+    fun partialResultsAreShownButNotCachedAsFreshAndAreRetried() = runBlocking {
+        val quick = ResponseCache(dao, Json, partialRetryDelayMs = 1)
+        var fetches = 0
+        val emissions = quick.resourceOf("p", String.serializer(), 60_000) {
+            fetches++
+            if (fetches < 3) CacheFill("partial$fetches", partial = true) else CacheFill("complete")
+        }.toList()
+        assertEquals(
+            listOf(
+                Resource.Loading<String>(null),
+                Resource.Success("partial1"),
+                Resource.Success("partial2"),
+                Resource.Success("complete"),
+            ),
+            emissions,
+        )
+        // Only the complete value is stored as fresh.
+        assertEquals("\"complete\"", dao.rows["p"]?.json)
+        assertTrue(dao.rows["p"]!!.fetchedAt > 0)
+    }
+
+    @Test
+    fun partialResultFillsAnEmptyRowAsStaleAndNeverReplacesACachedOne() = runBlocking {
+        val quick = ResponseCache(dao, Json, partialRetryDelayMs = 1)
+        // No row yet: stored for offline display, but stale (refetched on the next read).
+        val first = quick.resourceOf("empty", String.serializer(), 60_000) { CacheFill("partial", partial = true) }.toList()
+        assertEquals(Resource.Success("partial"), first.last())
+        assertEquals(2 + ResponseCache.PARTIAL_RETRIES, first.size)
+        assertEquals("\"partial\"", dao.rows["empty"]?.json)
+        assertTrue(dao.rows["empty"]!!.fetchedAt < 0)
+        // An earlier complete row stays (stale) for offline use.
+        quick.put("full", String.serializer(), "complete")
+        quick.invalidate("full")
+        var retryFails = false
+        val emissions = quick.resourceOf("full", String.serializer(), 60_000) {
+            if (retryFails) throw IOException("offline")
+            retryFails = true
+            CacheFill("partial", partial = true)
+        }.toList()
+        assertEquals(listOf(Resource.Loading("complete"), Resource.Success("partial")), emissions)
+        assertEquals("\"complete\"", dao.rows["full"]?.json)
+        assertTrue(dao.rows["full"]!!.fetchedAt < 0)
+    }
+
+    @Test
     fun liveReloadsWhenItsKeyIsInvalidated() = runBlocking {
         var fetches = 0
         val out = Channel<Resource<String>>(Channel.UNLIMITED)

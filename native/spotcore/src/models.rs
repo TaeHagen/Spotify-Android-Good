@@ -148,6 +148,9 @@ pub struct Album {
     pub copyrights: Vec<String>,
     #[serde(default)]
     pub tracks: Vec<Track>,
+    /// Some track metadata could not be fetched right now (docs §6.5 `partial`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -175,6 +178,9 @@ pub struct Artist {
     pub related: Vec<ArtistRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub following: Option<bool>,
+    /// Top tracks, releases or related artists could not all be fetched (docs §6.5 `partial`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -244,6 +250,9 @@ pub struct Playlist {
     pub items: Vec<PlaylistItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub following: Option<bool>,
+    /// Some item metadata could not be fetched right now (docs §6.5 `partial`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -265,6 +274,9 @@ pub struct Show {
     pub offset: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub following: Option<bool>,
+    /// Some episode metadata could not be fetched right now (docs §6.5 `partial`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

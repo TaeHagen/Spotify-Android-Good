@@ -4,6 +4,8 @@ import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.nativebridge.NativeRpc
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
@@ -19,14 +21,21 @@ import kotlinx.serialization.json.put
  *
  * After every successful mutation the affected caches (playlist pages, rootlist) are invalidated and
  * [LibraryRepository.changes] emits, so open screens refetch.
+ *
+ * Mutations run detached in [scope] (the app scope): if the caller is cancelled (its screen closed),
+ * the write and its cache/revision bookkeeping still complete; the caller just stops waiting.
  */
 class PlaylistEditor(
+    private val scope: CoroutineScope,
     private val rpc: NativeRpc,
     private val library: LibraryRepository,
     private val catalog: CatalogRepository,
 ) {
     /** Creates a playlist (added to the library) and returns its URI. */
-    suspend fun create(name: String, description: String? = null, public: Boolean = false, initialUris: List<String> = emptyList()): String {
+    suspend fun create(name: String, description: String? = null, public: Boolean = false, initialUris: List<String> = emptyList()): String =
+        detached { createNow(name, description, public, initialUris) }
+
+    private suspend fun createNow(name: String, description: String?, public: Boolean, initialUris: List<String>): String {
         val uri = rpc.callOffMain<CreatedPlaylist>(
             "playlist.create",
             rpcArgs {
@@ -47,16 +56,22 @@ class PlaylistEditor(
     /** Appends [uris]; returns the new revision (null if the engine reported none). */
     suspend fun addItems(playlistUri: String, uris: List<String>): String? {
         if (uris.isEmpty()) return null
-        try {
-            return appendItems(playlistUri, uris)
-        } finally {
-            library.onPlaylistEdited(playlistUri)
+        return detached {
+            try {
+                appendItems(playlistUri, uris)
+            } finally {
+                library.onPlaylistEdited(playlistUri)
+            }
         }
     }
 
     /** [items]: (uri, index) pairs from the latest fetched [revision]. Returns the new revision. */
     suspend fun removeItems(playlistUri: String, items: List<Pair<String, Int>>, revision: String?): String? {
         if (items.isEmpty()) return revision
+        return detached { removeItemsNow(playlistUri, items, revision) }
+    }
+
+    private suspend fun removeItemsNow(playlistUri: String, items: List<Pair<String, Int>>, revision: String?): String? {
         val result = retryOnStaleRevision(revision, { currentRevision(playlistUri, items) }) { rev ->
             rpc.callOffMain<RevisionResult>(
                 "playlist.removeItems",
@@ -89,6 +104,10 @@ class PlaylistEditor(
      */
     suspend fun moveItem(playlistUri: String, fromIndex: Int, toIndex: Int, revision: String?, itemUri: String? = null): String? {
         if (fromIndex == toIndex) return revision
+        return detached { moveItemNow(playlistUri, fromIndex, toIndex, revision, itemUri) }
+    }
+
+    private suspend fun moveItemNow(playlistUri: String, fromIndex: Int, toIndex: Int, revision: String?, itemUri: String?): String? {
         val expected = listOfNotNull(itemUri?.let { it to fromIndex })
         val result = retryOnStaleRevision(revision, { currentRevision(playlistUri, expected) }) { rev ->
             rpc.callOffMain<RevisionResult>(
@@ -108,26 +127,31 @@ class PlaylistEditor(
 
     suspend fun updateDetails(playlistUri: String, name: String? = null, description: String? = null) {
         if (name == null && description == null) return
-        rpc.callUnitOffMain(
-            "playlist.updateDetails",
-            rpcArgs {
-                put("uri", playlistUri)
-                if (name != null) put("name", name)
-                if (description != null) put("description", description)
-            },
-        )
-        library.onPlaylistEdited(playlistUri)
+        detached {
+            rpc.callUnitOffMain(
+                "playlist.updateDetails",
+                rpcArgs {
+                    put("uri", playlistUri)
+                    if (name != null) put("name", name)
+                    if (description != null) put("description", description)
+                },
+            )
+            library.onPlaylistEdited(playlistUri)
+        }
     }
 
-    suspend fun delete(playlistUri: String) {
+    suspend fun delete(playlistUri: String) = detached {
         rpc.callUnitOffMain("playlist.delete", rpcArgs { put("uri", playlistUri) })
         library.onPlaylistDeleted(playlistUri)
     }
 
-    /** Follows with an optimistic library state (rolled back on failure). */
+    /** Follows with an optimistic library state (rolled back on failure; already detached). */
     suspend fun follow(playlistUri: String) = library.setSaved(listOf(playlistUri), true)
 
     suspend fun unfollow(playlistUri: String) = library.setSaved(listOf(playlistUri), false)
+
+    /** Runs [block] in [scope]; cancelling the caller only stops it from waiting for the result. */
+    private suspend fun <T> detached(block: suspend () -> T): T = scope.async { block() }.await()
 
     /** Returns the revision after the last batch. */
     private suspend fun appendItems(playlistUri: String, uris: List<String>): String? {
