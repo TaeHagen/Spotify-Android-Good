@@ -346,8 +346,9 @@ internal class SpotifyPlayer(
         // with its shuffle / repeat: its item carries them (LibraryTree.resumeItem).
         val withModes = ResumeModes.applyTo(request, mediaItems.singleOrNull()?.requestMetadata?.extras)
         // Media-session loads (Auto, Assistant, watches, resumption) play on this phone, never on
-        // the pending Connect target: in a car, a speaker picked earlier at home would be wrong.
-        return track(controller.playAsync(withModes, toPendingTarget = false), settleMs = LOAD_SETTLE_MS)
+        // the pending Connect target nor on another active device: in a car, a speaker at home
+        // would be wrong (and the stored session must not overwrite what it plays now).
+        return track(controller.playAsync(withModes, toPendingTarget = false, onThisPhone = true), settleMs = LOAD_SETTLE_MS)
     }
 
     override fun handleAddMediaItems(index: Int, mediaItems: List<MediaItem>): ListenableFuture<*> {

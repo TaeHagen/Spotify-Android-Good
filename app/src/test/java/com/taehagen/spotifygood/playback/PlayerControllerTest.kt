@@ -408,12 +408,15 @@ class PlayerControllerTest {
 
     private fun JsonObject.deviceId(): String? = this["deviceId"]?.jsonPrimitive?.content
 
+    private fun JsonObject.local(): Boolean = this["local"]?.jsonPrimitive?.content == "true"
+
     @Test
     fun aPlayWhileNothingIsActiveGoesToThePendingTargetOnce() = runTest {
         val h = Harness(this, Env(EngineReach.ONLINE))
         h.target = "speaker"
         assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(1)), toPendingTarget = true).await())
         assertEquals("speaker", h.calls.single().second.deviceId())
+        assertFalse(h.calls.single().second.local()) // in-app plays are routed as usual
         // Used once: the next play is routed as usual.
         assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist), toPendingTarget = true).await())
         assertNull(h.calls[1].second.deviceId())
@@ -422,11 +425,22 @@ class PlayerControllerTest {
 
     @Test
     fun mediaSessionLoadsPlayOnThisPhone() = runTest {
-        // Auto, Assistant, watches: the media session's loads use the default.
+        // Auto, Assistant, watches: here, also over an active remote device, never on the target.
         val h = Harness(this, Env(EngineReach.ONLINE))
         h.target = "speaker"
-        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(1))).await())
-        assertNull(h.calls.single().second.deviceId())
+        h.snapshot.value = PlaybackSnapshot(
+            source = PlaybackSource.REMOTE,
+            activeDevice = ActiveDeviceRef("tv", "TV"),
+            track = PlaybackTrack(uri = t(5)),
+        )
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(1)), onThisPhone = true).await())
+        val load = h.calls.single().second
+        assertTrue(load.local())
+        assertNull(load.deviceId())
+        // Even a play asking for the target goes here when it is the media session's.
+        h.snapshot.value = PlaybackSnapshot()
+        assertTrue(h.controller.playAsync(PlayRequest(trackUris = listOf(t(1))), toPendingTarget = true, onThisPhone = true).await())
+        assertNull(h.calls[1].second.deviceId())
         assertEquals(0, h.targetTaken)
         assertEquals("speaker", h.target)
     }
@@ -450,10 +464,12 @@ class PlayerControllerTest {
         assertTrue(h.controller.resumeAsync().await())
         assertEquals(listOf("player.play", "player.load"), h.methods())
         assertNull(h.calls[1].second.deviceId())
+        assertTrue(h.calls[1].second.local())
         // Media3 resumption, "Tap to resume", "play something" (media-session loads).
         h.fail = { null }
-        assertTrue(h.controller.playAsync(resumeState(playlist).toPlayRequest()).await())
+        assertTrue(h.controller.playAsync(resumeState(playlist).toPlayRequest(), onThisPhone = true).await())
         assertNull(h.calls[2].second.deviceId())
+        assertTrue(h.calls[2].second.local())
         assertEquals(0, h.targetTaken)
         assertEquals("speaker", h.target)
     }

@@ -635,7 +635,9 @@ For a remote active device, smart shuffle is not supported (the command reports
   `DevicesRepository.pendingTarget`, and the next in-app play or radio start carries it as
   `player.load {deviceId}` (a connect-state `play` command there). Media-session loads (Auto,
   Assistant, watches, resumption), the stored session and offline plays never take it: they
-  play on this phone. It is used once and expires 10 minutes after the pick (also checked when
+  play on this phone, and media-session loads and the stored session are sent with
+  `"local": true`, so they also take playback over from an active remote device instead of
+  being routed onto it. It is used once and expires 10 minutes after the pick (also checked when
   taken, so a timer delayed by Doze cannot let an old pick through); it is cleared too when any
   device becomes active, when this phone is picked, and on logout.
 * **Remote playback in the app**: `PlaybackSnapshot.source == "remote"` is built from the
@@ -797,7 +799,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   active. Media-session loads (`SpotifyPlayer.handleSetMediaItems`: Auto, Assistant, watches,
   Media3 resumption, Tap to resume, "play something"), the Play fallback to the stored session
   and offline plans (offline reach, or rewritten for the offline queue) never take it: they play
-  through this phone (in a car, a speaker picked earlier at home would be wrong).
+  through this phone (in a car, a speaker picked earlier at home would be wrong). Media-session
+  loads and the Play fallback to the stored session carry `"local": true`: they play here even
+  while another Connect device is active (the stored session must not overwrite what that device
+  plays now); in-app plays and radio are routed as usual.
 * `onConnectAsync` grants full commands to Media3-trusted controllers (MEDIA_CONTENT_CONTROL /
   notification listener: SysUI, Bluetooth, watch apps), the media notification, Auto/AAOS, our
   own uid and known system packages (package name verified by Media3); connection hints are not
