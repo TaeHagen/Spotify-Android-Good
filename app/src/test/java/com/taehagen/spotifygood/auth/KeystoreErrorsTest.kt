@@ -11,6 +11,8 @@ import java.security.KeyStoreException
 import java.security.ProviderException
 import java.security.UnrecoverableKeyException
 import javax.crypto.AEADBadTagException
+import javax.crypto.BadPaddingException
+import javax.crypto.IllegalBlockSizeException
 
 class KeystoreErrorsTest {
     @Test
@@ -26,10 +28,34 @@ class KeystoreErrorsTest {
     }
 
     @Test
-    fun dataAndOtherFailures() {
+    fun onlyATagMismatchIsData() {
         assertEquals(KeystoreFailure.DATA, classifyKeystoreFailure(AEADBadTagException("tag mismatch")))
-        assertEquals(KeystoreFailure.OTHER, classifyKeystoreFailure(IOException("disk")))
-        assertEquals(KeystoreFailure.OTHER, classifyKeystoreFailure(IllegalStateException("bug")))
+        // A real tag mismatch also carries a keystore error (VERIFICATION_FAILED) as its cause.
+        assertEquals(
+            KeystoreFailure.DATA,
+            classifyKeystoreFailure(AEADBadTagException("tag mismatch").apply { initCause(KeyStoreException("verification failed")) }),
+        )
+        // AndroidKeyStore reports other keystore failures in doFinal (keystore2 restarting, a
+        // pruned operation handle) as IllegalBlockSizeException: transient, never corrupt data.
+        assertEquals(
+            KeystoreFailure.RETRYABLE,
+            classifyKeystoreFailure(IllegalBlockSizeException().apply { initCause(KeyStoreException("system error")) }),
+        )
+        assertEquals(KeystoreFailure.RETRYABLE, classifyKeystoreFailure(IllegalBlockSizeException().apply { initCause(ProviderException()) }))
+        assertEquals(KeystoreFailure.RETRYABLE, classifyKeystoreFailure(BadPaddingException("invalid argument")))
+        assertEquals(KeystoreFailure.RETRYABLE, classifyKeystoreFailure(IllegalBlockSizeException()))
+        assertEquals(KeystoreFailure.RETRYABLE, classifyKeystoreFailure(IOException("disk")))
+    }
+
+    @Test
+    fun aTransientDoFinalFailureIsRetried() {
+        var calls = 0
+        val result = withKeystoreRetry("decrypt", sleep = {}, log = {}) {
+            if (++calls < 3) throw IllegalBlockSizeException().apply { initCause(KeyStoreException("operation handle pruned")) }
+            "plain"
+        }
+        assertEquals("plain", result)
+        assertEquals(3, calls)
     }
 
     @Test
