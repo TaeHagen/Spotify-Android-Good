@@ -112,6 +112,7 @@
     <string name="player_devices_cannot_play">Can\'t play here</string>
     <string name="player_devices_connecting">Connecting…</string>
     <string name="player_devices_refresh">Refresh devices</string>
+    <string name="player_devices_refreshing">Refreshing devices</string>
     <string name="player_devices_none">No other devices found</string>
     <string name="player_devices_tip_account">Make sure your other devices are signed in to the same Spotify account.</string>
     <string name="player_devices_hint">Don\'t see your device? Open Spotify on it, signed in to the same account, then tap refresh.</string>
