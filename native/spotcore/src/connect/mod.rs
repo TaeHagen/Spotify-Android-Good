@@ -217,7 +217,15 @@ fn spirc() -> AppResult<std::sync::Arc<librespot_connect::Spirc>> {
     hub::spirc().ok_or_else(AppError::not_connected)
 }
 
+/// The device a load names, unless it is this phone (see `LoadArgs::device_id`).
+fn load_target(args: &LoadArgs, me: &str) -> Option<String> {
+    args.device_id.as_deref().map(str::trim).filter(|d| !d.is_empty() && *d != me).map(str::to_string)
+}
+
 async fn load(args: LoadArgs) -> AppResult<Value> {
+    if let Some(device) = load_target(&args, &hub::me()) {
+        return load_on(&device, &args).await;
+    }
     player_events::on_user_load();
     // An explicit load replaces whatever a reconnect would restore, but only once it is known to
     // go through: the restore doesn't run meanwhile, and stays if the load fails.
@@ -255,6 +263,22 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
             offline::load(&args).await?
         }
     }
+    ok()
+}
+
+/// A load for another Connect device (picked while nothing played anywhere): a play command
+/// there, whatever is active (the same body as a transfer's resume: context or tracks, start,
+/// position, shuffle, repeat). Once it went through, this device lets go of its own playback
+/// (restore point, offline queue).
+async fn load_on(device: &str, args: &LoadArgs) -> AppResult<Value> {
+    let _hold = restore::hold();
+    await_ready(CommandKind::Load, false).await;
+    if !engine::is_online() || !engine::network_available() {
+        return Err(AppError::not_connected());
+    }
+    remote::send(device, remote::play(args, &uri::random_command_id())).await.map_err(remote::remote_error)?;
+    restore::clear();
+    offline::stop();
     ok()
 }
 
@@ -822,6 +846,16 @@ mod tests {
         assert!(!stopped_with_track(Some(&ConnectSnapshot { is_active: false, ..halted.clone() })));
         assert!(!stopped_with_track(Some(&ConnectSnapshot { track: None, ..halted })));
         assert!(!stopped_with_track(None));
+    }
+
+    #[test]
+    fn a_load_for_another_device_goes_there() {
+        let args = |device: Option<&str>| LoadArgs { device_id: device.map(str::to_string), ..Default::default() };
+        assert_eq!(load_target(&args(Some("speaker")), "me").as_deref(), Some("speaker"));
+        // absent, blank or this phone: routed as usual
+        assert_eq!(load_target(&args(None), "me"), None);
+        assert_eq!(load_target(&args(Some(" ")), "me"), None);
+        assert_eq!(load_target(&args(Some("me")), "me"), None);
     }
 
     #[test]

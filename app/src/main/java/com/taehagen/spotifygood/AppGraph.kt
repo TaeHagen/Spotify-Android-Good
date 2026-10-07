@@ -144,6 +144,8 @@ class AppGraph(val app: Application) {
             }
             step("settings") { settings.reset() }
             step("events") { events.reset() }
+            // A device picked for the next play was the old account's.
+            step("pending device") { devices.clearPendingTarget() }
             failure?.let { throw it }
         }
     }

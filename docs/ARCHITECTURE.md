@@ -429,7 +429,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 
 | method | args |
 |---|---|
-| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true}` |
+| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual |
 | `player.play` / `player.pause` / `player.togglePlay` | `{}` |
 | `player.next` / `player.prev` | `{}` |
 | `player.seek` | `{"positionMs":0}` |
@@ -444,7 +444,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
-| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs"}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE`. Pushing offline playback hands over its tracks (in play order), current position and repeat mode, and keeps it paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as the visible track window in play order) |
+| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs","shuffle"?,"smartShuffle"?,"repeat"?}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session, with its modes; smart shuffle becomes a plain shuffle on another device) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE` (Kotlin then keeps the device as the pending target for the next play, see §8). Pushing offline playback hands over its tracks (in play order), current position and repeat mode, and keeps it paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as the visible track window in play order) |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
@@ -844,7 +844,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   other system audio outputs not yet connected (the app does not cast). Never use `setCommunicationDevice` for media.
 * Device sheet (one UI for everything, like Spotify's): **This phone** (with current output
   name + icon and local output choices), then **Spotify Connect devices**, then
-  "More devices…". Selecting a Connect device → `connect.transfer`.
+  "More devices…". Selecting a Connect device → `connect.transfer`. With nothing playing
+  anywhere and no session to resume, the picked device becomes the pending target
+  (`DevicesRepository.pendingTarget`): the next play goes there (`player.load {deviceId}`),
+  the standard Connect "send". It is used once, and cleared when any device becomes active,
+  when this phone is picked, and on logout.
 * On BT disconnect: `ACTION_AUDIO_BECOMING_NOISY` pauses; route listener updates UI and
   reports `player.setAudioOutput`. AudioTrack `ERROR_DEAD_OBJECT` → recreate track.
 
