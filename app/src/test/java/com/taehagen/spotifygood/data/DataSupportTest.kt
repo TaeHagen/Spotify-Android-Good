@@ -25,14 +25,35 @@ class PagingTest {
     }
 
     @Test
-    fun stopsOnEmptyPageWhenTotalIsOverReported() = runTest {
+    fun anEmptyPageBeforeTotalFailsInsteadOfTruncating() = runTest {
         var calls = 0
-        val items = pageAll(10) { offset, _ ->
-            calls++
-            Page(total = 1_000, items = if (offset == 0) listOf(1, 2, 3) else emptyList())
-        }
-        assertEquals(listOf(1, 2, 3), items)
+        val failure = runCatching {
+            pageAll(10) { offset, _ ->
+                calls++
+                Page(total = 1_000, items = if (offset == 0) (0 until 10).toList() else emptyList())
+            }
+        }.exceptionOrNull()
+        assertTrue(failure is IllegalStateException)
         assertEquals(2, calls)
+        // An empty page at the (new) end is fine: the list shrank between pages.
+        val items = pageAll(10) { offset, _ -> if (offset == 0) Page(total = 15, items = (0 until 10).toList()) else Page(total = 8) }
+        assertEquals((0 until 10).toList(), items)
+    }
+
+    @Test
+    fun advancesByWholeWindowsAndReportsPartialPages() = runTest {
+        val requested = mutableListOf<Int>()
+        val paged = pageAllChecked(100) { offset, limit ->
+            requested += offset
+            val window = (offset until minOf(offset + limit, 250)).toList()
+            // An older engine dropped one item of the first window.
+            Page(total = 250, items = if (offset == 0) window - 57 else window, partial = offset == 100)
+        }
+        assertEquals(listOf(0, 100, 200), requested)
+        assertEquals(249, paged.items.size)
+        assertEquals("no overlap, no duplicates", paged.items.distinct(), paged.items)
+        assertTrue(paged.partial)
+        assertFalse(pageAllChecked(10) { _, _ -> Page(total = 3, items = listOf(1, 2, 3)) }.partial)
     }
 
     @Test

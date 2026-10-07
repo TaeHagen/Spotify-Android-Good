@@ -60,18 +60,32 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
         return page
     }
 
-    /** All Liked Songs URIs (newest first) for play/shuffle/download. */
-    suspend fun allLikedTrackUris(): List<String> =
-        pageAll(LIKED_PAGE_SIZE) { offset, limit -> likedTracks(offset, limit) }.map { it.track.uri }
+    /**
+     * All Liked Songs URIs (newest first) for play/shuffle/download. Uses `urisOnly` (docs §6.3): no
+     * metadata is fetched, so a metadata failure cannot drop songs from the list.
+     */
+    suspend fun allLikedTrackUris(): List<String> {
+        val seq = saved.currentSeq()
+        val uris = pageAll(LIKED_URI_PAGE_SIZE) { offset, limit ->
+            val page = rpc.callOffMain<UriPage>("library.tracks", rpcArgs {
+                put("offset", offset)
+                put("limit", limit)
+                put("urisOnly", true)
+            })
+            Page(page.total, page.uris)
+        }
+        saved.applyLookup(uris.associateWith { true }, seq)
+        return uris
+    }
 
     fun albums(): Flow<Resource<List<SavedAlbum>>> =
-        savedList(CacheKeys.LIBRARY_ALBUMS, "library.albums", SavedAlbum.serializer()) { it.album.uri }
+        savedList(CacheKeys.LIBRARY_ALBUMS, "library.albums", SavedAlbum.serializer(), { it.album.uri }, { it.album.name })
 
     fun artists(): Flow<Resource<List<SavedArtist>>> =
-        savedList(CacheKeys.LIBRARY_ARTISTS, "library.artists", SavedArtist.serializer()) { it.artist.uri }
+        savedList(CacheKeys.LIBRARY_ARTISTS, "library.artists", SavedArtist.serializer(), { it.artist.uri }, { it.artist.name })
 
     fun shows(): Flow<Resource<List<SavedShow>>> =
-        savedList(CacheKeys.LIBRARY_SHOWS, "library.shows", SavedShow.serializer()) { it.show.uri }
+        savedList(CacheKeys.LIBRARY_SHOWS, "library.shows", SavedShow.serializer(), { it.show.uri }, { it.show.name })
 
     suspend fun episodes(offset: Int, limit: Int = 50): Page<SavedEpisode> {
         val seq = saved.currentSeq()
@@ -236,13 +250,23 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
         return rootlist
     }
 
-    private fun <T> savedList(key: String, method: String, serializer: KSerializer<T>, uriOf: (T) -> String): Flow<Resource<List<T>>> =
-        cache.live(key, ListSerializer(serializer), CacheKeys.TTL_LIBRARY) {
+    /**
+     * A whole saved list. Every entry counts for the saved state; entries without metadata (nameless
+     * placeholders, docs §6.3) are not listed. A list with `partial` pages is not cached as fresh.
+     */
+    private fun <T> savedList(
+        key: String,
+        method: String,
+        serializer: KSerializer<T>,
+        uriOf: (T) -> String,
+        nameOf: (T) -> String,
+    ): Flow<Resource<List<T>>> =
+        cache.liveOf(key, ListSerializer(serializer), CacheKeys.TTL_LIBRARY) {
             val seq = saved.currentSeq()
             val pageSerializer = Page.serializer(serializer)
-            val items = pageAll(LIST_PAGE_SIZE) { offset, limit -> rpc.callWith(pageSerializer, method, pageArgs(offset, limit)) }
-            saved.applyLookup(items.associate { uriOf(it) to true }, seq)
-            items
+            val paged = pageAllChecked(LIST_PAGE_SIZE) { offset, limit -> rpc.callWith(pageSerializer, method, pageArgs(offset, limit)) }
+            saved.applyLookup(paged.items.associate { uriOf(it) to true }, seq)
+            CacheFill(paged.items.filter { nameOf(it).isNotEmpty() }, paged.partial)
         }
 
     private fun pageArgs(offset: Int, limit: Int) = rpcArgs {
@@ -254,7 +278,8 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
         const val LOOKUP_WINDOW_MS = 50L
         const val LOOKUP_BATCH = 50
         const val MUTATION_BATCH = 50
-        const val LIKED_PAGE_SIZE = 100
+        /** URI-only pages are cheap; `library.*` accepts up to 500 (docs §6.3). */
+        const val LIKED_URI_PAGE_SIZE = 500
         const val LIST_PAGE_SIZE = 100
         const val MAX_REFRESH_LOOKUPS = 200
     }
@@ -262,3 +287,7 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
 
 @Serializable
 internal data class ContainsResult(val contains: List<Boolean> = emptyList())
+
+/** `library.tracks {urisOnly:true}` result (docs §6.3). */
+@Serializable
+internal data class UriPage(val total: Int = 0, val uris: List<String> = emptyList())
