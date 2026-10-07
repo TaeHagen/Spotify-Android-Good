@@ -68,6 +68,7 @@ import com.taehagen.spotifygood.ui.components.EmptyState
 import com.taehagen.spotifygood.ui.components.MediaCard
 import com.taehagen.spotifygood.ui.components.MediaCarousel
 import com.taehagen.spotifygood.ui.components.MediaRow
+import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.components.PlayFab
 import com.taehagen.spotifygood.ui.components.SectionHeader
 import com.taehagen.spotifygood.ui.components.TrackRow
@@ -119,6 +120,7 @@ fun ArtistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier 
                 onRadio = viewModel::startRadio,
                 onToggleFollow = viewModel::toggleFollow,
                 onPlayTrack = viewModel::playTrack,
+                onRetry = viewModel::retry,
             )
         }
     }
@@ -137,6 +139,7 @@ private fun ArtistList(
     onRadio: () -> Unit,
     onToggleFollow: () -> Unit,
     onPlayTrack: (Track) -> Unit,
+    onRetry: () -> Unit,
 ) {
     val artist = content.artist
     var popularExpanded by rememberSaveable { mutableStateOf(false) }
@@ -168,6 +171,10 @@ private fun ArtistList(
                     PlayFab(isPlaying = state.playback.isPlayingContext(uri), onClick = onPlay)
                 },
             )
+        }
+        if (artist.partial) {
+            // Some top tracks are placeholders, or releases / related artists are missing right now.
+            item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetry) }
         }
         if (popular.isNotEmpty()) {
             item(key = "popular-title", contentType = "section") {

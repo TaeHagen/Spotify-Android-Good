@@ -13,6 +13,7 @@ import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.Show
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.playback.PlayRequest
+import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadUi
 import com.taehagen.spotifygood.ui.screens.album.DetailViewModel
 import com.taehagen.spotifygood.ui.screens.album.FailureReason
@@ -67,6 +68,8 @@ internal data class EpisodePage(
     val loading: Boolean = false,
     val failed: Boolean = false,
     val endReached: Boolean = false,
+    /** A page loaded after the show itself came back partial (placeholder episodes). */
+    val partial: Boolean = false,
 )
 
 @Immutable
@@ -79,6 +82,8 @@ internal data class ShowUiState(
     val download: CollectionDownloadUi = CollectionDownloadUi(),
     val rowDownloads: Map<String, DownloadState> = emptyMap(),
     val offline: Boolean = false,
+    /** Some listed episodes are placeholders (metadata failed right now): offer a retry. */
+    val partial: Boolean = false,
 )
 
 internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailViewModel(graph, uri) {
@@ -100,7 +105,9 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         graph.downloads.collectionUi(uri),
         combine(graph.downloads.statesFor(episodeUris), offline, ::Pair),
     ) { (load, page), playback, following, download, (rows, offline) ->
-        ShowUiState(load, page, playback, following, download, rows, offline)
+        // The show's own first page is listed only in newest-first order.
+        val partial = page.partial || (page.sort == EpisodeSort.NEWEST && load.dataOrNull()?.show?.partial == true)
+        ShowUiState(load, page, playback, following, download, rows, offline, partial)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ShowUiState())
 
     init {
@@ -146,16 +153,23 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         loadJob = viewModelScope.launch {
             list.update { it.copy(loading = true, failed = false) }
             try {
+                var pagePartial = false
                 val page: List<Episode> = when (sort) {
                     EpisodeSort.NEWEST -> graph.catalog.showPage(uri, current.episodes.size, PAGE_SIZE)
-                        .also { total = it.total }
+                        .also {
+                            total = it.total
+                            pagePartial = it.partial
+                        }
                         .episodes
                     EpisodeSort.OLDEST -> {
                         val range = oldestFirstPage(total, current.episodes.size, PAGE_SIZE)
                         if (range == null) {
                             emptyList()
                         } else {
-                            graph.catalog.showPage(uri, range.first, range.second).episodes.asReversed()
+                            graph.catalog.showPage(uri, range.first, range.second)
+                                .also { pagePartial = it.partial }
+                                .episodes
+                                .asReversed()
                         }
                     }
                 }
@@ -167,6 +181,7 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
                         latest.copy(
                             episodes = merged,
                             loading = false,
+                            partial = latest.partial || pagePartial,
                             // No progress (empty or fully duplicate page) also ends paging.
                             endReached = merged.size == latest.episodes.size || merged.size >= total,
                         )
@@ -180,6 +195,13 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         }
     }
 
+    /** Some episodes came back as placeholders: reload the show and its list from the start. */
+    fun retryPartial() {
+        loadJob?.cancel()
+        list.update { EpisodePage(sort = it.sort) }
+        retry()
+    }
+
     fun setSort(sort: EpisodeSort) {
         if (list.value.sort == sort) return
         loadJob?.cancel()
@@ -191,12 +213,13 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
     }
 
     fun playEpisode(episode: Episode) {
+        if (episode.isPlaceholder || !episode.playable) return
         graph.player.play(PlayRequest(contextUri = uri, startUri = episode.uri, positionMs = episode.resumePosition()))
     }
 
     /** Toggles playback of this show, or starts its newest episode. */
     override fun playContext() {
-        val newest = firstPage.firstOrNull()
+        val newest = firstPage.firstOrNull { it.playable && !it.isPlaceholder }
         when {
             currentPlayback().isContext(uri) -> graph.player.togglePlayPause()
             newest != null -> playEpisode(newest)

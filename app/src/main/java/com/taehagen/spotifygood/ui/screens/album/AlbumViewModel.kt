@@ -14,6 +14,7 @@ import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.playback.PlayRequest
+import com.taehagen.spotifygood.ui.components.isPlaceholder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
@@ -91,6 +92,7 @@ internal class AlbumViewModel(graph: AppGraph, private val uri: String) : Detail
 
     /** Plays the album starting at [track]. */
     fun playTrack(track: Track) {
+        if (track.isPlaceholder || !track.playable) return
         graph.player.play(PlayRequest(contextUri = uri, startUri = track.uri))
     }
 

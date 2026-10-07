@@ -62,6 +62,7 @@ import com.taehagen.spotifygood.ui.appViewModel
 import com.taehagen.spotifygood.ui.components.EmptyState
 import com.taehagen.spotifygood.ui.components.ErrorState
 import com.taehagen.spotifygood.ui.components.OfflineBanner
+import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.components.PlayFab
 import com.taehagen.spotifygood.ui.components.TrackRow
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
@@ -107,6 +108,11 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
                 }
                 item(key = "filter", contentType = "filter") {
                     FilterField(value = viewModel.filterText, onValueChange = viewModel::onFilterChange)
+                }
+                if (state.partial) {
+                    item(key = "partial", contentType = "banner") {
+                        PartialContentNotice(onRetry = viewModel::refresh)
+                    }
                 }
                 if (state.offline) {
                     item(key = "offline", contentType = "banner") {

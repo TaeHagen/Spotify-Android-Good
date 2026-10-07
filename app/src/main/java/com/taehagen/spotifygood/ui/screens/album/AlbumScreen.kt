@@ -28,6 +28,7 @@ import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.ui.appViewModel
 import com.taehagen.spotifygood.ui.components.DetailHeader
 import com.taehagen.spotifygood.ui.components.MediaCarousel
+import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.components.PlayFab
 import com.taehagen.spotifygood.ui.components.TrackRow
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
@@ -64,6 +65,7 @@ fun AlbumScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier =
                 onToggleSaved = { viewModel.toggleSaved(state.saved) },
                 onDownload = viewModel::download,
                 onRemoveDownload = { viewModel.removeCollectionDownload() },
+                onRetry = viewModel::retry,
             )
         }
     }
@@ -83,6 +85,7 @@ private fun AlbumList(
     onToggleSaved: () -> Unit,
     onDownload: () -> Unit,
     onRemoveDownload: () -> Unit,
+    onRetry: () -> Unit,
 ) {
     val album = content.album
     LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
@@ -98,6 +101,10 @@ private fun AlbumList(
                 onRemoveDownload = onRemoveDownload,
                 onMore = { navigator.showActions(MediaActionTarget.AlbumTarget(album.toRef())) },
             )
+        }
+        if (album.partial) {
+            // Some tracks are placeholders (their metadata failed right now).
+            item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetry) }
         }
         content.discs.forEach { disc ->
             if (content.multiDisc) {
