@@ -60,6 +60,22 @@ pub(crate) struct HubState {
     /// A play was just sent to another device (nothing was active): until a cluster names the
     /// active device, commands follow it there.
     pub remote_activation: Option<RemoteActivation>,
+    /// The offline queue's window ended and Spirc loads its context (see `offline::hand_back`):
+    /// until Spirc has its track, the queue's last view is shown.
+    pub handing_back: Option<HandingBack>,
+    /// A start of this layer failed on the attached Spirc, which goes inactive (its disconnect is
+    /// on its way, see [`on_local_load_failed`]): its empty active snapshots read inactive until
+    /// an inactive one or one with a track arrives (a play meanwhile gets `NOT_ACTIVE_DEVICE`, a
+    /// load activates it again).
+    pub deactivating: bool,
+}
+
+/// See [`HubState::handing_back`].
+#[derive(Debug, Clone)]
+pub(crate) struct HandingBack {
+    pub generation: u64,
+    pub at: Instant,
+    pub view: PlaybackSnapshot,
 }
 
 /// See [`HubState::remote_activation`].
@@ -148,9 +164,12 @@ pub(crate) fn local_active_or_activating() -> bool {
 
 pub(crate) fn activating_or_active(hub: &HubState) -> bool {
     let link = hub.link.as_ref().map(|l| l.generation);
-    hub.snapshot.as_ref().is_some_and(|s| s.is_active)
-        || hub.activation.is_some_and(|a| link == Some(a.generation) && a.at.elapsed() < ACTIVATION_GRACE)
-        || restore_applying(hub.restoring.as_ref(), link, Instant::now())
+    hub.snapshot.as_ref().is_some_and(|s| s.is_active) || activating(hub, link, Instant::now()) || starting(hub, link, Instant::now())
+}
+
+/// An activation was sent to the attached Spirc (`link`) within [`ACTIVATION_GRACE`].
+fn activating(hub: &HubState, link: Option<u64>, now: Instant) -> bool {
+    hub.activation.is_some_and(|a| link == Some(a.generation) && now.saturating_duration_since(a.at) < ACTIVATION_GRACE)
 }
 
 /// A restore is being applied to the attached Spirc (`link`): commands queue behind it there,
@@ -158,6 +177,38 @@ pub(crate) fn activating_or_active(hub: &HubState) -> bool {
 /// take longer on a weak link).
 fn restore_applying(restoring: Option<&restore::Restoring>, link: Option<u64>, now: Instant) -> bool {
     restoring.is_some_and(|r| link == Some(r.generation) && now.saturating_duration_since(r.at) < restore::RESTORING_MAX)
+}
+
+/// The hand-back's view while it is on its way to the attached Spirc (`link`), for as long as a
+/// restore would be.
+fn handing_back_view(hub: &HubState, link: Option<u64>, now: Instant) -> Option<&PlaybackSnapshot> {
+    hub.handing_back
+        .as_ref()
+        .filter(|h| link == Some(h.generation) && now.saturating_duration_since(h.at) < restore::RESTORING_MAX)
+        .map(|h| &h.view)
+}
+
+/// A start of this layer is on its way to the attached Spirc (the restore, a hand-back): its
+/// activation's empty snapshot isn't the playback yet.
+fn starting(hub: &HubState, link: Option<u64>, now: Instant) -> bool {
+    restore_applying(hub.restoring.as_ref(), link, now) || handing_back_view(hub, link, now).is_some()
+}
+
+/// The offline queue hands its playback back to the attached Spirc (activate + load follow):
+/// `view` (the queue's) stays shown until Spirc has its track, commands go to Spirc.
+pub(crate) fn set_handing_back(view: PlaybackSnapshot) {
+    let mut hub = HUB.lock();
+    hub.remote_activation = None;
+    if let Some(generation) = hub.link.as_ref().map(|l| l.generation) {
+        let at = Instant::now();
+        hub.activation = Some(Activation { generation, at });
+        hub.handing_back = Some(HandingBack { generation, at, view });
+    }
+}
+
+/// The hand-back isn't on its way (it wasn't sent), or a load replaces it.
+pub(crate) fn forget_hand_back() {
+    HUB.lock().handing_back = None;
 }
 
 /// The Spirc `generation` (if attached) and its latest snapshot.
@@ -218,10 +269,7 @@ fn local_active_empty_in(hub: &HubState, link: Option<u64>, now: Instant) -> boo
     let empty = hub.snapshot.as_ref().is_some_and(|s| {
         s.is_active && s.track.is_none() && s.status == librespot_connect::SnapshotPlayStatus::Stopped
     });
-    let activating = hub
-        .activation
-        .is_some_and(|a| link == Some(a.generation) && now.saturating_duration_since(a.at) < ACTIVATION_GRACE);
-    empty && !activating && !restore_applying(hub.restoring.as_ref(), link, now)
+    empty && !activating(hub, link, now) && !starting(hub, link, now)
 }
 
 pub(crate) fn cluster() -> Option<Arc<Cluster>> {
@@ -260,6 +308,8 @@ pub(crate) fn forget_previous_link(hub: &mut HubState) {
     hub.remote_activation = None;
     hub.last_active = None;
     hub.restoring = None;
+    hub.handing_back = None;
+    hub.deactivating = false;
 }
 
 /// [`detach`] on the state. `online`: the session stays (hidden from Spotify Connect), so the last
@@ -271,6 +321,8 @@ pub(crate) fn detach_state(hub: &mut HubState, generation: u64, online: bool) {
         hub.snapshot = None;
         hub.activation = None;
         hub.remote_activation = None;
+        hub.handing_back = None;
+        hub.deactivating = false;
     }
     if hub.link.is_none() && !online {
         hub.cluster = None;
@@ -340,6 +392,8 @@ pub(crate) fn detach_all() {
         hub.cluster = None;
         hub.activation = None;
         hub.remote_activation = None;
+        hub.handing_back = None;
+        hub.deactivating = false;
         released
     };
     pause_released(released);
@@ -440,7 +494,16 @@ fn on_snapshot(generation: u64, snap: ConnectSnapshot, session: &Session) {
 
 /// Records a snapshot of the attached Spirc; returns whether this device became active.
 /// `session_invalid`: the session is gone, so an inactive snapshot is not a deliberate stop.
-pub(crate) fn apply_snapshot(hub: &mut HubState, snap: ConnectSnapshot, session_invalid: bool, now_ms: i64) -> bool {
+pub(crate) fn apply_snapshot(hub: &mut HubState, mut snap: ConnectSnapshot, session_invalid: bool, now_ms: i64) -> bool {
+    if hub.deactivating {
+        // Going inactive (see `HubState::deactivating`): until it is, or something plays there
+        // again, its empty active snapshots are stale.
+        if snap.is_active && snap.track.is_none() {
+            snap.is_active = false;
+        } else {
+            hub.deactivating = false;
+        }
+    }
     let was_active = hub.snapshot.as_ref().is_some_and(|s| s.is_active);
     let became_active = snap.is_active && !was_active;
     if became_active {
@@ -448,9 +511,14 @@ pub(crate) fn apply_snapshot(hub: &mut HubState, snap: ConnectSnapshot, session_
     }
     if snap.is_active && snap.track.is_some() {
         hub.last_active = Some(LastActive { snap: snap.clone(), ended_at_ms: None });
-        // A restore being applied took.
+        // A restore being applied, or a hand-back, took.
         hub.restoring = None;
+        hub.handing_back = None;
     } else if !snap.is_active {
+        if was_active {
+            // Taken over or stopped before the hand-back took.
+            hub.handing_back = None;
+        }
         if was_active && !session_invalid {
             // Deliberately inactive (taken over, user stop) before a restore being applied took.
             hub.restoring = None;
@@ -493,7 +561,7 @@ fn on_spirc_error(err: SpircCommandError) {
         return;
     }
     if !err.remote && err.command == "load" {
-        restore::on_load_failed();
+        on_local_load_failed();
     }
     use librespot_core::error::ErrorKind;
     let code = match err.kind {
@@ -509,6 +577,73 @@ fn on_spirc_error(err: SpircCommandError) {
     events::emit_error(&AppError::new(code, message).with_context(error_context(&err.command, err.remote)));
 }
 
+/// A load of this phone failed on the attached Spirc. If it was a start this layer sent (the
+/// restore, the offline queue's hand-back), the Spirc is active with nothing loaded: the session
+/// that start carried goes (the app's own resume is the fallback: a play gets `NOT_ACTIVE_DEVICE`
+/// and the app loads its stored session), and this phone goes inactive right away (see
+/// [`HubState::deactivating`]). A failed load of the user's leaves things as they are (the
+/// playback before it plays on; with nothing loaded a play gets `NOT_ACTIVE_DEVICE` too).
+fn on_local_load_failed() {
+    let (spirc, failed) = {
+        let mut hub = HUB.lock();
+        let Some((generation, spirc)) = hub.link.as_ref().map(|l| (l.generation, l.spirc.clone())) else { return };
+        let Some(failed) = local_load_failed_in(&mut hub, generation) else { return };
+        (spirc, failed)
+    };
+    if failed.deactivated {
+        if let Err(e) = spirc.disconnect(false) {
+            log::debug!("spirc gone: {e}");
+        }
+    }
+    if failed.orphaned && !offline::is_active() {
+        // The interrupted session's paused track has no owner anymore (the hand-back stopped
+        // the queue's before it was sent).
+        if let Some(player) = engine::player_host::player() {
+            player.stop();
+        }
+    }
+    changed();
+    publish();
+}
+
+/// What [`local_load_failed_in`] did.
+#[derive(Debug, PartialEq, Eq)]
+struct LoadFailed {
+    /// The Spirc is made inactive (to disconnect).
+    deactivated: bool,
+    /// The restore's paused track has no owner anymore (to stop).
+    orphaned: bool,
+}
+
+/// [`on_local_load_failed`] on the state of the attached Spirc `generation`: `None` if it wasn't
+/// a start of this layer.
+fn local_load_failed_in(hub: &mut HubState, generation: u64) -> Option<LoadFailed> {
+    let restore = restore::load_failed_in(hub, generation);
+    let hand_back = hub.handing_back.take_if(|h| h.generation == generation).is_some();
+    if !restore && !hand_back {
+        return None;
+    }
+    if hand_back {
+        log::warn!("the hand-back's load failed");
+    }
+    // (unless something plays there by now: a transfer to this phone meanwhile)
+    let empty = hub.snapshot.as_ref().is_none_or(|s| s.track.is_none());
+    if empty {
+        deactivate(hub);
+    }
+    Some(LoadFailed { deactivated: empty, orphaned: restore && empty })
+}
+
+/// The attached Spirc is made inactive (its disconnect is sent): see
+/// [`HubState::deactivating`].
+fn deactivate(hub: &mut HubState) {
+    hub.activation = None;
+    hub.deactivating = true;
+    if let Some(s) = hub.snapshot.as_mut() {
+        s.is_active = false;
+    }
+}
+
 /// The error context of a failed Spirc command: `playback` for this phone's own commands that
 /// start playback (a failed load, a play with nothing to play: the player shows them), else
 /// `connect`.
@@ -520,34 +655,53 @@ fn time_delta_s() -> i64 {
     engine::try_session().map(|s| s.time_delta()).unwrap_or(0)
 }
 
-/// The local side of [`compose`]: this device's active snapshot, and the reconnect placeholder
-/// (the frozen session, also while its restore is applied to Spirc `link`). Until the restored
-/// Spirc has its track, its activation's empty snapshot doesn't replace the placeholder (the
-/// notification and the media session would go away in between).
-fn local_view(hub: &HubState, link: Option<u64>, now: Instant, now_ms: i64) -> (Option<ConnectSnapshot>, Option<restore::Frozen>) {
-    let applying = restore_applying(hub.restoring.as_ref(), link, now);
-    let local = hub.snapshot.clone().filter(|s| s.is_active && (s.track.is_some() || !applying));
+/// The local side of [`compose`] (see [`local_view`]).
+#[derive(Debug, Default)]
+struct LocalView {
+    /// This device's active snapshot.
+    active: Option<ConnectSnapshot>,
+    /// The offline queue's last view while it hands back to Spirc.
+    hand_back: Option<PlaybackSnapshot>,
+    /// The reconnect placeholder (the frozen session, also while its restore is applied).
+    placeholder: Option<restore::Frozen>,
+    /// An activation of this device is on its way (a load here, e.g. a media-session resume):
+    /// another device's playback isn't shown meanwhile.
+    activating: bool,
+}
+
+/// What this device shows, on Spirc `link`. Until a start of this layer (the restore, a
+/// hand-back) has its track, its activation's empty snapshot doesn't replace that start's view
+/// (the notification and the media session would go away in between).
+fn local_view(hub: &HubState, link: Option<u64>, now: Instant, now_ms: i64) -> LocalView {
+    let starting = starting(hub, link, now);
+    let active = hub.snapshot.clone().filter(|s| s.is_active && (s.track.is_some() || !starting));
     let frozen = hub.reconnect.as_ref().or(hub.restoring.as_ref().map(|r| &r.frozen));
-    let placeholder = frozen.filter(|f| f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned();
-    (local, placeholder)
+    LocalView {
+        active,
+        hand_back: handing_back_view(hub, link, now).cloned(),
+        placeholder: frozen.filter(|f| f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned(),
+        activating: activating(hub, link, now),
+    }
 }
 
 /// Composes the snapshot from the current sources (without emitting).
 pub(crate) fn compose() -> PlaybackSnapshot {
     let device = this_device_ref();
-    let (local, cluster, placeholder, refused) = {
+    let (view, cluster, refused) = {
         let hub = HUB.lock();
         let link = hub.link.as_ref().map(|l| l.generation);
-        let (local, placeholder) = local_view(&hub, link, Instant::now(), super::now_ms());
-        (local, hub.cluster.clone(), placeholder, hub.refused_error.clone())
+        (local_view(&hub, link, Instant::now(), super::now_ms()), hub.cluster.clone(), hub.refused_error.clone())
     };
     // None once a paused or finished offline queue gave way to a device that took over.
     let offline = offline::snapshot(device.clone(), mixer_volume());
-    let mut snap = if let Some(s) = local {
+    let remote = || cluster.as_deref().and_then(|c| snapshot::map_remote(c, &device.id, time_delta_s()));
+    let mut snap = if let Some(s) = view.active {
         snapshot::map_local(&s, device.clone())
+    } else if let Some(s) = view.hand_back {
+        s
     } else if let Some(s) = offline {
         s
-    } else if let Some(f) = placeholder {
+    } else if let Some(f) = view.placeholder {
         // Reconnecting: keep showing what was playing (paused) instead of flashing "nothing".
         let mut p = snapshot::map_local(&f.snap, device.clone());
         p.position_ms = f.position_ms.max(0) as u64;
@@ -555,7 +709,7 @@ pub(crate) fn compose() -> PlaybackSnapshot {
         p.status = PlaybackStatus::Paused;
         p.playback_speed = 0.0;
         p
-    } else if let Some(r) = cluster.as_deref().and_then(|c| snapshot::map_remote(c, &device.id, time_delta_s())) {
+    } else if let Some(r) = remote().filter(|_| !view.activating) {
         r
     } else {
         snapshot::none_snapshot(mixer_volume())
@@ -725,17 +879,119 @@ mod hub_tests {
             ..Default::default()
         };
         // the activation's empty snapshot: the frozen track stays shown
-        let (local, placeholder) = local_view(&hub, Some(3), now, 1_001_000);
-        assert!(local.is_none());
-        assert_eq!(placeholder.and_then(|f| f.snap.track).map(|t| t.uri).as_deref(), Some("spotify:track:a"));
+        let view = local_view(&hub, Some(3), now, 1_001_000);
+        assert!(view.active.is_none());
+        assert_eq!(view.placeholder.and_then(|f| f.snap.track).map(|t| t.uri).as_deref(), Some("spotify:track:a"));
         // with its track the restored playback is shown
         hub.snapshot = Some(s);
-        let (local, _) = local_view(&hub, Some(3), now, 1_001_000);
-        assert!(local.is_some());
+        assert!(local_view(&hub, Some(3), now, 1_001_000).active.is_some());
         // an empty active snapshot without a restore in flight is shown as it is (a real stop)
         hub.snapshot = Some(ConnectSnapshot { is_active: true, ..Default::default() });
         hub.restoring = None;
-        assert!(local_view(&hub, Some(3), now, 1_001_000).0.is_some());
+        assert!(local_view(&hub, Some(3), now, 1_001_000).active.is_some());
+    }
+
+    fn playing_track() -> ConnectSnapshot {
+        ConnectSnapshot {
+            is_active: true,
+            status: librespot_connect::SnapshotPlayStatus::Playing,
+            track: Some(librespot_connect::SnapshotTrack {
+                uri: "spotify:track:b".into(),
+                uid: "b".into(),
+                provider: librespot_connect::TrackProvider::Context,
+                context_index: None,
+                hidden: false,
+                metadata: Default::default(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn empty_active() -> ConnectSnapshot {
+        ConnectSnapshot { is_active: true, status: librespot_connect::SnapshotPlayStatus::Stopped, ..Default::default() }
+    }
+
+    #[test]
+    fn a_hand_back_shows_the_queue_until_spirc_has_its_track() {
+        let now = Instant::now();
+        let view = PlaybackSnapshot { status: PlaybackStatus::Loading, ..Default::default() };
+        let hand_back = || Some(HandingBack { generation: 3, at: now, view: view.clone() });
+        let mut hub = HubState { snapshot: Some(empty_active()), handing_back: hand_back(), ..Default::default() };
+        // the activation's empty snapshot: the queue's view stays, commands go to Spirc
+        let v = local_view(&hub, Some(3), now, 0);
+        assert!(v.active.is_none());
+        assert_eq!(v.hand_back.map(|s| s.status), Some(PlaybackStatus::Loading));
+        assert!(!local_active_empty_in(&hub, Some(3), now + ACTIVATION_GRACE));
+        // another Spirc, or past the bound: not any more
+        assert!(local_view(&hub, Some(4), now, 0).hand_back.is_none());
+        assert!(local_view(&hub, Some(3), now + restore::RESTORING_MAX, 0).hand_back.is_none());
+        // Spirc's track: shown, the hand-back is done
+        apply_snapshot(&mut hub, playing_track(), false, 0);
+        assert!(hub.handing_back.is_none());
+        // taken over (or stopped) before it took
+        let mut hub = HubState { snapshot: Some(empty_active()), handing_back: hand_back(), ..Default::default() };
+        apply_snapshot(&mut hub, ConnectSnapshot::default(), false, 0);
+        assert!(hub.handing_back.is_none());
+    }
+
+    #[test]
+    fn a_failed_start_makes_this_phone_inactive_at_once() {
+        let now = Instant::now();
+        let frozen = restore::freeze(playing_track(), 0, now);
+        // the restore's load failed: its restore point goes, the empty Spirc reads inactive
+        let mut hub = HubState {
+            snapshot: Some(empty_active()),
+            restoring: Some(restore::Restoring { generation: 3, frozen, at: now }),
+            ..Default::default()
+        };
+        assert_eq!(local_load_failed_in(&mut hub, 4), None, "another Spirc's");
+        assert_eq!(local_load_failed_in(&mut hub, 3), Some(LoadFailed { deactivated: true, orphaned: true }));
+        assert!(hub.restoring.is_none() && hub.reconnect.is_none());
+        assert!(!activating_or_active(&hub) && !local_active_empty_in(&hub, Some(3), now));
+        let v = local_view(&hub, Some(3), now, 0);
+        assert!(v.active.is_none() && v.placeholder.is_none());
+        // the Spirc's empty active snapshots before its disconnect stay inactive ...
+        apply_snapshot(&mut hub, empty_active(), false, 0);
+        assert!(!activating_or_active(&hub));
+        // ... until its inactive one
+        apply_snapshot(&mut hub, ConnectSnapshot::default(), false, 0);
+        assert!(!hub.deactivating);
+        apply_snapshot(&mut hub, empty_active(), false, 0);
+        assert!(activating_or_active(&hub), "activated again (a load)");
+        // or until something plays there again
+        let mut hub = HubState { snapshot: Some(empty_active()), deactivating: true, ..Default::default() };
+        apply_snapshot(&mut hub, playing_track(), false, 0);
+        assert!(!hub.deactivating && activating_or_active(&hub));
+        // a failed hand-back: the same, nothing to stop
+        let view = PlaybackSnapshot::default();
+        let mut hub = HubState {
+            snapshot: Some(empty_active()),
+            handing_back: Some(HandingBack { generation: 3, at: now, view }),
+            ..Default::default()
+        };
+        assert_eq!(local_load_failed_in(&mut hub, 3), Some(LoadFailed { deactivated: true, orphaned: false }));
+        assert!(hub.handing_back.is_none() && hub.deactivating);
+        // a failed load of the user's: left as it is
+        let mut hub = HubState { snapshot: Some(empty_active()), ..Default::default() };
+        assert_eq!(local_load_failed_in(&mut hub, 3), None);
+        // something plays there by now (a transfer here meanwhile): not torn down
+        let frozen = restore::freeze(playing_track(), 0, now);
+        let mut hub = HubState {
+            snapshot: Some(playing_track()),
+            restoring: Some(restore::Restoring { generation: 3, frozen, at: now }),
+            ..Default::default()
+        };
+        assert_eq!(local_load_failed_in(&mut hub, 3), Some(LoadFailed { deactivated: false, orphaned: false }));
+        assert!(activating_or_active(&hub));
+    }
+
+    #[test]
+    fn an_activation_here_hides_another_devices_playback() {
+        let now = Instant::now();
+        let hub = HubState { activation: Some(Activation { generation: 3, at: now }), ..Default::default() };
+        assert!(local_view(&hub, Some(3), now, 0).activating);
+        assert!(!local_view(&hub, Some(3), now + ACTIVATION_GRACE, 0).activating);
+        assert!(!local_view(&hub, Some(4), now, 0).activating);
     }
 
     #[test]

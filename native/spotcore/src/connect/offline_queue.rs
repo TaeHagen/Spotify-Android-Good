@@ -39,6 +39,8 @@ pub(crate) struct Continuation {
     pub context_uri: String,
     pub start_uri: String,
     pub smart_shuffle: bool,
+    /// The user queue's tracks after the window (queued again).
+    pub queued: Vec<String>,
 }
 
 /// Spirc loads the context at the continuation (online again): the end of the handed-over window
@@ -52,6 +54,8 @@ pub(crate) struct HandBack {
     pub smart_shuffle: bool,
     pub repeat_context: bool,
     pub repeat_track: bool,
+    /// Added to Spirc's queue after the load.
+    pub queued: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +155,8 @@ pub(crate) struct OfflineQueue {
     ended_request: Option<u64>,
     /// See [`Continuation`] (kept until a load or a shuffle toggle changes the window).
     continuation: Option<Continuation>,
+    /// Items that aren't tracks of `context_uri` (see [`Adoption::outside`]).
+    outside: Vec<usize>,
     /// The driver: a visible online session is up, the window's end hands back to Spirc.
     hand_back: bool,
 }
@@ -163,6 +169,8 @@ pub(crate) struct Adoption {
     /// In play order; `uris[start]` is the track the Player has loaded.
     pub uris: Vec<String>,
     pub start: usize,
+    /// Indices of `uris` that aren't tracks of the context (the user queue's, suggestions).
+    pub outside: Vec<usize>,
     pub position_ms: u64,
     pub duration_ms: u64,
     /// It plays, or loads to play.
@@ -206,6 +214,7 @@ impl Default for OfflineQueue {
             last_request: None,
             ended_request: None,
             continuation: None,
+            outside: Vec::new(),
             hand_back: false,
         }
     }
@@ -435,6 +444,7 @@ impl OfflineQueue {
                 smart_shuffle: c.smart_shuffle,
                 repeat_context: self.repeat_context,
                 repeat_track: self.repeat == RepeatMode::Track,
+                queued: c.queued.clone(),
             };
             self.status = PlaybackStatus::Loading;
             self.play_intent = play;
@@ -707,6 +717,7 @@ impl OfflineQueue {
         // Already in play order: shown as shuffled, a toggle reshuffles or keeps this order.
         self.shuffle = a.shuffle;
         self.continuation = a.continuation;
+        self.outside = a.outside;
         let Some(request) = request else { return Some(load) };
         self.pending_loads = self.pending_loads.saturating_sub(1);
         self.own_request = Some(request);
@@ -893,11 +904,29 @@ impl OfflineQueue {
     }
 
     /// What to hand over to another device: the current item followed by up to `max_next` next
-    /// items, and the position at `now_ms` (the snapshot only carries the last anchor).
+    /// items, the position at `now_ms` (the snapshot only carries the last anchor), and the
+    /// context at the current item when it is one of its tracks.
     pub fn handover(&self, now_ms: i64, max_next: usize) -> Handover {
         let mut uris: Vec<String> = self.current_uri().map(str::to_string).into_iter().collect();
         uris.extend(self.next_tracks().into_iter().take(max_next).map(|t| t.uri));
-        Handover { uris, position_ms: self.position_at(now_ms), repeat: self.repeat, playing: self.is_playing() }
+        let context = match &self.current {
+            Some(Current::Context(i)) if !self.outside.contains(i) => self
+                .context_uri
+                .as_ref()
+                .filter(|c| uri::is_resolvable_context(c))
+                .zip(self.items.get(*i))
+                .map(|(context_uri, item)| ContextStart { context_uri: context_uri.clone(), track_uri: item.uri.clone() }),
+            _ => None,
+        };
+        Handover {
+            uris,
+            position_ms: self.position_at(now_ms),
+            repeat: self.repeat,
+            playing: self.is_playing(),
+            context,
+            shuffle: self.shuffle,
+            queued: self.queue.iter().map(|q| q.uri.clone()).collect(),
+        }
     }
 
     /// The snapshot (bare tracks; metadata is filled by the caller). Positions are reported as
@@ -954,6 +983,19 @@ pub(crate) struct Handover {
     pub position_ms: u64,
     pub repeat: RepeatMode,
     pub playing: bool,
+    /// The queue's context at its current item, when that is a track of a context that can be
+    /// loaded again (the target plays the whole context, not just the downloads).
+    pub context: Option<ContextStart>,
+    pub shuffle: bool,
+    /// The user queue (after the current item).
+    pub queued: Vec<String>,
+}
+
+/// See [`Handover::context`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextStart {
+    pub context_uri: String,
+    pub track_uri: String,
 }
 
 /// The downloaded subset of a request and where it starts.
@@ -1403,6 +1445,7 @@ mod tests {
             context_uri: "spotify:playlist:p".into(),
             start_uri: "spotify:track:gap".into(),
             smart_shuffle: false,
+            queued: vec!["spotify:track:q".into()],
         };
         for repeat_context in [false, true] {
             let mut q = OfflineQueue::default();
@@ -1425,6 +1468,7 @@ mod tests {
             assert_eq!((back.context_uri.as_str(), back.start_uri.as_str()), ("spotify:playlist:p", "spotify:track:gap"));
             assert!(back.play);
             assert_eq!(back.repeat_context, repeat_context);
+            assert_eq!(back.queued, ["spotify:track:q"], "the user queue after the window");
             // it couldn't be sent: as without one
             let action = q.hand_back_failed(true, 1_000);
             assert!(matches!(action, Action::Stop | Action::Load { .. }));
@@ -1442,11 +1486,36 @@ mod tests {
         assert!(!matches!(q.next(0), Some(Action::HandBack(_))));
     }
 
+    #[test]
+    fn a_handover_names_the_context_at_a_track_of_it() {
+        let context = |h: &Handover| h.context.as_ref().map(|c| (c.context_uri.clone(), c.track_uri.clone()));
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.adopt(Adoption { shuffle: true, ..adoption(3, 1) }, 0);
+        q.add_to_queue("spotify:track:q".into());
+        let h = q.handover(0, 50);
+        assert_eq!(context(&h), Some(("spotify:playlist:p".into(), "spotify:track:1".into())));
+        assert!(h.shuffle);
+        assert_eq!(h.queued, ["spotify:track:q"]);
+        assert_eq!(h.uris, ["spotify:track:1", "spotify:track:q", "spotify:track:2"], "the window as before");
+        // the current track came from the user queue or suggestions: not a track of the context
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.adopt(Adoption { outside: vec![1], ..adoption(3, 1) }, 0);
+        assert_eq!(context(&q.handover(0, 50)), None);
+        // a context that can't be loaded again
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.adopt(Adoption { context_uri: Some("spotify:web-api".into()), ..adoption(3, 1) }, 0);
+        assert_eq!(context(&q.handover(0, 50)), None);
+    }
+
     fn adoption(n: usize, start: usize) -> Adoption {
         Adoption {
             context_uri: Some("spotify:playlist:p".into()),
             uris: uris(n),
             start,
+            outside: Vec::new(),
             position_ms: 42_000,
             duration_ms: 200_000,
             playing: true,
