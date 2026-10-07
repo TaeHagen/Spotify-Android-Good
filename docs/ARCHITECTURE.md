@@ -776,6 +776,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
   set-media-items (Auto/Assistant/resumption), device volume only when remote (relative
   steps accumulate from the last sent target for 2 s), seek back/forward 15 s for episodes.
+  Handlers complete once the next snapshot arrives (≤ 2 s); set-media-items only once a snapshot
+  shows a track or remote playback, or the start failed (≤ 15 s after the load went through), so
+  Media3's BUFFERING placeholder, and with it the notification and the foreground, lasts over a
+  cold session's trackless snapshots (engine start, Spirc activation before the context resolved).
+  With an empty timeline Media3 drops the notification and the foreground, so the service does
+  not count itself media-foreground then.
   Media button preferences: like/unlike, shuffle (3-state), repeat (3-state); for episodes
   −15 s / +15 s next to play/pause instead of shuffle/repeat. `onSetRating` (HeartRating)
   toggles like. Remote playback: the current item's artist reads "<artists> • Playing on

@@ -225,8 +225,10 @@ class PlaybackService : MediaLibraryService() {
             {
                 val succeeded = runCatching { future.get() }.isSuccess
                 if (!succeeded) return@addListener
-                mediaForeground = foregroundRequired
-                if (foregroundRequired) {
+                // With an empty timeline Media3 removes the notification and leaves the
+                // foreground, even when the foreground is still required.
+                mediaForeground = !idle
+                if (!idle) {
                     presence.onMediaForeground()
                     main.removeCallbacks(foregroundDeadline)
                     coordinator.onServiceForeground()

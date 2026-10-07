@@ -348,7 +348,7 @@ internal class SpotifyPlayer(
         // Media-session loads (Auto, Assistant, watches, resumption) play on this phone, never on
         // the pending Connect target nor on another active device: in a car, a speaker at home
         // would be wrong (and the stored session must not overwrite what it plays now).
-        return track(controller.playAsync(withModes, toPendingTarget = false, onThisPhone = true), settleMs = LOAD_SETTLE_MS)
+        return trackLoad(controller.playAsync(withModes, toPendingTarget = false, onThisPhone = true))
     }
 
     override fun handleAddMediaItems(index: Int, mediaItems: List<MediaItem>): ListenableFuture<*> {
@@ -429,11 +429,25 @@ internal class SpotifyPlayer(
         }
     }
 
+    /**
+     * [track] for a load: completes once the loaded item (or remote playback) shows, or the start
+     * failed ([LoadSettle]), so Media3's placeholder and foreground last over a cold session's
+     * activation; bounded by [LOAD_SETTLE_MS] after the command went through.
+     */
+    private fun trackLoad(op: Deferred<Boolean>): ListenableFuture<*> {
+        val before = playback.snapshot.value
+        return scope.future {
+            if (op.await()) LoadSettle.await(before, playback.snapshot, controller.failure, LOAD_SETTLE_MS)
+            Unit
+        }
+    }
+
     internal companion object {
         /** Skip back / forward of podcast episodes (the Now Playing ±15 s buttons). */
         const val EPISODE_SKIP_MS = 15_000L
         private const val SETTLE_MS = 2_000L
-        private const val LOAD_SETTLE_MS = 8_000L
+        /** A cold context resolve can take a while after the load command went through. */
+        private const val LOAD_SETTLE_MS = 15_000L
         private const val RESTART_THRESHOLD_MS = 3_000L
         private const val VOLUME_STEP_PERCENT = 5
         private const val DEFAULT_UNMUTE_PERCENT = 50
