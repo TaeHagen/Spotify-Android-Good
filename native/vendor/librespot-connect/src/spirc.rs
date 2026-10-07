@@ -12,6 +12,8 @@ use crate::{
             manager::{BoxedStream, BoxedStreamResult, Reply, RequestReply},
             protocol::{Command, FallbackWrapper, Message, Request},
         },
+        // SPOTIFYGOOD: ErrorKind (state put retries)
+        error::ErrorKind,
         session::UserAttributes,
         // SPOTIFYGOOD: + SpClientResult (state puts next to the loop)
         spclient::{SpClientResult, TransferRequest},
@@ -63,7 +65,7 @@ use thiserror::Error;
 // smart shuffle backoff
 use tokio::{
     sync::{broadcast, mpsc, watch},
-    time::{Instant, error::Elapsed, sleep, timeout},
+    time::{Instant, error::Elapsed, sleep, sleep_until, timeout},
 };
 
 #[derive(Debug, Error)]
@@ -214,42 +216,114 @@ impl StatePut {
 
 type StatePutResult = Result<SpClientResult, Elapsed>;
 
+// SPOTIFYGOOD: a failed or timed out put was dropped: Spotify and the other devices kept the old
+// state (e.g. still playing after a pause) until some later put
+/// The delays before the retries of a failed state put, it is given up after them
+const STATE_PUT_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(10)];
+
+/// The put in flight
+struct InFlightPut {
+    put: StatePut,
+    /// how many retries it is (0: the first try)
+    retry: usize,
+    sending: BoxFuture<'static, StatePutResult>,
+}
+
 /// The state puts: at most one is in flight (polled by the loop, bounded by [STATE_PUT_TIMEOUT]),
 /// the ones requested meanwhile wait, at most one of each kind in the order they were first
 /// requested. A put is built when it is sent, so it carries the state of then.
+///
+/// A failed put is sent again after a delay ([STATE_PUT_RETRY_DELAYS]), unless a newer put of
+/// its kind supersedes it.
 #[derive(Default)]
 struct StatePuts {
-    in_flight: Option<(StatePut, BoxFuture<'static, StatePutResult>)>,
-    waiting: VecDeque<StatePut>,
+    in_flight: Option<InFlightPut>,
+    /// the waiting puts with their retry count
+    waiting: VecDeque<(StatePut, usize)>,
+    /// the failed puts to send again: kind, retry count, when (at most one of each kind)
+    retries: Vec<(StatePut, usize, Instant)>,
 }
 
 impl StatePuts {
-    /// Requests a put, returns whether it is to be sent right away (none is in flight)
+    /// Requests a (new) put, returns whether it is to be sent right away (none is in flight)
     fn request(&mut self, put: StatePut) -> bool {
+        // it carries the newer state
+        self.retries.retain(|(kind, ..)| *kind != put);
+        self.enqueue(put, 0)
+    }
+
+    /// Queues a put (`retry`: its retry count), returns whether it is to be sent right away
+    fn enqueue(&mut self, put: StatePut, retry: usize) -> bool {
         if self.in_flight.is_none() {
             return true;
         }
-        if !self.waiting.contains(&put) {
-            self.waiting.push_back(put)
+        match self.waiting.iter_mut().find(|(kind, _)| *kind == put) {
+            Some((_, waiting)) => *waiting = (*waiting).min(retry),
+            None => self.waiting.push_back((put, retry)),
         }
         false
     }
 
-    fn start(&mut self, put: StatePut, request: BoxFuture<'static, StatePutResult>) {
-        self.in_flight = Some((put, request));
+    fn start(&mut self, put: StatePut, retry: usize, sending: BoxFuture<'static, StatePutResult>) {
+        self.in_flight = Some(InFlightPut {
+            put,
+            retry,
+            sending,
+        });
     }
 
-    /// The put in flight is done, returns the next one to send
-    fn done(&mut self) -> Option<StatePut> {
+    /// The put in flight failed (call it before [StatePuts::done]), returns the delay before it
+    /// is sent again, `None` if it is superseded by a waiting one or given up
+    fn failed(&mut self, put: StatePut, retry: usize, now: Instant) -> Option<Duration> {
+        if self.waiting.iter().any(|(kind, _)| *kind == put) {
+            return None;
+        }
+        let delay = *STATE_PUT_RETRY_DELAYS.get(retry)?;
+        self.retries.retain(|(kind, ..)| *kind != put);
+        self.retries.push((put, retry + 1, now + delay));
+        Some(delay)
+    }
+
+    /// The put in flight is done, returns the next one to send (with its retry count)
+    fn done(&mut self) -> Option<(StatePut, usize)> {
         self.in_flight = None;
         self.waiting.pop_front()
     }
 
-    /// Drops the put in flight (its request is cancelled) and the waiting ones
+    /// When the next retry is due
+    fn next_retry_at(&self) -> Option<Instant> {
+        self.retries.iter().map(|(.., at)| *at).min()
+    }
+
+    /// Takes the retries that are due
+    fn take_due(&mut self, now: Instant) -> Vec<(StatePut, usize)> {
+        let (due, later) = self.retries.drain(..).partition(|(.., at)| *at <= now);
+        self.retries = later;
+        due.into_iter()
+            .map(|(put, retry, _)| (put, retry))
+            .collect()
+    }
+
+    /// Drops the put in flight (its request is cancelled), the waiting ones and the retries
     fn cancel(&mut self) {
         self.in_flight = None;
         self.waiting.clear();
+        self.retries.clear();
     }
+}
+
+/// Whether a failed state put is worth sending again
+fn is_transient(error: &Error) -> bool {
+    matches!(
+        error.kind,
+        ErrorKind::DeadlineExceeded
+            | ErrorKind::Unavailable
+            | ErrorKind::ResourceExhausted
+            | ErrorKind::Aborted
+            | ErrorKind::Unknown
+            | ErrorKind::Internal
+            | ErrorKind::Cancelled
+    )
 }
 
 // SPOTIFYGOOD: the result of a smart shuffle suggestion fetch, sent back into the loop
@@ -949,6 +1023,7 @@ impl SpircTask {
             let commands = self.commands.as_mut();
             let player_events = self.player_events.as_mut();
             // SPOTIFYGOOD: see StatePuts
+            let put_retry_at = self.state_puts.next_retry_at();
             let state_put = self.state_puts.in_flight.as_mut();
 
             // when state and volume update have a higher priority than context resolving
@@ -1042,11 +1117,17 @@ impl SpircTask {
                 },
                 // SPOTIFYGOOD: the state put in flight, see StatePuts
                 done = async {
-                    let (put, sending) = state_put?;
-                    Some((*put, sending.await))
-                }, if state_put.is_some() => if let Some((put, result)) = done {
-                    self.handle_state_put_done(put, result)
+                    let in_flight = state_put?;
+                    Some((in_flight.put, in_flight.retry, (&mut in_flight.sending).await))
+                }, if state_put.is_some() => if let Some((put, retry, result)) = done {
+                    self.handle_state_put_done(put, retry, result)
                 },
+                // SPOTIFYGOOD: failed state puts sent again, see StatePuts
+                _ = async {
+                    if let Some(at) = put_retry_at {
+                        sleep_until(at).await
+                    }
+                }, if put_retry_at.is_some() => self.handle_state_put_retries(),
                 _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
                     self.update_state = false;
 
@@ -3020,11 +3101,11 @@ impl SpircTask {
     /// Requests a state put, it is sent right away or after the one in flight
     fn put_state(&mut self, put: StatePut) {
         if self.state_puts.request(put) {
-            self.send_state_put(put)
+            self.send_state_put(put, 0)
         }
     }
 
-    fn send_state_put(&mut self, put: StatePut) {
+    fn send_state_put(&mut self, put: StatePut, retry: usize) {
         // like notify
         self.connect_state.set_status(&self.play_status);
         if self.connect_state.is_playing() {
@@ -3042,18 +3123,42 @@ impl SpircTask {
             )
             .await
         };
-        self.state_puts.start(put, sending.boxed());
+        self.state_puts.start(put, retry, sending.boxed());
     }
 
-    fn handle_state_put_done(&mut self, put: StatePut, result: StatePutResult) {
-        match result {
+    fn handle_state_put_done(&mut self, put: StatePut, retry: usize, result: StatePutResult) {
+        let transient = match result {
             // the response may contain the cluster
-            Ok(Ok(response)) => self.publish_cluster_from_response(&response),
-            Ok(Err(why)) => error!("{put:?} put failed: {why}"),
-            Err(_) => error!("{put:?} put timed out"),
+            Ok(Ok(response)) => {
+                self.publish_cluster_from_response(&response);
+                None
+            }
+            Ok(Err(why)) => {
+                error!("{put:?} put failed: {why}");
+                Some(is_transient(&why))
+            }
+            Err(_) => {
+                error!("{put:?} put timed out");
+                Some(true)
+            }
+        };
+        if transient == Some(true) {
+            match self.state_puts.failed(put, retry, Instant::now()) {
+                Some(delay) => debug!("sending the {put:?} put again in {delay:?}"),
+                None => debug!("not sending the {put:?} put again"),
+            }
         }
-        if let Some(next) = self.state_puts.done() {
-            self.send_state_put(next)
+        if let Some((next, retry)) = self.state_puts.done() {
+            self.send_state_put(next, retry)
+        }
+    }
+
+    // SPOTIFYGOOD: see StatePuts
+    fn handle_state_put_retries(&mut self) {
+        for (put, retry) in self.state_puts.take_due(Instant::now()) {
+            if self.state_puts.enqueue(put, retry) {
+                self.send_state_put(put, retry)
+            }
         }
     }
 
@@ -3173,7 +3278,7 @@ mod tests {
             puts.request(StatePut::State),
             "nothing in flight, sent right away"
         );
-        puts.start(StatePut::State, std::future::pending().boxed());
+        puts.start(StatePut::State, 0, std::future::pending().boxed());
 
         assert!(!puts.request(StatePut::Volume));
         assert!(!puts.request(StatePut::State));
@@ -3182,14 +3287,18 @@ mod tests {
         assert!(!puts.request(StatePut::State));
         assert_eq!(
             puts.waiting,
-            [StatePut::Volume, StatePut::State, StatePut::AudioOutput]
+            [
+                (StatePut::Volume, 0),
+                (StatePut::State, 0),
+                (StatePut::AudioOutput, 0)
+            ]
         );
 
-        assert_eq!(puts.done(), Some(StatePut::Volume));
+        assert_eq!(puts.done(), Some((StatePut::Volume, 0)));
         assert!(puts.in_flight.is_none());
-        puts.start(StatePut::Volume, std::future::pending().boxed());
-        assert_eq!(puts.done(), Some(StatePut::State));
-        puts.start(StatePut::State, std::future::pending().boxed());
+        puts.start(StatePut::Volume, 0, std::future::pending().boxed());
+        assert_eq!(puts.done(), Some((StatePut::State, 0)));
+        puts.start(StatePut::State, 0, std::future::pending().boxed());
 
         // a disconnect drops them all
         puts.cancel();
@@ -3209,7 +3318,7 @@ mod tests {
             let stalled = async {
                 tokio::time::timeout(Duration::from_millis(50), std::future::pending()).await
             };
-            puts.start(StatePut::State, stalled.boxed());
+            puts.start(StatePut::State, 0, stalled.boxed());
             assert!(!puts.request(StatePut::State));
 
             // the loop handles the command (e.g. a pause) while the put is in flight
@@ -3217,16 +3326,83 @@ mod tests {
             commands.send("pause").unwrap();
             let state_put = puts.in_flight.as_mut();
             tokio::select! {
-                _ = async { (&mut state_put.unwrap().1).await } => panic!("the put was answered"),
+                _ = async { (&mut state_put.unwrap().sending).await } => panic!("the put was answered"),
                 cmd = rx.recv() => assert_eq!(cmd, Some("pause")),
             }
 
             // and the put gives up, the waiting one follows
-            let (_, sending) = puts.in_flight.as_mut().unwrap();
-            let result: StatePutResult = sending.await;
+            let in_flight = puts.in_flight.as_mut().unwrap();
+            let result: StatePutResult = (&mut in_flight.sending).await;
             assert!(result.is_err(), "timed out");
-            assert_eq!(puts.done(), Some(StatePut::State));
+            assert_eq!(puts.done(), Some((StatePut::State, 0)));
         });
+    }
+
+    #[test]
+    fn a_failed_state_put_is_sent_again_until_superseded_or_given_up() {
+        use super::STATE_PUT_RETRY_DELAYS;
+        use tokio::time::Instant;
+
+        let now = Instant::now();
+        let mut puts = StatePuts::default();
+        assert!(puts.request(StatePut::State));
+        puts.start(StatePut::State, 0, std::future::pending().boxed());
+
+        // the first retry after 2 s
+        assert_eq!(
+            puts.failed(StatePut::State, 0, now),
+            Some(STATE_PUT_RETRY_DELAYS[0])
+        );
+        assert_eq!(puts.done(), None);
+        assert_eq!(puts.next_retry_at(), Some(now + STATE_PUT_RETRY_DELAYS[0]));
+        assert!(puts.take_due(now + Duration::from_secs(1)).is_empty());
+        let due = puts.take_due(now + STATE_PUT_RETRY_DELAYS[0]);
+        assert_eq!(due, [(StatePut::State, 1)]);
+        assert!(puts.enqueue(StatePut::State, 1));
+        puts.start(StatePut::State, 1, std::future::pending().boxed());
+
+        // the second after 10 s, then it is given up
+        assert_eq!(
+            puts.failed(StatePut::State, 1, now),
+            Some(STATE_PUT_RETRY_DELAYS[1])
+        );
+        assert_eq!(puts.done(), None);
+        let due = puts.take_due(now + STATE_PUT_RETRY_DELAYS[1]);
+        assert_eq!(due, [(StatePut::State, 2)]);
+        assert!(puts.enqueue(StatePut::State, 2));
+        puts.start(StatePut::State, 2, std::future::pending().boxed());
+        assert_eq!(puts.failed(StatePut::State, 2, now), None);
+        assert_eq!(puts.done(), None);
+        assert_eq!(puts.next_retry_at(), None);
+
+        // a newer put of its kind supersedes the retry, another kind doesn't
+        assert!(puts.request(StatePut::Volume));
+        puts.start(StatePut::Volume, 0, std::future::pending().boxed());
+        assert!(puts.failed(StatePut::Volume, 0, now).is_some());
+        puts.done();
+        assert!(puts.request(StatePut::State));
+        assert!(puts.next_retry_at().is_some(), "still the volume retry");
+        puts.start(StatePut::State, 0, std::future::pending().boxed());
+        assert!(!puts.request(StatePut::Volume));
+        assert_eq!(puts.next_retry_at(), None);
+
+        // so does a waiting one of its kind (it is sent next anyway)
+        assert!(!puts.request(StatePut::State));
+        assert_eq!(puts.failed(StatePut::State, 0, now), None);
+
+        // a due retry waits behind the put in flight, with its retry count
+        assert!(!puts.enqueue(StatePut::AudioOutput, 1));
+        assert!(puts.waiting.contains(&(StatePut::AudioOutput, 1)));
+
+        // a disconnect drops the retries too
+        assert!(
+            puts.failed(StatePut::AudioOutput, 0, now).is_none(),
+            "waiting"
+        );
+        puts.retries.push((StatePut::AudioOutput, 1, now));
+        puts.cancel();
+        assert_eq!(puts.next_retry_at(), None);
+        assert!(puts.waiting.is_empty() && puts.in_flight.is_none());
     }
 
     #[test]
