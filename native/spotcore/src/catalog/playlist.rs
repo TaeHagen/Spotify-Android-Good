@@ -1204,8 +1204,7 @@ mod tests {
         assert!(undecorated(&r).is_empty());
     }
 
-    /// Serialises the tests that use the process-wide rootlist and header caches.
-    static CACHES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use crate::catalog::TEST_CACHES as CACHES;
 
     #[test]
     fn the_rootlist_belongs_to_its_account() {
