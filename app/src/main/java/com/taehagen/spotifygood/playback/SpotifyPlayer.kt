@@ -251,7 +251,8 @@ internal class SpotifyPlayer(
             .setMediaType(if (t.isEpisode) MediaMetadata.MEDIA_TYPE_PODCAST_EPISODE else MediaMetadata.MEDIA_TYPE_MUSIC)
             .setExtras(extras)
             .build()
-        val mediaId = key.contextUri?.takeIf { it != t.uri }?.let { MediaIds.inContext(it, t.uri) } ?: t.uri
+        // Only loadable contexts go into the id (controllers cache and replay it).
+        val mediaId = key.contextUri?.takeIf { it != t.uri && MediaIds.isResolvableContext(it) }?.let { MediaIds.inContext(it, t.uri) } ?: t.uri
         return MediaItemData.Builder(uid)
             .setMediaItem(MediaItem.Builder().setMediaId(mediaId).setMediaMetadata(metadata).build())
             .setMediaMetadata(metadata)

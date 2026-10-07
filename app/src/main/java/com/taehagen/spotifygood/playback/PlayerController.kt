@@ -379,7 +379,7 @@ class PlayerController internal constructor(
 
     /** `player.load`, rewritten for the offline queue while the session is not Online. */
     private suspend fun load(request: PlayRequest) {
-        call("player.load", loadArgs(prepareLoad(request)))
+        call("player.load", loadArgs(prepareLoad(withLoadableContext(request))))
     }
 
     private suspend fun prepareLoad(request: PlayRequest): PlayRequest {
@@ -611,6 +611,19 @@ class PlayerController internal constructor(
                 val state = last() ?: throw e
                 call("player.load", loadArgs(prepare(state.toPlayRequest())))
             }
+        }
+
+        /**
+         * A load of a context that cannot be loaded (`spotify:web-api`, the context of a plain track
+         * list) without `trackUris` plays its start track instead of being rejected; a
+         * non-loadable context next to `trackUris` is dropped. Single items given as context stay.
+         */
+        fun withLoadableContext(request: PlayRequest): PlayRequest {
+            val context = request.contextUri ?: return request
+            if (MediaIds.isResolvableContext(context) || MediaIds.isItemUri(context)) return request
+            if (!request.trackUris.isNullOrEmpty()) return request.copy(contextUri = null)
+            val start = request.startUri ?: return request
+            return request.copy(contextUri = null, trackUris = listOf(start), startIndex = 0, startUid = null)
         }
 
         fun loadArgs(request: PlayRequest): JsonObject = buildJsonObject {

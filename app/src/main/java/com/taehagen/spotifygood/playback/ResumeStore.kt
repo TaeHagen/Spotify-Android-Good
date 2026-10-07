@@ -27,9 +27,13 @@ data class ResumeState(
     val durationMs: Long?,
     val isEpisode: Boolean,
 ) {
-    /** The context to resume in; null when there is none or it is just the track itself. */
+    /**
+     * The context to resume in; null when there is none, it is just the track itself, or it cannot
+     * be loaded again (a plain track list reports `spotify:web-api`). Applied when reading, so
+     * states stored by older versions are repaired too.
+     */
     private val resumeContext: String?
-        get() = contextUri?.takeIf { it != trackUri && !MediaIds.isItemUri(it) }
+        get() = contextUri?.takeIf { it != trackUri && MediaIds.isResolvableContext(it) }
 
     /** Media id understood by the session player (see [MediaIds]). */
     val mediaId: String

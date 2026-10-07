@@ -44,6 +44,22 @@ class MediaIdsTest {
     }
 
     @Test
+    fun resolvableContextsMirrorTheEngine() {
+        for (uri in listOf(playlist, "spotify:album:a", "spotify:artist:a", "spotify:show:s", "spotify:user:u:collection", "spotify:station:track:1")) {
+            assertEquals(uri, true, MediaIds.isResolvableContext(uri))
+        }
+        for (uri in listOf(null, "", "spotify:web-api", "spotify:web-api:x", t1, "spotify:episode:e", "spotify:local:a:b:c:1", "https://x")) {
+            assertEquals(uri, false, MediaIds.isResolvableContext(uri))
+        }
+    }
+
+    @Test
+    fun cachedIdsWithATrackListContextPlayTheTrack() {
+        val plan = MediaIds.plan(listOf(MediaIds.inContext("spotify:web-api", t1)), 0) { error("unused") }
+        assertEquals(LoadPlan(trackUris = listOf(t1), startIndex = 0), plan)
+    }
+
+    @Test
     fun uriOnlyPlaceholdersAreNotBrowseRows() {
         assertEquals(true, LibraryTree.isPlaceholder(""))
         assertEquals(true, LibraryTree.isPlaceholder("  "))
