@@ -27,18 +27,20 @@ import kotlinx.serialization.json.put
  */
 internal class CollectionResolver(private val rpc: NativeRpc, private val json: Json) {
     /**
-     * [metadataJson] is null when the source lists URIs only (Liked Songs). [unavailable]: the catalog
-     * resolved the item and reports it as not playable here (region, explicit filter, relinking
-     * included), so downloading it would fail. Unresolved placeholders (`playable:false` without a
-     * name) are not unavailable: their lookup failed, `download.track` may well succeed.
+     * [metadataJson] is null when the source lists URIs only (Liked Songs) and for placeholders
+     * (`playable:false` without a name: metadata failed or missing), so new rows get it later.
+     * [unavailable]: the catalog resolved the item and reports it as not playable here (region,
+     * explicit filter, relinking included), so downloading it would fail. Placeholders are never
+     * unavailable: their lookup failed, `download.track` may well succeed.
      */
     data class Item(val uri: String, val metadataJson: String?, val unavailable: Boolean = false)
 
     /**
-     * [complete]: the source listed every item and nothing failed (item count matches the total it
-     * reports, no empty or short page). Only a complete resolution may drop items from a downloaded
-     * collection: for an incomplete one, the items it does not list are unknown, not gone. An empty
-     * resolution is never complete (a failed lookup and an emptied collection look the same).
+     * [complete]: the source listed every item and nothing failed ([DownloadRules.listingComplete]: not
+     * `partial`, no empty or short page). Only a complete resolution may drop items from a downloaded
+     * collection: for an incomplete one, the items it does not list (or lists as placeholders) are
+     * unknown, not gone. An empty resolution is never complete (a failed lookup and an emptied
+     * collection look the same).
      */
     data class Resolved(
         val items: List<Item>,
@@ -55,9 +57,10 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
     suspend fun resolve(type: CollectionType, uri: String, knownRevision: String? = null): Resolved? = when (type) {
         CollectionType.ALBUM -> {
             val album = rpc.callOffMain<Album>("catalog.album", rpcArgs { put("uri", uri) })
-            // Tracks whose metadata failed are missing from the list: compare with the track count.
-            val complete = album.tracks.isNotEmpty() && (album.totalTracks == null || album.tracks.size >= album.totalTracks)
-            Resolved(album.tracks.map(::trackItem).distinctItems(), album.name, album.images.best(), null, complete)
+            // Tracks whose metadata failed are placeholders and the album is `partial`; tracks the
+            // server has no data for (taken down) are dropped, which is a real change (docs §6.3).
+            val complete = DownloadRules.listingComplete(album.tracks.size, album.partial)
+            Resolved(album.tracks.map { trackItem(it, json) }.distinctItems(), album.name, album.images.best(), null, complete)
         }
         CollectionType.PLAYLIST -> resolvePlaylist(uri, knownRevision)
         CollectionType.LIKED_SONGS -> resolveLikedSongs()
@@ -65,8 +68,8 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
             // Newest episodes only: a whole back catalogue would be tens of GB. Syncing keeps this a
             // rolling window (new episodes are added, ones that fall out are removed).
             val show = rpc.callOffMain<Show>("catalog.show", rpcArgs { put("uri", uri); put("offset", 0); put("limit", MAX_SHOW_EPISODES) })
-            val complete = show.episodes.isNotEmpty() && show.episodes.size >= minOf(show.total, MAX_SHOW_EPISODES)
-            Resolved(show.episodes.take(MAX_SHOW_EPISODES).map(::episodeItem).distinctItems(), show.name, show.images.best(), null, complete)
+            val complete = DownloadRules.listingComplete(show.episodes.size, show.partial)
+            Resolved(show.episodes.take(MAX_SHOW_EPISODES).map { episodeItem(it, json) }.distinctItems(), show.name, show.images.best(), null, complete)
         }
     }
 
@@ -95,7 +98,7 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
             uris += page.uris
             if (uris.size >= page.total) break
         }
-        val complete = uris.isNotEmpty() && !shortPage && uris.size >= total
+        val complete = DownloadRules.listingComplete(uris.size, partial = shortPage, total = total)
         return Resolved(uris.map { Item(it, null) }.distinctItems(), null, null, null, complete)
     }
 
@@ -149,17 +152,19 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
         // Unchanged playlist: skip fetching the remaining pages.
         if (knownRevision != null && first.revision != null && first.revision == knownRevision) return null
         val items = ArrayList(first.items)
+        var partial = first.partial
         var offset = first.items.size
         while (offset < first.total && items.size < MAX_PAGED_ITEMS) {
             val page = fetchPlaylistPage(uri, offset)
             if (page.items.isEmpty()) break
             items += page.items
+            partial = partial || page.partial
             offset += page.items.size
         }
         // Items never drop out of a playlist page (unresolved ones keep their slot), so a complete
         // listing has `total` entries.
-        val complete = items.isNotEmpty() && items.size >= first.total
-        val resolved = items.mapNotNull { item -> item.track?.let(::trackItem) ?: item.episode?.let(::episodeItem) }
+        val complete = DownloadRules.listingComplete(items.size, partial, first.total)
+        val resolved = items.mapNotNull { item -> item.track?.let { trackItem(it, json) } ?: item.episode?.let { episodeItem(it, json) } }
         return Resolved(resolved.distinctItems(), first.name, first.images.best(), first.revision, complete)
     }
 
@@ -172,11 +177,6 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
     private suspend fun fetchEpisodes(uris: List<String>): List<Episode> =
         rpc.callOffMain<EpisodesResult>("catalog.episodes", rpcArgs { putStrings("uris", uris) }).episodes
 
-    private fun trackItem(track: Track) =
-        Item(track.uri, json.encodeToString(Track.serializer(), track), unavailable = !track.playable && track.name.isNotEmpty())
-
-    private fun episodeItem(episode: Episode) =
-        Item(episode.uri, json.encodeToString(Episode.serializer(), episode), unavailable = !episode.playable && episode.name.isNotEmpty())
 
     private fun List<Item>.distinctItems(): List<Item> = filter { SpotifyUris.isPlayableItem(it.uri) }.distinctBy { it.uri }
 
@@ -185,6 +185,29 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
     private data class UriPage(val total: Int = 0, val uris: List<String> = emptyList())
 
     companion object {
+        /**
+         * A member from catalog metadata. A placeholder (no name: metadata failed or missing) carries
+         * no metadata, so a new row gets it later, and is never [Item.unavailable].
+         */
+        internal fun trackItem(track: Track, json: Json): Item {
+            val resolved = track.name.isNotEmpty()
+            return Item(
+                uri = track.uri,
+                metadataJson = if (resolved) json.encodeToString(Track.serializer(), track) else null,
+                unavailable = resolved && !track.playable,
+            )
+        }
+
+        /** Like [trackItem]. */
+        internal fun episodeItem(episode: Episode, json: Json): Item {
+            val resolved = episode.name.isNotEmpty()
+            return Item(
+                uri = episode.uri,
+                metadataJson = if (resolved) json.encodeToString(Episode.serializer(), episode) else null,
+                unavailable = resolved && !episode.playable,
+            )
+        }
+
         private const val PAGE_SIZE = 100
         private const val URI_PAGE_SIZE = 500
 
