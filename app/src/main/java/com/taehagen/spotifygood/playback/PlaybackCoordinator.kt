@@ -97,20 +97,21 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
     val appVisible: StateFlow<Boolean> = foreground.asStateFlow()
 
     /**
-     * Main thread. A background start of the service for local audio is under way: no second one,
-     * and audio focus is requested only once it is in the foreground.
+     * Main thread. Local audio started in the background and the service is not in the foreground
+     * yet (we just started it, or it runs without a foreground): no second start, and audio focus is
+     * requested only once it is in the foreground (Android 15 refuses focus to background apps).
      */
-    private var backgroundStart = false
-    /** Audio focus is held back until the service is in the foreground ([backgroundStart]). */
+    private var awaitingForeground = false
+    /** Audio focus is held back until the service is in the foreground ([awaitingForeground]). */
     private var focusAfterForeground = false
     /** Local playback of this activation was paused for want of a foreground service. */
     private var refusedThisActivation = false
-    private val backgroundStartTimeout = Runnable {
-        if (backgroundStart && isPlayingLocally()) {
+    private val foregroundTimeout = Runnable {
+        if (awaitingForeground && isPlayingLocally()) {
             Log.w(TAG, "Playback service did not reach the foreground; pausing local playback")
             refuseBackgroundPlayback()
         }
-        backgroundStart = false
+        awaitingForeground = false
         focusAfterForeground = false
     }
 
@@ -167,7 +168,9 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
                 graph.engine.isLoggedIn,
             ) { presence, visible, loggedIn -> presence && visible && loggedIn }
                 .distinctUntilChanged()
-                .collect { wanted -> if (wanted && !PlaybackService.isPresenceForeground) startService(PlaybackService.ACTION_START_PRESENCE) }
+                .collect { wanted ->
+                    if (wanted && !PlaybackService.isPresenceForeground) startService(PlaybackService.internalIntent(app, PlaybackService.ACTION_START_PRESENCE))
+                }
         }
     }
 
@@ -201,12 +204,12 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
      */
     fun ensureServiceStarted() {
         if (PlaybackService.isRunning || !isAppInForeground) return
-        startService(null)
+        startService()
     }
 
-    private fun startService(action: String?) {
+    private fun startService(intent: Intent = Intent(app, PlaybackService::class.java)) {
         try {
-            app.startService(Intent(app, PlaybackService::class.java).setAction(action))
+            app.startService(intent)
         } catch (e: IllegalStateException) {
             Log.w(TAG, "Cannot start the playback service now", e)
         } catch (e: SecurityException) {
@@ -220,15 +223,22 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
      */
     private fun ensureServiceForLocalAudio(): Boolean {
         if (refusedThisActivation) return false
-        if (PlaybackService.isRunning || backgroundStart) return true
+        if (awaitingForeground) return true
+        if (PlaybackService.isRunning) {
+            // Running but not in the foreground while the app is in the background (e.g. started for
+            // "Tap to resume", or bound by Auto): Media3 asks for the foreground once the session
+            // player reports playing; until then (bounded) no focus.
+            if (!isAppInForeground && !PlaybackService.isMediaForeground && !PlaybackService.isPresenceForeground) awaitForeground()
+            return true
+        }
         if (isAppInForeground) {
-            startService(null)
+            startService()
             return true
         }
         // In the background without the service: a plain start would be refused, and audio must
         // not play without the media foreground anyway.
         val started = try {
-            ContextCompat.startForegroundService(app, Intent(app, PlaybackService::class.java).setAction(PlaybackService.ACTION_LOCAL_PLAYBACK))
+            ContextCompat.startForegroundService(app, PlaybackService.internalIntent(app, PlaybackService.ACTION_LOCAL_PLAYBACK))
             true
         } catch (e: IllegalStateException) {
             // ForegroundServiceStartNotAllowedException (API 31+) is an IllegalStateException.
@@ -243,10 +253,14 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
             return false
         }
         Log.i(TAG, "Local playback started in the background; starting the playback service")
-        backgroundStart = true
-        main.removeCallbacks(backgroundStartTimeout)
-        main.postDelayed(backgroundStartTimeout, BACKGROUND_START_TIMEOUT_MS)
+        awaitForeground()
         return true
+    }
+
+    private fun awaitForeground() {
+        awaitingForeground = true
+        main.removeCallbacks(foregroundTimeout)
+        main.postDelayed(foregroundTimeout, FOREGROUND_TIMEOUT_MS)
     }
 
     /**
@@ -265,8 +279,8 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
 
     /** The playback service is in the media foreground. Main thread. */
     fun onServiceForeground() {
-        main.removeCallbacks(backgroundStartTimeout)
-        backgroundStart = false
+        main.removeCallbacks(foregroundTimeout)
+        awaitingForeground = false
         if (focusAfterForeground) {
             focusAfterForeground = false
             if (sinkActive) focus.request()
@@ -282,7 +296,7 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
             updateLocks()
             return
         }
-        if (backgroundStart) {
+        if (awaitingForeground) {
             // Background apps without a foreground service get no focus (Android 15+).
             focusAfterForeground = true
         } else {
@@ -374,8 +388,8 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
 
     companion object {
         private const val TAG = "PlaybackCoordinator"
-        /** Time for a background-started service to reach the media foreground. */
-        private const val BACKGROUND_START_TIMEOUT_MS = 5_000L
+        /** Time for the service to reach the media foreground once local audio started in the background. */
+        private const val FOREGROUND_TIMEOUT_MS = 5_000L
 
         @Volatile private var instance: PlaybackCoordinator? = null
 

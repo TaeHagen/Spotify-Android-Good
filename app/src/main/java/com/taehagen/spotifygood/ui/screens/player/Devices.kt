@@ -41,12 +41,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -73,9 +75,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.util.UUID
 
 @Immutable
 internal data class DevicesUiState(
@@ -105,10 +109,17 @@ internal data class DevicesUiState(
     val distinctOutputs: List<AudioOutput> get() = outputs.distinctBy { it.id }
 }
 
+/**
+ * Results for one open devices sheet. The ViewModels outlive the sheet (main-session scope), so a
+ * transfer finishing after its sheet was dismissed must not act on the next one: every event names
+ * the [sheet] instance that asked ([DevicesSheetContent]) and other sheets ignore it.
+ */
 internal sealed interface DevicesEvent {
-    data class TransferFailed(val deviceName: String, val network: Boolean) : DevicesEvent
-    data object TransferSucceeded : DevicesEvent
-    data object RefreshFailed : DevicesEvent
+    val sheet: String
+
+    data class TransferFailed(override val sheet: String, val deviceName: String, val network: Boolean) : DevicesEvent
+    data class TransferSucceeded(override val sheet: String) : DevicesEvent
+    data class RefreshFailed(override val sheet: String) : DevicesEvent
 }
 
 internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
@@ -135,8 +146,11 @@ internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
         DevicesUiState(devicesRepository.devices.value, outputs.outputs.value, graph.playback.snapshot.value),
     )
 
-    /** Refreshes the device list; failures are only reported when the user asked. */
-    fun refresh(userInitiated: Boolean) {
+    /**
+     * Refreshes the device list in the background (the engine may take ~3 s; the cached list stays
+     * shown, with [DevicesUiState.refreshing]). Failures are only reported when the user asked.
+     */
+    fun refresh(sheet: String, userInitiated: Boolean) {
         if (refreshing.value) return
         viewModelScope.launch {
             refreshing.value = true
@@ -145,26 +159,27 @@ internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (userInitiated) eventChannel.trySend(DevicesEvent.RefreshFailed)
+                if (userInitiated) eventChannel.trySend(DevicesEvent.RefreshFailed(sheet))
             } finally {
                 refreshing.value = false
             }
         }
     }
 
-    fun transferTo(deviceId: String, deviceName: String) {
+    /** Moves playback; keeps running if [sheet] is dismissed meanwhile (only its result is dropped). */
+    fun transferTo(deviceId: String, deviceName: String, sheet: String) {
         if (transferring.value != null) return
         viewModelScope.launch {
             transferring.value = deviceId
             try {
                 devicesRepository.transferTo(deviceId)
-                eventChannel.trySend(DevicesEvent.TransferSucceeded)
+                eventChannel.trySend(DevicesEvent.TransferSucceeded(sheet))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: NativeException) {
-                eventChannel.trySend(DevicesEvent.TransferFailed(deviceName, e.isNetwork))
+                eventChannel.trySend(DevicesEvent.TransferFailed(sheet, deviceName, e.isNetwork))
             } catch (e: Exception) {
-                eventChannel.trySend(DevicesEvent.TransferFailed(deviceName, network = false))
+                eventChannel.trySend(DevicesEvent.TransferFailed(sheet, deviceName, network = false))
             } finally {
                 transferring.value = null
             }
@@ -186,12 +201,15 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    // This sheet instance (kept across configuration changes): results of a dismissed sheet's
+    // transfer or refresh are for that sheet only and must not close or message this one.
+    val sheetToken = rememberSaveable { UUID.randomUUID().toString() }
 
-    LaunchedEffect(Unit) { viewModel.refresh(userInitiated = false) }
-    LaunchedEffect(viewModel) {
-        viewModel.events.collect { event ->
+    LaunchedEffect(Unit) { viewModel.refresh(sheetToken, userInitiated = false) }
+    LaunchedEffect(viewModel, sheetToken) {
+        viewModel.events.filter { it.sheet == sheetToken }.collect { event ->
             when (event) {
-                DevicesEvent.TransferSucceeded -> scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() }
+                is DevicesEvent.TransferSucceeded -> scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() }
                 is DevicesEvent.TransferFailed -> {
                     val message = context.getString(
                         if (event.network) R.string.player_devices_transfer_failed_network else R.string.player_devices_transfer_failed,
@@ -199,7 +217,7 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
                     )
                     scope.launch { snackbar.showSnackbar(message) }
                 }
-                DevicesEvent.RefreshFailed -> scope.launch { snackbar.showSnackbar(context.getString(R.string.player_devices_refresh_failed)) }
+                is DevicesEvent.RefreshFailed -> scope.launch { snackbar.showSnackbar(context.getString(R.string.player_devices_refresh_failed)) }
             }
         }
     }
@@ -209,9 +227,10 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
             Box {
                 DevicesList(
                     state = state,
+                    sheetToken = sheetToken,
                     onConnectedLocal = { scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() } },
-                    onRefresh = { viewModel.refresh(userInitiated = true) },
-                    onTransfer = viewModel::transferTo,
+                    onRefresh = { viewModel.refresh(sheetToken, userInitiated = true) },
+                    onTransfer = { id, name -> viewModel.transferTo(id, name, sheetToken) },
                     onSelectOutput = viewModel::selectOutput,
                     onVolumeChange = viewModel::setVolume,
                     onMoreDevices = {
@@ -229,6 +248,7 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
 @Composable
 private fun DevicesList(
     state: DevicesUiState,
+    sheetToken: String,
     onConnectedLocal: () -> Unit,
     onRefresh: () -> Unit,
     onTransfer: (id: String, name: String) -> Unit,
@@ -254,7 +274,13 @@ private fun DevicesList(
                         .semantics { heading() },
                 )
                 if (state.refreshing) {
-                    Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                    val refreshingLabel = stringResource(R.string.player_devices_refreshing)
+                    Box(
+                        Modifier
+                            .size(48.dp)
+                            .semantics { contentDescription = refreshingLabel },
+                        contentAlignment = Alignment.Center,
+                    ) {
                         CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                     }
                 } else {
@@ -355,7 +381,7 @@ private fun DevicesList(
             }
         }
         // Spotify Connect receivers on the local network that aren't in the account yet (§8).
-        item(key = "local") { LocalDevicesSection(onConnected = onConnectedLocal) }
+        item(key = "local") { LocalDevicesSection(sheet = sheetToken, onConnected = onConnectedLocal) }
         item(key = "hint") {
             Text(
                 text = stringResource(R.string.player_devices_hint),

@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeout
@@ -51,6 +52,9 @@ data class PlayRequest(
     val repeat: RepeatMode? = null,
     val play: Boolean = true,
 )
+
+/** Outcome of [PlayerController.addToQueueCounted]: [added] items, then the first failure ([error]; null: none). */
+data class QueueAddResult(val added: Int, val error: NativeErrorInfo?)
 
 /** A failed attempt to start playback while nothing was playing (Media3's player error). */
 data class PlaybackFailure(val kind: PlaybackErrorKind, val message: String)
@@ -132,7 +136,19 @@ class PlayerController internal constructor(
         /** Completed by a pause while this command waits for the session ([awaitSession]). */
         val abort = CompletableDeferred<Unit>()
         var started = false
+        /** Enqueue order (guarded by [lock]); see [cancelStartsBefore]. */
+        var seq = 0L
+        /**
+         * `player.load` only: what to load. A play that follows a paused load before it is sent
+         * merges into it (play = true) instead of racing it (guarded by [lock]).
+         */
+        var request: PlayRequest? = null
+        /** The load request was handed to the engine (no more merging; guarded by [lock]). */
+        var sent = false
     }
+
+    /** How the last start-playback command ended (queue consumer only). */
+    private class StartOutcome(val wasLoad: Boolean, val ok: Boolean, val atNanos: Long)
 
     private val queue = Channel<Command>(Channel.UNLIMITED)
     private val lock = Any()
@@ -140,6 +156,16 @@ class PlayerController internal constructor(
     private var lastQueued: Command? = null
     /** The command currently waiting for the session to start (guarded by [lock]). */
     private var waitingForSession: Command? = null
+    /** Sequence number of the next queued command (guarded by [lock]). */
+    private var nextSeq = 0L
+    /**
+     * Start-playback commands queued before this sequence number were cancelled by a pause while
+     * the session was starting (guarded by [lock]): the pause wins over every pending start.
+     */
+    private var cancelStartsBefore = 0L
+    /** The most recent `player.load` (guarded by [lock]). */
+    private var latestLoad: Command? = null
+    @Volatile private var lastStart: StartOutcome? = null
 
     /** Optimistic tri-state values so quick repeated taps cycle correctly before the snapshot catches up. */
     @Volatile private var pendingShuffle: Pending<ShuffleMode>? = null
@@ -283,7 +309,17 @@ class PlayerController internal constructor(
 
     internal fun playAsync(request: PlayRequest): Deferred<Boolean> {
         if (request.play) onPlaybackRequested?.invoke()
-        return enqueue("player.load", timeoutMs = LOAD_TIMEOUT_MS, startsPlayback = true) { load(request) }
+        lateinit var self: Command
+        return enqueue(
+            "player.load",
+            timeoutMs = LOAD_TIMEOUT_MS,
+            startsPlayback = true,
+            onQueued = { command ->
+                self = command
+                command.request = request
+                latestLoad = command
+            },
+        ) { sendLoad(self) }
     }
 
     /** Also used by the media session (play button, Bluetooth play after a cold start). */
@@ -355,6 +391,37 @@ class PlayerController internal constructor(
         }
     }
 
+    /**
+     * Adds [uris] in order (one `queue.add` each) and stops at the first failure, which is returned
+     * instead of reported on [errors]: the caller says what happened (e.g. the engine's "The queue is
+     * full" after part of an album).
+     */
+    internal fun addToQueueCounted(uris: List<String>): Deferred<QueueAddResult> {
+        val result = CompletableDeferred<QueueAddResult>()
+        if (uris.isEmpty()) return result.apply { complete(QueueAddResult(0, null)) }
+        var added = 0
+        var error: NativeErrorInfo? = null
+        val done = enqueue("queue.add", timeoutMs = COMMAND_TIMEOUT_MS * (uris.size + 1)) {
+            for (uri in uris) {
+                try {
+                    withTimeout(COMMAND_TIMEOUT_MS) { call("queue.add", buildJsonObject { put("uri", uri) }) }
+                    added++
+                } catch (e: TimeoutCancellationException) {
+                    error = NativeErrorInfo(NativeErrorCode.NETWORK, "The device didn't respond")
+                    break
+                } catch (e: NativeException) {
+                    error = e.info
+                    break
+                }
+            }
+        }
+        done.invokeOnCompletion {
+            val ran = runCatching { done.getCompleted() }.getOrDefault(false)
+            result.complete(QueueAddResult(added, error ?: if (ran) null else NativeErrorInfo(NativeErrorCode.CANCELLED, "Not sent")))
+        }
+        return result
+    }
+
     internal fun removeFromQueueAsync(uid: String): Deferred<Boolean> =
         send("queue.remove", buildJsonObject { put("uid", uid) })
 
@@ -379,7 +446,18 @@ class PlayerController internal constructor(
 
     /** `player.load`, rewritten for the offline queue while the session is not Online. */
     private suspend fun load(request: PlayRequest) {
-        call("player.load", loadArgs(prepareLoad(request)))
+        call("player.load", loadArgs(prepareLoad(withLoadableContext(request))))
+    }
+
+    /** [load] of a queued `player.load` [command], with a play merged in until the last moment. */
+    private suspend fun sendLoad(command: Command) {
+        val initial = synchronized(lock) { checkNotNull(command.request) }
+        val prepared = prepareLoad(withLoadableContext(initial))
+        val play = synchronized(lock) {
+            command.sent = true
+            checkNotNull(command.request).play
+        }
+        call("player.load", loadArgs(prepared.copy(play = play)))
     }
 
     private suspend fun prepareLoad(request: PlayRequest): PlayRequest {
@@ -413,21 +491,70 @@ class PlayerController internal constructor(
 
     /** Pause / toggle-to-pause: also cancels a play still waiting for the session to start. */
     private fun pauseLike(method: String): Deferred<Boolean> {
-        synchronized(lock) { waitingForSession?.abort?.complete(Unit) }
+        synchronized(lock) {
+            // While the session is starting, a pause cancels every start queued before it (e.g.
+            // Media3's load + play of a cold Bluetooth resumption), not only the one waiting.
+            val waiting = waitingForSession
+            if (waiting != null || environment?.reach() == EngineReach.CONNECTING) {
+                cancelStartsBefore = nextSeq
+                waiting?.abort?.complete(Unit)
+            }
+        }
         return send(method, quietCodes = INACTIVE_CODES)
     }
 
-    /** [method] (play / toggle) with the last-session fallback, in one queued command. */
+    /**
+     * [method] (play / toggle) with the last-session fallback, in one queued command. A play that
+     * follows a paused `player.load` (Media3: setMediaItems, then play) is merged into that load
+     * while it has not been sent; right after a load it never falls back to the stored session.
+     */
     private fun sendResuming(method: String): Deferred<Boolean> {
         onPlaybackRequested?.invoke()
-        return enqueue(method, timeoutMs = LOAD_TIMEOUT_MS, startsPlayback = true) {
-            resumeOrLoadLast(
-                method = method,
-                call = { m, args -> call(m, args) },
-                fallBackOn = { code -> shouldResumeLast(code, snapshot.value.source == PlaybackSource.REMOTE, environment?.reach()) },
-                prepare = ::prepareLoad,
-                last = lastSession,
-            )
+        val followsPendingLoad = synchronized(lock) {
+            val load = latestLoad
+            val nothingAfter = load != null && (lastQueued === load || (lastQueued == null && load.started))
+            if (load != null && nothingAfter && !load.sent && !load.done.isCompleted) {
+                load.request = load.request?.copy(play = true)
+                return load.done
+            }
+            load != null && !load.done.isCompleted
+        }
+        return enqueue(method, timeoutMs = LOAD_TIMEOUT_MS, startsPlayback = true) { resume(method, followsPendingLoad) }
+    }
+
+    /**
+     * [followsPendingLoad]: queued while a `player.load` was still pending — the play belongs to
+     * that load (Media3: setMediaItems, prepare, play), so it is dropped if the load failed. A play
+     * shortly after a successful load starts that content too. Neither uses the stored session.
+     */
+    private suspend fun resume(method: String, followsPendingLoad: Boolean) {
+        val previous = lastStart
+        val recentLoad = previous != null && previous.wasLoad && System.nanoTime() - previous.atNanos < FOLLOWS_LOAD_NANOS
+        if (followsPendingLoad && recentLoad && previous?.ok == false) throw SupersededException("the load before it failed")
+        if (followsPendingLoad || (recentLoad && previous?.ok == true)) {
+            playAfterLoad(method)
+            return
+        }
+        resumeOrLoadLast(
+            method = method,
+            call = { m, args -> call(m, args) },
+            fallBackOn = { code -> shouldResumeLast(code, snapshot.value.source == PlaybackSource.REMOTE, environment?.reach()) },
+            prepare = ::prepareLoad,
+            last = lastSession,
+        )
+    }
+
+    /**
+     * Play after a load that may not have activated this device yet (the engine activates
+     * asynchronously): on NOT_ACTIVE_DEVICE wait (bounded) for the local session, then once more.
+     */
+    private suspend fun playAfterLoad(method: String) {
+        try {
+            call(method)
+        } catch (e: NativeException) {
+            if (e.code != NativeErrorCode.NOT_ACTIVE_DEVICE) throw e
+            withTimeoutOrNull(ACTIVATION_WAIT_MS) { snapshot.first { it.source == PlaybackSource.LOCAL && it.track != null } } ?: throw e
+            call(method)
         }
     }
 
@@ -437,6 +564,7 @@ class PlayerController internal constructor(
         timeoutMs: Long = COMMAND_TIMEOUT_MS,
         quietCodes: Set<String> = emptySet(),
         startsPlayback: Boolean = false,
+        onQueued: (Command) -> Unit = {},
         block: suspend () -> Unit,
     ): Deferred<Boolean> {
         // A new attempt replaces whatever failed before.
@@ -450,6 +578,8 @@ class PlayerController internal constructor(
                 return last.done
             }
             val command = Command(name, conflateKey, timeoutMs, quietCodes, startsPlayback, block)
+            command.seq = nextSeq++
+            onQueued(command)
             lastQueued = command
             if (queue.trySend(command).isFailure) command.done.complete(false)
             return command.done
@@ -457,18 +587,27 @@ class PlayerController internal constructor(
     }
 
     private suspend fun execute(command: Command) {
+        var ok = false
+        var cancelled = false
         try {
             val env = environment
-            if (command.startsPlayback && env != null && awaitSession(command, env)) {
-                warn("${command.name} cancelled by a pause while the session was starting")
-                command.done.complete(false)
-                return
+            if (command.startsPlayback) {
+                cancelled = cancelledByPause(command) || (env != null && awaitSession(command, env)) || cancelledByPause(command)
+                if (cancelled) {
+                    warn("${command.name} cancelled by a pause while the session was starting")
+                    command.done.complete(false)
+                    return
+                }
             }
             val block = synchronized(lock) { command.block }
             // Native commands wait briefly for a connecting session themselves: allow for it.
             val allowance = if (env?.reach() == EngineReach.CONNECTING) NATIVE_ONLINE_WAIT_MS else 0L
             withTimeout(command.timeoutMs + allowance) { block() }
+            ok = true
             command.done.complete(true)
+        } catch (e: SupersededException) {
+            warn("${command.name} skipped: ${e.message}")
+            command.done.complete(false)
         } catch (e: TimeoutCancellationException) {
             warn("${command.name} timed out")
             report(command, PlaybackErrorKind.TIMEOUT, null)
@@ -488,8 +627,14 @@ class PlayerController internal constructor(
             warn("${command.name} failed", e)
             report(command, PlaybackErrorKind.GENERIC, e.message)
             command.done.complete(false)
+        } finally {
+            if (command.startsPlayback && !cancelled) {
+                lastStart = StartOutcome(wasLoad = command.request != null, ok = ok, atNanos = System.nanoTime())
+            }
         }
     }
+
+    private fun cancelledByPause(command: Command): Boolean = synchronized(lock) { command.seq < cancelStartsBefore }
 
     /**
      * Waits (bounded) for a starting session before [command]. Returns true when a pause cancelled
@@ -552,6 +697,9 @@ class PlayerController internal constructor(
     @Serializable
     private data class RadioContext(val contextUri: String? = null, val trackUris: List<String> = emptyList())
 
+    /** The command no longer applies (e.g. a play after a failed load); dropped without a message. */
+    private class SupersededException(message: String) : Exception(message)
+
     /** Offline, and nothing of [contextUri] is downloaded. */
     internal class NotAvailableOfflineException(contextUri: String) : Exception("$contextUri is not downloaded")
 
@@ -566,6 +714,12 @@ class PlayerController internal constructor(
 
         /** Extra time for a command the engine holds back until a connecting session is Online. */
         private const val NATIVE_ONLINE_WAIT_MS = 20_000L
+
+        /** A play this soon after a load belongs to that load (Media3: setMediaItems, prepare, play). */
+        private const val FOLLOWS_LOAD_NANOS = 10_000_000_000L
+
+        /** How long a play after a load waits for the engine to activate this device. */
+        private const val ACTIVATION_WAIT_MS = 3_000L
 
         /** Nothing is (or can be) playing: nothing to pause / skip / seek, not worth a message. */
         private val INACTIVE_CODES = setOf(NativeErrorCode.NOT_ACTIVE_DEVICE, NativeErrorCode.NOT_CONNECTED)
@@ -611,6 +765,19 @@ class PlayerController internal constructor(
                 val state = last() ?: throw e
                 call("player.load", loadArgs(prepare(state.toPlayRequest())))
             }
+        }
+
+        /**
+         * A load of a context that cannot be loaded (`spotify:web-api`, the context of a plain track
+         * list) without `trackUris` plays its start track instead of being rejected; a
+         * non-loadable context next to `trackUris` is dropped. Single items given as context stay.
+         */
+        fun withLoadableContext(request: PlayRequest): PlayRequest {
+            val context = request.contextUri ?: return request
+            if (MediaIds.isResolvableContext(context) || MediaIds.isItemUri(context)) return request
+            if (!request.trackUris.isNullOrEmpty()) return request.copy(contextUri = null)
+            val start = request.startUri ?: return request
+            return request.copy(contextUri = null, trackUris = listOf(start), startIndex = 0, startUid = null)
         }
 
         fun loadArgs(request: PlayRequest): JsonObject = buildJsonObject {

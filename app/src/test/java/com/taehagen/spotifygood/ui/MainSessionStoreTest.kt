@@ -62,6 +62,46 @@ class MainSessionStoreTest {
     }
 
     @Test
+    fun aSessionStillShownIsNotReleasedWhenIdle() {
+        // The root already left MAIN, but the signed-in UI is still fading out.
+        val store = MainSessionStore()
+        val probe = store.acquire().probe()
+        store.enter()
+        assertFalse(store.releaseIfIdle())
+        assertFalse(probe.cleared)
+    }
+
+    @Test
+    fun aSessionDisposedByAConfigurationChangeMidFadeIsReleasedWhenIdle() {
+        // MAIN was fading out to Login when the activity was recreated: its own release was
+        // skipped (configuration change) and the new activity never shows it again.
+        val store = MainSessionStore()
+        val owner = store.acquire()
+        val probe = owner.probe()
+        store.enter()
+        store.exit()
+        assertTrue(store.releaseIfIdle())
+        assertTrue(probe.cleared)
+        assertNotSame(owner, store.acquire())
+        // Nothing left to release.
+        store.releaseIfIdle()
+        assertFalse(MainSessionStore().releaseIfIdle())
+    }
+
+    @Test
+    fun aConfigurationChangeWhileSignedInKeepsTheSession() {
+        val store = MainSessionStore()
+        val owner = store.acquire()
+        val probe = owner.probe()
+        store.enter()
+        store.exit() // old activity's composition disposed
+        store.enter() // recreated activity shows MAIN again
+        assertSame(owner, store.acquire())
+        assertFalse(store.releaseIfIdle())
+        assertFalse(probe.cleared)
+    }
+
+    @Test
     fun clearingTheShellClearsTheCurrentSession() {
         val store = MainSessionStore()
         val probe = store.acquire().probe()

@@ -64,12 +64,31 @@ class DownloadRulesTest {
 
     @Test
     fun aRateLimitPausesTheQueueForTheServerDelay() {
-        val breaker = QueueBreaker()
-        assertEquals(120_000L, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 120_000L))
+        // The first limit in a row follows the server (a fresh breaker each).
+        assertEquals(120_000L, QueueBreaker().onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 120_000L))
+        assertEquals(20_000L, QueueBreaker().onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 20_000L))
         // Longer than the per-item backoff cap: a server delay is honoured up to the queue cap.
-        assertEquals(20 * 60_000L, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 20 * 60_000L))
-        assertEquals(DownloadRules.MAX_QUEUE_PAUSE_MS, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 5 * 3_600_000L))
-        assertEquals(DownloadRules.BASE_BACKOFF_MS, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 0L))
+        assertEquals(20 * 60_000L, QueueBreaker().onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 20 * 60_000L))
+        assertEquals(DownloadRules.MAX_QUEUE_PAUSE_MS, QueueBreaker().onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 5 * 3_600_000L))
+        assertEquals(DownloadRules.BASE_BACKOFF_MS, QueueBreaker().onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 0L))
+    }
+
+    @Test
+    fun repeatedShortServerDelaysStillGrowThePause() {
+        // The CDN keeps answering "Retry-After: 60" for an hour.
+        val breaker = QueueBreaker()
+        val pauses = (1..4).map { breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 60_000L) }
+        assertEquals(listOf(60_000L, 120_000L, 240_000L, 480_000L), pauses)
+        // Past the 2 min a run waits inline from the third limit on: the run reschedules.
+        assertTrue(pauses[2]!! > 2 * 60_000L)
+        // A longer server delay still wins (the 5th in a row has grown to 16 min).
+        assertEquals(25 * 60_000L, breaker.onFailure(NativeErrorCode.RATE_LIMITED, online = true, retryAfterMs = 25 * 60_000L))
+    }
+
+    @Test
+    fun aRunStopsAfterFiveMinutesOfRateLimitPauses() {
+        assertEquals(false, DownloadRules.throttleBudgetSpent(60_000L + 120_000L))
+        assertTrue(DownloadRules.throttleBudgetSpent(60_000L + 120_000L + 120_000L))
     }
 
     @Test

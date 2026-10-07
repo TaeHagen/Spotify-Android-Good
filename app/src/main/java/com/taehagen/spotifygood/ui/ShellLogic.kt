@@ -35,8 +35,32 @@ internal class MainSessionStore {
 
     private var current: Session? = null
 
+    /** Compositions that show the current session right now ([enter] / [exit]). */
+    private var users = 0
+
     /** The current session (a new one once the previous one was released). */
     fun acquire(): ViewModelStoreOwner = current ?: Session().also { current = it }
+
+    /** A composition shows the session now; balanced by [exit] when it leaves. */
+    fun enter() {
+        users++
+    }
+
+    fun exit() {
+        users = (users - 1).coerceAtLeast(0)
+    }
+
+    /**
+     * Releases the current session when no composition shows it any more; returns true if it did.
+     * For a signed-in UI that was disposed by a configuration change while it was already on its
+     * way out (its own release is skipped then, and the recreated activity never shows it again).
+     */
+    fun releaseIfIdle(): Boolean {
+        val session = current ?: return false
+        if (users > 0) return false
+        release(session)
+        return true
+    }
 
     /** Clears every ViewModel of [session]; the next [acquire] starts a new session. */
     fun release(session: ViewModelStoreOwner) {

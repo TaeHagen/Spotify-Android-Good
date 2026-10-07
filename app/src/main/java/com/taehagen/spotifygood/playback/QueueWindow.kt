@@ -104,6 +104,17 @@ internal object MediaIds {
     fun isItemUri(uri: String): Boolean =
         uri.startsWith("spotify:track:") || uri.startsWith("spotify:episode:") || uri.startsWith("spotify:local:")
 
+    /**
+     * A context Spirc can load by uri (playlist, album, artist, show, Liked Songs, station, ...): the
+     * same rule as the engine's `connect/uri.rs` `is_resolvable_context`. Plain track lists report
+     * `spotify:web-api…` as their context, which cannot be loaded again.
+     */
+    fun isResolvableContext(uri: String?): Boolean =
+        uri != null && uri.startsWith("spotify:") && !uri.startsWith(WEB_API_CONTEXT) && !isItemUri(uri)
+
+    /** Context uri of plain track lists (Liked Songs as tracks, downloads, search results). */
+    const val WEB_API_CONTEXT = "spotify:web-api"
+
     /** The single playable item behind [mediaId], if any. */
     fun itemUriOf(mediaId: String): String? = when (val p = parse(mediaId)) {
         is Parsed.InContext -> p.trackUri
@@ -120,7 +131,12 @@ internal object MediaIds {
         if (mediaIds.isEmpty()) return null
         val index = startIndex.coerceIn(0, mediaIds.lastIndex)
         return when (val start = parse(mediaIds[index])) {
-            is Parsed.InContext -> LoadPlan(contextUri = start.contextUri, startUri = start.trackUri)
+            // Ids cached by a browser may name a context that cannot be loaded: play the item alone.
+            is Parsed.InContext -> if (isResolvableContext(start.contextUri)) {
+                LoadPlan(contextUri = start.contextUri, startUri = start.trackUri)
+            } else {
+                LoadPlan(trackUris = listOf(start.trackUri), startIndex = 0)
+            }
             is Parsed.Downloaded -> {
                 val all = downloaded()
                 val queue = if (start.trackUri in all) all else listOf(start.trackUri) + all

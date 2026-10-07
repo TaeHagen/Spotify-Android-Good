@@ -3,6 +3,9 @@ package com.taehagen.spotifygood.download
 import com.taehagen.spotifygood.auth.KeystoreUnavailableException
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flow
 import java.io.File
 
 /**
@@ -26,6 +29,9 @@ internal object DownloadRules {
 
     /** Longest queue pause. */
     const val MAX_QUEUE_PAUSE_MS = 30 * 60_000L
+
+    /** Rate-limit pauses one run waits out before it hands the queue back to the system. */
+    const val MAX_THROTTLED_PER_RUN_MS = 5 * 60_000L
 
     /** Stop downloading when less than this is free on the data partition. */
     const val MIN_FREE_BYTES = 200L * 1024 * 1024
@@ -103,14 +109,23 @@ internal object DownloadRules {
     }
 
     /**
-     * Queue pause after the [consecutive]-th rate limit in a row (1-based): the server's
-     * [retryAfterMs] when it gave one (at least [BASE_BACKOFF_MS]), else [RATE_LIMIT_PAUSE_MS]
-     * doubling per consecutive limit; at most [MAX_QUEUE_PAUSE_MS].
+     * Queue pause after the [consecutive]-th rate limit in a row (1-based). The first follows the
+     * server's [retryAfterMs] when it gave one, else [RATE_LIMIT_PAUSE_MS]. From the second in a row
+     * the pause also grows ([RATE_LIMIT_PAUSE_MS] doubling: 2, 4, 8 min …) whatever the server says,
+     * so a limit that persists with short delays pushes the queue out of the run (past the inline
+     * wait) instead of trying an item every minute. At least [BASE_BACKOFF_MS], at most
+     * [MAX_QUEUE_PAUSE_MS].
      */
     fun rateLimitPauseMs(retryAfterMs: Long?, consecutive: Int): Long {
-        val pause = retryAfterMs?.coerceAtLeast(BASE_BACKOFF_MS) ?: grow(RATE_LIMIT_PAUSE_MS, 2, consecutive)
-        return pause.coerceAtMost(MAX_QUEUE_PAUSE_MS)
+        val grown = if (retryAfterMs == null || consecutive > 1) grow(RATE_LIMIT_PAUSE_MS, 2, consecutive) else 0L
+        return maxOf(retryAfterMs ?: 0L, grown).coerceIn(BASE_BACKOFF_MS, MAX_QUEUE_PAUSE_MS)
     }
+
+    /**
+     * Whether a run that has waited [throttledMs] for rate-limit pauses in total should stop and
+     * reschedule (the pause stays on the rows) rather than keep the engine, the job and its wake lock.
+     */
+    fun throttleBudgetSpent(throttledMs: Long): Boolean = throttledMs >= MAX_THROTTLED_PER_RUN_MS
 
     /** Queue pause after the [trips]-th connectivity trip in a row (1-based): 1, 4, 16 min …, ≤ 30 min. */
     fun connectivityPauseMs(trips: Int): Long = grow(CONNECTIVITY_PAUSE_MS, 4, trips).coerceAtMost(MAX_QUEUE_PAUSE_MS)
@@ -250,6 +265,24 @@ internal object DownloadRules {
         if (e is KeystoreUnavailableException) KeyFailure.RETRY_LATER else KeyFailure.UNREADABLE
 
     // ---- scheduling ----------------------------------------------------------------------------------
+
+    /** A change of the download settings that matters for scheduling. */
+    data class PolicyChange(val offline: Boolean, val cellularChanged: Boolean)
+
+    /**
+     * Changes of `(downloadOverCellular, offlineMode)` in [settings]: the first value is the reference
+     * and emits nothing; every later distinct value emits whether mobile data downloads were toggled.
+     * [settings] must be the values loaded from disk: a pre-load placeholder (the defaults) followed by
+     * the loaded value would look like the user toggling mobile data, and stop a running job.
+     */
+    fun policyChanges(settings: Flow<Pair<Boolean, Boolean>>): Flow<PolicyChange> = flow {
+        var previous: Boolean? = null
+        settings.distinctUntilChanged().collect { (cellular, offline) ->
+            val before = previous
+            previous = cellular
+            if (before != null) emit(PolicyChange(offline, cellularChanged = before != cellular))
+        }
+    }
 
     /**
      * Whether a pending user-initiated job is left to drain the queue: unless the network policy
