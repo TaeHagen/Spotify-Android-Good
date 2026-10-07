@@ -57,6 +57,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.FocusRequester
@@ -66,6 +67,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
@@ -289,20 +292,25 @@ internal fun TopResultCard(
     onPlay: (() -> Unit)?,
     isPlaying: Boolean,
     modifier: Modifier = Modifier,
+    /** A song / episode that cannot be played here: dimmed, "Unavailable" for accessibility. */
+    unavailable: Boolean = false,
 ) {
+    val unavailableLabel = stringResource(R.string.shell_state_unavailable)
     Surface(
         shape = RoundedCornerShape(10.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
         modifier = modifier.fillMaxWidth(),
     ) {
         Box(
-            Modifier.combinedClickable(
-                onClick = onClick,
-                onLongClick = onLongClick,
-                onLongClickLabel = stringResource(R.string.browse_more_options),
-            ),
+            Modifier
+                .combinedClickable(
+                    onClick = onClick,
+                    onLongClick = onLongClick,
+                    onLongClickLabel = stringResource(R.string.browse_more_options),
+                )
+                .semantics { if (unavailable) stateDescription = unavailableLabel },
         ) {
-            Column(Modifier.padding(16.dp)) {
+            Column(Modifier.padding(16.dp).alpha(if (unavailable) 0.38f else 1f)) {
                 Artwork(
                     url = ref.images.best(300),
                     contentDescription = null,

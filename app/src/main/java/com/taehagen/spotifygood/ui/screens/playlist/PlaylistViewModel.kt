@@ -53,6 +53,8 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
@@ -92,7 +94,10 @@ internal data class PlaylistData(
      * never kept in place of a fresh fetch, and the page offers a retry.
      */
     val partial: Boolean = false,
-    /** Some or all rows come from the download (offline: no cached page for them). */
+    /**
+     * Some or all rows come from the download (offline: no cached page for them). Their order is
+     * the download's, not the server's, so such data is read-only: no edits, no positional actions.
+     */
     val downloadedCopy: Boolean = false,
 ) {
     val allLoaded: Boolean get() = rows.size >= total
@@ -217,6 +222,12 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
                     .collect { onFirstPage(it) }
             }
         }
+        // Back online while showing the download: fetch the server's rows (they replace it).
+        viewModelScope.launch {
+            offline.drop(1).filter { !it }.collect {
+                if (data.value.dataOrNull()?.downloadedCopy == true) retry()
+            }
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -227,9 +238,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val page = resource.dataOrNull
         if (page == null) {
             if (data.value !is LoadState.Ready) {
-                // No page and no cached copy (offline, cache cleared or pruned): a downloaded
-                // playlist still opens, from the download database.
-                val copy = if (resource is Resource.Error) downloadedCopy() else null
+                // No page and no cached copy while offline (cache cleared or pruned), or the playlist
+                // is gone: a downloaded playlist still opens, read-only, from the download database.
+                val useCopy = resource is Resource.Error &&
+                    (offline.value || failureReason(resource.error) == FailureReason.NOT_FOUND)
+                val copy = if (useCopy) downloadedCopy() else null
                 data.value = when {
                     copy != null -> LoadState.Ready(downloadedData(copy), stale = true)
                     resource is Resource.Error -> LoadState.Failed(failureReason(resource.error))
@@ -244,12 +257,13 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val description = withContext(Dispatchers.Default) { parseHtml(page.description.orEmpty()) }
         val current = data.value.dataOrNull()
         val sameRevision = current != null && page.revision != null && current.revision == page.revision
-        // Loaded rows are kept for the same revision, unless they hold placeholders: then a refetch
-        // (this one, or the data layer's retries of a partial page) replaces them.
-        val keepRows = current != null && sameRevision && !current.partial && current.rows.size >= page.items.size
-        // A new revision (or placeholders) while more than the first page is loaded: keep showing the
-        // loaded rows (no scroll jump) and reload the whole loaded range in the background.
-        val reloadRange = current != null && (!sameRevision || current.partial) && current.rows.size > page.items.size
+        // Loaded rows are kept for the same revision, unless they hold placeholders or come from the
+        // download: then a refetch (this one, or the data layer's retries) replaces them.
+        val replaceable = current != null && (current.partial || current.downloadedCopy)
+        val keepRows = current != null && sameRevision && !replaceable && current.rows.size >= page.items.size
+        // A new revision (or replaceable rows) while more than the first page is loaded: keep showing
+        // the loaded rows (no scroll jump) and reload the whole loaded range in the background.
+        val reloadRange = current != null && (!sameRevision || replaceable) && current.rows.size > page.items.size
         val playlist = when {
             keepRows -> PlaylistData(page.copy(items = emptyList()), description, current.rows, maxOf(page.total, current.rows.size), page.revision)
             reloadRange -> current.copy(meta = page.copy(items = emptyList()), description = description)
@@ -264,7 +278,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             viewModelScope.launch {
                 mutationMutex.withLock {
                     val latest = data.value.dataOrNull()
-                    if (canApplyServerRows() && (latest?.revision != page.revision || latest?.partial == true)) refreshLoaded(force = false)
+                    val replace = latest?.revision != page.revision || latest?.partial == true || latest?.downloadedCopy == true
+                    if (canApplyServerRows() && replace) refreshLoaded(force = false)
                 }
             }
         }
@@ -301,8 +316,9 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            // Offline past the cached first page: the rest of a downloaded playlist is on disk.
-            if ((offline.value || failureReason(e) == FailureReason.OFFLINE) && appendDownloadedRows()) return false
+            // Offline past the cached first page: the rest of a downloaded playlist is on disk. Only
+            // when actually offline: a transient error online keeps the server list (Retry footer).
+            if (offline.value && appendDownloadedRows()) return false
             paging.update { it.copy(failed = true) }
             return false
         } finally {
@@ -325,15 +341,26 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         return PlaylistData(meta.copy(items = emptyList()), RichText.EMPTY, buildRows(meta.items), meta.total, null, copy.partial, downloadedCopy = true)
     }
 
-    /** Appends every downloaded row past the loaded ones; false when the playlist isn't downloaded. */
+    /**
+     * Appends every downloaded item not shown yet (matched by uri: the cached server page may hold
+     * local files, duplicates or another revision) and makes the page read-only; false when the
+     * playlist isn't downloaded or edits are in progress.
+     */
     private suspend fun appendDownloadedRows(): Boolean {
         val copy = downloadedCopy() ?: return false
         val latest = data.value.dataOrNull() ?: return false
-        if (pendingMutations > 0 || dragging) return false
+        if (pendingMutations > 0 || dragging || editMode.value) return false
         val used = latest.rows.mapTo(HashSet()) { it.key }
-        val rows = latest.rows + buildRows(copy.remainingPlaylistItems(latest.rows.size), used)
+        val shown = latest.rows.mapNotNullTo(HashSet()) { it.item.uri }
+        val rows = latest.rows + buildRows(copy.remainingPlaylistItems(shown), used)
         data.value = LoadState.Ready(
-            latest.copy(rows = rows, total = rows.size, partial = latest.partial || copy.partial, downloadedCopy = true),
+            latest.copy(
+                meta = latest.meta.copy(canEdit = false),
+                rows = rows,
+                total = rows.size,
+                partial = latest.partial || copy.partial,
+                downloadedCopy = true,
+            ),
             stale = true,
         )
         return true
@@ -400,7 +427,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
 
     fun setEditMode(enabled: Boolean) {
         val playlist = data.value.dataOrNull()
-        if (enabled && playlist?.meta?.canEdit != true) return
+        // Rows from the download are not in the server's order: never edit them.
+        if (enabled && (playlist?.meta?.canEdit != true || playlist.downloadedCopy)) return
         if (enabled) filter.value = ""
         editMode.value = enabled
     }
@@ -531,7 +559,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
 
     private fun mutate(change: (PlaylistData) -> Mutation?) {
         val playlist = data.value.dataOrNull() ?: return
-        if (!playlist.meta.canEdit) return
+        // Positions of rows from the download do not match the server's.
+        if (!playlist.meta.canEdit || playlist.downloadedCopy) return
         val mutation = change(playlist) ?: return
         data.value = LoadState.Ready(mutation.optimistic)
         pendingMutations++

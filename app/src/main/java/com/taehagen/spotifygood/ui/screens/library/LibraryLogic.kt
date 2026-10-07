@@ -2,6 +2,7 @@ package com.taehagen.spotifygood.ui.screens.library
 
 import androidx.compose.runtime.Immutable
 import com.taehagen.spotifygood.data.settings.LibrarySort
+import com.taehagen.spotifygood.download.CollectionType
 import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.ArtistRef
 import com.taehagen.spotifygood.model.Image
@@ -231,9 +232,30 @@ data class LibraryListing(
 )
 
 /**
+ * A downloaded collection as a library row (downloads need not be saved in the library, and the
+ * saved lists may be gone from the cache offline). Liked Songs has its own pinned row: null.
+ */
+fun DownloadedCollection.toLibraryItem(): LibraryItem? {
+    val kind = when (type) {
+        CollectionType.ALBUM -> LibraryItemKind.ALBUM
+        CollectionType.PLAYLIST -> LibraryItemKind.PLAYLIST
+        CollectionType.SHOW -> LibraryItemKind.SHOW
+        CollectionType.LIKED_SONGS -> return null
+    }
+    return LibraryItem(
+        kind = kind,
+        id = uri,
+        name = name,
+        images = imageUrl?.takeIf { it.isNotBlank() }?.let { listOf(Image(it)) }.orEmpty(),
+        addedAt = addedAt,
+    )
+}
+
+/**
  * The items to show: the open folder's children, or the top level for the filter. Text search
  * and the Downloaded filter / offline mode look through folders; downloaded-only views contain
- * only items in [downloaded].
+ * only items in [downloaded], and also list [downloadedItems] (downloads that are not, or no
+ * longer, in the saved lists; a saved item wins over its download row).
  */
 fun buildLibraryListing(
     playlists: List<LibraryItem>,
@@ -242,6 +264,7 @@ fun buildLibraryListing(
     shows: List<LibraryItem>,
     query: LibraryQuery,
     downloaded: Set<String>,
+    downloadedItems: List<LibraryItem> = emptyList(),
     recentRank: Map<String, Int> = emptyMap(),
     collator: Collator = defaultCollator(),
 ): LibraryListing {
@@ -254,13 +277,15 @@ fun buildLibraryListing(
         folders.isNotEmpty() -> folders.last().children
         else -> {
             val playlistItems = if (flatten) playlists.flattenFolders() else playlists
-            when (query.filter) {
+            val saved = when (query.filter) {
                 null, LibraryFilter.DOWNLOADED -> playlistItems + albums + artists + shows
                 LibraryFilter.PLAYLISTS -> playlistItems
                 LibraryFilter.ALBUMS -> albums
                 LibraryFilter.ARTISTS -> artists
                 LibraryFilter.PODCASTS -> shows
             }
+            // Saved items first: distinctBy below keeps their richer rows (creator, owner).
+            if (downloadedOnly) saved + downloadedItems.filter { it.kind in query.filter.kinds() } else saved
         }
     }
     val filtered = base.asSequence()
@@ -270,6 +295,15 @@ fun buildLibraryListing(
         .sortedWith(libraryComparator(query.sort, recentRank, collator))
         .toList()
     return LibraryListing(filtered, folders)
+}
+
+/** Item kinds a filter shows (no filter / Downloaded: all). */
+private fun LibraryFilter?.kinds(): Set<LibraryItemKind> = when (this) {
+    null, LibraryFilter.DOWNLOADED -> LibraryItemKind.entries.toSet()
+    LibraryFilter.PLAYLISTS -> setOf(LibraryItemKind.PLAYLIST, LibraryItemKind.FOLDER)
+    LibraryFilter.ALBUMS -> setOf(LibraryItemKind.ALBUM)
+    LibraryFilter.ARTISTS -> setOf(LibraryItemKind.ARTIST)
+    LibraryFilter.PODCASTS -> setOf(LibraryItemKind.SHOW)
 }
 
 /** Recency ranks from recently played references (first occurrence wins). */
