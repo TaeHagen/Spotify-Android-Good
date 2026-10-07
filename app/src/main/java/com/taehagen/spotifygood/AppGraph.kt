@@ -78,7 +78,19 @@ class AppGraph(val app: Application) {
     /** Last local session (playback resumption, cold-start play); one DataStore per process. */
     val resumeStore: ResumeStore by lazy { ResumeStore(app) }
     val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore, devices) }
-    val devices: DevicesRepository by lazy { DevicesRepository(appScope, rpc, events, resumeStore::read) }
+    val devices: DevicesRepository by lazy {
+        DevicesRepository(appScope, rpc, events, resumeStore::read).also { repo ->
+            // Coroutine timers don't count deep sleep: an expired pending target goes when the app
+            // comes back.
+            appScope.launch(Dispatchers.Main) {
+                androidx.lifecycle.ProcessLifecycleOwner.get().lifecycle.addObserver(
+                    object : androidx.lifecycle.DefaultLifecycleObserver {
+                        override fun onStart(owner: androidx.lifecycle.LifecycleOwner) = repo.expirePendingTarget()
+                    },
+                )
+            }
+        }
+    }
     private val localDiscoveryLazy = lazy {
         LocalDeviceDiscovery(app, rpc) { devices.devices.value.devices.map { it.id }.toSet() }
     }

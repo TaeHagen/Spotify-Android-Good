@@ -117,6 +117,36 @@ class DevicesRepositoryTest {
     }
 
     @Test
+    fun aPendingTargetNeedsItsDeviceListed() {
+        val speaker = com.taehagen.spotifygood.model.ConnectDevice(id = "speaker", name = "Living Room")
+        val phone = com.taehagen.spotifygood.model.ConnectDevice(id = "me", name = "Phone", isThisDevice = true)
+        val tv = com.taehagen.spotifygood.model.ConnectDevice(id = "tv", name = "TV")
+        assertTrue(DevicesRepository.listed("speaker", DeviceList(devices = listOf(phone, speaker))))
+        assertFalse(DevicesRepository.listed("speaker", DeviceList(devices = listOf(phone, tv))))
+        assertFalse(DevicesRepository.listed("me", DeviceList(devices = listOf(phone, speaker))))
+        assertFalse(DevicesRepository.listed("speaker", DeviceList(devices = listOf(speaker.copy(name = " ")))))
+    }
+
+    @Test
+    fun theExpiryCountsDeepSleep() = runTest {
+        // the clock jumps past the expiry while the coroutine time barely moves (the phone slept)
+        var now = 0L
+        val repo = DevicesRepository(backgroundScope, NativeRpc(Json), NativeEvents(Json), clock = { now })
+        runCurrent()
+        repo.pick("speaker")
+        runCurrent()
+        now += PendingTarget.TTL_MS
+        advanceTimeBy(DevicesRepository.EXPIRY_CHECK_MS)
+        runCurrent()
+        assertNull(repo.pendingTarget.value)
+        // and right away when the app comes back
+        repo.pick("speaker")
+        now += PendingTarget.TTL_MS
+        repo.expirePendingTarget()
+        assertNull(repo.pendingTarget.value)
+    }
+
+    @Test
     fun theRepositoryClearsAnExpiredPendingTarget() = runTest {
         val repo = DevicesRepository(backgroundScope, NativeRpc(Json), NativeEvents(Json), clock = { testScheduler.currentTime })
         runCurrent()

@@ -27,6 +27,9 @@ pub(crate) struct LoadArgs {
     /// phone: routed as usual.
     #[serde(default)]
     pub device_id: Option<String>,
+    /// An explicit pull to this phone (a media-session resume): see `connect::load`.
+    #[serde(default)]
+    pub local: bool,
 }
 
 impl LoadArgs {
@@ -135,6 +138,10 @@ pub(crate) struct ResumeArgs {
     pub smart_shuffle: Option<bool>,
     #[serde(default)]
     pub repeat: Option<RepeatMode>,
+    /// The session as a track list (its current track wasn't a context track: queued, autoplay,
+    /// a suggestion); played instead of the context, from `track_uri` on.
+    #[serde(default)]
+    pub track_uris: Option<Vec<String>>,
 }
 
 impl ResumeArgs {
@@ -155,6 +162,17 @@ impl ResumeArgs {
             play,
             ..Default::default()
         };
+        let tracks: Vec<String> = self
+            .track_uris
+            .iter()
+            .flatten()
+            .map(|u| u.trim())
+            .filter(|u| !u.is_empty())
+            .map(str::to_string)
+            .collect();
+        if let Some(start) = tracks.iter().position(|u| u == track) {
+            return Some(LoadArgs { track_uris: Some(tracks), start_index: Some(start as u32), ..modes });
+        }
         let context = self.context_uri.as_deref().map(str::trim).filter(|c| super::uri::is_resolvable_context(c));
         Some(match context {
             Some(context) => LoadArgs {
@@ -233,6 +251,7 @@ mod tests {
             shuffle: None,
             smart_shuffle: None,
             repeat: None,
+            track_uris: None,
         };
         let load = bare(Some("spotify:track:t"), "spotify:track:t").load_args(true).expect("load");
         assert_eq!(load.track_uris, Some(vec!["spotify:track:t".to_string()]));
@@ -241,6 +260,29 @@ mod tests {
 
         let plain: TransferArgs = serde_json::from_str(r#"{"deviceId":"d","play":false}"#).expect("parse");
         assert!(plain.resume.is_none() && !plain.play);
+    }
+
+    #[test]
+    fn a_resumed_track_list_wins_over_the_context() {
+        let t: TransferArgs = serde_json::from_str(
+            r#"{"deviceId":"d","resume":{"contextUri":"spotify:playlist:p","trackUri":"spotify:track:q","positionMs":7,
+                "trackUris":["spotify:track:a","spotify:track:q","spotify:track:b"]}}"#,
+        )
+        .expect("parse");
+        let load = t.resume.as_ref().and_then(|r| r.load_args(true)).expect("load");
+        assert_eq!(load.context_uri, None);
+        assert_eq!(load.track_uris.as_ref().map(Vec::len), Some(3));
+        assert_eq!((load.start_index, load.position_ms), (Some(1), 7));
+        // a list without the track: the context as before
+        let t: TransferArgs = serde_json::from_str(
+            r#"{"deviceId":"d","resume":{"contextUri":"spotify:playlist:p","trackUri":"spotify:track:q","trackUris":["spotify:track:a"]}}"#,
+        )
+        .expect("parse");
+        let load = t.resume.as_ref().and_then(|r| r.load_args(true)).expect("load");
+        assert_eq!(load.context_uri.as_deref(), Some("spotify:playlist:p"));
+        // a pull to this phone
+        let a: LoadArgs = serde_json::from_str(r#"{"contextUri":"spotify:album:a","local":true}"#).expect("parse");
+        assert!(a.local);
     }
 
     #[test]

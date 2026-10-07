@@ -57,6 +57,17 @@ pub(crate) struct HubState {
     pub activation: Option<Activation>,
     /// `lastError` override after the load brake stopped playback (see `player_events`).
     pub refused_error: Option<String>,
+    /// A play was just sent to another device (nothing was active): until a cluster names the
+    /// active device, commands follow it there.
+    pub remote_activation: Option<RemoteActivation>,
+}
+
+/// See [`HubState::remote_activation`].
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteActivation {
+    pub device: String,
+    pub generation: u64,
+    pub at: Instant,
 }
 
 /// See [`HubState::activation`].
@@ -168,9 +179,49 @@ pub(crate) fn detach_current() {
 /// A local load with activation was sent to the attached Spirc.
 pub(crate) fn set_activating() {
     let mut hub = HUB.lock();
+    hub.remote_activation = None;
     if let Some(generation) = hub.link.as_ref().map(|l| l.generation) {
         hub.activation = Some(Activation { generation, at: Instant::now() });
     }
+}
+
+/// A play was sent to `device` (a load for it, or a transfer starting a session there).
+pub(crate) fn set_remote_activating(device: &str) {
+    let mut hub = HUB.lock();
+    if let Some(generation) = hub.link.as_ref().map(|l| l.generation) {
+        hub.remote_activation = Some(RemoteActivation { device: device.to_string(), generation, at: Instant::now() });
+    }
+}
+
+/// The device a play was just sent to, until a cluster names the active one (at most
+/// [`ACTIVATION_GRACE`]).
+pub(crate) fn remote_activating() -> Option<String> {
+    let hub = HUB.lock();
+    remote_activating_in(&hub, hub.link.as_ref().map(|l| l.generation), Instant::now())
+}
+
+fn remote_activating_in(hub: &HubState, link: Option<u64>, now: Instant) -> Option<String> {
+    hub.remote_activation
+        .as_ref()
+        .filter(|r| link == Some(r.generation) && now.saturating_duration_since(r.at) < ACTIVATION_GRACE)
+        .map(|r| r.device.clone())
+}
+
+/// This device is the active one with nothing loaded (a load failed after its activation), and
+/// no activation or restore is on its way: a play there would do nothing.
+pub(crate) fn local_active_empty() -> bool {
+    let hub = HUB.lock();
+    local_active_empty_in(&hub, hub.link.as_ref().map(|l| l.generation), Instant::now())
+}
+
+fn local_active_empty_in(hub: &HubState, link: Option<u64>, now: Instant) -> bool {
+    let empty = hub.snapshot.as_ref().is_some_and(|s| {
+        s.is_active && s.track.is_none() && s.status == librespot_connect::SnapshotPlayStatus::Stopped
+    });
+    let activating = hub
+        .activation
+        .is_some_and(|a| link == Some(a.generation) && now.saturating_duration_since(a.at) < ACTIVATION_GRACE);
+    empty && !activating && !restore_applying(hub.restoring.as_ref(), link, now)
 }
 
 pub(crate) fn cluster() -> Option<Arc<Cluster>> {
@@ -206,6 +257,7 @@ pub(crate) fn forget_previous_link(hub: &mut HubState) {
     hub.snapshot = None;
     hub.cluster = None;
     hub.activation = None;
+    hub.remote_activation = None;
     hub.last_active = None;
     hub.restoring = None;
 }
@@ -218,6 +270,7 @@ pub(crate) fn detach_state(hub: &mut HubState, generation: u64, online: bool) {
         hub.link = None;
         hub.snapshot = None;
         hub.activation = None;
+        hub.remote_activation = None;
     }
     if hub.link.is_none() && !online {
         hub.cluster = None;
@@ -286,6 +339,7 @@ pub(crate) fn detach_all() {
         hub.snapshot = None;
         hub.cluster = None;
         hub.activation = None;
+        hub.remote_activation = None;
         released
     };
     pause_released(released);
@@ -419,6 +473,10 @@ fn on_cluster(generation: u64, cluster: Arc<Cluster>) {
         if hub.link.as_ref().map(|l| l.generation) != Some(generation) {
             return;
         }
+        if !cluster.active_device_id.is_empty() {
+            // The device a play was sent to is known (or another one took over).
+            hub.remote_activation = None;
+        }
         hub.cluster = Some(cluster.clone());
     }
     CLUSTER_CHANGED.notify_waiters();
@@ -435,13 +493,7 @@ fn on_spirc_error(err: SpircCommandError) {
         return;
     }
     if !err.remote && err.command == "load" {
-        // The restore's load failed: its placeholder goes (the error is shown).
-        let dropped = HUB.lock().restoring.take().is_some();
-        if dropped {
-            log::warn!("the restore's load failed");
-            changed();
-            publish();
-        }
+        restore::on_load_failed();
     }
     use librespot_core::error::ErrorKind;
     let code = match err.kind {
@@ -453,7 +505,15 @@ fn on_spirc_error(err: SpircCommandError) {
     };
     let origin = if err.remote { "Remote command" } else { "Command" };
     log::warn!("{origin} {} failed: {}", err.command, err.message);
-    events::emit_error(&AppError::new(code, format!("{origin} {} failed: {}", err.command, err.message)).with_context("connect"));
+    let message = format!("{origin} {} failed: {}", err.command, err.message);
+    events::emit_error(&AppError::new(code, message).with_context(error_context(&err.command, err.remote)));
+}
+
+/// The error context of a failed Spirc command: `playback` for this phone's own commands that
+/// start playback (a failed load, a play with nothing to play: the player shows them), else
+/// `connect`.
+fn error_context(command: &str, remote: bool) -> &'static str {
+    if !remote && matches!(command, "load" | "play" | "play_pause" | "skip_to") { "playback" } else { "connect" }
 }
 
 fn time_delta_s() -> i64 {
@@ -676,6 +736,51 @@ mod hub_tests {
         hub.snapshot = Some(ConnectSnapshot { is_active: true, ..Default::default() });
         hub.restoring = None;
         assert!(local_view(&hub, Some(3), now, 1_001_000).0.is_some());
+    }
+
+    #[test]
+    fn commands_follow_a_play_sent_to_another_device() {
+        let now = Instant::now();
+        let mut hub = HubState {
+            remote_activation: Some(RemoteActivation { device: "speaker".into(), generation: 3, at: now }),
+            ..Default::default()
+        };
+        assert_eq!(remote_activating_in(&hub, Some(3), now + Duration::from_secs(2)).as_deref(), Some("speaker"));
+        assert_eq!(remote_activating_in(&hub, Some(3), now + ACTIVATION_GRACE), None, "the grace ran out");
+        assert_eq!(remote_activating_in(&hub, Some(4), now), None, "another Spirc");
+        forget_previous_link(&mut hub);
+        assert_eq!(remote_activating_in(&hub, Some(3), now), None);
+    }
+
+    #[test]
+    fn an_empty_active_spirc_is_no_place_to_play() {
+        let now = Instant::now();
+        let empty = ConnectSnapshot { is_active: true, status: librespot_connect::SnapshotPlayStatus::Stopped, ..Default::default() };
+        let mut hub = HubState { snapshot: Some(empty), ..Default::default() };
+        assert!(local_active_empty_in(&hub, Some(3), now));
+        // an activation on its way, or a restore being applied: not yet
+        hub.activation = Some(Activation { generation: 3, at: now });
+        assert!(!local_active_empty_in(&hub, Some(3), now + Duration::from_secs(1)));
+        assert!(local_active_empty_in(&hub, Some(3), now + ACTIVATION_GRACE));
+        hub.activation = None;
+        let frozen = restore::freeze(ConnectSnapshot::default(), 0, now);
+        hub.restoring = Some(restore::Restoring { generation: 3, frozen, at: now });
+        assert!(!local_active_empty_in(&hub, Some(3), now));
+        hub.restoring = None;
+        // inactive, or with a track: an ordinary play
+        hub.snapshot = Some(ConnectSnapshot::default());
+        assert!(!local_active_empty_in(&hub, Some(3), now));
+    }
+
+    #[test]
+    fn own_failed_starts_are_playback_errors() {
+        assert_eq!(error_context("load", false), "playback");
+        assert_eq!(error_context("play", false), "playback");
+        assert_eq!(error_context("play_pause", false), "playback");
+        assert_eq!(error_context("skip_to", false), "playback");
+        // commands from other devices that failed here, and the rest
+        assert_eq!(error_context("load", true), "connect");
+        assert_eq!(error_context("shuffle", false), "connect");
     }
 
     #[test]
