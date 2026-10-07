@@ -70,8 +70,11 @@ internal sealed interface LocalConnectEvent {
     /** Logged in and playing there (the sheet closes). */
     data class Connected(override val sheet: String) : LocalConnectEvent
 
-    /** Logged in, but nothing was playing and there was no saved session to start there. */
-    data class Ready(override val sheet: String, val deviceName: String) : LocalConnectEvent
+    /**
+     * Logged in, but nothing was playing and there was no saved session to start there. [selected]:
+     * the device became the pending target, so the next play goes there.
+     */
+    data class Ready(override val sheet: String, val deviceName: String, val selected: Boolean = false) : LocalConnectEvent
 
     /** `connect.localLogin` failed: the device did not join the account. */
     data class Failed(override val sheet: String, val deviceName: String, val network: Boolean) : LocalConnectEvent
@@ -91,6 +94,7 @@ internal suspend fun connectLocalDevice(
     deviceName: String,
     login: suspend () -> String,
     transfer: suspend (String) -> Unit,
+    isSelected: (String) -> Boolean = { false },
 ): LocalConnectEvent {
     val deviceId = try {
         login()
@@ -108,7 +112,7 @@ internal suspend fun connectLocalDevice(
         throw e
     } catch (e: NativeException) {
         if (e.code == NativeErrorCode.NOT_ACTIVE_DEVICE) {
-            LocalConnectEvent.Ready(sheet, deviceName)
+            LocalConnectEvent.Ready(sheet, deviceName, selected = isSelected(deviceId))
         } else {
             LocalConnectEvent.TransferFailed(sheet, deviceName, e.isNetwork)
         }
@@ -173,6 +177,8 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
                     deviceName = device.name,
                     login = { discovery.login(device) },
                     transfer = { id -> devicesRepository.transferTo(id) },
+                    // A failed transfer with nothing to resume keeps the device for the next play.
+                    isSelected = { id -> devicesRepository.pendingTarget.value == id },
                 )
                 eventChannel.trySend(event)
             } finally {
@@ -234,7 +240,10 @@ internal fun rememberLocalDevices(sheet: String, onConnected: () -> Unit): Local
             when (event) {
                 is LocalConnectEvent.Connected -> currentOnConnected()
                 // The device is in the account now (listed under Connect devices): not a failure.
-                is LocalConnectEvent.Ready -> notice.value = context.getString(R.string.local_connect_ready, event.deviceName)
+                is LocalConnectEvent.Ready -> notice.value = context.getString(
+                    if (event.selected) R.string.player_devices_selected else R.string.local_connect_ready,
+                    event.deviceName,
+                )
                 is LocalConnectEvent.Failed -> {
                     error.value = context.getString(
                         if (event.network) R.string.local_connect_login_failed_network else R.string.local_connect_login_failed,
