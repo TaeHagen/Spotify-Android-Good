@@ -413,13 +413,13 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
 | `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` | `SearchResults` |
-| `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection]}` |
+| `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
 | `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
 | `catalog.recentlyPlayed` | `{"limit":50}` | `{"items":[MediaRef]}` |
 | `catalog.user` | `{"username"?}` | `User` (me when omitted; other users include their `publicPlaylists`) |
 | `library.playlists` | `{}` | `{"items":[RootlistEntry],"partial"?:true}` (rootlist, folders preserved; entries without decorations are named through cached header lookups, ≤100 requests per call; deleted/inaccessible playlists are remembered for 30 min; `partial` when some names could not be looked up yet and those playlists are missing) |
-| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}],"partial"?}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` (no metadata involved: the membership source for downloads) |
+| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}],"partial"?}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` (no metadata involved: the membership source for downloads). Library sets are read whole or not at all; only the context-resolve fallback can stop at its budget (20 000 items / 200 pages): pages are then `partial`, and `urisOnly` fails with `UNAVAILABLE` instead of listing a prefix as the whole collection |
 | `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"≤500}` | paged `{"total","items":[…],"partial"?}` |
 | `library.contains` | `{"uris":[…]}` | `{"contains":[bool]}` |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
@@ -816,6 +816,11 @@ Native catalog strategy (Rust `catalog/`):
   rootlist playlists (incl. followed Made-For-You mixes), followed artists and radio
   stations seeded from recent tracks. Liked Songs → context-resolve when `collection/v2/paging`
   fails (not when offline or rate limited); the resolved list is reused for 60 s.
+* **Per-account caches** (library set snapshots, the Liked Songs fallback, the rootlist,
+  playlist headers, lyrics, the pathfinder token state) are tagged with the username they were
+  read for and never served to another account (a load that finishes after a logout included).
+  `session.logout` drops them (`catalog::clear_user_state`, next to `metadata::clear_cache`),
+  and a login as another account without a logout drops them on first use.
 * The public Web API is never used by default.
 
 
@@ -825,7 +830,8 @@ Repositories call the native catalog RPCs and expose `suspend` functions / `Flow
 successful response of browse calls (home, library lists, album/artist/playlist pages) so
 the app opens instantly and works offline; stale-while-revalidate. A `partial` response
 (§6.3) is shown but never stored as fresh: it only fills a missing row (stored stale) and is
-refetched twice while on screen (after 15 s and 30 s). Paged lists advance by whole windows
+refetched twice while on screen (after 15 s and 30 s). The home feed is treated the same way
+when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
 app scope, so they complete even if their screen closes. Liked-state of the

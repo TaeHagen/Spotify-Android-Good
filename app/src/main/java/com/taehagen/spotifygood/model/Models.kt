@@ -224,7 +224,11 @@ data class SearchResults(
 data class HomeSection(val id: String, val title: String, val items: List<MediaRef> = emptyList())
 
 @Serializable
-data class HomeFeed(val sections: List<HomeSection> = emptyList())
+data class HomeFeed(
+    val sections: List<HomeSection> = emptyList(),
+    /** Part of the (local) feed failed to load; its sections are missing (docs §6.3). */
+    val partial: Boolean = false,
+)
 
 @Serializable
 enum class RootlistEntryType {

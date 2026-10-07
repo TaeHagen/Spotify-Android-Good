@@ -1,9 +1,11 @@
 //! `catalog.home`: pathfinder `home` (sections of tiles), falling back to a feed assembled
 //! locally from recently played, the rootlist, followed artists and radio playlists. A failing
-//! section never fails the whole feed.
+//! source only drops its sections and marks the feed `partial`; when every source fails the
+//! call fails (an empty feed would pass for the user's home and be cached as such).
 
 use super::collection;
 use super::http::{self, JSON};
+use super::metadata;
 use super::pathfinder;
 use super::pfparse;
 use super::playlist;
@@ -11,8 +13,8 @@ use super::radio;
 use super::recent;
 use super::refs;
 use crate::engine;
-use crate::error::AppResult;
-use crate::models::{HomeSection, MediaRef, MediaType};
+use crate::error::{AppError, AppResult, ErrorCode};
+use crate::models::{ArtistRef, HomeSection, MediaRef, MediaType, PlaylistRef};
 use crate::rpc::{parse_args, to_value};
 use futures_util::future::join_all;
 use librespot_core::Session;
@@ -85,35 +87,83 @@ fn section(id: &str, title: &str, items: Vec<MediaRef>) -> Option<HomeSection> {
     (!items.is_empty()).then(|| HomeSection { id: id.into(), title: title.into(), items })
 }
 
-async fn radio_section(session: &Session, seeds: Vec<String>) -> Option<HomeSection> {
+/// The radio section and whether a seed lookup failed (then the feed is partial).
+async fn radio_section(session: &Session, seeds: Vec<String>) -> (Option<HomeSection>, bool) {
     let lookups = seeds.into_iter().take(3).map(|seed| async move {
-        let body = http::spc_get(
-            session,
-            &format!("/inspiredby-mix/v2/seed_to_playlist/{seed}?response-format=json"),
-            Some(JSON),
-        )
-        .await
-        .ok()?;
-        radio::parse_inspiredby(&body)
+        http::spc_get(session, &format!("/inspiredby-mix/v2/seed_to_playlist/{seed}?response-format=json"), Some(JSON))
+            .await
+            .map(|body| radio::parse_inspiredby(&body))
     });
-    let uris: Vec<String> = join_all(lookups).await.into_iter().flatten().collect();
+    let mut failed = false;
+    let mut uris: Vec<String> = Vec::new();
+    for r in join_all(lookups).await {
+        match r {
+            Ok(uri) => uris.extend(uri),
+            Err(e) => {
+                log::info!("home: radio seed failed: {}", e.error);
+                failed = true;
+            }
+        }
+    }
     let tiles = refs::resolve(session, &uris).await;
-    section("local:radio", "Radio for you", tiles)
+    (section("local:radio", "Radio for you", tiles), failed)
 }
 
-/// Feed assembled from the user's own data.
-pub(crate) async fn local_feed(session: &Session) -> Vec<HomeSection> {
+/// What the local feed's sources returned.
+#[derive(Debug, Default)]
+pub(crate) struct Sources {
+    pub recent: Vec<MediaRef>,
+    pub rootlist: Vec<PlaylistRef>,
+    pub artists: Vec<ArtistRef>,
+    /// Some source failed: the feed lacks its sections.
+    pub partial: bool,
+}
+
+fn transport(e: &AppError) -> bool {
+    matches!(e.code, ErrorCode::Network | ErrorCode::RateLimited)
+}
+
+/// Combines the local feed's sources. Every source failing is an error (a retryable one), never
+/// an empty feed that would pass for the user's home; some failing make the feed partial.
+pub(crate) fn combine_sources(
+    recent: AppResult<Vec<MediaRef>>,
+    rootlist: AppResult<Vec<PlaylistRef>>,
+    artists: AppResult<Vec<ArtistRef>>,
+) -> AppResult<Sources> {
+    fn keep<T>(errors: &mut Vec<AppError>, name: &str, r: AppResult<T>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::info!("home: {name} failed: {e}");
+                errors.push(e);
+                None
+            }
+        }
+    }
+    let mut errors: Vec<AppError> = Vec::new();
+    let recent = keep(&mut errors, "recently played", recent);
+    let rootlist = keep(&mut errors, "rootlist", rootlist);
+    let artists = keep(&mut errors, "followed artists", artists);
+    if recent.is_none() && rootlist.is_none() && artists.is_none() {
+        let first = errors.iter().position(transport).unwrap_or(0);
+        return Err(metadata::page_error(errors.swap_remove(first)));
+    }
+    Ok(Sources {
+        partial: !errors.is_empty(),
+        recent: recent.unwrap_or_default(),
+        rootlist: rootlist.unwrap_or_default(),
+        artists: artists.unwrap_or_default(),
+    })
+}
+
+/// Feed assembled from the user's own data, and whether it is partial (a source failed).
+pub(crate) async fn local_feed(session: &Session) -> AppResult<(Vec<HomeSection>, bool)> {
     let (recent, rootlist, artists) = tokio::join!(
         recent::recently_played(session, 20),
         playlist::rootlist_refs(session, Duration::from_secs(120)),
         collection::followed_artists(session, SECTION_ITEMS),
     );
-    let recent = recent.unwrap_or_else(|e| {
-        log::info!("home: recently played failed: {e}");
-        Vec::new()
-    });
-    let rootlist = rootlist.unwrap_or_default();
-    let artists = artists.unwrap_or_default();
+    let Sources { recent, rootlist, artists, partial } = combine_sources(recent, rootlist, artists)?;
 
     let seeds: Vec<String> = recent
         .iter()
@@ -123,7 +173,7 @@ pub(crate) async fn local_feed(session: &Session) -> Vec<HomeSection> {
         .collect::<Vec<_>>();
     let mut seen = HashSet::new();
     let seeds: Vec<String> = seeds.into_iter().filter(|s| seen.insert(s.clone())).collect();
-    let radio = radio_section(session, seeds).await;
+    let (radio, radio_failed) = radio_section(session, seeds).await;
 
     let made_for_you: Vec<MediaRef> = rootlist
         .iter()
@@ -135,7 +185,7 @@ pub(crate) async fn local_feed(session: &Session) -> Vec<HomeSection> {
     let jump_back: Vec<MediaRef> =
         recent.iter().filter(|m| m.kind == MediaType::Album).take(SECTION_ITEMS).cloned().collect();
 
-    [
+    let sections = [
         section("local:recently-played", "Recently played", recent.into_iter().take(SECTION_ITEMS).collect()),
         section("local:made-for-you", "Made for you", made_for_you),
         section("local:your-playlists", "Your playlists", yours),
@@ -145,24 +195,46 @@ pub(crate) async fn local_feed(session: &Session) -> Vec<HomeSection> {
     ]
     .into_iter()
     .flatten()
-    .collect()
+    .collect();
+    Ok((sections, partial || radio_failed))
+}
+
+/// The `catalog.home` result: sections, plus `"partial": true` when part of the feed failed.
+pub(crate) fn feed_value(sections: Vec<HomeSection>, partial: bool) -> Value {
+    let mut out = json!({ "sections": sections });
+    if partial {
+        out["partial"] = json!(true);
+    }
+    out
 }
 
 pub(crate) async fn rpc(args: Value) -> AppResult<Value> {
     let a: Args = if args.is_null() { Args::default() } else { parse_args(args)? };
     let session = engine::session()?;
     let tz = a.time_zone.filter(|t| !t.is_empty()).unwrap_or_else(|| "UTC".to_string());
-    match pathfinder::query(&session, "home", variables(&tz)).await {
+    let pathfinder_error = match pathfinder::query(&session, "home", variables(&tz)).await {
         Ok(data) => {
             let sections = parse_home(&data);
             if !sections.is_empty() {
-                return to_value(&json!({ "sections": sections }));
+                return to_value(&feed_value(sections, false));
             }
             log::info!("pathfinder home returned no sections; using the local feed");
+            None
         }
-        Err(e) => log::info!("pathfinder home failed: {}", crate::error::AppError::from(e)),
+        Err(e) => {
+            let e = AppError::from(e);
+            log::info!("pathfinder home failed: {e}");
+            Some(e)
+        }
+    };
+    match local_feed(&session).await {
+        Ok((sections, partial)) => to_value(&feed_value(sections, partial)),
+        // Offline or throttled says more than whichever local source failed last.
+        Err(e) => Err(match pathfinder_error {
+            Some(p) if transport(&p) && !transport(&e) => p,
+            _ => e,
+        }),
     }
-    to_value(&json!({ "sections": local_feed(&session).await }))
 }
 
 #[cfg(test)]
@@ -188,6 +260,26 @@ mod tests {
         assert_eq!(sections[2].items[1].kind, MediaType::Artist);
         let json = serde_json::to_value(&sections).unwrap();
         assert_eq!(json[0]["items"][0]["type"], "playlist");
+    }
+
+    #[test]
+    fn local_feed_sources_never_fail_into_an_empty_feed() {
+        let net = || AppError::new(ErrorCode::Network, "offline");
+        let artist = ArtistRef { uri: "spotify:artist:0gxyHStUsqpMadRV0Di1Qt".into(), name: "Rick".into(), images: vec![] };
+        // Everything answered: complete (even when there is little to show).
+        let s = combine_sources(Ok(vec![]), Ok(vec![]), Ok(vec![artist.clone()])).unwrap();
+        assert!(!s.partial && s.artists.len() == 1);
+        // Some sources failed: what arrived, marked partial.
+        let s = combine_sources(Err(net()), Ok(vec![]), Ok(vec![artist])).unwrap();
+        assert!(s.partial && s.recent.is_empty() && s.artists.len() == 1);
+        // All failed: a retryable error, preferring the transport one.
+        let e = combine_sources(Err(AppError::not_found("404")), Err(net()), Err(AppError::unavailable("403"))).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Network);
+        let e = combine_sources(Err(AppError::not_found("404")), Err(AppError::internal("x")), Err(AppError::internal("y"))).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Unavailable, "never NOT_FOUND for the home feed");
+
+        assert_eq!(feed_value(vec![], true)["partial"], true);
+        assert!(feed_value(vec![], false).get("partial").is_none());
     }
 
     #[test]

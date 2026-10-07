@@ -423,6 +423,7 @@ async fn logout() -> AppResult<Value> {
     connect::reset();
     // Cached metadata carries the account's country / filter in `playable`.
     crate::catalog::metadata::clear_cache();
+    crate::catalog::clear_user_state();
     *CATALOG_FILTER.lock() = None;
     let dirs = [runtime::credentials_dir(), runtime::streaming_cache_dir(), runtime::librespot_tmp_dir()];
     let cleanup = tokio::task::spawn_blocking(move || {
