@@ -72,6 +72,7 @@ import com.taehagen.spotifygood.ui.navigation.Route
 import com.taehagen.spotifygood.ui.screens.library.BrowseError
 import com.taehagen.spotifygood.ui.screens.library.ChipRow
 import com.taehagen.spotifygood.ui.screens.library.ConfirmDialog
+import com.taehagen.spotifygood.ui.screens.library.ScrollToTopOnChange
 import com.taehagen.spotifygood.ui.screens.library.StateBox
 import com.taehagen.spotifygood.ui.screens.library.contentPaddingWith
 import com.taehagen.spotifygood.ui.screens.library.messageRes
@@ -273,6 +274,9 @@ private fun TopResults(
         is TopResultsState.Empty -> StateBox { NoResults(top.query, onRetry) }
         is TopResultsState.Ready -> {
             val listState = rememberLazyListState()
+            // A new query's results start at the top; coming back from a result keeps the place.
+            // (The refreshing copy keeps the old query, so the old list stays put meanwhile.)
+            ScrollToTopOnChange(top.query) { listState.scrollToItem(0) }
             HideKeyboardOnDrag(listState, onDrag)
             val sections = top.sections
             val actionsFor: (MediaRef) -> Unit = { ref ->
@@ -404,13 +408,15 @@ private fun TypedResults(
     onRetry: () -> Unit,
     onDrag: () -> Unit,
 ) {
+    // Saveable, and created before the loading branch: coming back from a result (or another tab,
+    // or a rotation) restores the place in the kept pages; a new query or filter starts at the top.
+    val listState = rememberLazyListState()
+    ScrollToTopOnChange("${state.query}|${state.filter}") { listState.scrollToItem(0) }
     val paged = state.typed
     if (paged == null || paged.isInitialLoading) {
         LoadingState()
         return
     }
-    // A fresh list per query/filter so the scroll position starts at the top.
-    val listState = remember(state.query, state.filter) { LazyListState() }
     HideKeyboardOnDrag(listState, onDrag)
     SearchItemsList(
         paged = paged,
