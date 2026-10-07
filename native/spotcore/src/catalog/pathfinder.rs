@@ -16,8 +16,11 @@
 //! * CDN bodies may arrive gzip-compressed regardless of `Accept-Encoding` (inflated here).
 //!
 //! Hashes are persisted in `files_dir/pathfinder.json` `{fetchedAt, hashes, appVersion,
-//! bundleUrl}`, refreshed weekly in the background or immediately on `PersistedQueryNotFound`
-//! (one refresh in flight; at most one attempt per hour). Shipped defaults cover first use.
+//! bundleUrl, nextAttemptAt}`, refreshed weekly in the background or immediately on
+//! `PersistedQueryNotFound`. A refresh runs as a detached task (a cancelled query never aborts
+//! it; a query waits for it at most 20 s before using its fallbacks), one at a time, at most one
+//! attempt per hour across restarts (5 min after a network failure). Bundle inflating and
+//! scanning run on the blocking pool. Shipped defaults cover first use.
 
 use super::http::{self, HttpError, TIMEOUT};
 use super::inflate;
@@ -47,7 +50,16 @@ const WEB_ROOT: &str = "https://open.spotify.com/";
 const SERVICE_WORKER: &str = "https://open.spotify.com/service-worker.js";
 const DEFAULT_PUBLIC_PATH: &str = "https://open.spotifycdn.com/cdn/build/web-player/";
 const REFRESH_AFTER_MS: i64 = 7 * 24 * 3600 * 1000;
-const REFRESH_BACKOFF: Duration = Duration::from_secs(3600);
+/// At most one discovery attempt per hour (persisted, so it also holds across cold starts).
+const REFRESH_BACKOFF_MS: i64 = 3600 * 1000;
+/// Retry delay after an attempt that failed on the network (nothing was learned).
+const TRANSIENT_BACKOFF_MS: i64 = 5 * 60 * 1000;
+/// Upper bound for one discovery (it holds the refresh lock).
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a query waits for a refresh before using its fallbacks; the refresh carries on.
+const REFRESH_WAIT: Duration = Duration::from_secs(20);
+/// The `client-token` header is optional: do not let a stalled token request hold a query.
+const CLIENT_TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
 const LOGIN5_REJECTED_FOR: Duration = Duration::from_secs(30 * 60);
 const BUNDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CHUNKS: usize = 4;
@@ -227,7 +239,9 @@ pub(crate) async fn discover(fetch: &Fetch, previous_bundle: Option<&str>) -> Ap
         return Ok(Discovered { app_version, bundle_url: Some(main), unchanged: true, ..Default::default() });
     }
     let js = fetch(main.clone()).await?;
-    let mut hashes: HashMap<String, String> = extract_operations(&js).into_iter().collect();
+    // Regex scans over the multi-MB bundle run on the blocking pool, not on a runtime worker.
+    let (operations, chunks) = off_runtime(move || (extract_operations(&js), extract_chunks(&js))).await?;
+    let mut hashes: HashMap<String, String> = operations.into_iter().collect();
     let missing = |h: &HashMap<String, String>| REQUIRED.iter().copied().filter(|op| !h.contains_key(*op)).collect::<Vec<_>>();
     let mut tried = std::collections::HashSet::new();
     for round in 0..2 {
@@ -236,7 +250,7 @@ pub(crate) async fn discover(fetch: &Fetch, previous_bundle: Option<&str>) -> Ap
             break;
         }
         let candidates = if round == 0 {
-            chunk_candidates(&extract_chunks(&js), &still)
+            chunk_candidates(&chunks, &still)
         } else {
             // Fallback: chunk URLs precached by the service worker.
             if sw_urls.is_none() {
@@ -255,7 +269,7 @@ pub(crate) async fn discover(fetch: &Fetch, previous_bundle: Option<&str>) -> Ap
             }
             match fetch(url.clone()).await {
                 Ok(chunk) => {
-                    for (name, hash) in extract_operations(&chunk) {
+                    for (name, hash) in off_runtime(move || extract_operations(&chunk)).await? {
                         hashes.entry(name).or_insert(hash);
                     }
                 }
@@ -272,15 +286,21 @@ pub(crate) async fn discover(fetch: &Fetch, previous_bundle: Option<&str>) -> Ap
     Ok(Discovered { hashes, app_version, bundle_url: Some(main), unchanged: false })
 }
 
+/// Runs CPU-bound work (inflating, regex scans of the bundles) on the blocking pool: the async
+/// runtime has only two workers, which also forward RPC results and playback/Connect events.
+async fn off_runtime<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> AppResult<T> {
+    tokio::task::spawn_blocking(work).await.map_err(|e| AppError::internal(format!("pathfinder parse task: {e}")))
+}
+
 fn web_fetcher(session: Option<Session>) -> Fetch {
     Box::new(move |url: String| {
         let session = session.clone();
         async move {
             let timeout = if url.ends_with(".js") { BUNDLE_TIMEOUT } else { TIMEOUT };
             let body = http::web_get(session.as_ref(), &url, timeout).await?;
-            let body = inflate::maybe_gunzip(body.to_vec())
-                .map_err(|e| AppError::new(ErrorCode::Unavailable, format!("{url}: {e}")))?;
-            Ok(String::from_utf8_lossy(&body).into_owned())
+            off_runtime(move || inflate::maybe_gunzip(body.to_vec()).map(|b| String::from_utf8_lossy(&b).into_owned()))
+                .await?
+                .map_err(|e| AppError::new(ErrorCode::Unavailable, format!("{url}: {e}")))
         }
         .boxed()
     })
@@ -297,13 +317,23 @@ pub(crate) struct Persisted {
     pub hashes: HashMap<String, String>,
     pub app_version: Option<String>,
     pub bundle_url: Option<String>,
+    /// Earliest wall-clock time (ms) of the next discovery attempt (hourly budget, shorter after a
+    /// network failure).
+    pub next_attempt_at: i64,
+}
+
+/// Whether a discovery may start at `now`: due (weekly) or forced, and not backing off. A
+/// backoff further away than the hourly budget means the clock moved backwards: ignored.
+pub(crate) fn may_attempt(p: &Persisted, force: bool, now: i64) -> bool {
+    let due = now - p.fetched_at >= REFRESH_AFTER_MS;
+    let backing_off = now < p.next_attempt_at && p.next_attempt_at - now <= REFRESH_BACKOFF_MS;
+    (force || due) && !backing_off
 }
 
 #[derive(Default)]
 struct State {
     persisted: Persisted,
     loaded: bool,
-    last_attempt: Option<Instant>,
     login5_rejected_until: Option<Instant>,
 }
 
@@ -371,23 +401,55 @@ pub(crate) fn merge(old: &Persisted, found: &Discovered, now: i64) -> Persisted 
     next
 }
 
-/// Refreshes the hashes. `force` ignores the weekly schedule (stale-hash errors); every attempt
-/// is rate limited to one per hour and only one runs at a time. Returns true if hashes changed.
-pub(crate) async fn refresh(session: Option<Session>, force: bool) -> AppResult<bool> {
+/// Refreshes the hashes and waits for the outcome (at most `wait`). `force` ignores the weekly
+/// schedule (stale-hash errors); attempts are limited to one per hour and one at a time.
+/// Returns true if hashes changed.
+///
+/// The refresh runs as a detached task: a cancelled caller (a search superseded by the next
+/// keystroke aborts its RPC task) neither aborts a discovery midway nor wastes the hourly
+/// budget, and callers that stop waiting find its result in the hashes later.
+async fn refresh(fetch: Fetch, force: bool, wait: Duration) -> AppResult<bool> {
+    let task = tokio::spawn(refresh_now(fetch, force));
+    match tokio::time::timeout(wait, task).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => Err(AppError::internal(format!("pathfinder refresh task: {e}"))),
+        Err(_) => Err(AppError::unavailable("pathfinder refresh still running")),
+    }
+}
+
+async fn refresh_now(fetch: Fetch, force: bool) -> AppResult<bool> {
     ensure_loaded().await;
     let _guard = REFRESH.lock().await;
+    let started = now_ms();
     let previous = {
         let mut st = STATE.lock();
-        let fresh = now_ms() - st.persisted.fetched_at < REFRESH_AFTER_MS;
-        if (!force && fresh) || st.last_attempt.is_some_and(|t| t.elapsed() < REFRESH_BACKOFF) {
+        if !may_attempt(&st.persisted, force, started) {
             return Ok(false);
         }
-        st.last_attempt = Some(Instant::now());
+        st.persisted.next_attempt_at = started + REFRESH_BACKOFF_MS;
         st.persisted.clone()
     };
     // A forced refresh must re-read the bundle even if its URL did not change.
     let known_bundle = if force { None } else { previous.bundle_url.clone() };
-    let found = discover(&web_fetcher(session), known_bundle.as_deref()).await?;
+    let found = match tokio::time::timeout(DISCOVERY_TIMEOUT, discover(&fetch, known_bundle.as_deref())).await {
+        Ok(r) => r,
+        Err(_) => Err(AppError::new(ErrorCode::Network, "pathfinder discovery timed out")),
+    };
+    let found = match found {
+        Ok(f) => f,
+        Err(e) => {
+            let attempted = {
+                let mut st = STATE.lock();
+                if matches!(e.code, ErrorCode::Network | ErrorCode::RateLimited | ErrorCode::Cancelled) {
+                    // Offline or throttled: nothing was learned, try again soon.
+                    st.persisted.next_attempt_at = now_ms() + TRANSIENT_BACKOFF_MS;
+                }
+                st.persisted.clone()
+            };
+            persist(&attempted).await;
+            return Err(e);
+        }
+    };
     let next = merge(&previous, &found, now_ms());
     let changed = next.hashes != previous.hashes;
     STATE.lock().persisted = next.clone();
@@ -397,15 +459,10 @@ pub(crate) async fn refresh(session: Option<Session>, force: bool) -> AppResult<
 }
 
 fn maybe_refresh_in_background(session: &Session) {
-    let due = {
-        let st = STATE.lock();
-        now_ms() - st.persisted.fetched_at >= REFRESH_AFTER_MS
-            && st.last_attempt.is_none_or(|t| t.elapsed() >= REFRESH_BACKOFF)
-    };
-    if due {
-        let s = session.clone();
+    if may_attempt(&STATE.lock().persisted, false, now_ms()) {
+        let fetch = web_fetcher(Some(session.clone()));
         tokio::spawn(async move {
-            if let Err(e) = refresh(Some(s), false).await {
+            if let Err(e) = refresh_now(fetch, false).await {
                 log::warn!("pathfinder background refresh failed: {e}");
             }
         });
@@ -495,9 +552,24 @@ async fn tokens(session: &Session) -> Vec<(TokenKind, String)> {
     out
 }
 
-async fn post(session: &Session, op: &str, hash: &str, variables: &Value) -> Result<Value, PfError> {
+/// The client token for the optional `client-token` header, bounded by [`CLIENT_TOKEN_TIMEOUT`]
+/// (fetching an expired one goes to clienttoken.spotify.com without any timeout of its own).
+async fn client_token(session: &Session) -> Option<String> {
+    match tokio::time::timeout(CLIENT_TOKEN_TIMEOUT, session.spclient().client_token()).await {
+        Ok(Ok(t)) => Some(t),
+        Ok(Err(e)) => {
+            log::debug!("client token unavailable: {e}");
+            None
+        }
+        Err(_) => {
+            log::info!("client token timed out; querying pathfinder without it");
+            None
+        }
+    }
+}
+
+async fn post(session: &Session, op: &str, hash: &str, variables: &Value, client_token: Option<&str>) -> Result<Value, PfError> {
     let body = request_body(op, hash, variables).to_string();
-    let client_token = session.spclient().client_token().await.ok();
     let version = app_version();
     let candidates = tokens(session).await;
     if candidates.is_empty() {
@@ -513,7 +585,7 @@ async fn post(session: &Session, op: &str, hash: &str, variables: &Value) -> Res
             .header(ACCEPT, "application/json")
             .header("app-platform", "WebPlayer")
             .header("spotify-app-version", version.as_str());
-        if let Some(ct) = client_token.as_deref().and_then(|t| HeaderValue::from_str(t).ok()) {
+        if let Some(ct) = client_token.and_then(|t| HeaderValue::from_str(t).ok()) {
             builder = builder.header("client-token", ct);
         }
         let req = builder.body(Bytes::from(body.clone())).map_err(|e| {
@@ -540,29 +612,30 @@ async fn post(session: &Session, op: &str, hash: &str, variables: &Value) -> Res
 }
 
 /// Runs a persisted query and returns its `data` object. Retries once with freshly discovered
-/// hashes when the server reports an unknown hash.
+/// hashes when the server reports an unknown hash (waiting at most [`REFRESH_WAIT`] for them).
 pub(crate) async fn query(session: &Session, op: &str, variables: Value) -> Result<Value, PfError> {
     ensure_loaded().await;
     maybe_refresh_in_background(session);
     let hash = match hash_for(op) {
         Some(h) => h,
         None => {
-            let _ = refresh(Some(session.clone()), true).await;
+            let _ = refresh(web_fetcher(Some(session.clone())), true, REFRESH_WAIT).await;
             hash_for(op).ok_or_else(|| PfError::GraphQl(format!("unknown operation {op}")))?
         }
     };
-    match post(session, op, &hash, &variables).await {
+    // Fetched once per query, so the stale-hash retry does not wait for it again.
+    let client_token = client_token(session).await;
+    let client_token = client_token.as_deref();
+    match post(session, op, &hash, &variables, client_token).await {
         Err(PfError::StaleHash) => {
             log::info!("pathfinder: hash for {op} rejected, refreshing");
-            match refresh(Some(session.clone()), true).await {
-                Ok(_) => match hash_for(op) {
-                    Some(h) if h != hash => post(session, op, &h, &variables).await,
-                    _ => Err(PfError::StaleHash),
-                },
-                Err(e) => {
-                    log::warn!("pathfinder refresh failed: {e}");
-                    Err(PfError::StaleHash)
-                }
+            if let Err(e) = refresh(web_fetcher(Some(session.clone())), true, REFRESH_WAIT).await {
+                log::warn!("pathfinder refresh: {e}");
+            }
+            // A refresh by another caller may have brought the new hash as well.
+            match hash_for(op) {
+                Some(h) if h != hash => post(session, op, &h, &variables, client_token).await,
+                _ => Err(PfError::StaleHash),
             }
         }
         other => other,
@@ -664,6 +737,68 @@ mod tests {
         assert!(json["fetchedAt"].is_number() && json["hashes"]["home"].is_string());
         let back: Persisted = serde_json::from_value(json).unwrap();
         assert_eq!(back, merged);
+    }
+
+    #[test]
+    fn refresh_budget() {
+        let now = 10 * REFRESH_AFTER_MS;
+        let fresh = Persisted { fetched_at: now - 1000, ..Default::default() };
+        assert!(!may_attempt(&fresh, false, now), "not due");
+        assert!(may_attempt(&fresh, true, now), "forced");
+        let stale = Persisted { fetched_at: now - REFRESH_AFTER_MS, ..Default::default() };
+        assert!(may_attempt(&stale, false, now), "weekly refresh due");
+        let backing_off = Persisted { next_attempt_at: now + 1000, ..fresh.clone() };
+        assert!(!may_attempt(&backing_off, true, now));
+        assert!(may_attempt(&backing_off, true, now + 1000));
+        // A backoff beyond the hourly budget means the clock went backwards.
+        let skewed = Persisted { next_attempt_at: now + 2 * REFRESH_BACKOFF_MS, ..fresh };
+        assert!(may_attempt(&skewed, true, now));
+    }
+
+    fn delayed(inner: Fetch, delay: Duration) -> Fetch {
+        Box::new(move |url: String| {
+            let fut = inner(url);
+            async move {
+                tokio::time::sleep(delay).await;
+                fut.await
+            }
+            .boxed()
+        })
+    }
+
+    #[tokio::test]
+    async fn refresh_outlives_a_cancelled_caller_and_backs_off() {
+        {
+            let mut st = STATE.lock();
+            st.loaded = true;
+            st.persisted = Persisted::default();
+        }
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        // The caller stops waiting long before discovery ends (as an aborted RPC would)…
+        let r = refresh(delayed(fake_fetcher(log.clone(), false), Duration::from_millis(30)), true, Duration::from_millis(1)).await;
+        assert!(r.is_err());
+        // …yet the refresh completes and stores the hashes.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !STATE.lock().persisted.hashes.contains_key("searchDesktop") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached refresh finished");
+        assert_eq!(log.lock().len(), 3);
+        // That one attempt spent the hourly budget: another forced refresh fetches nothing.
+        let log2 = std::sync::Arc::new(Mutex::new(Vec::new()));
+        assert!(!refresh(fake_fetcher(log2.clone(), false), true, Duration::from_secs(10)).await.unwrap());
+        assert!(log2.lock().is_empty());
+
+        // Offline: the attempt fails on the network and only backs off for a few minutes.
+        STATE.lock().persisted.next_attempt_at = 0;
+        let offline: Fetch = Box::new(|url: String| async move { Err(AppError::new(ErrorCode::Network, url)) }.boxed());
+        let e = refresh(offline, true, Duration::from_secs(10)).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::Network);
+        let wait = STATE.lock().persisted.next_attempt_at - now_ms();
+        assert!(wait > 0 && wait <= TRANSIENT_BACKOFF_MS, "{wait}");
+        assert!(STATE.lock().persisted.hashes.contains_key("searchDesktop"), "known hashes kept");
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! sent exactly once (no librespot retry loop).
 
 use super::http::{self, HttpError, JSON, PROTOBUF};
-use super::metadata;
+use super::metadata::{self, Fetched};
 use super::proto::playlist4_external as p4;
 use super::util::{decode_plus, encode_component, file_id_hex, now_ms, parse_kind, strip_html, UriKind};
 use crate::engine;
@@ -36,9 +36,13 @@ const DECORATE: &str = "decorate=revision,length,attributes,timestamp,owner,capa
 const MAX_PAGE: u32 = 500;
 const ROOTLIST_PAGE: usize = 500;
 const ROOTLIST_MAX_PAGES: usize = 20;
-/// Playlists whose names are resolved individually when the rootlist lacks decorations.
+/// Header requests per `library.playlists` call for rootlist entries without decorations
+/// (cached entries do not count, so later calls resolve the rest).
 const HEADER_LOOKUPS: usize = 100;
 const HEADER_TTL: Duration = Duration::from_secs(30 * 60);
+/// Lookups that will fail the same way again (deleted or private playlist) are not repeated
+/// for this long. Transport errors and rate limits are never cached.
+const HEADER_NEGATIVE_TTL: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) const CONFLICT_MESSAGE: &str = "playlist revision changed, reload and retry";
 
@@ -159,49 +163,100 @@ async fn fetch_list(
     http::proto(&body).map_err(|error| HttpError { status: None, error })
 }
 
-static HEADERS: LazyLock<Mutex<LruCache<String, (Instant, PlaylistRef)>>> =
+/// Header cache: `Some` = the playlist's reference, `None` = a lookup that will fail again.
+type HeaderCache = LruCache<String, (Instant, Option<PlaylistRef>)>;
+
+static HEADERS: LazyLock<Mutex<HeaderCache>> =
     LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(512).unwrap_or(NonZeroUsize::MIN))));
 
 fn header_from_list(uri: &str, list: &p4::SelectedListContent) -> PlaylistRef {
     playlist_ref(uri.to_string(), &list.attributes, list.owner_username(), list.length)
 }
 
-/// Playlist references (name, images, owner, length) for `uris`, cached for 30 minutes.
-/// Unresolvable playlists are omitted.
-pub(crate) async fn headers(session: &Session, uris: &[String]) -> HashMap<String, PlaylistRef> {
-    let mut out = HashMap::new();
+/// Outcome of resolving playlist references.
+#[derive(Debug, Default)]
+pub(crate) struct Headers {
+    pub refs: HashMap<String, PlaylistRef>,
+    /// Some lookups failed transiently or were left for later (fetch budget): the missing
+    /// playlists may well exist.
+    pub incomplete: bool,
+}
+
+enum HeaderOutcome {
+    Found(PlaylistRef),
+    /// Deleted or not accessible: cached as such.
+    Gone,
+    /// Network, rate limit, server error: retried next time.
+    Failed,
+}
+
+/// What a failed header lookup says about the playlist.
+fn header_failure(e: &HttpError) -> HeaderOutcome {
+    if e.is_not_found() || e.status == Some(403) {
+        HeaderOutcome::Gone
+    } else {
+        HeaderOutcome::Failed
+    }
+}
+
+/// Cached header state of `key`: `Some(Some(r))` known, `Some(None)` known to fail, `None` unknown.
+fn cached_header(cache: &mut HeaderCache, key: &str) -> Option<Option<PlaylistRef>> {
+    match cache.get(key) {
+        Some((at, Some(r))) if at.elapsed() < HEADER_TTL => Some(Some(r.clone())),
+        Some((at, None)) if at.elapsed() < HEADER_NEGATIVE_TTL => Some(None),
+        _ => None,
+    }
+}
+
+/// Playlist references (name, images, owner, length) for `uris`, cached for 30 minutes; at most
+/// `max_fetches` uncached ones are requested. Unresolvable playlists are omitted.
+pub(crate) async fn headers(session: &Session, uris: &[String], max_fetches: usize) -> Headers {
+    let mut out = Headers::default();
     let mut missing = Vec::new();
     {
         let mut cache = HEADERS.lock();
         for uri in uris.iter().filter_map(|u| parse_kind(u, UriKind::Playlist)) {
             let key = uri.uri();
-            match cache.get(&key) {
-                Some((at, r)) if at.elapsed() < HEADER_TTL => {
-                    out.insert(key, r.clone());
+            match cached_header(&mut cache, &key) {
+                Some(Some(r)) => {
+                    out.refs.insert(key, r);
                 }
-                _ if !missing.contains(&uri) => missing.push(uri),
-                _ => {}
+                Some(None) => {}
+                None if !missing.contains(&uri) => missing.push(uri),
+                None => {}
             }
         }
     }
-    let fetched: Vec<(String, PlaylistRef)> = stream::iter(missing)
+    if missing.len() > max_fetches {
+        missing.truncate(max_fetches);
+        out.incomplete = true;
+    }
+    let fetched: Vec<(String, HeaderOutcome)> = stream::iter(missing)
         .map(|p| async move {
-            match fetch_list(session, &p.id, Some((0, 1))).await {
-                Ok(list) => Some((p.uri(), header_from_list(&p.uri(), &list))),
+            let outcome = match fetch_list(session, &p.id, Some((0, 1))).await {
+                Ok(list) => HeaderOutcome::Found(header_from_list(&p.uri(), &list)),
                 Err(e) => {
                     log::debug!("playlist header {} failed: {}", p.id, e.error);
-                    None
+                    header_failure(&e)
                 }
-            }
+            };
+            (p.uri(), outcome)
         })
         .buffer_unordered(6)
-        .filter_map(|x| async move { x })
         .collect()
         .await;
     let mut cache = HEADERS.lock();
-    for (uri, r) in fetched {
-        cache.put(uri.clone(), (Instant::now(), r.clone()));
-        out.insert(uri, r);
+    for (uri, outcome) in fetched {
+        match outcome {
+            HeaderOutcome::Found(r) => {
+                cache.put(uri.clone(), (Instant::now(), Some(r.clone())));
+                out.refs.insert(uri, r);
+            }
+            HeaderOutcome::Gone => {
+                cache.put(uri, (Instant::now(), None));
+            }
+            HeaderOutcome::Failed => out.incomplete = true,
+        }
     }
     out
 }
@@ -311,16 +366,14 @@ pub(crate) async fn playlist(args: Value) -> AppResult<Value> {
     let episode_uris: Vec<String> =
         page.iter().filter_map(|i| parse_kind(i.uri(), UriKind::Episode)).map(|p| p.uri()).collect();
     let (tracks, episodes) =
-        tokio::join!(metadata::track_map(&session, &track_uris), metadata::episode_map(&session, &episode_uris));
-    let tracks = tracks.unwrap_or_else(|e| {
-        log::warn!("playlist track metadata failed: {e}");
-        HashMap::new()
-    });
-    let episodes = episodes.unwrap_or_default();
+        tokio::join!(metadata::track_lookup(&session, &track_uris), metadata::episode_lookup(&session, &episode_uris));
+    let tracks = Fetched::or_all_failed(tracks, &track_uris);
+    let episodes = Fetched::or_all_failed(episodes, &episode_uris);
+    let partial = page_partial(&tracks, &track_uris, &episodes, &episode_uris)?;
 
     let uri = p.uri();
     let header = header_from_list(&uri, &list);
-    HEADERS.lock().put(uri.clone(), (Instant::now(), header.clone()));
+    HEADERS.lock().put(uri.clone(), (Instant::now(), Some(header.clone())));
     let me = engine::username().unwrap_or_else(|| session.username());
     let owner_name = list.owner_username().to_string();
     let owned = !owner_name.is_empty() && owner_name.eq_ignore_ascii_case(&me);
@@ -340,9 +393,31 @@ pub(crate) async fn playlist(args: Value) -> AppResult<Value> {
         revision: revision_hex(list.revision()),
         offset: a.offset,
         total,
-        items: build_items(&page, &tracks, &episodes),
+        items: build_items(&page, &tracks.map, &episodes.map),
         following,
+        partial,
     })
+}
+
+/// Whether a page whose item metadata came from `tracks`/`episodes` is partial (some requests
+/// failed; those items become placeholders). Fails when requests failed and nothing resolved:
+/// a page of nameless placeholders is not worth returning.
+pub(crate) fn page_partial(
+    tracks: &Fetched<Track>,
+    track_uris: &[String],
+    episodes: &Fetched<Episode>,
+    episode_uris: &[String],
+) -> AppResult<bool> {
+    let partial = tracks.any_failed(track_uris.iter()) || episodes.any_failed(episode_uris.iter());
+    if !partial {
+        return Ok(false);
+    }
+    let error = tracks.error.clone().or_else(|| episodes.error.clone());
+    if tracks.map.is_empty() && episodes.map.is_empty() {
+        return Err(metadata::page_error(error.unwrap_or_else(|| AppError::unavailable("item metadata unavailable"))));
+    }
+    log::warn!("playlist page partial: item metadata failed ({error:?})");
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -358,6 +433,15 @@ pub(crate) struct RootItem {
     pub length: Option<i32>,
     /// `capabilities.can_edit_items` decoration, when present.
     pub can_edit_items: Option<bool>,
+    /// `status_code` decoration (e.g. 404 for a playlist its owner deleted), when present.
+    pub status_code: Option<i32>,
+}
+
+impl RootItem {
+    /// The rootlist reports the playlist as gone: there is nothing to look up.
+    fn is_gone(&self) -> bool {
+        matches!(self.status_code, Some(404) | Some(410))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -412,6 +496,7 @@ pub(crate) fn parse_rootlist_page(list: &p4::SelectedListContent) -> Vec<RootIte
                 owner: meta.map(|m| m.owner_username().to_string()).unwrap_or_default(),
                 length: meta.and_then(|m| m.length),
                 can_edit_items: meta.and_then(|m| m.capabilities.as_ref()).and_then(|c| c.can_edit_items),
+                status_code: meta.and_then(|m| m.status_code),
             }
         })
         .collect()
@@ -542,7 +627,7 @@ pub(crate) fn build_tree(items: &[RootItem], username: &str, extra: &HashMap<Str
 /// Rootlist playlists (folders flattened) as references, resolving missing decorations.
 pub(crate) async fn rootlist_refs(session: &Session, max_age: Duration) -> AppResult<Vec<PlaylistRef>> {
     let r = rootlist(session, max_age).await?;
-    let extra = resolve_undecorated(session, &r).await;
+    let extra = resolve_undecorated(session, &r).await.refs;
     Ok(r.playlists()
         .filter_map(|it| {
             let uri = parse_kind(&it.uri, UriKind::Playlist)?.uri();
@@ -554,17 +639,20 @@ pub(crate) async fn rootlist_refs(session: &Session, max_age: Duration) -> AppRe
         .collect())
 }
 
-async fn resolve_undecorated(session: &Session, r: &Rootlist) -> HashMap<String, PlaylistRef> {
-    let missing: Vec<String> = r
-        .playlists()
-        .filter(|it| it.attrs.as_ref().is_none_or(|a| a.name().is_empty()))
-        .take(HEADER_LOOKUPS)
+/// Rootlist entries that need a header lookup: no name decoration, not reported gone.
+fn undecorated(r: &Rootlist) -> Vec<String> {
+    r.playlists()
+        .filter(|it| it.attrs.as_ref().is_none_or(|a| a.name().is_empty()) && !it.is_gone())
         .map(|it| it.uri.clone())
-        .collect();
+        .collect()
+}
+
+async fn resolve_undecorated(session: &Session, r: &Rootlist) -> Headers {
+    let missing = undecorated(r);
     if missing.is_empty() {
-        HashMap::new()
+        Headers::default()
     } else {
-        headers(session, &missing).await
+        headers(session, &missing, HEADER_LOOKUPS).await
     }
 }
 
@@ -573,7 +661,12 @@ pub(crate) async fn library_playlists(_args: Value) -> AppResult<Value> {
     let r = rootlist(&session, Duration::from_secs(30)).await?;
     let extra = resolve_undecorated(&session, &r).await;
     let user = engine::username().unwrap_or_else(|| session.username());
-    Ok(json!({ "items": build_tree(&r.items, &user, &extra) }))
+    let mut out = json!({ "items": build_tree(&r.items, &user, &extra.refs) });
+    if extra.incomplete {
+        // Playlists whose names could not be looked up right now are missing from the tree.
+        out["partial"] = json!(true);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -942,8 +1035,12 @@ pub(crate) async fn follow_uri(session: &Session, uri: &str) -> AppResult<()> {
     if r.contains(&id) {
         return Ok(());
     }
-    let changes = list_changes(None, vec![add_op(&[format!("spotify:playlist:{id}")], Some(0), now_ms(), None)]);
-    apply_rootlist_changes(session, &changes).await
+    let uri = format!("spotify:playlist:{id}");
+    let changes = list_changes(None, vec![add_op(std::slice::from_ref(&uri), Some(0), now_ms(), None)]);
+    let result = apply_rootlist_changes(session, &changes).await;
+    // A failed lookup remembered from before must not hide the newly followed playlist.
+    forget_header(&uri);
+    result
 }
 
 /// Removes a playlist from the rootlist (no-op if absent). Retries once on a revision conflict.
@@ -1089,9 +1186,57 @@ mod tests {
         assert_eq!(v[2]["name"], "Resolved");
         assert_eq!(tree.len(), 3, "invalid ids and stray end markers are ignored");
 
-        let r = Rootlist { revision: list.revision().to_vec(), items, fetched: Instant::now() };
+        let mut r = Rootlist { revision: list.revision().to_vec(), items, fetched: Instant::now() };
         assert_eq!(r.find("5ihSl7a56tjMkVSzwQpSnl").map(|(i, _)| i), Some(2));
         assert_eq!(r.playlists().count(), 4);
+        // Only the undecorated playlist needs a header lookup, unless the rootlist reports it gone.
+        assert_eq!(undecorated(&r), ["spotify:playlist:2UZk7JjJnbTut1w8fqs3JL"]);
+        r.items[7].status_code = Some(404);
+        assert!(undecorated(&r).is_empty());
+    }
+
+    #[test]
+    fn parses_status_code_decorations() {
+        let mut list = rootlist_fixture();
+        list.contents.as_mut().unwrap().meta_items[7].set_status_code(404);
+        let items = parse_rootlist_page(&list);
+        assert_eq!(items[7].status_code, Some(404));
+        assert!(items[7].is_gone() && !items[0].is_gone());
+    }
+
+    #[test]
+    fn classifies_header_failures() {
+        let err = |status: Option<u16>, code: ErrorCode| HttpError { status, error: AppError::new(code, "x") };
+        assert!(matches!(header_failure(&err(Some(404), ErrorCode::NotFound)), HeaderOutcome::Gone));
+        assert!(matches!(header_failure(&err(Some(403), ErrorCode::Unavailable)), HeaderOutcome::Gone));
+        assert!(matches!(header_failure(&err(None, ErrorCode::Network)), HeaderOutcome::Failed));
+        assert!(matches!(header_failure(&err(Some(429), ErrorCode::RateLimited)), HeaderOutcome::Failed));
+        assert!(matches!(header_failure(&err(Some(503), ErrorCode::Unavailable)), HeaderOutcome::Failed));
+    }
+
+    #[tokio::test]
+    async fn header_lookups_remember_dead_playlists_and_respect_the_budget() {
+        let (dead, live, unknown) =
+            ("spotify:playlist:0dGxZ1eGqsqLRFmIGHbZbS", "spotify:playlist:0DuAFMvFHpXWLn6jJBoCnw", "spotify:playlist:0Gd6DzmDyb3DMrg3kg4NFe");
+        HEADERS.lock().put(dead.into(), (Instant::now(), None));
+        let live_ref = PlaylistRef { uri: live.into(), name: "Live".into(), ..Default::default() };
+        HEADERS.lock().put(live.into(), (Instant::now(), Some(live_ref)));
+        // An unconnected session: any request would fail, so a complete answer proves none was sent.
+        let session = Session::new(Default::default(), None);
+        let h = headers(&session, &[dead.to_string(), live.to_string()], 10).await;
+        assert_eq!(h.refs.keys().collect::<Vec<_>>(), [live]);
+        assert!(!h.incomplete, "a known-dead playlist is neither fetched nor a failure");
+        // Lookups beyond the budget are left for a later call.
+        let h = headers(&session, &[dead.to_string(), unknown.to_string()], 0).await;
+        assert!(h.incomplete && h.refs.is_empty());
+        // Following a playlist forgets what was known about it.
+        forget_header(dead);
+        assert!(HEADERS.lock().peek(dead).is_none());
+        // Expired negative entries are looked up again.
+        if let Some(expired) = Instant::now().checked_sub(HEADER_NEGATIVE_TTL) {
+            HEADERS.lock().put(dead.into(), (expired, None));
+            assert_eq!(cached_header(&mut HEADERS.lock(), dead), None);
+        }
     }
 
     #[test]
@@ -1104,6 +1249,7 @@ mod tests {
                 owner: String::new(),
                 length: None,
                 can_edit_items: None,
+                status_code: None,
             })
             .collect();
         let tree = build_tree(&items, "u", &HashMap::new());
@@ -1152,6 +1298,22 @@ mod tests {
         assert!(!out[3].track.as_ref().unwrap().playable, "unresolved track placeholder");
         assert!(out[4].track.is_none() && out[4].episode.is_none());
         let _ = gid("4uLU6hMCjMI75M1A2tKUQC");
+    }
+
+    #[test]
+    fn pages_with_failed_metadata_are_partial_or_fail() {
+        use crate::catalog::pages::tests::fetched;
+        let t = vec!["spotify:track:a".to_string(), "spotify:track:b".to_string()];
+        let none: Vec<String> = Vec::new();
+        let no_episodes = || fetched::<Episode>(&[], &[]);
+        let a = Track { uri: t[0].clone(), name: "A".into(), ..Default::default() };
+        // Complete (b merely has no data): not partial.
+        assert!(!page_partial(&fetched(&[(t[0].as_str(), a.clone())], &[]), &t, &no_episodes(), &none).unwrap());
+        // b's request failed: partial.
+        assert!(page_partial(&fetched(&[(t[0].as_str(), a)], &[t[1].as_str()]), &t, &no_episodes(), &none).unwrap());
+        // Every request failed: a retryable error instead of a page of placeholders.
+        let err = page_partial(&fetched::<Track>(&[], &[t[0].as_str(), t[1].as_str()]), &t, &no_episodes(), &none).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Network);
     }
 
     #[test]
