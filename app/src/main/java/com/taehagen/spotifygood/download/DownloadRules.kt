@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.download
 
+import com.taehagen.spotifygood.auth.KeystoreUnavailableException
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import java.io.File
@@ -228,6 +229,25 @@ internal object DownloadRules {
         repeat((failures - 1).coerceIn(0, 10)) { backoff = (backoff * 2).coerceAtMost(SYNC_RETRY_MAX_MS) }
         return maxOf(afterSync, lastAttemptAt + backoff)
     }
+
+    // ---- audio keys ----------------------------------------------------------------------------------
+
+    /** What a failed decryption of a download's audio key means for the download. */
+    enum class KeyFailure {
+        /** The Keystore is busy or failing right now; the key and the data are intact: try later. */
+        RETRY_LATER,
+
+        /** The stored key cannot be decrypted for good (corrupt, sealed with a replaced key). */
+        UNREADABLE,
+    }
+
+    /**
+     * Only a [KeystoreUnavailableException] is transient: the download stays COMPLETED and is left out
+     * of this index push only. Anything else ([javax.crypto.AEADBadTagException], a permanently
+     * invalid key) means the stored key is unusable and the download is marked failed.
+     */
+    fun keyFailure(e: Throwable): KeyFailure =
+        if (e is KeystoreUnavailableException) KeyFailure.RETRY_LATER else KeyFailure.UNREADABLE
 
     // ---- scheduling ----------------------------------------------------------------------------------
 

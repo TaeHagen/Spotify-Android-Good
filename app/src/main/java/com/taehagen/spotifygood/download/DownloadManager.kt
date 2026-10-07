@@ -42,7 +42,9 @@ import com.taehagen.spotifygood.nativebridge.NativeRpc
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -168,6 +170,9 @@ class DownloadManager(
 
     /** True while [DownloadJobService] runs a job (it must not be replaced then, see [scheduleExecution]). */
     @Volatile internal var jobExecuting = false
+
+    /** Registers downloads an index push left out because the Keystore was busy ([registerLate]). */
+    @Volatile private var lateKeys: Job? = null
 
     /** URIs of completed downloads (hot), iterating newest download first (Android Auto queue order). */
     val downloadedUris: StateFlow<Set<String>> = dao.observeCompletedUris()
@@ -419,32 +424,89 @@ class DownloadManager(
         val records = ArrayList<OfflineTrackRecord>(rows.size)
         val undecryptable = ArrayList<String>()
         val missing = ArrayList<String>()
+        val keystoreBusy = ArrayList<String>()
         for (row in rows) {
-            val record = row.recordJson?.let { runCatching { json.decodeFromString(OfflineTrackRecord.serializer(), it) }.getOrNull() }
-            if (record == null) {
-                undecryptable += row.uri
-                continue
+            when (val result = offlineRecord(row)) {
+                is RecordResult.Ready -> records += result.record
+                RecordResult.Unreadable -> undecryptable += row.uri
+                RecordResult.Missing -> missing += row.uri
+                RecordResult.KeystoreBusy -> keystoreBusy += row.uri
             }
-            val path = row.path ?: record.path
-            if (!File(path).isFile) {
-                missing += row.uri
-                continue
-            }
-            val keyHex = keys[row.uri] ?: decryptKey(row)?.also { keys[row.uri] = it }
-            if (keyHex == null) {
-                undecryptable += row.uri
-                continue
-            }
-            records += record.copy(keyHex = keyHex, path = path)
         }
         val now = System.currentTimeMillis()
         undecryptable.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, appContext.getString(R.string.data_dl_error_key), now) }
         missing.chunked(SQL_CHUNK).forEach { dao.markMissing(it, appContext.getString(R.string.data_dl_error_missing_file), now) }
-        if (undecryptable.isNotEmpty() || missing.isNotEmpty()) {
-            Log.w(TAG, "Skipped ${undecryptable.size} undecryptable and ${missing.size} missing downloads")
+        if (undecryptable.isNotEmpty() || missing.isNotEmpty() || keystoreBusy.isNotEmpty()) {
+            Log.w(
+                TAG,
+                "Skipped ${undecryptable.size} undecryptable, ${missing.size} missing and " +
+                    "${keystoreBusy.size} downloads whose key the Keystore could not decrypt right now",
+            )
         }
         index.beginSnapshot(seq)
+        lateKeys?.cancel()
+        // Left out of this push only (still COMPLETED): registered as soon as the Keystore answers.
+        if (keystoreBusy.isNotEmpty()) lateKeys = scope.launch { registerLate(keystoreBusy) }
         records
+    }
+
+    private sealed interface RecordResult {
+        data class Ready(val record: OfflineTrackRecord) : RecordResult
+        data object Unreadable : RecordResult
+        data object Missing : RecordResult
+        data object KeystoreBusy : RecordResult
+    }
+
+    /** The decrypted index record of a COMPLETED [row]. Blocking (file check, Keystore). */
+    private fun offlineRecord(row: DownloadEntity): RecordResult {
+        val record = row.recordJson?.let { runCatching { json.decodeFromString(OfflineTrackRecord.serializer(), it) }.getOrNull() }
+            ?: return RecordResult.Unreadable
+        val path = row.path ?: record.path
+        if (!File(path).isFile) return RecordResult.Missing
+        val keyHex = keys[row.uri] ?: when (val key = decryptKey(row)) {
+            is KeyResult.Key -> key.hex.also { keys[row.uri] = it }
+            KeyResult.Unreadable -> return RecordResult.Unreadable
+            KeyResult.KeystoreBusy -> return RecordResult.KeystoreBusy
+        }
+        return RecordResult.Ready(record.copy(keyHex = keyHex, path = path))
+    }
+
+    /**
+     * Registers the downloads [uris] that an index push left out because the Keystore could not
+     * decrypt their keys right now, retrying with backoff (bounded; the next engine start pushes
+     * everything again). Each registration is a numbered change taken under [mutex] while the row is
+     * still COMPLETED, so a later removal wins over it.
+     */
+    private suspend fun registerLate(uris: List<String>) {
+        var waiting = uris
+        var delayMs = LATE_KEY_RETRY_MS
+        repeat(LATE_KEY_ATTEMPTS) {
+            delay(delayMs)
+            delayMs *= 4
+            waiting = withContext(Dispatchers.IO) {
+                val stillBusy = ArrayList<String>()
+                val records = ArrayList<OfflineTrackRecord>()
+                val unreadable = ArrayList<String>()
+                val seq = mutex.withLock {
+                    waiting.chunked(SQL_CHUNK).flatMap { dao.getAll(it) }.filter { it.state == DownloadState.COMPLETED }.forEach { row ->
+                        when (val result = offlineRecord(row)) {
+                            is RecordResult.Ready -> records += result.record
+                            RecordResult.Unreadable -> unreadable += row.uri
+                            RecordResult.Missing -> Unit // the next push marks it
+                            RecordResult.KeystoreBusy -> stillBusy += row.uri
+                        }
+                    }
+                    unreadable.chunked(SQL_CHUNK).forEach {
+                        dao.markUnavailable(it, appContext.getString(R.string.data_dl_error_key), System.currentTimeMillis())
+                    }
+                    index.next()
+                }
+                index.add(records, seq)
+                stillBusy
+            }
+            if (waiting.isEmpty()) return
+        }
+        Log.w(TAG, "${waiting.size} downloads stay out of the offline index until the next engine start (Keystore unavailable)")
     }
 
     /**
@@ -690,13 +752,28 @@ class DownloadManager(
         }
     }
 
-    private fun decryptKey(row: DownloadEntity): String? {
-        val cipher = row.encryptedKey ?: return null
+    private sealed interface KeyResult {
+        data class Key(val hex: String) : KeyResult
+        data object Unreadable : KeyResult
+        data object KeystoreBusy : KeyResult
+    }
+
+    /** Blocking (Keystore). Tells a transient Keystore failure from a key that is unusable for good. */
+    private fun decryptKey(row: DownloadEntity): KeyResult {
+        val cipher = row.encryptedKey ?: return KeyResult.Unreadable
         return try {
-            Hex.encode(credentialStore.decrypt(cipher))
+            KeyResult.Key(Hex.encode(credentialStore.decrypt(cipher)))
         } catch (e: Exception) {
-            Log.w(TAG, "Could not decrypt the key of ${row.uri}", e)
-            null
+            when (DownloadRules.keyFailure(e)) {
+                DownloadRules.KeyFailure.RETRY_LATER -> {
+                    Log.w(TAG, "Keystore unavailable for the key of ${row.uri}; trying again later")
+                    KeyResult.KeystoreBusy
+                }
+                DownloadRules.KeyFailure.UNREADABLE -> {
+                    Log.w(TAG, "Could not decrypt the key of ${row.uri}", e)
+                    KeyResult.Unreadable
+                }
+            }
         }
     }
 
@@ -872,6 +949,8 @@ class DownloadManager(
         private const val STATES_STOP_TIMEOUT_MS = 5_000L
         private const val METADATA_TIMEOUT_MS = 10_000L
         private const val COLLECTION_METADATA_TIMEOUT_MS = 60_000L
+        private const val LATE_KEY_RETRY_MS = 5_000L
+        private const val LATE_KEY_ATTEMPTS = 5
         private const val SYNC_ONLINE_TIMEOUT_MS = 60_000L
         private const val JOB_BACKOFF_MS = 30_000L
         private const val WORK_BACKOFF_S = 30L
