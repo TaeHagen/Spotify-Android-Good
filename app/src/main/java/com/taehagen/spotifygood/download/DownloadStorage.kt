@@ -9,13 +9,17 @@ import java.io.File
  * On-disk layout of downloads (docs/ARCHITECTURE.md §9.7): encrypted audio in
  * `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part` while incomplete, resumed natively) and
  * cover art in `noBackupFilesDir/offline/images/<imageHex>.jpg`. Both directories belong to downloads
- * only. Files can be shared by several downloads (see [DownloadRules.audioToDelete]). All methods do
+ * only; next to them, `offline/datakey.bin` holds the data key that seals their audio keys
+ * ([KeyVault]). Files can be shared by several downloads (see [DownloadRules.audioToDelete]). All methods do
  * blocking file I/O: call them off the main thread.
  */
 internal class DownloadStorage(context: Context) {
     private val root = File(context.noBackupFilesDir, "offline")
     val audioDir = File(root, "audio")
     val imageDir = File(root, "images")
+
+    /** The downloads' data key, sealed with the Keystore ([KeyVault]); goes with [deleteAll]. */
+    val keyFile = File(root, "datakey.bin")
 
     fun ensureDirs() {
         audioDir.mkdirs()

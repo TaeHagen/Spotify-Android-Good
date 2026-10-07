@@ -31,6 +31,7 @@ import com.taehagen.spotifygood.data.db.AppDatabase
 import com.taehagen.spotifygood.data.db.DownloadCollectionEntity
 import com.taehagen.spotifygood.data.db.DownloadEntity
 import com.taehagen.spotifygood.data.db.DownloadFileRow
+import com.taehagen.spotifygood.data.db.IndexRow
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.engine.SpotifyEngine
@@ -171,8 +172,11 @@ class DownloadManager(
 
     internal val storage = DownloadStorage(appContext)
     internal val notifications = DownloadNotifications(appContext)
+
+    /** Audio keys are sealed with one Keystore-wrapped data key: one TEE operation per process. */
+    private val vault = KeyVault(storage.keyFile, credentialStore::encrypt, credentialStore::decrypt)
     internal val runner = DownloadRunner(
-        appContext, database, rpc, events, engine, settings, credentialStore, storage, notifications, keys, mutex, index,
+        appContext, database, rpc, events, engine, settings, storage, notifications, keys, mutex, index, vault,
     )
 
     /** True while [DownloadJobService] runs a job (it must not be replaced then, see [scheduleExecution]). */
@@ -440,6 +444,7 @@ class DownloadManager(
                 collectionDao.deleteAll()
             }
             withContext(Dispatchers.IO) { storage.deleteAll() }
+            vault.reset() // its data key file went with the downloads
             keys.clear()
             Removal(all, index.next())
         }
@@ -469,15 +474,19 @@ class DownloadManager(
      * change it contains, so commits and removals made while it is built and sent survive the push.
      */
     suspend fun offlineRecords(): List<OfflineTrackRecord> = withContext(Dispatchers.IO) {
-        val (seq, rows) = mutex.withLock { index.last() to dao.withState(DownloadState.COMPLETED) }
+        val (seq, rows) = mutex.withLock { index.last() to dao.completedIndexRows() }
         val records = ArrayList<OfflineTrackRecord>(rows.size)
         val undecryptable = ArrayList<String>()
         val missing = ArrayList<String>()
         val keystoreBusy = ArrayList<String>()
+        val legacy = ArrayList<Pair<IndexRow, String>>()
         var keystoreDown = false
         for (row in rows) {
             when (val result = offlineRecord(row, skipKeystore = keystoreDown)) {
-                is RecordResult.Ready -> records += result.record
+                is RecordResult.Ready -> {
+                    records += result.record
+                    if (result.legacyKey) legacy += row to result.record.keyHex
+                }
                 RecordResult.Unreadable -> undecryptable += row.uri
                 RecordResult.Missing -> missing += row.uri
                 RecordResult.KeystoreBusy -> {
@@ -501,11 +510,38 @@ class DownloadManager(
         lateKeys?.cancel()
         // Left out of this push only (still COMPLETED): registered as soon as the Keystore answers.
         if (keystoreBusy.isNotEmpty()) lateKeys = scope.launch { registerLate(keystoreBusy) }
+        // Keys still sealed by the Keystore itself (from before the data key): moved over in the
+        // background, so the next start opens them in software.
+        if (legacy.isNotEmpty()) scope.launch { resealLegacy(legacy) }
         records
     }
 
+    /**
+     * Re-seals keys that were sealed with the Keystore key itself with the data key (one row at a
+     * time, guarded so a newer commit of the row is never overwritten). Resumable: what is left over
+     * moves at the next start.
+     */
+    private suspend fun resealLegacy(rows: List<Pair<IndexRow, String>>) = withContext(Dispatchers.IO) {
+        var moved = 0
+        for (chunk in rows.chunked(RESEAL_BATCH)) {
+            ensureActive()
+            val sealed = try {
+                chunk.mapNotNull { (row, hex) -> row.completedAt?.let { Triple(row.uri, it, vault.seal(Hex.decode(hex), row.uri)) } }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Moving download keys to the data key stopped; retried at the next start", e)
+                break
+            }
+            database.withTransaction { sealed.forEach { (uri, completedAt, key) -> dao.resealKey(uri, completedAt, key) } }
+            moved += sealed.size
+        }
+        if (moved > 0) Log.i(TAG, "Moved $moved download keys to the data key")
+    }
+
     private sealed interface RecordResult {
-        data class Ready(val record: OfflineTrackRecord) : RecordResult
+        /** [legacyKey]: its key was sealed with the Keystore key itself (to be moved to the data key). */
+        data class Ready(val record: OfflineTrackRecord, val legacyKey: Boolean = false) : RecordResult
         data object Unreadable : RecordResult
         data object Missing : RecordResult
         data object KeystoreBusy : RecordResult
@@ -515,19 +551,20 @@ class DownloadManager(
      * The decrypted index record of a COMPLETED [row]. Blocking (file check, Keystore). With
      * [skipKeystore] (it was busy for an earlier row of this pass) only a cached key is used.
      */
-    private fun offlineRecord(row: DownloadEntity, skipKeystore: Boolean): RecordResult {
+    private fun offlineRecord(row: IndexRow, skipKeystore: Boolean): RecordResult {
         val record = row.recordJson?.let { runCatching { json.decodeFromString(OfflineTrackRecord.serializer(), it) }.getOrNull() }
             ?: return RecordResult.Unreadable
         val path = row.path ?: record.path
         if (!File(path).isFile) return RecordResult.Missing
-        val keyHex = keys[row.uri] ?: if (skipKeystore) return RecordResult.KeystoreBusy else when (val key = decryptKey(row)) {
+        keys[row.uri]?.let { return RecordResult.Ready(record.copy(keyHex = it, path = path), legacyKey = row.keyVersion == 0) }
+        if (skipKeystore) return RecordResult.KeystoreBusy
+        return when (val key = decryptKey(row)) {
             // Not overwriting a key a newer commit of this URI cached meanwhile; this row's record
             // still gets this row's key.
-            is KeyResult.Key -> key.hex.also { keys.remember(row.uri, it) }
-            KeyResult.Unreadable -> return RecordResult.Unreadable
-            KeyResult.KeystoreBusy -> return RecordResult.KeystoreBusy
+            is KeyResult.Key -> RecordResult.Ready(record.copy(keyHex = key.hex.also { keys.remember(row.uri, it) }, path = path), key.legacy)
+            KeyResult.Unreadable -> RecordResult.Unreadable
+            KeyResult.KeystoreBusy -> RecordResult.KeystoreBusy
         }
-        return RecordResult.Ready(record.copy(keyHex = keyHex, path = path))
     }
 
     /**
@@ -545,11 +582,11 @@ class DownloadManager(
             delayMs *= 4
             waiting = withContext(Dispatchers.IO) {
                 val (seq, rows) = mutex.withLock {
-                    index.next() to waiting.chunked(SQL_CHUNK).flatMap { dao.getAll(it) }.filter { it.state == DownloadState.COMPLETED }
+                    index.next() to waiting.chunked(SQL_CHUNK).flatMap { dao.completedIndexRows(it) }
                 }
                 val stillBusy = ArrayList<String>()
                 val records = ArrayList<OfflineTrackRecord>()
-                val unreadable = ArrayList<DownloadEntity>()
+                val unreadable = ArrayList<IndexRow>()
                 var keystoreDown = false
                 for (row in rows) {
                     ensureActive() // a newer push supersedes this one
@@ -999,16 +1036,25 @@ class DownloadManager(
     }
 
     private sealed interface KeyResult {
-        data class Key(val hex: String) : KeyResult
+        /** [legacy]: sealed with the Keystore key itself (one TEE operation each). */
+        data class Key(val hex: String, val legacy: Boolean) : KeyResult
         data object Unreadable : KeyResult
         data object KeystoreBusy : KeyResult
     }
 
-    /** Blocking (Keystore). Tells a transient Keystore failure from a key that is unusable for good. */
-    private fun decryptKey(row: DownloadEntity): KeyResult {
+    /**
+     * Blocking. Opens a row's audio key: with the data key in software ([KeyVault]; the first one of
+     * the process unseals the data key with the Keystore), or for keys from before the data key with
+     * the Keystore itself. Tells a transient Keystore failure from a key that is unusable for good.
+     */
+    private fun decryptKey(row: IndexRow): KeyResult {
         val cipher = row.encryptedKey ?: return KeyResult.Unreadable
         return try {
-            KeyResult.Key(Hex.encode(credentialStore.decrypt(cipher)))
+            if (row.keyVersion >= 1) {
+                KeyResult.Key(Hex.encode(vault.unseal(cipher, row.uri)), legacy = false)
+            } else {
+                KeyResult.Key(Hex.encode(credentialStore.decrypt(cipher)), legacy = true)
+            }
         } catch (e: Exception) {
             when (DownloadRules.keyFailure(e)) {
                 DownloadRules.KeyFailure.RETRY_LATER -> {
@@ -1201,6 +1247,7 @@ class DownloadManager(
         private const val SYNC_ONLINE_TIMEOUT_MS = 60_000L
         private const val COUNTRY_TIMEOUT_MS = 10_000L
         private const val EDIT_SYNC_DELAY_MS = 5_000L
+        private const val RESEAL_BATCH = 200
         private const val JOB_BACKOFF_MS = 30_000L
         private const val WORK_BACKOFF_S = 30L
         private const val SYNC_BACKOFF_MIN = 15L

@@ -547,8 +547,9 @@ Calls without `seq` apply unconditionally.
 
 `OfflineTrackRecord`:
 `{"uri","playedUri","fileId","format","keyHex","path","sizeBytes","normalisation":{"trackGainDb","trackPeak","albumGainDb","albumPeak"},"track":Track|"episode":Episode,"imagePath":"…"}`.
-Kotlin persists it in Room (key encrypted with the Keystore key) and sends the decrypted
-records to `offline.setIndex` as soon as the engine starts, whatever the session state (the
+Kotlin persists it in Room (key sealed with the downloads' data key, §9.7) and sends the decrypted
+records to `offline.setIndex` as soon as the engine starts (building the snapshot costs one
+Keystore operation, not one per download), whatever the session state (the
 index needs no session; downloads must play while the session is still connecting, e.g. behind
 a captive portal), retrying until it went through. Natively, a `player.load` while the session
 is not online, or without a network (also while the session still reads Online), waits (at
@@ -770,7 +771,7 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * A finished login (`LoginState.Success`) goes back to the options as soon as the engine
   reports logged out (logout, rejected credentials).
 * `CredentialStore`: AES-256-GCM key in AndroidKeyStore; ciphertext in
-  `noBackupFilesDir/credentials.bin`. Also encrypts per-download audio keys. The key is only
+  `noBackupFilesDir/credentials.bin`. Also seals the downloads' data key (§9.7). The key is only
   replaced when it is permanently invalid (`KeyPermanentlyInvalidatedException`, a corrupted or
   missing key); transient Keystore failures are retried and then reported as
   `KeystoreUnavailableException` without deleting anything.
@@ -987,7 +988,18 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   downloads that still own their file (failed by re-validation or the key check) and are playable
   again; `download.track` reuses the file.
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
-  `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks start at 2 MiB and adapt between 1 and
+  `noBackupFilesDir/offline/images/<imageIdHex>.jpg`.
+* Audio keys (`KeyVault`, envelope encryption): one random AES-256 data key in
+  `noBackupFilesDir/offline/datakey.bin`, sealed with the `CredentialStore` Keystore key, unsealed
+  once per process and kept in memory; each download's key is sealed with it in software (AES-GCM,
+  the row's URI as associated data; `keyVersion` 1). A cold start's index snapshot therefore costs
+  one TEE operation instead of one per download, so the first `offline.setIndex` lands well within
+  the native 8 s wait. Keys from before (`keyVersion` 0, sealed with the Keystore key itself) are
+  opened with the Keystore once and re-sealed in the background (only while the row is the same
+  completed download; resumable at the next start). A busy Keystore never replaces the data key
+  (rows wait for `registerLate`); a data key that can no longer be unsealed fails its rows at once
+  (marked failed, fetched again) and the next finished download creates a new one. "Remove all" and
+  logout delete it with the downloads. CDN chunks start at 2 MiB and adapt between 1 and
   4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all";
   usage counts every row that still owns a finished file (also ones marked failed later), each
   shared file once.

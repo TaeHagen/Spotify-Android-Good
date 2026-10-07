@@ -19,8 +19,14 @@ data class DownloadEntity(
      */
     val fileId: String? = null,
     val format: String? = null,
-    /** Audio key encrypted with [com.taehagen.spotifygood.auth.CredentialStore.encrypt]. */
+    /**
+     * Audio key, sealed per [keyVersion]: 0 = with the Keystore key itself
+     * ([com.taehagen.spotifygood.auth.CredentialStore.encrypt], one TEE operation to open), 1 = with
+     * the downloads' data key ([com.taehagen.spotifygood.download.KeyVault], software).
+     */
     val encryptedKey: ByteArray? = null,
+    @ColumnInfo(defaultValue = "0")
+    val keyVersion: Int = 0,
     val path: String? = null,
     val sizeBytes: Long = 0,
     val bytesDone: Long = 0,
