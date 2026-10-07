@@ -4,6 +4,7 @@ import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.PlaybackContext
 import com.taehagen.spotifygood.model.PlaybackSnapshot
+import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.playback.EngineReach
@@ -110,21 +111,47 @@ class TrackStartTest {
         assertEquals(TrackStartPlan.Superseded, plan(null, EngineReach.CONNECTING, fakes))
     }
 
+    private fun t(uri: String) = PlaybackTrack(uri = uri, name = uri)
+
+    private val local = PlaybackSnapshot(
+        source = PlaybackSource.LOCAL,
+        status = PlaybackStatus.PLAYING,
+        context = PlaybackContext(uri = "spotify:album:x"),
+        track = t("a"),
+        nextTracks = listOf(t("b")),
+    )
+
     @Test
-    fun supersededMeansAnotherStartOrAPauseNotTheSongEnding() {
-        fun t(uri: String) = PlaybackTrack(uri = uri, name = uri)
-        val start = PlaybackSnapshot(
+    fun anotherLocalStartDuringTheWaitSupersedes() {
+        assertTrue(startSuperseded(local, local.copy(track = t("z"))))
+        assertTrue(startSuperseded(local, local.copy(context = PlaybackContext(uri = "spotify:playlist:y"), track = t("y"))))
+        assertTrue("the song ended, the next one plays", !startSuperseded(local, local.copy(track = t("b"))))
+        assertTrue(!startSuperseded(local, local))
+        assertTrue("same track, handed back to Spirc", !startSuperseded(local, local.copy(context = PlaybackContext(uri = "spotify:internal:x"))))
+    }
+
+    @Test
+    fun theSessionComingOnlineDoesNotSupersede() {
+        // The first cluster after reconnecting: another device's playback replaces the empty snapshot.
+        val remote = PlaybackSnapshot(
+            source = PlaybackSource.REMOTE,
             status = PlaybackStatus.PLAYING,
-            context = PlaybackContext(uri = "spotify:album:x"),
-            track = t("a"),
-            nextTracks = listOf(t("b")),
+            context = PlaybackContext(uri = "spotify:playlist:laptop"),
+            track = t("l"),
         )
-        assertTrue(!startSuperseded(start, start))
-        assertTrue("the song ended, the next one plays", !startSuperseded(start, start.copy(track = t("b"))))
-        assertTrue(startSuperseded(start, start.copy(track = t("z"))))
-        assertTrue(startSuperseded(start, start.copy(context = PlaybackContext(uri = "spotify:playlist:y"))))
-        assertTrue("paused", startSuperseded(start, start.copy(status = PlaybackStatus.PAUSED)))
-        val idle = PlaybackSnapshot()
-        assertTrue("something started", startSuperseded(idle, start))
+        assertTrue(!startSuperseded(PlaybackSnapshot(), remote))
+        assertTrue(!startSuperseded(local, remote))
+        // The reconnect placeholder restored: same track, playing again.
+        val placeholder = local.copy(status = PlaybackStatus.PAUSED)
+        assertTrue(!startSuperseded(placeholder, placeholder.copy(status = PlaybackStatus.PLAYING)))
+        // Nothing to compare with (empty snapshot): a local load can't be told from a restore.
+        assertTrue(!startSuperseded(PlaybackSnapshot(), local))
+    }
+
+    @Test
+    fun aPreviousSingleTrackStartLandingDoesNotSupersedeTheNewerTap() {
+        val landed = local.copy(context = PlaybackContext(uri = "spotify:album:tileA"), track = t("spotify:track:A"))
+        assertTrue(!startSuperseded(local, landed, ownTargets = setOf("spotify:album:tileA", "spotify:track:A")))
+        assertTrue(startSuperseded(local, landed, ownTargets = emptySet()))
     }
 }
