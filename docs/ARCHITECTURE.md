@@ -784,6 +784,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   play) is merged into it, or waits ≤ 3 s for the activation, and is dropped if the load failed.
   Plain track-list contexts (`spotify:web-api`) are never resumed or loaded as a context.
   Auto browse/search/voice wait the same way.
+* Pending Connect target (§9.5): a user-started `player.load` that plays (in-app plays, radio,
+  media-session picks) takes `DevicesRepository.consumePendingTarget()` as `deviceId` when no
+  device is active. The stored session (the Play fallback, Media3 resumption, Tap to resume,
+  "play something") and offline plans (offline reach, or rewritten for the offline queue) never
+  take it: this phone plays them.
 * `onConnectAsync` grants full commands to Media3-trusted controllers (MEDIA_CONTENT_CONTROL /
   notification listener: SysUI, Bluetooth, watch apps), the media notification, Auto/AAOS, our
   own uid and known system packages (package name verified by Media3); connection hints are not

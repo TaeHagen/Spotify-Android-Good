@@ -77,7 +77,7 @@ class AppGraph(val app: Application) {
     val playback: PlaybackRepository by lazy { PlaybackRepository(appScope, events) }
     /** Last local session (playback resumption, cold-start play); one DataStore per process. */
     val resumeStore: ResumeStore by lazy { ResumeStore(app) }
-    val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore) }
+    val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore, devices) }
     val devices: DevicesRepository by lazy { DevicesRepository(appScope, rpc, events, resumeStore::read) }
     private val localDiscoveryLazy = lazy {
         LocalDeviceDiscovery(app, rpc) { devices.devices.value.devices.map { it.id }.toSet() }
