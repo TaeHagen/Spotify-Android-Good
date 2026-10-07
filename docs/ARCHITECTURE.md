@@ -393,8 +393,12 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.skipTo` | `{"uid":"…"}` |
 | `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs"}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE`. Pushing offline playback hands over its tracks and current position |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
-| `connect.localInfo` | `{"url":"http://host:port/<CPath>"}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
-| `connect.localLogin` | `{"url":"…","deviceId"?:"…"}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
+| `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
+| `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
+
+`scopeId` is the interface index for a link-local IPv6 host (`fe80::/10`), which a URL cannot
+carry; such a host is connected through that interface and rejected (`INVALID_ARGUMENT`) without
+one. Kotlin prefers an IPv4 address when the service has one.
 
 `LocalDeviceInfo`: `{"deviceId","remoteName","deviceType":<DeviceList type>,"activeUser"?,"tokenTypes":[…],"supportsAccessToken":bool,"version","brand"?,"model"?,"isGroup":bool,"availability"?}`.
 Key material (the device's DH public key, client id) never crosses the JNI boundary; Rust keeps it
@@ -569,9 +573,14 @@ For a remote active device, smart shuffle is not supported (the command reports
   * **Kotlin (`connect/LocalDeviceDiscovery.kt`)** browses mDNS with `NsdManager`
     (`registerServiceInfoCallback` on API 34+, `resolveService` below, one resolve at a time),
     reads the `CPath` TXT record (default `/`), and holds a Wi-Fi `MulticastLock` **only while the
-    devices sheet is visible**. Discovery runs only while the sheet is open and stops on dispose,
-    background or logout (battery). Each resolved service is probed with `connect.localInfo`, then
-    deduped by `deviceId` and dropped if it is already in the cluster `DeviceList`.
+    devices sheet is visible**. The sheet itself (`rememberLocalDevices` in `DevicesSheetContent`,
+    never a list row, which is disposed when scrolled away) runs discovery while it is in
+    composition and STARTED; it pauses on background (results kept, unconfirmed ones dropped
+    12 s after the next start) and stops on dismissal of the sheet or logout (battery). Below
+    API 34 the one-resolve-at-a-time slot is tracked across browse runs, `FAILURE_ALREADY_ACTIVE`
+    is retried with a short backoff, and a resolve without a callback is given up after 10 s.
+    Each resolved service is probed with `connect.localInfo`, then deduped by `deviceId` and
+    dropped if it is already in the cluster `DeviceList`.
   * **Rust (`zeroconf_client/`)** is the exact inverse of `librespot-discovery` 0.8.0's device
     side. `connect.localInfo` GETs `?action=getInfo`. `connect.localLogin` POSTs `?action=addUser`
     with the credentials blob: Diffie-Hellman with the device's `publicKey` (librespot's DH group),
@@ -583,8 +592,13 @@ For a remote active device, smart shuffle is not supported (the command reports
     block step, AES-192-ECB under a PBKDF2 key from `SHA1(deviceId)` and the username, then base64).
     When `getInfo` advertises `tokenType` `accesstoken`, a fresh login5 access token (keymaster,
     `streaming` scope) is sent as the blob with the device's client id as `clientKey`; otherwise the
-    stored reusable credentials blob is used. After a successful `addUser` the engine waits up to
-    10 s for the device to appear in the cluster and returns its Connect device id for
+    stored reusable credentials blob is used. A `default`-token device whose service is not
+    loaded (`availability` NOT-LOADED, `publicKey` "INVALID") first gets a **wake-up `addUser`**
+    with empty `blob` and `clientKey` (no credential material; origin `deviceName`/`deviceId`);
+    it loads and answers 203 ERROR-INVALID-PUBLICKEY, the engine polls getInfo (≤ 5 s) until it is
+    loaded and then sends the real `addUser`. A later 203 is retried once; never a second wake-up.
+    After a successful `addUser` the engine waits up to 10 s for the device to appear in the
+    cluster (pushes, plus one device refresh after 4 s) and returns its Connect device id for
     `connect.transfer`. Only local-network hosts (loopback / private / link-local / `.local`) over
     plain HTTP are accepted; all timeouts are bounded. mDNS browsing is Kotlin's `NsdManager`, so
     Rust only ever sees the URL.
