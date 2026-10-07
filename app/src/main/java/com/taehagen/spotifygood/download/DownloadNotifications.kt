@@ -115,6 +115,11 @@ internal class DownloadNotifications(private val context: Context) {
         notify(Notifications.ID_DOWNLOADS_DONE, notification)
     }
 
+    /** Removes a previous run's completion / paused notice (a new run shows live progress). */
+    fun clearDone() {
+        manager.cancel(Notifications.ID_DOWNLOADS_DONE)
+    }
+
     fun cancelAll() {
         manager.cancel(Notifications.ID_DOWNLOADS)
         manager.cancel(Notifications.ID_DOWNLOADS_DONE)

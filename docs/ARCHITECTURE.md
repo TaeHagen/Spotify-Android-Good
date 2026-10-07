@@ -906,7 +906,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `nativeCancel`), stores records (encrypted key), updates `offline.add`, retries failures
   with backoff (max 3), stops gracefully on `onStopped`/timeout (Android 15 6 h limit),
   re-enqueues itself if work remains. "Not enough storage" reschedules (the hosts require
-  storage not low) instead of stopping for good.
+  storage not low) instead of stopping for good. Progress is persisted on a state change and every
+  5 s (resume / crash recovery); live bytes reach the Downloads screens through the runner's
+  activity, so long-lived observers (the playback service observes `downloadedImages`, which
+  changes only with the completed set) are not woken twice a second. "N downloads complete" is
+  posted only when the queue is empty; a run that ends with items still queued after doing work
+  posts "Downloads paused" (x of y downloaded).
 * Scheduling: turning "Download using mobile data" off or on stops a running run (its item
   resumes from the `.part`) and re-creates the job / worker with the new network constraint;
   pending work whose constraint does not match the setting is re-created too, and the runner
@@ -923,7 +928,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   queue finishes at once, and removals that empty the queue cancel the scheduled work.
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
-  of another downloaded collection). Liked Songs are listed with `library.tracks
+  of another downloaded collection). Likes and playlist edits made in the app
+  (`LibraryRepository.edits`) re-sync the affected downloaded collection 5 s after the last edit
+  (coalesced; after a sync that is running; marked due when offline). A sync waits ≤ 10 s for the
+  session's country and is postponed without it: the catalog's `playable` is per country, and
+  re-validation must not fail good downloads. Liked Songs are listed with `library.tracks
   {urisOnly:true}`; members without a row and members whose row failed get metadata and their
   playability from `catalog.tracks` (batched, ≤ 60 s; completed and pending rows are not looked up
   again; placeholders are stored without metadata). Re-validation adds a member found not playable

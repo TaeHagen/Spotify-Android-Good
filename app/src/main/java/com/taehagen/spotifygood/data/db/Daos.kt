@@ -34,6 +34,9 @@ data class CollectionSyncRow(
     val syncFailures: Int,
 )
 
+/** Cover of a completed download. */
+data class UriImage(val uri: String, val imagePath: String)
+
 /** Files referenced by a download row (deletion / garbage collection). */
 data class DownloadFileRow(val uri: String, val path: String?, val imagePath: String?, val individual: Boolean)
 
@@ -216,6 +219,9 @@ interface DownloadDao {
     @Query("SELECT uri, state FROM downloads WHERE uri IN (:uris)")
     suspend fun statesOf(uris: List<String>): List<DownloadStateRow>
 
+    @Query("SELECT uri, imagePath FROM downloads WHERE state = 'completed' AND imagePath IS NOT NULL")
+    suspend fun completedImages(): List<UriImage>
+
     /** Completed downloads not validated since [before] (re-validation of availability). */
     @Query("SELECT uri FROM downloads WHERE state = 'completed' AND COALESCE(lastValidatedAt, completedAt, addedAt) < :before")
     suspend fun completedUrisNotValidatedSince(before: Long): List<String>
@@ -282,6 +288,10 @@ interface DownloadCollectionDao {
 
     @Query("SELECT uri, type, lastSyncedAt, lastAttemptAt, syncFailures FROM download_collections")
     suspend fun syncStates(): List<CollectionSyncRow>
+
+    /** Makes [uris] due for the next sync (an edit made while offline). */
+    @Query("UPDATE download_collections SET lastSyncedAt = NULL, lastAttemptAt = NULL, syncFailures = 0 WHERE uri IN (:uris)")
+    suspend fun markSyncDue(uris: List<String>)
 
     /** A sync of [uri] failed: counts towards its retry backoff. */
     @Query("UPDATE download_collections SET lastAttemptAt = :at, syncFailures = syncFailures + 1 WHERE uri = :uri")

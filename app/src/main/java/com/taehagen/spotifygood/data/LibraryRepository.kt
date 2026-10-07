@@ -39,11 +39,21 @@ import kotlinx.serialization.json.put
  * * Mutations run in the repository scope (a like is not lost when the screen closes), flip the
  *   local state immediately and roll back the URIs that failed.
  */
+/** A library change the app itself made (downloads re-sync the downloaded collection it affects). */
+sealed interface LibraryEdit {
+    /** Tracks liked ([saved]) or unliked: Liked Songs changed. */
+    data class LikedTracks(val uris: List<String>, val saved: Boolean) : LibraryEdit
+
+    /** Items of playlist [uri] were added, removed or moved (or it was renamed). */
+    data class PlaylistEdited(val uri: String) : LibraryEdit
+}
+
 class LibraryRepository(private val scope: CoroutineScope, private val rpc: NativeRpc, private val cache: ResponseCache) {
     private val saved = SavedStateStore()
     private val lookups = CoalescingBatcher(scope, LOOKUP_WINDOW_MS, LOOKUP_BATCH, ::resolveSaved)
 
     private val _changes = MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    private val _edits = MutableSharedFlow<LibraryEdit>(extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
     init {
         // Logout wipes the response cache; drop the previous account's saved state with it.
@@ -133,6 +143,9 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
     /** Emits after any library mutation (lists can refresh). */
     val changes: SharedFlow<Unit> = _changes.asSharedFlow()
 
+    /** What the app changed, with the URIs (likes, playlist edits); not emitted for pull-to-refresh. */
+    val edits: SharedFlow<LibraryEdit> = _edits.asSharedFlow()
+
     /**
      * Pull-to-refresh: invalidates every cached library list (the engine's own caches first, so the
      * refetch reaches the server instead of the engine's 30–60 s copies), re-checks recently used
@@ -158,6 +171,7 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
         // The rootlist carries names and images (the mosaic image changes with the first items).
         cache.invalidate(CacheKeys.LIBRARY_PLAYLISTS)
         _changes.emit(Unit)
+        _edits.tryEmit(LibraryEdit.PlaylistEdited(uri))
     }
 
     internal suspend fun onPlaylistDeleted(uri: String) {
@@ -201,6 +215,8 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
             if (done.isNotEmpty()) {
                 invalidateListsFor(done)
                 _changes.tryEmit(Unit)
+                val tracks = done.filter { SpotifyUris.typeOf(it) == "track" }
+                if (tracks.isNotEmpty()) _edits.tryEmit(LibraryEdit.LikedTracks(tracks, value))
             }
         }
     }
