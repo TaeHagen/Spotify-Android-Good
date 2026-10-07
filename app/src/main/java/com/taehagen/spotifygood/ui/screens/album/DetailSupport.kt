@@ -160,9 +160,15 @@ internal abstract class DetailViewModel(
         retryTrigger.update { it + 1 }
     }
 
+    /**
+     * The signed-in session this page belongs to (it lives in that session's ViewModel store): a
+     * write that finishes after the session ended (logout, app closed) reports nothing.
+     */
+    private val messageGeneration = BackgroundMessages.currentGeneration()
+
     /** A snackbar message, shown by the main scaffold (also once the page is gone). */
     protected fun message(@StringRes res: Int, vararg args: Any) {
-        BackgroundMessages.post(graph.app.getString(res, *args))
+        BackgroundMessages.post(graph.app.getString(res, *args), messageGeneration)
     }
 
     /**

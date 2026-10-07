@@ -3,29 +3,59 @@ package com.taehagen.spotifygood.ui.components
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Snackbar messages of work that outlives the page that started it: detail-page writes run in
- * [com.taehagen.spotifygood.AppGraph.appScope] and may finish after their page was popped and its
- * ViewModel cleared. Process-wide like that scope; the main scaffold shows them whichever page is
- * visible. Thread-safe.
+ * Snackbar messages of work that outlives the page that started it, for one signed-in session at a
+ * time. Each message carries the session generation it belongs to: once a session ends ([clear] on
+ * release or logout), its messages are dropped, also ones posted later by writes still running in the
+ * app scope, so they never reach the next launch or the next account. Messages that waited longer
+ * than [maxAgeMs] for a collector are dropped too (out of context by then). Thread-safe.
  */
-internal object BackgroundMessages {
-    private val channel = Channel<String>(capacity = CAPACITY, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+internal open class SessionMessageBus(
+    private val clock: () -> Long = { System.nanoTime() / 1_000_000 },
+    private val maxAgeMs: Long = MAX_AGE_MS,
+) {
+    private class Tagged(val generation: Int, val text: String, val postedAtMs: Long)
 
-    /** Collected by the main scaffold only (each message is delivered once). */
-    val messages: Flow<String> = channel.receiveAsFlow()
+    private val generation = AtomicInteger()
+    private val channel = Channel<Tagged>(capacity = CAPACITY, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
-    fun post(message: String) {
-        channel.trySend(message)
+    /** The current session; a ViewModel captures it when it is created and posts with it. */
+    fun currentGeneration(): Int = generation.get()
+
+    /** Posts [message] for session [generation]; dropped when that session has already ended. */
+    fun post(message: String, generation: Int = currentGeneration()) {
+        if (generation == this.generation.get()) channel.trySend(Tagged(generation, message, clock()))
     }
 
-    /** Drops undelivered messages (the signed-in UI went away: logout, activity finished). */
+    /**
+     * Fresh messages of the current session. Collected by the main scaffold only (each message is
+     * delivered once). The generation is checked again here: a post can race [clear].
+     */
+    val messages: Flow<String> = channel.receiveAsFlow()
+        .filter { it.generation == generation.get() && clock() - it.postedAtMs <= maxAgeMs }
+        .map { it.text }
+
+    /** The session ended (signed-in UI released, logout): drops its pending and later messages. */
     fun clear() {
+        generation.incrementAndGet()
         var received = channel.tryReceive()
         while (received.isSuccess) received = channel.tryReceive()
     }
 
-    private const val CAPACITY = 16
+    private companion object {
+        const val CAPACITY = 16
+        const val MAX_AGE_MS = 10_000L
+    }
 }
+
+/**
+ * Process-wide [SessionMessageBus]: detail-page writes run in
+ * [com.taehagen.spotifygood.AppGraph.appScope] and may finish after their page was popped and its
+ * ViewModel cleared; the main scaffold shows their results whichever page is visible.
+ */
+internal object BackgroundMessages : SessionMessageBus()
