@@ -49,8 +49,9 @@ interface PlaybackEnvironment {
 
     /**
      * Downloads of the context [contextUri] (playlist, Liked Songs, album or show) in context
-     * order ([startUri]: the requested start item, see [OfflineLoads.members]); null for other
-     * context kinds (left to the engine).
+     * order ([startUri]: the requested start item, see [OfflineLoads.members]); for other context
+     * kinds (artists, …, resolved by the engine) only which items are downloaded. Null when the
+     * downloads cannot be read.
      */
     suspend fun downloadedMembers(contextUri: String, startUri: String?): OfflineMembers?
 }
