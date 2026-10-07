@@ -481,18 +481,31 @@ mod tests {
     fn each_resolve_asks_the_right_endpoint() {
         use ContextAction::*;
         use ContextType::*;
-        let fetch = |update, action| ResolveContext::from_uri(PLAYLIST, "", update, action).fetch_as();
+        let fetch =
+            |update, action| ResolveContext::from_uri(PLAYLIST, "", update, action).fetch_as();
         // the autoplay continuation (spirc's Append of the playing context) asks for new radio
         // tracks, not for the playlist again
         assert_eq!(fetch(Autoplay, Append), Autoplay);
         assert_eq!(fetch(Autoplay, Replace), Autoplay);
         assert_eq!(fetch(Default, Append), Default);
         assert_eq!(fetch(Default, Replace), Default);
-        let ctx = Context { uri: Some(PLAYLIST.into()), ..Context::default() };
-        assert_eq!(ResolveContext::from_context(ctx, Autoplay, Replace).fetch_as(), Autoplay);
+        let ctx = Context {
+            uri: Some(PLAYLIST.into()),
+            ..Context::default()
+        };
+        assert_eq!(
+            ResolveContext::from_context(ctx, Autoplay, Replace).fetch_as(),
+            Autoplay
+        );
         // only a further page of a context is fetched as a page, also one of an autoplay context
-        assert_eq!(ResolveContext::append_context("spotify:album:a", Autoplay).fetch_as(), Default);
-        assert_eq!(ResolveContext::append_context("spotify:album:a", Default).fetch_as(), Default);
+        assert_eq!(
+            ResolveContext::append_context("spotify:album:a", Autoplay).fetch_as(),
+            Default
+        );
+        assert_eq!(
+            ResolveContext::append_context("spotify:album:a", Default).fetch_as(),
+            Default
+        );
         // a page and the continuation of the same uri are different resolves
         assert_ne!(
             ResolveContext::append_context(PLAYLIST, Autoplay),
@@ -504,9 +517,8 @@ mod tests {
     fn an_explicit_load_asks_again_after_a_failure() {
         let (_rt, session) = session();
         let mut resolver = ContextResolver::new(session);
-        let load = || {
-            ResolveContext::from_uri(PLAYLIST, "", ContextType::Default, ContextAction::Replace)
-        };
+        let load =
+            || ResolveContext::from_uri(PLAYLIST, "", ContextType::Default, ContextAction::Replace);
         resolver.add(load());
         resolver.mark_next_unavailable();
         resolver.remove_used_and_invalid();
@@ -522,13 +534,19 @@ mod tests {
     #[test]
     fn only_a_context_that_cant_be_resolved_is_skipped_for_a_while() {
         assert!(ContextResolver::is_unavailable(&Error::not_found("404")));
-        assert!(ContextResolver::is_unavailable(&Error::permission_denied("403")));
+        assert!(ContextResolver::is_unavailable(&Error::permission_denied(
+            "403"
+        )));
         assert!(ContextResolver::is_unavailable(
             &ContextResolverError::NotAllowedContext(String::new()).into()
         ));
         assert!(!ContextResolver::is_unavailable(&Error::unavailable("503")));
-        assert!(!ContextResolver::is_unavailable(&Error::deadline_exceeded("timeout")));
-        assert!(!ContextResolver::is_unavailable(&Error::resource_exhausted("429")));
+        assert!(!ContextResolver::is_unavailable(&Error::deadline_exceeded(
+            "timeout"
+        )));
+        assert!(!ContextResolver::is_unavailable(
+            &Error::resource_exhausted("429")
+        ));
         assert!(!ContextResolver::is_unavailable(&Error::aborted("reset")));
     }
 

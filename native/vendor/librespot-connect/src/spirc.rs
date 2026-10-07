@@ -4,7 +4,9 @@ use crate::{
     LoadContextOptions, LoadRequestOptions, PlayContext,
     context_resolver::{ContextAction, ContextResolver, ResolveContext},
     core::{
-        Error, Session, SpotifyUri,
+        Error,
+        Session,
+        SpotifyUri,
         authentication::Credentials,
         dealer::{
             manager::{BoxedStream, BoxedStreamResult, Reply, RequestReply},
@@ -33,11 +35,12 @@ use crate::{
     },
     snapshot::{ConnectSnapshot, SnapshotPlayStatus, SpircCommandError},
     state::{
+        // SPOTIFYGOOD: queue limit of Spirc::add_to_queue
+        SPOTIFY_MAX_NEXT_TRACKS_SIZE,
+        StateError,
         context::{ContextType, ResetContext},
         provider::IsProvider,
         {ConnectConfig, ConnectState},
-        // SPOTIFYGOOD: queue limit of Spirc::add_to_queue
-        SPOTIFY_MAX_NEXT_TRACKS_SIZE, StateError,
     },
 };
 // SPOTIFYGOOD: + BoxFuture, FutureExt (the state put in flight)
@@ -383,7 +386,10 @@ const SUGGESTION_TIMEOUT: Duration = Duration::from_secs(20);
 const NEW_DEVICE_PUT_TIMEOUT: Duration = Duration::from_secs(30);
 
 // SPOTIFYGOOD: the result of a put bounded by a timeout
-fn bounded_put<T>(what: &str, result: Result<Result<T, Error>, tokio::time::error::Elapsed>) -> Result<T, Error> {
+fn bounded_put<T>(
+    what: &str,
+    result: Result<Result<T, Error>, tokio::time::error::Elapsed>,
+) -> Result<T, Error> {
     result.unwrap_or_else(|_| Err(Error::deadline_exceeded(format!("{what} put timed out"))))
 }
 
@@ -1721,7 +1727,11 @@ impl SpircTask {
             // SPOTIFYGOOD: bounded, see handle_disconnect
             let res = bounded_put(
                 "inactive state",
-                timeout(STATE_PUT_TIMEOUT, self.connect_state.became_inactive(&self.session)).await,
+                timeout(
+                    STATE_PUT_TIMEOUT,
+                    self.connect_state.became_inactive(&self.session),
+                )
+                .await,
             );
             self.handle_stop();
             res?;
@@ -1862,8 +1872,7 @@ impl SpircTask {
             // SPOTIFYGOOD: preload the new next track after queue changes
             AddToQueue(add_to_queue) => {
                 // SPOTIFYGOOD: fails (instead of dropping the track) when the queue is full
-                self.connect_state
-                    .add_to_queue(add_to_queue.track, true)?;
+                self.connect_state.add_to_queue(add_to_queue.track, true)?;
                 self.handle_next_tracks_changed();
             }
             SetQueue(set_queue) => {
@@ -2041,7 +2050,11 @@ impl SpircTask {
 
         let inactive = bounded_put(
             "inactive state",
-            timeout(STATE_PUT_TIMEOUT, self.connect_state.became_inactive(&self.session)).await,
+            timeout(
+                STATE_PUT_TIMEOUT,
+                self.connect_state.became_inactive(&self.session),
+            )
+            .await,
         );
 
         self.player
@@ -2262,8 +2275,12 @@ impl SpircTask {
             self.context_resolver.clear();
             // SPOTIFYGOOD: a pending transfer was finished against the loaded context
             self.transfer_state = None;
-            let resolve =
-                ResolveContext::from_uri(&context_uri, fallback, update_context, ContextAction::Replace);
+            let resolve = ResolveContext::from_uri(
+                &context_uri,
+                fallback,
+                update_context,
+                ContextAction::Replace,
+            );
             // SPOTIFYGOOD: an explicit load always asks again, a failure of the same context a
             // moment ago (e.g. a network hiccup) refused it without any request for a minute
             self.context_resolver.forget_unavailable(&resolve);
