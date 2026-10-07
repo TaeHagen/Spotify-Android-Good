@@ -73,9 +73,10 @@ data class PlaybackFailure(val kind: PlaybackErrorKind, val message: String)
  * * commands that start playback (load, play, skip-to, radio) first wait (bounded) while the
  *   session is still starting, so a Bluetooth play, a resumption or Android Auto on a cold engine
  *   reach an Online session; a pause cancels such a waiting command;
- * * while the session is not Online, context loads of playlists / Liked Songs / albums / shows are
- *   turned into loads of their downloads ([OfflineLoads]); nothing downloaded → "not available
- *   offline".
+ * * whenever the engine cannot stream (offline mode, an offline session, or no network — also while
+ *   the session still reads Online), context loads of playlists / Liked Songs / albums / shows are
+ *   turned into loads of their downloads, which the engine's offline queue plays ([OfflineLoads]);
+ *   nothing downloaded → "not available offline", as the engine itself answers (UNAVAILABLE).
  *
  * Play / resume with no active Connect device (NOT_ACTIVE_DEVICE: cold start, or the last device
  * went away) or without a session (NOT_CONNECTED: the session did not come up in time, or no
@@ -528,7 +529,7 @@ class PlayerController internal constructor(
         transport(method, args)
     }
 
-    /** `player.load`, rewritten for the offline queue while the session is not Online. */
+    /** `player.load`, rewritten for the offline queue whenever the engine cannot stream ([OfflineLoads]). */
     private suspend fun load(request: PlayRequest) {
         call("player.load", loadArgs(prepareLoad(withLoadableContext(request))))
     }
