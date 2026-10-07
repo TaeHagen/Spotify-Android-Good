@@ -573,13 +573,15 @@ impl ConnectState {
         session: &Session,
         reason: PutStateReason,
     ) -> SpClientResult {
-        let prev_reason = self.request.put_state_reason;
-
-        self.request.put_state_reason = EnumOrUnknown::new(reason);
-        let res = self.send_state(session).await;
-
-        self.request.put_state_reason = prev_reason;
-        res
+        // SPOTIFYGOOD: send a copy carrying the reason instead of setting it on `self.request`
+        // and restoring it after the await. Spirc bounds these PUTs with a timeout; a cancelled
+        // future skipped the restore, so every later state PUT went out as e.g. VOLUME_CHANGED.
+        let mut request = self.request.clone();
+        request.put_state_reason = EnumOrUnknown::new(reason);
+        session
+            .spclient()
+            .put_connect_state_request(&request)
+            .await
     }
 
     /// Notifies the remote server about a new device
