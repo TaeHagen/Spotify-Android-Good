@@ -16,6 +16,9 @@ import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadUi
 import com.taehagen.spotifygood.ui.screens.album.DetailViewModel
+import com.taehagen.spotifygood.ui.screens.album.DownloadedPage
+import com.taehagen.spotifygood.ui.screens.album.appendDownloadedEpisodes
+import com.taehagen.spotifygood.ui.screens.album.downloadedPageFlow
 import com.taehagen.spotifygood.ui.screens.album.FailureReason
 import com.taehagen.spotifygood.ui.screens.album.LoadState
 import com.taehagen.spotifygood.ui.screens.album.PlaybackInfo
@@ -59,7 +62,12 @@ internal fun Episode.resumePosition(): Long {
 internal enum class EpisodeSort { NEWEST, OLDEST }
 
 @Immutable
-internal data class ShowHeader(val show: Show, val description: RichText)
+internal data class ShowHeader(
+    val show: Show,
+    val description: RichText,
+    /** Built from the download (offline without a cached page). */
+    val downloadedCopy: Boolean = false,
+)
 
 @Immutable
 internal data class EpisodePage(
@@ -70,6 +78,8 @@ internal data class EpisodePage(
     val endReached: Boolean = false,
     /** A page loaded after the show itself came back partial (placeholder episodes). */
     val partial: Boolean = false,
+    /** Episodes past the cached ones were taken from the download (offline). */
+    val fromDownloads: Boolean = false,
 )
 
 @Immutable
@@ -84,6 +94,8 @@ internal data class ShowUiState(
     val offline: Boolean = false,
     /** Some listed episodes are placeholders (metadata failed right now): offer a retry. */
     val partial: Boolean = false,
+    /** Showing the download (offline): the header or part of the list comes from it. */
+    val downloadedCopy: Boolean = false,
 )
 
 internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailViewModel(graph, uri) {
@@ -107,7 +119,8 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
     ) { (load, page), playback, following, download, (rows, offline) ->
         // The show's own first page is listed only in newest-first order.
         val partial = page.partial || (page.sort == EpisodeSort.NEWEST && load.dataOrNull()?.show?.partial == true)
-        ShowUiState(load, page, playback, following, download, rows, offline, partial)
+        val downloadedCopy = load.dataOrNull()?.downloadedCopy == true || page.fromDownloads
+        ShowUiState(load, page, playback, following, download, rows, offline, partial, downloadedCopy)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ShowUiState())
 
     init {
@@ -124,6 +137,9 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         val show = resource.dataOrNull
         if (show == null) {
             if (header.value !is LoadState.Ready) {
+                // No page and no cached copy (offline, cache cleared or pruned): a downloaded show
+                // still opens, from the download database.
+                if (resource is Resource.Error && showDownloadedCopy()) return
                 header.value = if (resource is Resource.Error) LoadState.Failed(failureReason(resource.error)) else LoadState.Loading
             }
             return
@@ -189,10 +205,51 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
                 }
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
-                list.update { if (it.sort == sort) it.copy(loading = false, failed = true) else it }
+            } catch (e: Exception) {
+                // Offline past the cached episodes: list the downloaded ones instead of failing.
+                val copy = if (offline.value || failureReason(e) == FailureReason.OFFLINE) downloadedCopy() else null
+                list.update { latest ->
+                    when {
+                        latest.sort != sort -> latest
+                        copy != null -> latest.copy(
+                            episodes = appendDownloadedEpisodes(latest.episodes, copy.episodes(), newestFirst = sort == EpisodeSort.NEWEST),
+                            loading = false,
+                            endReached = true,
+                            partial = latest.partial || copy.partial,
+                            fromDownloads = true,
+                        )
+                        else -> latest.copy(loading = false, failed = true)
+                    }
+                }
             }
         }
+    }
+
+    /** The downloaded copy of this show, or null when it is not downloaded. */
+    private suspend fun downloadedCopy(): DownloadedPage? = try {
+        graph.downloadedPageFlow(uri).first()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Shows the downloaded copy as the page; false when the show isn't downloaded. */
+    private suspend fun showDownloadedCopy(): Boolean {
+        val copy = downloadedCopy() ?: return false
+        val episodes = copy.episodes()
+        total = episodes.size
+        firstPage = episodes
+        header.value = LoadState.Ready(ShowHeader(copy.toShow(), RichText.EMPTY, downloadedCopy = true), stale = true)
+        list.update {
+            EpisodePage(
+                sort = it.sort,
+                episodes = if (it.sort == EpisodeSort.NEWEST) episodes else episodes.asReversed(),
+                endReached = true,
+                partial = copy.partial,
+            )
+        }
+        return true
     }
 
     /** Some episodes came back as placeholders: reload the show and its list from the start. */

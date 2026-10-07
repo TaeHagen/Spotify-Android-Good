@@ -8,6 +8,7 @@ import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.download.DownloadActivity
 import com.taehagen.spotifygood.download.DownloadItem
 import com.taehagen.spotifygood.model.DownloadState
+import com.taehagen.spotifygood.ui.components.SessionMessenger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -37,7 +38,9 @@ data class DownloadsUiState(
 
 class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
     private val messages = Channel<LibraryMessage>(Channel.BUFFERED)
+    /** Page-only messages (nothing to play); write results go through [messenger]. */
     val events: Flow<LibraryMessage> = messages.receiveAsFlow()
+    private val messenger = SessionMessenger(graph.app)
 
     /** Decoded metadata per URI (metadata JSON never changes for a download). */
     private val metadataCache = ConcurrentHashMap<String, DownloadMetadata>()
@@ -114,12 +117,15 @@ class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
 
     fun retryItem(uri: String) = mutate(notify = false) { graph.downloads.downloadItems(listOf(uri)) }
 
-    /** Runs in the app scope: leaving the screen must not interrupt a removal half-way. */
+    /**
+     * Runs in the app scope: leaving the screen must not interrupt a removal half-way. The result
+     * is shown also when the page was left meanwhile.
+     */
     private fun mutate(notify: Boolean = true, block: suspend () -> Unit) {
         graph.appScope.launch {
             attempt { block() }
-                .onSuccess { if (notify) messages.trySend(LibraryMessage.DOWNLOAD_REMOVED) }
-                .onFailure { messages.trySend(LibraryMessage.DOWNLOAD_FAILED) }
+                .onSuccess { if (notify) messenger.post(LibraryMessage.DOWNLOAD_REMOVED.messageRes()) }
+                .onFailure { messenger.post(LibraryMessage.DOWNLOAD_FAILED.messageRes()) }
         }
     }
 }

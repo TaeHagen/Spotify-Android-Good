@@ -63,6 +63,7 @@ import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
 import com.taehagen.spotifygood.ui.screens.album.AddedButton
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadButton
+import com.taehagen.spotifygood.ui.screens.album.DownloadedCopyNotice
 import com.taehagen.spotifygood.ui.screens.album.DetailActionRow
 import com.taehagen.spotifygood.ui.screens.album.DetailScaffold
 import com.taehagen.spotifygood.ui.screens.album.ExpandableText
@@ -196,6 +197,11 @@ private fun ShowList(
                     }
                 },
             )
+        }
+        if (state.downloadedCopy) {
+            item(key = "downloaded", contentType = "notice") {
+                DownloadedCopyNotice(stringResource(R.string.detail_showing_downloaded_episodes))
+            }
         }
         if (state.partial) {
             item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetryPartial) }

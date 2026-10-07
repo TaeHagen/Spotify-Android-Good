@@ -750,6 +750,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * `BecomingNoisyReceiver`: registered only while playing locally → `player.pause`.
 * Wake locks: Media3 `WakeLockManager` + `WifiLockManager` `setStayAwake(true)` only while
   local status is playing/loading; false otherwise.
+* Sleep timer (`SleepTimer`): coroutine delays stop while the CPU sleeps (remote playback holds
+  no wake lock), so an inexact `ELAPSED_REALTIME_WAKEUP` alarm window ending at the timer's end
+  (≤ 10 min earlier; plus an allow-while-idle alarm at the end for Doze) reaches the non-exported
+  `SleepTimerAlarmReceiver`, which pokes the timer and holds a timed partial wake lock until the
+  end + 30 s. "End of track" arms it for the snapshot's track end and re-arms on every snapshot.
+  Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
 
