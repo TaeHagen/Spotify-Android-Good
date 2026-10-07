@@ -493,6 +493,8 @@ pub(crate) struct Store<T: Send + Sync + 'static> {
     lru: Mutex<LruCache<String, Entry<T>>>,
     inflight: Mutex<HashMap<String, Inflight<T>>>,
     seq: AtomicU64,
+    /// Bumped by [`Store::clear`]: fetches started before it do not fill the cache.
+    epoch: AtomicU64,
     max_age: Duration,
 }
 
@@ -502,11 +504,16 @@ impl<T: Send + Sync + 'static> Store<T> {
             lru: Mutex::new(LruCache::new(NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN))),
             inflight: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
+            epoch: AtomicU64::new(0),
             max_age,
         }
     }
 
+    /// Forgets every entry. Fetches still running were made for the previous state (account,
+    /// country, filter): later lookups do not join them and their results are not cached.
     fn clear(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.inflight.lock().clear();
         self.lru.lock().clear();
     }
 
@@ -599,18 +606,22 @@ impl<T: Send + Sync + 'static> Store<T> {
     }
 
     fn spawn_fetch(&'static self, session: Session, uris: Vec<String>, fetch: Fetcher<T>, id: u64) -> BatchFuture<T> {
+        let epoch = self.epoch.load(Ordering::SeqCst);
         let handle = tokio::spawn(async move {
             let result = fetch(session, uris.clone()).await;
             let out: BatchResult<T> = match result {
                 Ok(partial) => {
                     let now = Instant::now();
                     let mut lru = self.lru.lock();
+                    let current = self.epoch.load(Ordering::SeqCst) == epoch;
                     let map = partial
                         .found
                         .into_iter()
                         .map(|(k, v)| {
                             let a = Arc::new(v);
-                            lru.put(k.clone(), Entry { at: now, value: a.clone() });
+                            if current {
+                                lru.put(k.clone(), Entry { at: now, value: a.clone() });
+                            }
                             (k, a)
                         })
                         .collect();
@@ -646,6 +657,8 @@ pub(crate) fn clear_cache() {
     ALBUMS.clear();
     ARTISTS.clear();
     SHOWS.clear();
+    // Context-resolve episode lists are market-specific too.
+    SHOW_EPISODES.clear();
 }
 
 static TRACKS: LazyLock<Store<Track>> = LazyLock::new(|| Store::new(4096, MAX_AGE));
@@ -1460,6 +1473,32 @@ pub(crate) mod tests {
         assert!(none.map.is_empty() && none.failed.is_empty() && none.error.is_none());
         // Failures are not cached: the next lookup retries.
         assert!(store.peek("fail1").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fetch_running_across_a_clear_does_not_refill_the_cache() {
+        static STORE: LazyLock<Store<String>> = LazyLock::new(|| Store::new(16, MAX_AGE));
+        fn fetch(_s: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<String>>> {
+            async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok(Partial { found: uris.into_iter().map(|u| (u.clone(), format!("old:{u}"))).collect(), ..Default::default() })
+            }
+            .boxed()
+        }
+        let session = Session::new(Default::default(), None);
+        let store: &'static Store<String> = &STORE;
+        let uris = ["a".to_string()];
+        let lookup = store.get_many(&session, &uris, fetch);
+        let clear = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            store.clear();
+        };
+        let (r, ()) = tokio::join!(lookup, clear);
+        // The caller that asked before the clear still gets its answer…
+        assert_eq!(r.unwrap().map.get("a").map(|v| v.as_str()), Some("old:a"));
+        // …but it is not cached for later lookups.
+        assert!(store.peek("a").is_none());
+        assert!(store.inflight.lock().is_empty());
     }
 
     #[test]

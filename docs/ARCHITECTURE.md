@@ -402,8 +402,12 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.skipTo` | `{"uid":"…"}` |
 | `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs"}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE`. Pushing offline playback hands over its tracks (in play order), current position and repeat mode, and keeps it paused if it was |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
-| `connect.localInfo` | `{"url":"http://host:port/<CPath>"}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
-| `connect.localLogin` | `{"url":"…","deviceId"?:"…"}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
+| `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
+| `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
+
+`scopeId` is the interface index for a link-local IPv6 host (`fe80::/10`), which a URL cannot
+carry; such a host is connected through that interface and rejected (`INVALID_ARGUMENT`) without
+one. Kotlin prefers an IPv4 address when the service has one.
 
 `LocalDeviceInfo`: `{"deviceId","remoteName","deviceType":<DeviceList type>,"activeUser"?,"tokenTypes":[…],"supportsAccessToken":bool,"version","brand"?,"model"?,"isGroup":bool,"availability"?}`.
 Key material (the device's DH public key, client id) never crosses the JNI boundary; Rust keeps it
@@ -422,13 +426,13 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
 | `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` | `SearchResults` |
-| `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection]}` |
+| `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
 | `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
 | `catalog.recentlyPlayed` | `{"limit":50}` | `{"items":[MediaRef]}` |
 | `catalog.user` | `{"username"?}` | `User` (me when omitted; other users include their `publicPlaylists`) |
 | `library.playlists` | `{}` | `{"items":[RootlistEntry],"partial"?:true}` (rootlist, folders preserved; entries without decorations are named through cached header lookups, ≤100 requests per call; deleted/inaccessible playlists are remembered for 30 min; `partial` when some names could not be looked up yet and those playlists are missing) |
-| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}],"partial"?}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` (no metadata involved: the membership source for downloads) |
+| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}],"partial"?}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` (no metadata involved: the membership source for downloads). Library sets are read whole or not at all; only the context-resolve fallback can stop at its budget (20 000 items / 200 pages): pages are then `partial`, and `urisOnly` fails with `UNAVAILABLE` instead of listing a prefix as the whole collection |
 | `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"≤500}` | paged `{"total","items":[…],"partial"?}` |
 | `library.contains` | `{"uris":[…]}` | `{"contains":[bool]}` |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
@@ -536,7 +540,10 @@ For a remote active device, smart shuffle is not supported (the command reports
   starts audio on its own at launch.
 * **Visibility**: the phone is listed only while it can play. Kotlin sets `connectVisible`
   while a UI (app in the foreground), PLAYBACK or PRESENCE holder is held; a DOWNLOAD holder
-  alone and the idle grace keep it hidden. Hidden, the supervisor connects the Session without
+  alone and the idle grace keep it hidden. Becoming visible applies at once; becoming hidden only
+  after 20 s without such a holder (`ConnectVisibility`), because becoming visible again costs a
+  re-login, so a quick switch to another app and back changes nothing. A fresh start uses the
+  holders as they are (a start for downloads alone is hidden from the beginning). Hidden, the supervisor connects the Session without
   Spirc (catalog, downloads and tokens keep working). `connect` then never starts offline
   playback: `player.load`, control, queue and `connect.transfer` fail with `NOT_CONNECTED`
   (controls still reach a running offline queue, volume the local mixer), except while
@@ -582,9 +589,14 @@ For a remote active device, smart shuffle is not supported (the command reports
   * **Kotlin (`connect/LocalDeviceDiscovery.kt`)** browses mDNS with `NsdManager`
     (`registerServiceInfoCallback` on API 34+, `resolveService` below, one resolve at a time),
     reads the `CPath` TXT record (default `/`), and holds a Wi-Fi `MulticastLock` **only while the
-    devices sheet is visible**. Discovery runs only while the sheet is open and stops on dispose,
-    background or logout (battery). Each resolved service is probed with `connect.localInfo`, then
-    deduped by `deviceId` and dropped if it is already in the cluster `DeviceList`.
+    devices sheet is visible**. The sheet itself (`rememberLocalDevices` in `DevicesSheetContent`,
+    never a list row, which is disposed when scrolled away) runs discovery while it is in
+    composition and STARTED; it pauses on background (results kept, unconfirmed ones dropped
+    12 s after the next start) and stops on dismissal of the sheet or logout (battery). Below
+    API 34 the one-resolve-at-a-time slot is tracked across browse runs, `FAILURE_ALREADY_ACTIVE`
+    is retried with a short backoff, and a resolve without a callback is given up after 10 s.
+    Each resolved service is probed with `connect.localInfo`, then deduped by `deviceId` and
+    dropped if it is already in the cluster `DeviceList`.
   * **Rust (`zeroconf_client/`)** is the exact inverse of `librespot-discovery` 0.8.0's device
     side. `connect.localInfo` GETs `?action=getInfo`. `connect.localLogin` POSTs `?action=addUser`
     with the credentials blob: Diffie-Hellman with the device's `publicKey` (librespot's DH group),
@@ -596,8 +608,13 @@ For a remote active device, smart shuffle is not supported (the command reports
     block step, AES-192-ECB under a PBKDF2 key from `SHA1(deviceId)` and the username, then base64).
     When `getInfo` advertises `tokenType` `accesstoken`, a fresh login5 access token (keymaster,
     `streaming` scope) is sent as the blob with the device's client id as `clientKey`; otherwise the
-    stored reusable credentials blob is used. After a successful `addUser` the engine waits up to
-    10 s for the device to appear in the cluster and returns its Connect device id for
+    stored reusable credentials blob is used. A `default`-token device whose service is not
+    loaded (`availability` NOT-LOADED, `publicKey` "INVALID") first gets a **wake-up `addUser`**
+    with empty `blob` and `clientKey` (no credential material; origin `deviceName`/`deviceId`);
+    it loads and answers 203 ERROR-INVALID-PUBLICKEY, the engine polls getInfo (≤ 5 s) until it is
+    loaded and then sends the real `addUser`. A later 203 is retried once; never a second wake-up.
+    After a successful `addUser` the engine waits up to 10 s for the device to appear in the
+    cluster (pushes, plus one device refresh after 4 s) and returns its Connect device id for
     `connect.transfer`. Only local-network hosts (loopback / private / link-local / `.local`) over
     plain HTTP are accepted; all timeouts are bounded. mDNS browsing is Kotlin's `NsdManager`, so
     Rust only ever sees the URL.
@@ -679,19 +696,32 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `playback` error events). `prepare()` clears it. Browsing logged out / without Premium
   returns the matching `SessionError`.
 * Cold start: commands that start playback wait (≤ 15 s, outside their timeout; a pause cancels
-  the wait) while the session is starting with a network; play/resume fall back to the
-  `ResumeStore` session on NOT_ACTIVE_DEVICE, NOT_CONNECTED (not while mirroring a remote
-  device) and UNAVAILABLE while connecting. Auto browse/search/voice wait the same way.
-* `onConnectAsync` grants commands to the notification, SysUI, Auto/AAOS, Wear and the
-  app's own controller; others get read-only.
+  every start queued before it while the session is starting) while the session is starting
+  with a network; play/resume fall back to the `ResumeStore` session on NOT_ACTIVE_DEVICE,
+  NOT_CONNECTED (not while mirroring a remote device) and UNAVAILABLE while connecting — but
+  never right after a load: a play following a paused `player.load` (Media3 setMediaItems +
+  play) is merged into it, or waits ≤ 3 s for the activation, and is dropped if the load failed.
+  Plain track-list contexts (`spotify:web-api`) are never resumed or loaded as a context.
+  Auto browse/search/voice wait the same way.
+* `onConnectAsync` grants full commands to Media3-trusted controllers (MEDIA_CONTENT_CONTROL /
+  notification listener: SysUI, Bluetooth, watch apps), the media notification, Auto/AAOS, our
+  own uid and known system packages (package name verified by Media3); connection hints are not
+  trusted. Others get read-only player state and no library commands.
+* The session is added to the service in `onCreate` (Media3 adds it only on a controller bind),
+  so our own starts get the notification and the foreground. The exported service accepts its
+  internal actions (START_PRESENCE, RESUME, LOCAL_PLAYBACK) only with a per-process token;
+  notification actions (Tap to resume, presence Stop) go through the non-exported
+  `PlaybackActionReceiver`.
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata) persisted on pause and every 15 s while playing.
 * Foreground: Media3 default (10 min after pause, then notification becomes dismissable).
   Local audio never plays without it: local audio starting in the background with no service
   (remote "play on this phone" during the idle grace or a download) starts the service with
-  `startForegroundService` (focus waits for the foreground); refused, or not foreground within
-  5 s → pause + "Tap to resume" (`ResumeAlert`). `onForegroundServiceStartNotAllowedException`
+  `startForegroundService` (focus waits for the foreground, also when a running service is not in
+  the foreground while the app is in the background); refused, or not foreground within 5 s →
+  pause + "Tap to resume" (`ResumeAlert`; the tap starts the stored session through the session
+  player so Media3 goes foreground at once). `onForegroundServiceStartNotAllowedException`
   → for local playback pause + "Tap to resume"; while mirroring a remote device the notification
   is posted without the foreground (the remote device is never paused).
   `onTaskRemoved` default behaviour. Engine holder released when the service is destroyed.
@@ -816,6 +846,11 @@ Native catalog strategy (Rust `catalog/`):
   rootlist playlists (incl. followed Made-For-You mixes), followed artists and radio
   stations seeded from recent tracks. Liked Songs → context-resolve when `collection/v2/paging`
   fails (not when offline or rate limited); the resolved list is reused for 60 s.
+* **Per-account caches** (library set snapshots, the Liked Songs fallback, the rootlist,
+  playlist headers, lyrics, the pathfinder token state) are tagged with the username they were
+  read for and never served to another account (a load that finishes after a logout included).
+  `session.logout` drops them (`catalog::clear_user_state`, next to `metadata::clear_cache`),
+  and a login as another account without a logout drops them on first use.
 * The public Web API is never used by default.
 
 
@@ -825,7 +860,8 @@ Repositories call the native catalog RPCs and expose `suspend` functions / `Flow
 successful response of browse calls (home, library lists, album/artist/playlist pages) so
 the app opens instantly and works offline; stale-while-revalidate. A `partial` response
 (§6.3) is shown but never stored as fresh: it only fills a missing row (stored stale) and is
-refetched twice while on screen (after 15 s and 30 s). Paged lists advance by whole windows
+refetched twice while on screen (after 15 s and 30 s). The home feed is treated the same way
+when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
 app scope, so they complete even if their screen closes. Liked-state of the
@@ -855,7 +891,7 @@ current track is cached in memory (LRU) and refreshed via `library.contains`.
 | App visible | Online | yes | none unless playing | none |
 | Playing locally | Online (or offline mode) | yes | mediaPlayback | wake + Wi-Fi |
 | Paused < 10 min | Online | yes | mediaPlayback (Media3 timeout) | none |
-| Paused ≥ 10 min, app background | hidden, stopped 60 s after release | no | none | none |
+| Paused ≥ 10 min, app background | hidden 20 s after release, stopped after 60 s | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
 | Presence opt-in, idle | Online | yes | connectedDevice (low-importance) | none |

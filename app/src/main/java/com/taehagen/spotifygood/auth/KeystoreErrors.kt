@@ -4,9 +4,7 @@ import android.os.Build
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.util.Log
 import java.security.GeneralSecurityException
-import java.security.ProviderException
-import javax.crypto.BadPaddingException
-import javax.crypto.IllegalBlockSizeException
+import javax.crypto.AEADBadTagException
 
 /**
  * The Keystore could not be used right now (keystore2 busy, a binder or system error), even
@@ -20,26 +18,31 @@ internal enum class KeystoreFailure {
     /** The key is gone for good (invalidated, corrupted, deleted): only now may it be replaced. */
     PERMANENT,
 
-    /** The data does not match the key (corrupt, or sealed by an older key). */
+    /**
+     * The data does not match the key (corrupt, or sealed by an older key): an
+     * [AEADBadTagException], the only definite signal for that.
+     */
     DATA,
 
     /**
-     * Any other security / keystore failure: retried, then reported as
-     * [KeystoreUnavailableException]; never deletes anything.
+     * Everything else: retried, then reported as [KeystoreUnavailableException]; never deletes
+     * anything.
      */
     RETRYABLE,
-
-    /** Not a Keystore failure at all (a bug, an I/O error): rethrown as it is. */
-    OTHER,
 }
 
 /**
- * Classifies a failure by its cause chain. Only definite signals count as [PERMANENT]: a
- * [KeyPermanentlyInvalidatedException], or (API 33+) a non-transient keystore error saying the
- * key is corrupted or does not exist. Transient keystore2 failures (BACKEND_BUSY, SYSTEM_ERROR,
- * wrapped in ProviderException / InvalidKeyException / UnrecoverableKeyException) are
- * [RETRYABLE], as is anything unknown: losing the key would log the user out and make every
- * downloaded track undecryptable.
+ * Classifies a failure by its cause chain. Only definite signals count:
+ * * [PERMANENT]: a [KeyPermanentlyInvalidatedException], or (API 33+) a non-transient keystore
+ *   error saying the key is corrupted or does not exist.
+ * * [DATA]: an [AEADBadTagException] (checked before the causes: a real one also carries a
+ *   VERIFICATION_FAILED keystore error).
+ * * [RETRYABLE]: everything else. AndroidKeyStore reports any other keystore failure in
+ *   `doFinal` (a binder / SYSTEM_ERROR while keystore2 restarts, an operation handle pruned
+ *   under slot pressure) as a plain `IllegalBlockSizeException` caused by the KeyStoreException,
+ *   and transient init failures as ProviderException / InvalidKeyException /
+ *   UnrecoverableKeyException. Treating those as corrupt data deleted valid credentials and
+ *   downloads; losing the key would make every downloaded track undecryptable.
  */
 internal fun classifyKeystoreFailure(e: Throwable): KeystoreFailure {
     val chain = generateSequence(e) { it.cause.takeIf { cause -> cause !== it } }.take(MAX_CAUSES).toList()
@@ -47,10 +50,8 @@ internal fun classifyKeystoreFailure(e: Throwable): KeystoreFailure {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && chain.any(::isPermanentKeystoreError)) {
         return KeystoreFailure.PERMANENT
     }
-    if (e is BadPaddingException || e is IllegalBlockSizeException) return KeystoreFailure.DATA
-    // keystore2 errors (android.security.KeyStoreException) arrive wrapped in one of these.
-    if (chain.any { it is GeneralSecurityException || it is ProviderException }) return KeystoreFailure.RETRYABLE
-    return KeystoreFailure.OTHER
+    if (e is AEADBadTagException) return KeystoreFailure.DATA
+    return KeystoreFailure.RETRYABLE
 }
 
 private fun isPermanentKeystoreError(e: Throwable): Boolean {

@@ -117,7 +117,9 @@ class ResumeFallbackTest {
 
     @Test
     fun resumeRequestWithoutAContextPlaysTheTrack() {
-        for (context in listOf(null, "spotify:track:t", "spotify:episode:e")) {
+        // spotify:web-api is what a plain track list (Liked Songs as tracks, downloads, search)
+        // reports as its context: it cannot be loaded again.
+        for (context in listOf(null, "spotify:track:t", "spotify:episode:e", "spotify:web-api", "spotify:web-api:tracks", "spotify:local:a:b:c:1")) {
             val request = state(context).toPlayRequest()
             assertNull(request.contextUri)
             assertEquals(listOf("spotify:track:t"), request.trackUris)
@@ -126,5 +128,24 @@ class ResumeFallbackTest {
         }
         val args = PlayerController.loadArgs(state(null).toPlayRequest())
         assertEquals(listOf("spotify:track:t"), args["trackUris"]?.jsonArray?.map { it.jsonPrimitive.content })
+        assertEquals("spotify:track:t", state("spotify:web-api").mediaId)
+        assertEquals(MediaIds.inContext("spotify:playlist:p", "spotify:track:t"), state("spotify:playlist:p").mediaId)
+        assertEquals("spotify:user:u:collection", state("spotify:user:u:collection").toPlayRequest().contextUri)
+    }
+
+    @Test
+    fun loadsOfANonLoadableContextPlayTheirStartTrack() {
+        val fixed = PlayerController.withLoadableContext(PlayRequest(contextUri = "spotify:web-api", startUri = "spotify:track:x", startUid = "u1", positionMs = 7))
+        assertNull(fixed.contextUri)
+        assertEquals(listOf("spotify:track:x"), fixed.trackUris)
+        assertEquals(0, fixed.startIndex)
+        assertNull(fixed.startUid)
+        assertEquals(7L, fixed.positionMs)
+        val tracks = PlayRequest(contextUri = "spotify:web-api", trackUris = listOf("spotify:track:a"), startIndex = 0)
+        assertEquals(tracks.copy(contextUri = null), PlayerController.withLoadableContext(tracks))
+        val album = PlayRequest(contextUri = "spotify:album:a", startUri = "spotify:track:x")
+        assertSame(album, PlayerController.withLoadableContext(album))
+        val single = PlayRequest(contextUri = "spotify:track:x")
+        assertSame(single, PlayerController.withLoadableContext(single))
     }
 }

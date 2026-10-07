@@ -123,6 +123,11 @@
             </intent-filter>
         </receiver>
 
+        <!-- The app's own playback notification actions (Tap to resume, presence Stop); not exported -->
+        <receiver
+            android:name=".playback.PlaybackActionReceiver"
+            android:exported="false" />
+
         <!-- Artwork for Android Auto / notification (content:// URIs) -->
         <provider
             android:name=".playback.ArtworkProvider"

@@ -35,8 +35,51 @@ mod search;
 mod user;
 mod util;
 
-use crate::error::{AppError, AppResult};
+use crate::engine;
+use crate::error::{AppError, AppResult, ErrorCode};
+use librespot_core::Session;
+use parking_lot::Mutex;
 use serde_json::Value;
+
+/// The account the per-user caches were last filled for.
+static ACCOUNT: Mutex<Option<String>> = Mutex::new(None);
+
+/// The logged-in username, which owns the per-user caches (library snapshots, the Liked Songs
+/// fallback, the rootlist, playlist headers). When it differs from the account they were filled
+/// for (a new login without a logout), they are dropped first. Entries are also tagged with
+/// their owner, so a load for the previous account that finishes late is never served.
+pub(crate) fn account(session: &Session) -> AppResult<String> {
+    let user = engine::username().unwrap_or_else(|| session.username());
+    if user.is_empty() {
+        return Err(AppError::new(ErrorCode::NotLoggedIn, "no username"));
+    }
+    if switch_account(&user) {
+        log::info!("catalog: account changed, dropping the previous account's caches");
+        clear_user_state();
+        *ACCOUNT.lock() = Some(user.clone());
+    }
+    Ok(user)
+}
+
+/// Records `user` as the cache owner; true when another account owned the caches before.
+fn switch_account(user: &str) -> bool {
+    let mut account = ACCOUNT.lock();
+    let changed = account.as_deref().is_some_and(|a| a != user);
+    *account = Some(user.to_string());
+    changed
+}
+
+/// Forgets everything the catalog holds for the logged-in account: library snapshots, the Liked
+/// Songs fallback, the rootlist, playlist headers, lyrics and pathfinder token state. Entity
+/// metadata is separate ([`metadata::clear_cache`]). Called on logout; an account switch without
+/// logout is detected by [`account`].
+pub(crate) fn clear_user_state() {
+    collection::forget_account();
+    playlist::forget_account();
+    lyrics::forget_account();
+    pathfinder::forget_account();
+    *ACCOUNT.lock() = None;
+}
 
 pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
     match method {
@@ -69,5 +112,20 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
         "playlist.delete" | "playlist.unfollow" => playlist::unfollow(args).await,
         "playlist.follow" => playlist::follow(args).await,
         _ => Err(AppError::invalid(format!("unknown method {method}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_account_switches() {
+        *ACCOUNT.lock() = None;
+        assert!(!switch_account("alice"), "the first login has nothing to drop");
+        assert!(!switch_account("alice"));
+        assert!(switch_account("bob"), "another account: the caches are dropped");
+        assert_eq!(ACCOUNT.lock().as_deref(), Some("bob"));
+        *ACCOUNT.lock() = None;
     }
 }

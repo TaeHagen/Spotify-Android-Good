@@ -379,7 +379,7 @@ pub(crate) async fn playlist(args: Value) -> AppResult<Value> {
     let owned = !owner_name.is_empty() && owner_name.eq_ignore_ascii_case(&me);
     let collaborative = list.attributes.collaborative();
     let can_edit = list.capabilities.can_edit_items.unwrap_or(owned || collaborative);
-    let following = cached_rootlist().map(|r| r.contains(&p.id));
+    let following = cached_rootlist(&me, Duration::from_secs(300)).map(|r| r.contains(&p.id));
     to_value(&Playlist {
         uri,
         name: header.name,
@@ -449,9 +449,15 @@ pub(crate) struct Rootlist {
     pub revision: Vec<u8>,
     pub items: Vec<RootItem>,
     fetched: Instant,
+    /// Account the rootlist was read for; another account's rootlist is never served.
+    owner: String,
 }
 
 impl Rootlist {
+    fn fresh_for(&self, owner: &str, max_age: Duration) -> bool {
+        self.owner == owner && self.fetched.elapsed() < max_age
+    }
+
     /// Index and raw URI of the playlist with base62 `id`.
     pub(crate) fn find(&self, id: &str) -> Option<(usize, &str)> {
         self.items.iter().enumerate().find_map(|(i, it)| {
@@ -472,12 +478,19 @@ impl Rootlist {
 static ROOTLIST: LazyLock<Mutex<Option<Arc<Rootlist>>>> = LazyLock::new(|| Mutex::new(None));
 static ROOTLIST_LOAD: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-fn cached_rootlist() -> Option<Arc<Rootlist>> {
-    ROOTLIST.lock().as_ref().filter(|r| r.fetched.elapsed() < Duration::from_secs(300)).cloned()
+fn cached_rootlist(owner: &str, max_age: Duration) -> Option<Arc<Rootlist>> {
+    ROOTLIST.lock().as_ref().filter(|r| r.fresh_for(owner, max_age)).cloned()
 }
 
 pub(crate) fn invalidate_rootlist() {
     *ROOTLIST.lock() = None;
+}
+
+/// Drops the rootlist and the playlist headers (logout / account switch, see
+/// `catalog::clear_user_state`): header lookups that failed with 403 depend on the account.
+pub(crate) fn forget_account() {
+    invalidate_rootlist();
+    HEADERS.lock().clear();
 }
 
 pub(crate) fn parse_rootlist_page(list: &p4::SelectedListContent) -> Vec<RootItem> {
@@ -504,17 +517,13 @@ pub(crate) fn parse_rootlist_page(list: &p4::SelectedListContent) -> Vec<RootIte
 
 /// The user's rootlist (all pages), cached for `max_age`. Loads are coalesced.
 pub(crate) async fn rootlist(session: &Session, max_age: Duration) -> AppResult<Arc<Rootlist>> {
-    let fresh = |r: &Arc<Rootlist>| r.fetched.elapsed() < max_age;
-    if let Some(r) = ROOTLIST.lock().as_ref().filter(|r| fresh(r)).cloned() {
+    let user = super::account(session)?;
+    if let Some(r) = cached_rootlist(&user, max_age) {
         return Ok(r);
     }
     let _guard = ROOTLIST_LOAD.lock().await;
-    if let Some(r) = ROOTLIST.lock().as_ref().filter(|r| fresh(r)).cloned() {
+    if let Some(r) = cached_rootlist(&user, max_age) {
         return Ok(r);
-    }
-    let user = engine::username().unwrap_or_else(|| session.username());
-    if user.is_empty() {
-        return Err(AppError::new(ErrorCode::NotLoggedIn, "no username"));
     }
     let mut items = Vec::new();
     let mut revision = Vec::new();
@@ -536,7 +545,7 @@ pub(crate) async fn rootlist(session: &Session, max_age: Duration) -> AppResult<
         }
         from += n;
     }
-    let r = Arc::new(Rootlist { revision, items, fetched: Instant::now() });
+    let r = Arc::new(Rootlist { revision, items, fetched: Instant::now(), owner: user });
     *ROOTLIST.lock() = Some(r.clone());
     Ok(r)
 }
@@ -1186,13 +1195,32 @@ mod tests {
         assert_eq!(v[2]["name"], "Resolved");
         assert_eq!(tree.len(), 3, "invalid ids and stray end markers are ignored");
 
-        let mut r = Rootlist { revision: list.revision().to_vec(), items, fetched: Instant::now() };
+        let mut r = Rootlist { revision: list.revision().to_vec(), items, fetched: Instant::now(), owner: "alice".into() };
         assert_eq!(r.find("5ihSl7a56tjMkVSzwQpSnl").map(|(i, _)| i), Some(2));
         assert_eq!(r.playlists().count(), 4);
         // Only the undecorated playlist needs a header lookup, unless the rootlist reports it gone.
         assert_eq!(undecorated(&r), ["spotify:playlist:2UZk7JjJnbTut1w8fqs3JL"]);
         r.items[7].status_code = Some(404);
         assert!(undecorated(&r).is_empty());
+    }
+
+    /// Serialises the tests that use the process-wide rootlist and header caches.
+    static CACHES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn the_rootlist_belongs_to_its_account() {
+        let _caches = CACHES.blocking_lock();
+        let items = parse_rootlist_page(&rootlist_fixture());
+        *ROOTLIST.lock() = Some(Arc::new(Rootlist { revision: vec![1], items, fetched: Instant::now(), owner: "alice".into() }));
+        let day = Duration::from_secs(86_400);
+        assert!(cached_rootlist("alice", day).is_some());
+        // The next account never sees it (also covers a load for alice finishing late).
+        assert!(cached_rootlist("bob", day).is_none());
+        // Logout drops it, and the account-dependent header cache with it.
+        HEADERS.lock().put("spotify:playlist:0dGxZ1eGqsqLRFmIGHbZbS".into(), (Instant::now(), None));
+        forget_account();
+        assert!(cached_rootlist("alice", day).is_none());
+        assert!(HEADERS.lock().is_empty());
     }
 
     #[test]
@@ -1216,6 +1244,7 @@ mod tests {
 
     #[tokio::test]
     async fn header_lookups_remember_dead_playlists_and_respect_the_budget() {
+        let _caches = CACHES.lock().await;
         let (dead, live, unknown) =
             ("spotify:playlist:0dGxZ1eGqsqLRFmIGHbZbS", "spotify:playlist:0DuAFMvFHpXWLn6jJBoCnw", "spotify:playlist:0Gd6DzmDyb3DMrg3kg4NFe");
         HEADERS.lock().put(dead.into(), (Instant::now(), None));

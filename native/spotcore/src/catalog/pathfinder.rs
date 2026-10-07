@@ -458,6 +458,12 @@ async fn refresh_now(fetch: Fetch, force: bool) -> AppResult<bool> {
     Ok(changed)
 }
 
+/// Forgets the account's token state (a refused login5 token says nothing about the next
+/// account's). The operation hashes belong to the web player, not to an account: they stay.
+pub(crate) fn forget_account() {
+    STATE.lock().login5_rejected_until = None;
+}
+
 fn maybe_refresh_in_background(session: &Session) {
     if may_attempt(&STATE.lock().persisted, false, now_ms()) {
         let fetch = web_fetcher(Some(session.clone()));

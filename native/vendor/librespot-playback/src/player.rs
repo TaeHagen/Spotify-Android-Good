@@ -64,6 +64,48 @@ const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 // SPOTIFYGOOD: audio-key retry policy for transient failures (librespot #1649 / PR #1763).
 const AUDIO_KEY_RETRIES: u32 = 3;
 const AUDIO_KEY_RETRY_DELAY: Duration = Duration::from_secs(1);
+// SPOTIFYGOOD: after the retries ran out on a transient failure (Spotify throttling keys, the AP
+// struggling), key requests in the next AUDIO_KEY_COOLDOWN make a single attempt instead of
+// 1 + AUDIO_KEY_RETRIES, so a run of skipped tracks doesn't multiply the requests. Shared by all
+// loaders and Players of the process (AUDIO_KEY_BRAKE).
+const AUDIO_KEY_COOLDOWN: Duration = Duration::from_secs(30);
+
+// SPOTIFYGOOD: the key-retry cool-down of the process (see AUDIO_KEY_COOLDOWN).
+static AUDIO_KEY_BRAKE: Mutex<KeyRetryBrake> = Mutex::new(KeyRetryBrake::new());
+
+// SPOTIFYGOOD: when audio-key requests may retry (see AUDIO_KEY_COOLDOWN).
+#[derive(Debug, Default)]
+struct KeyRetryBrake {
+    cooling_until: Option<Instant>,
+}
+
+impl KeyRetryBrake {
+    const fn new() -> Self {
+        Self { cooling_until: None }
+    }
+
+    /// Retries a key request that starts at `now` may make.
+    fn retries(&self, now: Instant) -> u32 {
+        match self.cooling_until {
+            Some(until) if now < until => 0,
+            _ => AUDIO_KEY_RETRIES,
+        }
+    }
+
+    /// The retries (or a single attempt while cooling down) ran out on a transient failure.
+    fn exhausted(&mut self, now: Instant) {
+        self.cooling_until = Some(now + AUDIO_KEY_COOLDOWN);
+    }
+
+    /// A key arrived: requests may retry again.
+    fn succeeded(&mut self) {
+        self.cooling_until = None;
+    }
+}
+
+fn audio_key_brake() -> MutexGuard<'static, KeyRetryBrake> {
+    AUDIO_KEY_BRAKE.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 // SPOTIFYGOOD: the player's own tokio runtime only drives loader I/O (the loaders run their
 // futures with `Handle::block_on` on their own threads, and hyper connection tasks are spawned
@@ -1116,16 +1158,21 @@ impl PlayerTrackLoader {
     }
 
     // SPOTIFYGOOD: audio-key request with retries for transient failures (librespot #1649,
-    // PR #1763). A permanent denial is returned at once as `KeyDenied`.
+    // PR #1763). A permanent denial is returned at once as `KeyDenied`. While the shared
+    // cool-down runs (AUDIO_KEY_COOLDOWN) only one attempt is made.
     async fn request_audio_key(
         &self,
         track_id: SpotifyId,
         file_id: FileId,
     ) -> Result<AudioKey, UnavailableReason> {
+        let max_retries = audio_key_brake().retries(Instant::now());
         let mut retries = 0;
         loop {
             let err = match self.session.audio_key().request(track_id, file_id).await {
-                Ok(key) => return Ok(key),
+                Ok(key) => {
+                    audio_key_brake().succeeded();
+                    return Ok(key);
+                }
                 Err(err) => err,
             };
             match classify_audio_key_error(&err, &self.session) {
@@ -1137,15 +1184,20 @@ impl PlayerTrackLoader {
                     warn!("Unable to request audio key, session is not connected: {err}");
                     return Err(UnavailableReason::KeyTemporarilyDenied);
                 }
-                KeyFailure::Transient if retries < AUDIO_KEY_RETRIES => {
+                KeyFailure::Transient if retries < max_retries => {
                     retries += 1;
                     warn!(
-                        "Audio key request failed: {err}; retry {retries}/{AUDIO_KEY_RETRIES} in {AUDIO_KEY_RETRY_DELAY:?}"
+                        "Audio key request failed: {err}; retry {retries}/{max_retries} in {AUDIO_KEY_RETRY_DELAY:?}"
                     );
                     tokio::time::sleep(AUDIO_KEY_RETRY_DELAY).await;
                 }
                 KeyFailure::Transient => {
-                    warn!("Audio key request failed after {AUDIO_KEY_RETRIES} retries: {err}");
+                    if max_retries == 0 {
+                        warn!("Audio key request failed while keys are cooling down: {err}");
+                    } else {
+                        warn!("Audio key request failed after {max_retries} retries: {err}");
+                    }
+                    audio_key_brake().exhausted(Instant::now());
                     return Err(UnavailableReason::KeyTemporarilyDenied);
                 }
             }
@@ -3019,5 +3071,40 @@ where
 
     fn byte_len(&self) -> Option<u64> {
         Some(self.length)
+    }
+}
+
+// SPOTIFYGOOD: unit tests for the local patches that don't need a session.
+#[cfg(test)]
+mod spotifygood_tests {
+    use super::*;
+
+    #[test]
+    fn key_retries_cool_down_after_exhaustion() {
+        let t0 = Instant::now();
+        let mut brake = KeyRetryBrake::new();
+        assert_eq!(brake.retries(t0), AUDIO_KEY_RETRIES);
+
+        // The retries ran out: for AUDIO_KEY_COOLDOWN every load makes a single key request.
+        brake.exhausted(t0);
+        assert_eq!(brake.retries(t0 + Duration::from_secs(1)), 0);
+        assert_eq!(brake.retries(t0 + AUDIO_KEY_COOLDOWN - Duration::from_millis(1)), 0);
+        assert_eq!(brake.retries(t0 + AUDIO_KEY_COOLDOWN), AUDIO_KEY_RETRIES);
+
+        // A failed single attempt extends the cool-down; a key ends it.
+        brake.exhausted(t0 + Duration::from_secs(20));
+        assert_eq!(brake.retries(t0 + Duration::from_secs(40)), 0);
+        brake.succeeded();
+        assert_eq!(brake.retries(t0 + Duration::from_secs(41)), AUDIO_KEY_RETRIES);
+    }
+
+    #[test]
+    fn key_brake_is_shared() {
+        let now = Instant::now();
+        audio_key_brake().succeeded();
+        audio_key_brake().exhausted(now);
+        let other_loader = std::thread::spawn(move || audio_key_brake().retries(now)).join().expect("join");
+        assert_eq!(other_loader, 0, "another loader thread sees the cool-down");
+        audio_key_brake().succeeded();
     }
 }

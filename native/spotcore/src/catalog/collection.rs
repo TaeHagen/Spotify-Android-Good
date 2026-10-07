@@ -157,12 +157,7 @@ pub(crate) fn parse_contains(body: &[u8], n: usize) -> AppResult<Vec<bool>> {
 }
 
 fn username(session: &Session) -> AppResult<String> {
-    let u = engine::username().unwrap_or_else(|| session.username());
-    if u.is_empty() {
-        Err(AppError::new(ErrorCode::NotLoggedIn, "no username"))
-    } else {
-        Ok(u)
-    }
+    super::account(session)
 }
 
 /// Encoding mismatch (worth retrying with the other encoding) vs. a real failure.
@@ -170,18 +165,28 @@ fn encoding_rejected(e: &HttpError) -> bool {
     matches!(e.status, Some(400) | Some(406) | Some(415)) || e.error.code == ErrorCode::Unavailable && e.status.is_none()
 }
 
+/// Items of a set and whether the paging reached its end (false: `MAX_PAGES` ran out while
+/// the server still offered a next page).
+type Listing = (Vec<CollItem>, bool);
+
+/// Every item of `set`. A listing cut off at `MAX_PAGES` fails: a snapshot is the authoritative
+/// membership (totals, `urisOnly`, download sync), so it is never silently short.
 async fn fetch_set(session: &Session, user: &str, set: Set) -> AppResult<Vec<CollItem>> {
-    match fetch_set_json(session, user, set).await {
-        Ok(v) => Ok(v),
+    let (items, complete) = match fetch_set_json(session, user, set).await {
+        Ok(v) => v,
         Err(e) if encoding_rejected(&e) => {
             log::info!("collection {} JSON paging failed ({}), trying protobuf", set.name(), e.error);
-            fetch_set_proto(session, user, set).await
+            fetch_set_proto(session, user, set).await?
         }
-        Err(e) => Err(e.into()),
+        Err(e) => return Err(e.into()),
+    };
+    if !complete {
+        return Err(AppError::unavailable(format!("collection {} has more than {MAX_PAGES} pages", set.name())));
     }
+    Ok(items)
 }
 
-async fn fetch_set_json(session: &Session, user: &str, set: Set) -> Result<Vec<CollItem>, HttpError> {
+async fn fetch_set_json(session: &Session, user: &str, set: Set) -> Result<Listing, HttpError> {
     let mut out = Vec::new();
     let mut token: Option<String> = None;
     for _ in 0..MAX_PAGES {
@@ -195,13 +200,13 @@ async fn fetch_set_json(session: &Session, user: &str, set: Set) -> Result<Vec<C
         out.extend(items);
         match next {
             Some(n) if token.as_deref() != Some(n.as_str()) => token = Some(n),
-            _ => break,
+            _ => return Ok((out, true)),
         }
     }
-    Ok(out)
+    Ok((out, false))
 }
 
-async fn fetch_set_proto(session: &Session, user: &str, set: Set) -> AppResult<Vec<CollItem>> {
+async fn fetch_set_proto(session: &Session, user: &str, set: Set) -> AppResult<Listing> {
     let mut out = Vec::new();
     let mut token = String::new();
     for _ in 0..MAX_PAGES {
@@ -216,10 +221,10 @@ async fn fetch_set_proto(session: &Session, user: &str, set: Set) -> AppResult<V
         out.extend(items);
         match next {
             Some(n) if n != token => token = n,
-            _ => break,
+            _ => return Ok((out, true)),
         }
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -229,33 +234,53 @@ async fn fetch_set_proto(session: &Session, user: &str, set: Set) -> AppResult<V
 struct Snapshot {
     items: Arc<Vec<CollItem>>,
     at: Instant,
+    /// Account the snapshot was read for; another account's snapshot is never served.
+    owner: String,
+    /// Only a prefix of the list (Liked Songs fallback cut off at its item/page budget).
+    truncated: bool,
+}
+
+impl Snapshot {
+    fn new(owner: &str, items: Arc<Vec<CollItem>>, truncated: bool) -> Self {
+        Self { items, at: Instant::now(), owner: owner.to_string(), truncated }
+    }
+
+    fn usable(&self, owner: &str, max_age: Duration) -> bool {
+        self.owner == owner && self.at.elapsed() < max_age
+    }
 }
 
 static SNAPSHOTS: LazyLock<Mutex<HashMap<Set, Snapshot>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static LOADS: LazyLock<HashMap<Set, tokio::sync::Mutex<()>>> =
     LazyLock::new(|| Set::ALL.iter().map(|s| (*s, tokio::sync::Mutex::new(()))).collect());
 
-fn cached(set: Set, max_age: Duration) -> Option<Arc<Vec<CollItem>>> {
-    SNAPSHOTS.lock().get(&set).filter(|s| s.at.elapsed() < max_age).map(|s| s.items.clone())
+fn cached(owner: &str, set: Set, max_age: Duration) -> Option<Arc<Vec<CollItem>>> {
+    SNAPSHOTS.lock().get(&set).filter(|s| s.usable(owner, max_age)).map(|s| s.items.clone())
+}
+
+/// Drops every snapshot (logout / account switch, see `catalog::clear_user_state`).
+pub(crate) fn forget_account() {
+    SNAPSHOTS.lock().clear();
+    *LIKED_FALLBACK.lock() = None;
 }
 
 /// Sorted (newest first) contents of `set`, at most `max_age` old.
 pub(crate) async fn snapshot(session: &Session, set: Set, max_age: Duration) -> AppResult<Arc<Vec<CollItem>>> {
-    if let Some(s) = cached(set, max_age) {
+    let user = username(session)?;
+    if let Some(s) = cached(&user, set, max_age) {
         return Ok(s);
     }
     let _guard = match LOADS.get(&set) {
         Some(m) => Some(m.lock().await),
         None => None,
     };
-    if let Some(s) = cached(set, max_age) {
+    if let Some(s) = cached(&user, set, max_age) {
         return Ok(s);
     }
-    let user = username(session)?;
     let mut items = fetch_set(session, &user, set).await?;
     sort_items(&mut items);
     let items = Arc::new(items);
-    SNAPSHOTS.lock().insert(set, Snapshot { items: items.clone(), at: Instant::now() });
+    SNAPSHOTS.lock().insert(set, Snapshot::new(&user, items.clone(), false));
     Ok(items)
 }
 
@@ -265,13 +290,14 @@ pub(crate) fn sort_items(items: &mut Vec<CollItem>) {
     items.sort_by_key(|i| std::cmp::Reverse(i.added_at));
 }
 
-fn patch_snapshot(set: Set, uris: &[String], removed: bool) {
-    if let Some(s) = SNAPSHOTS.lock().get_mut(&set) {
+/// Applies a library write by `owner` to their cached lists.
+fn patch_snapshot(owner: &str, set: Set, uris: &[String], removed: bool) {
+    if let Some(s) = SNAPSHOTS.lock().get_mut(&set).filter(|s| s.owner == owner) {
         s.items = Arc::new(patched(&s.items, uris, removed));
     }
     if set == Set::Collection {
         let tracks: Vec<String> = uris.iter().filter(|u| parse_kind(u, UriKind::Track).is_some()).cloned().collect();
-        if let Some(s) = LIKED_FALLBACK.lock().as_mut().filter(|_| !tracks.is_empty()) {
+        if let Some(s) = LIKED_FALLBACK.lock().as_mut().filter(|s| s.owner == owner && !tracks.is_empty()) {
             s.items = Arc::new(patched(&s.items, &tracks, removed));
         }
     }
@@ -307,7 +333,7 @@ async fn contains_set(session: &Session, user: &str, set: Set, uris: &[String]) 
             Ok(found) => out.extend(found),
             Err(e) => {
                 log::info!("collection contains failed ({e}); using the set snapshot");
-                let snap = match cached(set, CONTAINS_FALLBACK_AGE) {
+                let snap = match cached(user, set, CONTAINS_FALLBACK_AGE) {
                     Some(s) => s,
                     // Throttled or offline: downloading the whole set would only make it worse.
                     None if stops_fallback(&e) => return Err(e),
@@ -388,7 +414,7 @@ async fn write_set(session: &Session, user: &str, set: Set, uris: &[String], rem
             }
             Err(e) => return Err(e.into()),
         }
-        patch_snapshot(set, chunk, remove);
+        patch_snapshot(user, set, chunk, remove);
     }
     Ok(())
 }
@@ -489,12 +515,14 @@ pub(crate) fn window(items: &[CollItem], kind: UriKind, offset: u32, limit: u32)
 /// A `library.*` page: exactly one item per window slot, so `items.len() == min(limit, total -
 /// offset)` and offset paging stays aligned. Entries without metadata keep their slot as a
 /// placeholder carrying only the URI; `partial` is set when some of them are only missing
-/// because their request failed (docs §6.3, §6.5).
+/// because their request failed, or when the list itself is only a prefix (`truncated`, docs
+/// §6.3, §6.5).
 pub(crate) fn saved_page<M, V: Serialize>(
     total: u32,
     page: &[CollItem],
     kind: UriKind,
     fetched: &Fetched<M>,
+    truncated: bool,
     item: impl Fn(&str, Option<&M>) -> V,
 ) -> AppResult<Value> {
     let keys: Vec<String> = page.iter().map(|i| parse_kind(&i.uri, kind).map(|p| p.uri()).unwrap_or_else(|| i.uri.clone())).collect();
@@ -506,6 +534,9 @@ pub(crate) fn saved_page<M, V: Serialize>(
     let mut out = json!({ "total": total, "items": items });
     if fetched.any_failed(keys.iter()) {
         log::warn!("library {} page partial: {:?}", kind.as_str(), fetched.error);
+        out["partial"] = json!(true);
+    }
+    if truncated {
         out["partial"] = json!(true);
     }
     to_value(&out)
@@ -528,8 +559,20 @@ static LIKED_FALLBACK_LOAD: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| 
 const LIKED_CONTEXT_MAX_ITEMS: usize = 20_000;
 const LIKED_CONTEXT_MAX_PAGES: usize = 200;
 
-fn cached_liked_fallback() -> Option<Arc<Vec<CollItem>>> {
-    LIKED_FALLBACK.lock().as_ref().filter(|s| s.at.elapsed() < LIST_MAX_AGE).map(|s| s.items.clone())
+/// Liked Songs as served: the list and whether it is only a prefix (fallback cut off at its
+/// budget), which `library.tracks` reports instead of passing it off as the whole collection.
+#[derive(Clone)]
+struct Liked {
+    items: Arc<Vec<CollItem>>,
+    truncated: bool,
+}
+
+fn cached_liked_fallback(owner: &str) -> Option<Liked> {
+    LIKED_FALLBACK
+        .lock()
+        .as_ref()
+        .filter(|s| s.usable(owner, LIST_MAX_AGE))
+        .map(|s| Liked { items: s.items.clone(), truncated: s.truncated })
 }
 
 /// Liked Songs (newest first) from context items: tracks only, deduplicated.
@@ -543,40 +586,44 @@ pub(crate) fn liked_items(items: Vec<context::ContextItem>) -> Vec<CollItem> {
     list
 }
 
-/// The whole Liked Songs list from context-resolve, resolved once per [`LIST_MAX_AGE`] (loads
+/// The Liked Songs list from context-resolve, resolved once per [`LIST_MAX_AGE`] (loads
 /// coalesced) so paging does not re-resolve it for every page.
-async fn liked_from_context(session: &Session) -> AppResult<Arc<Vec<CollItem>>> {
-    if let Some(s) = cached_liked_fallback() {
+async fn liked_from_context(session: &Session, user: &str) -> AppResult<Liked> {
+    if let Some(s) = cached_liked_fallback(user) {
         return Ok(s);
     }
     let _guard = LIKED_FALLBACK_LOAD.lock().await;
-    if let Some(s) = cached_liked_fallback() {
+    if let Some(s) = cached_liked_fallback(user) {
         return Ok(s);
     }
-    let user = username(session)?;
-    // Fails when a page fails: a truncated list would read as songs that are no longer liked.
+    // Fails when a page fails, and reports a list cut off at the budget: a short list must not
+    // read as songs that are no longer liked.
     let context_uri = format!("spotify:user:{user}:collection");
-    let items = context::resolve(session, &context_uri, LIKED_CONTEXT_MAX_ITEMS, LIKED_CONTEXT_MAX_PAGES).await?;
-    let list = Arc::new(liked_items(items));
-    *LIKED_FALLBACK.lock() = Some(Snapshot { items: list.clone(), at: Instant::now() });
-    Ok(list)
+    let r = context::resolve_within(session, &context_uri, LIKED_CONTEXT_MAX_ITEMS, LIKED_CONTEXT_MAX_PAGES).await?;
+    if r.truncated {
+        log::warn!("Liked Songs fallback stopped at its budget ({} items)", r.items.len());
+    }
+    let liked = Liked { items: Arc::new(liked_items(r.items)), truncated: r.truncated };
+    *LIKED_FALLBACK.lock() = Some(Snapshot::new(user, liked.items.clone(), liked.truncated));
+    Ok(liked)
 }
 
 /// Liked Songs: the `collection` snapshot, or the context-resolve fallback when paging fails
 /// (not for transport errors). While a fallback list is fresh, the failing request is skipped.
-async fn liked_songs(session: &Session) -> AppResult<Arc<Vec<CollItem>>> {
-    if let Some(s) = cached(Set::Collection, LIST_MAX_AGE) {
-        return Ok(s);
+async fn liked_songs(session: &Session) -> AppResult<Liked> {
+    let user = username(session)?;
+    if let Some(items) = cached(&user, Set::Collection, LIST_MAX_AGE) {
+        return Ok(Liked { items, truncated: false });
     }
-    if let Some(s) = cached_liked_fallback() {
+    if let Some(s) = cached_liked_fallback(&user) {
         return Ok(s);
     }
     match snapshot(session, Set::Collection, LIST_MAX_AGE).await {
-        Ok(s) => Ok(s),
+        Ok(items) => Ok(Liked { items, truncated: false }),
         Err(e) if stops_fallback(&e) => Err(e),
         Err(e) => {
             log::warn!("collection paging failed ({e}); falling back to context-resolve");
-            liked_from_context(session).await
+            liked_from_context(session, &user).await
         }
     }
 }
@@ -585,13 +632,18 @@ pub(crate) async fn tracks(args: Value) -> AppResult<Value> {
     let a: PageArgs = parse_args(args)?;
     let limit = a.limit.clamp(1, MAX_LIMIT);
     let session = engine::session()?;
-    let (total, page) = window(&liked_songs(&session).await?, UriKind::Track, a.offset, limit);
+    let liked = liked_songs(&session).await?;
+    let (total, page) = window(&liked.items, UriKind::Track, a.offset, limit);
     if a.uris_only {
+        // The membership source (download sync drops what it does not list): only whole.
+        if liked.truncated {
+            return Err(AppError::unavailable("Liked Songs could not be listed completely"));
+        }
         let uris: Vec<&str> = page.iter().map(|i| i.uri.as_str()).collect();
         return Ok(json!({ "total": total, "items": [], "uris": uris }));
     }
     let fetched = metadata::track_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
-    saved_page(total, &page, UriKind::Track, &fetched, |uri, t| TrackItem {
+    saved_page(total, &page, UriKind::Track, &fetched, liked.truncated, |uri, t| TrackItem {
         track: t.cloned().unwrap_or_else(|| metadata::placeholder_track(uri)),
     })
 }
@@ -602,7 +654,7 @@ pub(crate) async fn albums(args: Value) -> AppResult<Value> {
     let snap = snapshot(&session, Set::Collection, LIST_MAX_AGE).await?;
     let (total, page) = window(&snap, UriKind::Album, a.offset, a.limit.clamp(1, MAX_LIMIT));
     let fetched = metadata::album_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
-    saved_page(total, &page, UriKind::Album, &fetched, |uri, m| AlbumItem {
+    saved_page(total, &page, UriKind::Album, &fetched, false, |uri, m| AlbumItem {
         album: m.map(|m| m.album.clone()).unwrap_or_else(|| AlbumRef { uri: uri.to_string(), ..Default::default() }),
     })
 }
@@ -613,7 +665,7 @@ pub(crate) async fn artists(args: Value) -> AppResult<Value> {
     let snap = snapshot(&session, Set::Artist, LIST_MAX_AGE).await?;
     let (total, page) = window(&snap, UriKind::Artist, a.offset, a.limit.clamp(1, MAX_LIMIT));
     let fetched = metadata::artist_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
-    saved_page(total, &page, UriKind::Artist, &fetched, |uri, m| ArtistItem {
+    saved_page(total, &page, UriKind::Artist, &fetched, false, |uri, m| ArtistItem {
         artist: m.map(|m| m.artist.clone()).unwrap_or_else(|| ArtistRef { uri: uri.to_string(), ..Default::default() }),
     })
 }
@@ -624,7 +676,7 @@ pub(crate) async fn shows(args: Value) -> AppResult<Value> {
     let snap = snapshot(&session, Set::Show, LIST_MAX_AGE).await?;
     let (total, page) = window(&snap, UriKind::Show, a.offset, a.limit.clamp(1, MAX_LIMIT));
     let fetched = metadata::show_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
-    saved_page(total, &page, UriKind::Show, &fetched, |uri, m| ShowItem {
+    saved_page(total, &page, UriKind::Show, &fetched, false, |uri, m| ShowItem {
         show: m.map(|m| m.show.clone()).unwrap_or_else(|| ShowRef { uri: uri.to_string(), ..Default::default() }),
     })
 }
@@ -635,7 +687,7 @@ pub(crate) async fn episodes(args: Value) -> AppResult<Value> {
     let snap = snapshot(&session, Set::ListenLater, LIST_MAX_AGE).await?;
     let (total, page) = window(&snap, UriKind::Episode, a.offset, a.limit.clamp(1, MAX_LIMIT));
     let fetched = metadata::episode_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
-    saved_page(total, &page, UriKind::Episode, &fetched, |uri, e| EpisodeItem {
+    saved_page(total, &page, UriKind::Episode, &fetched, false, |uri, e| EpisodeItem {
         episode: e.cloned().unwrap_or_else(|| metadata::placeholder_episode(uri)),
     })
 }
@@ -772,7 +824,7 @@ mod tests {
         let ta = Track { uri: a.into(), name: "A".into(), ..Default::default() };
         let track_item = |uri: &str, t: Option<&Track>| TrackItem { track: t.cloned().unwrap_or_else(|| metadata::placeholder_track(uri)) };
         // b has no data on the server, c's request failed.
-        let v = saved_page(total, &page, UriKind::Track, &fetched(&[(a, ta.clone())], &[c]), track_item).unwrap();
+        let v = saved_page(total, &page, UriKind::Track, &fetched(&[(a, ta.clone())], &[c]), false, track_item).unwrap();
         assert_eq!(v["total"], 3);
         let got: Vec<&str> = v["items"].as_array().unwrap().iter().map(|i| i["track"]["uri"].as_str().unwrap()).collect();
         assert_eq!(got, [a, b, c]);
@@ -781,20 +833,32 @@ mod tests {
         assert_eq!(v["items"][1]["addedAt"], 98_000);
         assert_eq!(v["partial"], true);
         // Missing data alone does not make a page partial.
-        let v = saved_page(total, &page, UriKind::Track, &fetched(&[(a, ta)], &[]), track_item).unwrap();
+        let v = saved_page(total, &page, UriKind::Track, &fetched(&[(a, ta.clone())], &[]), false, track_item).unwrap();
         assert_eq!(v["items"].as_array().unwrap().len(), 3);
         assert!(v.get("partial").is_none());
+        // A list that is only a prefix of the collection is partial.
+        let v = saved_page(total, &page, UriKind::Track, &fetched(&[(a, ta)], &[]), true, track_item).unwrap();
+        assert_eq!(v["partial"], true);
         // Albums keep their slot as a bare reference.
         let (total, page) = window(&items, UriKind::Album, 0, 10);
-        let v = saved_page(total, &page, UriKind::Album, &fetched::<metadata::AlbumMeta>(&[], &[]), |uri, m| AlbumItem {
+        let v = saved_page(total, &page, UriKind::Album, &fetched::<metadata::AlbumMeta>(&[], &[]), false, |uri, m| AlbumItem {
             album: m.map(|m| m.album.clone()).unwrap_or_else(|| AlbumRef { uri: uri.to_string(), ..Default::default() }),
         })
         .unwrap();
         assert_eq!(v["items"][0]["album"]["uri"], album);
     }
 
+    /// Serialises the tests that use the process-wide snapshot caches.
+    static CACHES: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn snap(owner: &str, uris: &[&str]) -> Snapshot {
+        let items = uris.iter().map(|u| CollItem { uri: u.to_string(), added_at: 1 }).collect();
+        Snapshot::new(owner, Arc::new(items), false)
+    }
+
     #[test]
     fn liked_songs_fallback_is_cached_patched_and_skipped_on_transport_errors() {
+        let _caches = CACHES.lock();
         let item = |uri: &str, at: &str| context::ContextItem {
             uri: uri.into(),
             uid: None,
@@ -804,13 +868,20 @@ mod tests {
         let list = liked_items(vec![item(a, "10"), item("spotify:episode:512ojhOuo1ktJprKbVcKyQ", "30"), item(b, "20"), item(a, "10")]);
         assert_eq!(list.iter().map(|i| i.uri.as_str()).collect::<Vec<_>>(), [b, a], "tracks only, deduplicated, newest first");
 
-        *LIKED_FALLBACK.lock() = Some(Snapshot { items: Arc::new(list), at: Instant::now() });
-        assert_eq!(cached_liked_fallback().map(|s| s.len()), Some(2));
+        *LIKED_FALLBACK.lock() = Some(Snapshot::new("alice", Arc::new(list), true));
+        let liked = cached_liked_fallback("alice").unwrap();
+        assert_eq!(liked.items.len(), 2);
+        assert!(liked.truncated, "a fallback cut off at its budget stays marked");
         // Likes and unlikes show up in the fallback list too (albums do not).
-        patch_snapshot(Set::Collection, &[b.to_string(), "spotify:album:6XhjNHCyCDyyGJRM5mg40G".into()], true);
-        assert_eq!(cached_liked_fallback().unwrap().iter().map(|i| i.uri.as_str()).collect::<Vec<_>>(), [a]);
-        patch_snapshot(Set::Collection, &[b.to_string()], false);
-        assert_eq!(cached_liked_fallback().unwrap()[0].uri, b);
+        patch_snapshot("alice", Set::Collection, &[b.to_string(), "spotify:album:6XhjNHCyCDyyGJRM5mg40G".into()], true);
+        let uris = |l: Liked| l.items.iter().map(|i| i.uri.clone()).collect::<Vec<_>>();
+        assert_eq!(uris(cached_liked_fallback("alice").unwrap()), [a]);
+        patch_snapshot("alice", Set::Collection, &[b.to_string()], false);
+        assert_eq!(uris(cached_liked_fallback("alice").unwrap())[0], b);
+        // Another account's write or lookup never touches it.
+        patch_snapshot("bob", Set::Collection, &[a.to_string()], true);
+        assert_eq!(cached_liked_fallback("alice").unwrap().items.len(), 2);
+        assert!(cached_liked_fallback("bob").is_none());
         *LIKED_FALLBACK.lock() = None;
 
         for code in [ErrorCode::Network, ErrorCode::RateLimited, ErrorCode::Cancelled, ErrorCode::NotLoggedIn] {
@@ -821,17 +892,28 @@ mod tests {
 
     #[test]
     fn patches_snapshots() {
-        SNAPSHOTS.lock().insert(
-            Set::Show,
-            Snapshot {
-                items: Arc::new(vec![CollItem { uri: "spotify:show:a".into(), added_at: 1 }]),
-                at: Instant::now(),
-            },
-        );
-        patch_snapshot(Set::Show, &["spotify:show:b".into()], false);
-        patch_snapshot(Set::Show, &["spotify:show:a".into()], true);
-        let s = cached(Set::Show, Duration::from_secs(60)).unwrap();
+        let _caches = CACHES.lock();
+        SNAPSHOTS.lock().insert(Set::Show, snap("alice", &["spotify:show:a"]));
+        patch_snapshot("alice", Set::Show, &["spotify:show:b".into()], false);
+        patch_snapshot("alice", Set::Show, &["spotify:show:a".into()], true);
+        let s = cached("alice", Set::Show, Duration::from_secs(60)).unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].uri, "spotify:show:b");
+        SNAPSHOTS.lock().remove(&Set::Show);
+    }
+
+    #[test]
+    fn snapshots_belong_to_their_account() {
+        let _caches = CACHES.lock();
+        SNAPSHOTS.lock().insert(Set::Artist, snap("alice", &["spotify:artist:0gxyHStUsqpMadRV0Di1Qt"]));
+        *LIKED_FALLBACK.lock() = Some(snap("alice", &["spotify:track:4uLU6hMCjMI75M1A2tKUQC"]));
+        // The next account never sees them (also covers a load for alice finishing late).
+        assert!(cached("bob", Set::Artist, Duration::from_secs(60)).is_none());
+        assert!(cached_liked_fallback("bob").is_none());
+        assert!(cached("alice", Set::Artist, Duration::from_secs(60)).is_some());
+        // Logout drops them altogether.
+        forget_account();
+        assert!(cached("alice", Set::Artist, Duration::from_secs(60)).is_none());
+        assert!(cached_liked_fallback("alice").is_none());
     }
 }
