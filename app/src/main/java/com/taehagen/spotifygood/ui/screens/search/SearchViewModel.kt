@@ -174,14 +174,16 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         emit(lastReady?.copy(isRefreshing = true) ?: TopResultsState.Loading)
         attempt { graph.search.search(query).distinct() }
             .onSuccess { results ->
-                cache[key] = results
+                // Empty results are not kept: revisiting the query or Retry asks the engine again
+                // (an empty answer can be transient).
+                if (results.hasAnyResult()) cache[key] = results
                 emit(readyOrEmpty(query, results))
             }
             .onFailure { emit(TopResultsState.Failed(query, it.toBrowseError())) }
     }
 
     private fun readyOrEmpty(query: String, results: SearchResults): TopResultsState =
-        if (results.isEmpty && results.topResult == null) {
+        if (!results.hasAnyResult()) {
             TopResultsState.Empty(query)
         } else {
             TopResultsState.Ready(query, results.toTopSections())
@@ -307,10 +309,13 @@ class SearchResultsViewModel(private val graph: AppGraph, private val query: Str
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SearchResultsUiState(type))
 
     init {
-        // First page as soon as we are online (and again after coming back online with nothing loaded).
+        // First page as soon as we are online, and again after coming back online with nothing loaded
+        // or a failed load (e.g. the reload after an explicit-filter change: it then replaces the
+        // stale rows).
         viewModelScope.launch {
             offline.collect { isOffline ->
-                if (!isOffline && loader.state.value.items.isEmpty()) loader.loadMore()
+                val paged = loader.state.value
+                if (!isOffline && (paged.items.isEmpty() || paged.error != null)) loader.loadMore()
             }
         }
         // Loaded pages carry playable flags of the old explicit filter.
@@ -319,13 +324,22 @@ class SearchResultsViewModel(private val graph: AppGraph, private val query: Str
 
     fun loadMore() = loader.loadMore()
 
-    fun retry() = loader.loadMore()
+    /**
+     * Error footer: the failed page again. Nothing listed (error or no results, which ends paging):
+     * from the start.
+     */
+    fun retry() {
+        if (loader.state.value.items.isEmpty()) loader.reload() else loader.loadMore()
+    }
 
     fun onOpened(ref: MediaRef) {
         viewModelScope.launch { attempt { graph.search.addRecent(RecentSearch.Item(ref)) } }
     }
 
     fun playTrack(track: Track) {
+        // Unplayable (explicit with the filter on, not available here): Spirc would skip to
+        // another track of the album.
+        if (!track.playable) return
         onOpened(track.toMediaRef())
         graph.playTrackInAlbum(track)
     }

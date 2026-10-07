@@ -131,11 +131,21 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
                     .collect { onShow(it) }
             }
         }
+        // Session back ONLINE while the header or episodes come from the download: fetch the show
+        // again; its first page replaces the downloaded list (onShow) and paging resumes.
+        refetchWhenOnline(showingDownload = {
+            header.value.dataOrNull()?.downloadedCopy == true || list.value.fromDownloads
+        })
     }
 
     private suspend fun onShow(resource: Resource<Show>) {
         val show = resource.dataOrNull
         if (show == null) {
+            val shown = header.value
+            if (shown is LoadState.Ready && shown.data.downloadedCopy) {
+                // Refetching while the download is shown: it stays, refreshing until the fetch ends.
+                header.value = shown.copy(refreshing = resource is Resource.Loading)
+            }
             if (header.value !is LoadState.Ready) {
                 // No page and no cached copy (offline, cache cleared or pruned): a downloaded show
                 // still opens, from the download database.
@@ -145,6 +155,8 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
             return
         }
         val description = withContext(Dispatchers.Default) { parseHtml(show.description) }
+        // Episodes listed from the download (the header was its copy, or paging fell back to it).
+        val listedFromDownload = header.value.dataOrNull()?.downloadedCopy == true || list.value.fromDownloads
         total = show.total
         firstPage = show.episodes.distinctBy { it.uri }
         header.value = LoadState.Ready(
@@ -152,6 +164,16 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
             refreshing = resource is Resource.Loading,
             stale = resource is Resource.Error,
         )
+        if (listedFromDownload) {
+            if (resource is Resource.Success) {
+                // The server answered: its pages replace the downloaded episodes.
+                loadJob?.cancel()
+                list.update { EpisodePage(sort = it.sort) }
+            } else {
+                // Cached (stale) server data: the downloaded episodes stay, and stay marked.
+                list.update { it.copy(fromDownloads = true) }
+            }
+        }
         val current = list.value
         when {
             current.sort == EpisodeSort.NEWEST -> {
@@ -206,9 +228,10 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                // Offline past the cached episodes: list the downloaded ones instead of failing. Only
-                // when actually offline: a transient error online keeps the Retry footer.
-                val copy = if (offline.value) downloadedCopy() else null
+                // The session can't reach the server past the cached episodes: list the downloaded
+                // ones instead of failing. Not while the session is ONLINE: a transient error then
+                // keeps the Retry footer.
+                val copy = if (downloadFallbackAllowed(e)) downloadedCopy() else null
                 list.update { latest ->
                     when {
                         latest.sort != sort -> latest

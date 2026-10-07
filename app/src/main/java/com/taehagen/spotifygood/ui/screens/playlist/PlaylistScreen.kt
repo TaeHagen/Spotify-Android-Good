@@ -125,6 +125,7 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
             onShuffle = viewModel::shuffleContext,
             onSmartShuffle = viewModel::smartShuffleContext,
             onRetryPartial = viewModel::retryPartial,
+            onRetry = viewModel::retry,
             onToggleFollow = viewModel::toggleFollow,
             onDownload = viewModel::download,
             onRemoveDownload = { viewModel.removeCollectionDownload() },
@@ -152,7 +153,8 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
                 state.editMode -> TextButton(onClick = exitEditMode) {
                     Text(stringResource(R.string.detail_done), fontWeight = FontWeight.Bold)
                 }
-                data?.meta?.canEdit == true -> IconButton(
+                // Rows from the download are read-only (setEditMode refuses them).
+                data?.meta?.canEdit == true && !data.downloadedCopy -> IconButton(
                     onClick = {
                         query = ""
                         viewModel.setEditMode(true)
@@ -226,6 +228,8 @@ private class PlaylistActions(
     val onShuffle: () -> Unit,
     val onSmartShuffle: () -> Unit,
     val onRetryPartial: () -> Unit,
+    /** Fetches the playlist again (e.g. to replace the downloaded copy). */
+    val onRetry: () -> Unit,
     val onToggleFollow: () -> Unit,
     val onDownload: () -> Unit,
     val onRemoveDownload: () -> Unit,
@@ -273,7 +277,10 @@ private fun PlaylistList(
         }
         if (playlist.downloadedCopy) {
             item(key = "downloaded", contentType = "notice") {
-                DownloadedCopyNotice(stringResource(R.string.detail_showing_downloaded_tracks))
+                DownloadedCopyNotice(
+                    stringResource(R.string.detail_showing_downloaded_tracks),
+                    onRetry = actions.onRetry.takeUnless { state.offline },
+                )
             }
         }
         if (playlist.partial && !state.editMode) {

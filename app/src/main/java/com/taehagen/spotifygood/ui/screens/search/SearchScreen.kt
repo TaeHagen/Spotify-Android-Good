@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -26,6 +27,7 @@ import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -268,13 +270,7 @@ private fun TopResults(
         is TopResultsState.Failed -> StateBox {
             ErrorState(message = stringResource(top.error.messageRes(search = true)), onRetry = onRetry)
         }
-        is TopResultsState.Empty -> StateBox {
-            EmptyState(
-                title = stringResource(R.string.browse_search_no_results_title, top.query),
-                message = stringResource(R.string.browse_search_no_results_message),
-                icon = Icons.Rounded.Search,
-            )
-        }
+        is TopResultsState.Empty -> StateBox { NoResults(top.query, onRetry) }
         is TopResultsState.Ready -> {
             val listState = rememberLazyListState()
             HideKeyboardOnDrag(listState, onDrag)
@@ -425,12 +421,24 @@ private fun TypedResults(
         onItemActions = onItemActions,
         onLoadMore = onLoadMore,
         onRetry = onRetry,
-        emptyContent = {
-            EmptyState(
-                title = stringResource(R.string.browse_search_no_results_title, state.query),
-                message = stringResource(R.string.browse_search_no_results_message),
-                icon = Icons.Rounded.Search,
-            )
+        emptyContent = { NoResults(state.query, onRetry) },
+    )
+}
+
+/**
+ * No results for [query]. [onRetry] asks the engine again (a transient failure can come back as an
+ * empty result; empty results are not cached).
+ */
+@Composable
+private fun NoResults(query: String, onRetry: () -> Unit) {
+    EmptyState(
+        title = stringResource(R.string.browse_search_no_results_title, query),
+        message = stringResource(R.string.browse_search_no_results_message),
+        icon = Icons.Rounded.Search,
+        action = {
+            OutlinedButton(onClick = onRetry, modifier = Modifier.heightIn(min = 48.dp)) {
+                Text(stringResource(R.string.shell_retry))
+            }
         },
     )
 }
@@ -491,13 +499,7 @@ fun SearchResultsScreen(query: String, type: String, contentPadding: PaddingValu
                     onItemActions = { navigator.showActions(it.actionTarget(state.myUsername)) },
                     onLoadMore = viewModel::loadMore,
                     onRetry = viewModel::retry,
-                    emptyContent = {
-                        EmptyState(
-                            title = stringResource(R.string.browse_search_no_results_title, query),
-                            message = stringResource(R.string.browse_search_no_results_message),
-                            icon = Icons.Rounded.Search,
-                        )
-                    },
+                    emptyContent = { NoResults(query, viewModel::retry) },
                 )
             }
         }

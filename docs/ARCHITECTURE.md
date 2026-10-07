@@ -464,7 +464,7 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.artist` | `{"uri"}` | `Artist` |
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
-| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
+| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. A pathfinder answer whose `searchV2` failed (`null` with a GraphQL field error, or every requested section failed) counts as a failed source: searchview and context-resolve are asked, and if they fail too the call fails instead of returning "no results". "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
 | `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
 | `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
@@ -775,6 +775,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   start-self intent) that is not in the foreground 3 s later enters and leaves the foreground
   (own notification id), so the system never kills the app; an unknown start then stops again.
   Bulk queue adds send one `queue.add` command per item (≤ 80), interleaved with other commands.
+  A queue clear stops bulk adds queued before it (silently: the user cleared); a load does not
+  (Spirc and remote devices keep the user queue across loads).
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata) persisted on pause and every 15 s while playing.
@@ -803,15 +805,16 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   local status is playing/loading; false otherwise.
 * Sleep timer (`SleepTimer`): coroutine delays stop while the CPU sleeps (remote playback holds
   no wake lock), so an `ELAPSED_REALTIME_WAKEUP` allow-while-idle alarm (also delivered, with
-  network, in Doze) reaches the non-exported `SleepTimerAlarmReceiver`, which pokes the timer and
-  holds a timed partial wake lock until the end + 30 s (≤ 10 min). Exact at the end where no
+  network, in Doze) reaches the non-exported `SleepTimerAlarmReceiver`, which pokes the timer. It
+  holds a timed partial wake lock until the end + 30 s only while a remote device plays and the end
+  is within 10 min, or at the final stage; early stages hold 2 s (re-check, re-arm). Exact at the end where no
   runtime grant is needed (API < 31, or SCHEDULE_EXACT_ALARM already allowed; never requested;
   not USE_EXACT_ALARM). Otherwise inexact and staged: its heuristic window
   [t, t + 0.75 × (t − now)] (≤ 1 h) is placed to end at the timer's end
   (t = now + (end − now) / 1.75), Android 12+ delivers at the window end unless woken earlier, and
   an early delivery arms the next stage until < 10 s remain (a handful of stages, within the
-  allow-while-idle quota). A remote timer ending within 10 min also holds the wake lock from the
-  start (honoured outside Doze). "End of track" arms the snapshot's track end and re-arms on every
+  allow-while-idle quota). A timer ending within 10 min while a remote device plays also holds the
+  wake lock from the start (honoured outside Doze). "End of track" arms the snapshot's track end and re-arms on every
   snapshot. Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
@@ -879,7 +882,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   {urisOnly:true}`; members without a row and members whose row failed get metadata and their
   playability from `catalog.tracks` (batched, ≤ 60 s; completed and pending rows are not looked up
   again; placeholders are stored without metadata). Re-validation adds a member found not playable
-  to the unavailable set of every collection containing it (and removes it when playable again). Only a *complete* resolution removes items (not `partial`, not empty, and for
+  to the unavailable set of every collection containing it (and removes it when playable again).
+  Members in a collection's unavailable set are looked up again once a day during sync
+  (`unavailableCheckedAt`), so an unchanged playlist revision or a URI-only listing cannot keep them
+  out: playable ones leave the set and are queued. Removing a member removes it from the set. Only a *complete* resolution removes items (not `partial`, not empty, and for
   playlists / Liked Songs every slot listed): an empty, short or partial one only adds, and is
   retried. A collection whose sync fails or is incomplete is retried after 1 h,
   doubling up to 24 h (`lastAttemptAt`, `syncFailures`), instead of at every reconnect.
