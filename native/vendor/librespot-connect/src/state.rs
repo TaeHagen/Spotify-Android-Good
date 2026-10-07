@@ -578,10 +578,7 @@ impl ConnectState {
         // future skipped the restore, so every later state PUT went out as e.g. VOLUME_CHANGED.
         let mut request = self.request.clone();
         request.put_state_reason = EnumOrUnknown::new(reason);
-        session
-            .spclient()
-            .put_connect_state_request(&request)
-            .await
+        session.spclient().put_connect_state_request(&request).await
     }
 
     /// Notifies the remote server about a new device
