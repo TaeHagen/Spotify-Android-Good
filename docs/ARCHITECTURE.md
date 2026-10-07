@@ -425,7 +425,7 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.artist` | `{"uri"}` | `Artist` |
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
-| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` | `SearchResults` |
+| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
 | `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
 | `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
@@ -435,6 +435,7 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}],"partial"?}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` (no metadata involved: the membership source for downloads). Library sets are read whole or not at all; only the context-resolve fallback can stop at its budget (20 000 items / 200 pages): pages are then `partial`, and `urisOnly` fails with `UNAVAILABLE` instead of listing a prefix as the whole collection |
 | `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"≤500}` | paged `{"total","items":[…],"partial"?}` |
 | `library.contains` | `{"uris":[…]}` | `{"contains":[bool]}` |
+| `library.invalidate` | `{}` | `{}` — forgets the engine's cached library lists (set snapshots ≤ 60 s, Liked Songs fallback, rootlist ≤ 30–300 s), so the next `library.*` reads come from the server; called on pull-to-refresh |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
 | — | | Playlist revision conflicts (stale `revision`) fail with `INVALID_ARGUMENT` and a message containing "revision"; clients reload and retry. |
 | `playlist.create` | `{"name","description"?,"public":false,"uris"?:[…]}` | `{"uri","revision"}` (also added to the top of the rootlist) |
@@ -514,7 +515,8 @@ Show         ShowRef + {"description","episodes":[Episode],"total","offset","fol
 partial      present (true) only when some item metadata could not be fetched right now; those items
              are placeholders with just `uri` (and `playable:false`). Artist: some top tracks,
              releases or related artists are missing. Do not cache as fresh; retry (§6.3).
-SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef}
+SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
+              "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n}}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
 HomeSection  {"id","title","items":[MediaRef]}
 RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit"}
