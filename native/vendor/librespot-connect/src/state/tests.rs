@@ -530,6 +530,65 @@ fn queue_add_while_filling_up_from_autoplay_keeps_autoplay_order() {
     assert!(state.current_track(|t| t.is_autoplay()));
 }
 
+/// suggestions and delimiters are unique in the next tracks (context tracks of later passes of a
+/// repeated context share their uids)
+fn assert_unique_uids(state: &ConnectState) {
+    let uids = state
+        .next_tracks()
+        .iter()
+        .filter(|t| t.is_suggestion() || t.uid.starts_with(IDENTIFIER_DELIMITER))
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    let unique = uids.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique.len(), uids.len(), "duplicate uids: {uids:?}");
+}
+
+#[test]
+fn smart_shuffle_with_repeat_plays_each_suggestion_once() {
+    let (_rt, mut state) = state(10);
+    state.set_repeat_context(true);
+    state.handle_smart_shuffle(true).unwrap();
+    assert_eq!(state.next_tracks().len(), 80, "the window covers several passes");
+    assert_unique_uids(&state);
+
+    // one after every 3rd context track, continuing through the following passes
+    let added = state.add_suggestions(suggestions(10)).unwrap();
+    assert_eq!(added, 10);
+    let in_window = |state: &ConnectState| {
+        state
+            .next_tracks()
+            .iter()
+            .filter(|t| t.is_suggestion())
+            .count()
+    };
+    assert_eq!(in_window(&state), 10, "each one once, not again in every pass");
+    assert_unique_uids(&state);
+
+    // 10 suggestions and 30 context tracks (3 passes)
+    let played = play_through(&mut state, 40);
+    let played_suggestions = played
+        .iter()
+        .filter(|uid| uid.starts_with('s'))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(played_suggestions.len(), 10);
+    assert_eq!(played.iter().filter(|uid| uid.starts_with('s')).count(), 10);
+    assert_eq!(in_window(&state), 0, "played suggestions don't come back");
+
+    // there is room for new suggestions again, they go into the passes ahead
+    assert!(state.prune_suggestions());
+    let added = state.add_suggestions(context(10, 8)).unwrap();
+    assert_eq!(added, 10);
+    assert_eq!(in_window(&state), added);
+    assert_unique_uids(&state);
+    let played = play_through(&mut state, 60);
+    assert_eq!(played.iter().filter(|uid| uid.starts_with('s')).count(), added);
+
+    // without repeat only the rest of the context gets suggestions
+    let (_rt, mut state) = self::state(10);
+    state.handle_smart_shuffle(true).unwrap();
+    assert_eq!(state.add_suggestions(suggestions(10)).unwrap(), 3);
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(

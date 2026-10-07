@@ -170,10 +170,11 @@ pub(super) struct ConnectState {
     skipped_uids: HashSet<String>,
     // SPOTIFYGOOD: local smart shuffle, see state/smart_shuffle.rs
     smart_shuffle: bool,
-    /// smart shuffle suggestions, keyed by the position in the (shuffled) default context
-    /// after which they are inserted. Never part of [StateContext::tracks], so that
+    /// smart shuffle suggestions, keyed by the pass through the default context (its fill up
+    /// `index.page`, counting the wraps with repeat) and the position in the (shuffled) default
+    /// context after which they are inserted. Never part of [StateContext::tracks], so that
     /// unshuffling is unaffected.
-    suggestions: BTreeMap<usize, ProvidedTrack>,
+    suggestions: BTreeMap<(u32, usize), ProvidedTrack>,
     /// uris that were already suggested for the current context
     used_suggestion_uris: HashSet<String>,
 }
@@ -466,6 +467,8 @@ impl ConnectState {
         let new_index = new_index.unwrap_or(0);
         self.update_current_index(|i| i.track = new_index as u32);
         self.update_context_index(self.active_context, new_index + 1)?;
+        // SPOTIFYGOOD: the next tracks start over, in the first pass (see fill_up_next_tracks)
+        self.get_context_mut(self.active_context)?.index.page = 0;
         self.fill_up_context = self.active_context;
 
         // SPOTIFYGOOD: a playing smart shuffle suggestion is not part of the context, keep it

@@ -314,6 +314,9 @@ impl<'ct> ConnectState {
                 {
                     self.update_context_index(self.fill_up_context, new_index)?;
 
+                    // SPOTIFYGOOD: keep the pass, see below
+                    self.get_context_mut(self.fill_up_context)?.index.page = iteration;
+
                     // transition to autoplay as fill up context
                     self.fill_up_context = ContextType::Autoplay;
                     new_index = self.get_context(ContextType::Autoplay)?.index.track as usize;
@@ -353,7 +356,7 @@ impl<'ct> ConnectState {
                 }
                 Some(ct) => {
                     // SPOTIFYGOOD: smart shuffle
-                    suggestion = self.suggestion_after(new_index, ct);
+                    suggestion = self.suggestion_after(iteration, new_index, ct);
                     new_index += 1;
                     ct.clone()
                 }
@@ -375,6 +378,10 @@ impl<'ct> ConnectState {
         );
 
         self.update_context_index(self.fill_up_context, new_index)?;
+        // SPOTIFYGOOD: keep the pass (wraps with repeat) of the fill up position, it only started
+        // at the persisted page and was never stored: every later fill up counted from 0 again,
+        // so delimiter uids repeated and smart shuffle suggestions came back in every pass
+        self.get_context_mut(self.fill_up_context)?.index.page = iteration;
 
         // the web-player needs a revision update, otherwise the queue isn't updated in the ui
         self.update_queue_revision();
@@ -515,6 +522,7 @@ impl<'ct> ConnectState {
             } else if let Ok(ctx) = self.get_context_mut(ContextType::Default) {
                 // a wrap of the context (repeat), the next fill up wraps again
                 ctx.index.track = ctx.tracks.len() as u32;
+                ctx.index.page = ctx.index.page.saturating_sub(1);
             }
             return;
         }
