@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeout
@@ -128,6 +129,21 @@ class PlayerController internal constructor(
      */
     val failure: StateFlow<PlaybackFailure?> = _failure.asStateFlow()
 
+    private val _userCommands = MutableStateFlow(0L)
+
+    /**
+     * Counts the user's playback commands — play, load, pause, toggle, skip, seek, radio — from the
+     * app and from the media session, bumped when the command is issued. Commands the app sends by
+     * itself (audio focus, headphones unplugged, the sleep timer, a refused background start) and
+     * fallbacks inside a command do not count. A delayed start compares it to know whether the
+     * user did something else meanwhile.
+     */
+    val userCommands: StateFlow<Long> = _userCommands.asStateFlow()
+
+    private fun userCommand() {
+        _userCommands.update { it + 1 }
+    }
+
     /**
      * Invoked (on the calling thread) before a command that may start local playback, so the
      * [PlaybackService] is running before audio starts. Installed by [PlaybackCoordinator].
@@ -228,15 +244,18 @@ class PlayerController internal constructor(
         play(PlayRequest(trackUris = trackUris, startIndex = startIndex.coerceIn(0, trackUris.lastIndex)))
     }
 
-    fun resume() {
-        resumeAsync()
+    /** [user]: false for resumes the app sends by itself (audio focus regained), see [userCommands]. */
+    fun resume(user: Boolean = true) {
+        resumeAsync(user)
     }
 
-    fun pause() {
-        pauseAsync()
+    /** [user]: false for pauses the app sends by itself (focus loss, unplugged, refused start). */
+    fun pause(user: Boolean = true) {
+        pauseAsync(user)
     }
 
     fun togglePlayPause() {
+        userCommand()
         if (snapshot.value.isPlayingOrLoading()) pauseLike("player.togglePlay") else sendResuming("player.togglePlay")
     }
 
@@ -319,6 +338,7 @@ class PlayerController internal constructor(
 
     /** Starts a radio station seeded by [uri] (track/artist/album/playlist). */
     fun startRadio(uri: String) {
+        userCommand()
         onPlaybackRequested?.invoke()
         enqueue("catalog.radio", timeoutMs = LOAD_TIMEOUT_MS, startsPlayback = true) {
             val radio = json.decodeFromJsonElement<RadioContext>(transport("catalog.radio", buildJsonObject { put("uri", uri) }))
@@ -356,6 +376,7 @@ class PlayerController internal constructor(
         toPendingTarget: Boolean = false,
         onThisPhone: Boolean = false,
     ): Deferred<Boolean> {
+        userCommand()
         if (request.play) onPlaybackRequested?.invoke()
         lateinit var self: Command
         // A running bulk add keeps going: Spirc and remote devices keep the user queue across a
@@ -375,20 +396,35 @@ class PlayerController internal constructor(
     }
 
     /** Also used by the media session (play button, Bluetooth play after a cold start). */
-    internal fun resumeAsync(): Deferred<Boolean> = sendResuming("player.play")
+    internal fun resumeAsync(user: Boolean = true): Deferred<Boolean> {
+        if (user) userCommand()
+        return sendResuming("player.play")
+    }
 
-    internal fun pauseAsync(): Deferred<Boolean> = pauseLike("player.pause")
+    internal fun pauseAsync(user: Boolean = true): Deferred<Boolean> {
+        if (user) userCommand()
+        return pauseLike("player.pause")
+    }
 
-    internal fun nextAsync(): Deferred<Boolean> = send("player.next", quietCodes = INACTIVE_CODES)
+    internal fun nextAsync(): Deferred<Boolean> {
+        userCommand()
+        return send("player.next", quietCodes = INACTIVE_CODES)
+    }
 
-    internal fun previousAsync(): Deferred<Boolean> = send("player.prev", quietCodes = INACTIVE_CODES)
+    internal fun previousAsync(): Deferred<Boolean> {
+        userCommand()
+        return send("player.prev", quietCodes = INACTIVE_CODES)
+    }
 
-    internal fun seekAsync(positionMs: Long): Deferred<Boolean> = send(
-        "player.seek",
-        buildJsonObject { put("positionMs", positionMs.coerceAtLeast(0)) },
-        conflateKey = "seek",
-        quietCodes = INACTIVE_CODES,
-    )
+    internal fun seekAsync(positionMs: Long): Deferred<Boolean> {
+        userCommand()
+        return send(
+            "player.seek",
+            buildJsonObject { put("positionMs", positionMs.coerceAtLeast(0)) },
+            conflateKey = "seek",
+            quietCodes = INACTIVE_CODES,
+        )
+    }
 
     internal fun setShuffleAsync(enabled: Boolean): Deferred<Boolean> {
         pendingShuffle = null
@@ -555,6 +591,7 @@ class PlayerController internal constructor(
     )
 
     internal fun skipToAsync(uid: String): Deferred<Boolean> {
+        userCommand()
         onPlaybackRequested?.invoke()
         return enqueue("queue.skipTo", startsPlayback = true) { call("queue.skipTo", buildJsonObject { put("uid", uid) }) }
     }

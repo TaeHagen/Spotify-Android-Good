@@ -2,11 +2,6 @@ package com.taehagen.spotifygood.ui.screens.library
 
 import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.DownloadState
-import com.taehagen.spotifygood.model.PlaybackContext
-import com.taehagen.spotifygood.model.PlaybackSnapshot
-import com.taehagen.spotifygood.model.PlaybackSource
-import com.taehagen.spotifygood.model.PlaybackStatus
-import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.ui.screens.album.canStartNow
@@ -111,47 +106,34 @@ class TrackStartTest {
         assertEquals(TrackStartPlan.Superseded, plan(null, EngineReach.CONNECTING, fakes))
     }
 
-    private fun t(uri: String) = PlaybackTrack(uri = uri, name = uri)
-
-    private val local = PlaybackSnapshot(
-        source = PlaybackSource.LOCAL,
-        status = PlaybackStatus.PLAYING,
-        context = PlaybackContext(uri = "spotify:album:x"),
-        track = t("a"),
-        nextTracks = listOf(t("b")),
-    )
-
     @Test
-    fun anotherLocalStartDuringTheWaitSupersedes() {
-        assertTrue(startSuperseded(local, local.copy(track = t("z"))))
-        assertTrue(startSuperseded(local, local.copy(context = PlaybackContext(uri = "spotify:playlist:y"), track = t("y"))))
-        assertTrue("the song ended, the next one plays", !startSuperseded(local, local.copy(track = t("b"))))
-        assertTrue(!startSuperseded(local, local))
-        assertTrue("same track, handed back to Spirc", !startSuperseded(local, local.copy(context = PlaybackContext(uri = "spotify:internal:x"))))
-    }
+    fun anyUserCommandAfterTheTapSupersedes() = runTest {
+        // A pause during the wait, or a play started from an empty snapshot, bumps the counter.
+        assertTrue(startSuperseded(at = 4, now = 5))
+        assertFalse(startSuperseded(at = 4, now = 4))
 
-    @Test
-    fun theSessionComingOnlineDoesNotSupersede() {
-        // The first cluster after reconnecting: another device's playback replaces the empty snapshot.
-        val remote = PlaybackSnapshot(
-            source = PlaybackSource.REMOTE,
-            status = PlaybackStatus.PLAYING,
-            context = PlaybackContext(uri = "spotify:playlist:laptop"),
-            track = t("l"),
+        // The wait itself: the counter is read after each wait, so a command meanwhile drops it.
+        var commands = 4L
+        val waited = planTrackStart(
+            trackUri = track.uri,
+            known = null,
+            downloaded = false,
+            reach = EngineReach.CONNECTING,
+            awaitOnline = { commands++; true }, // e.g. the user paused while the session connected
+            lookup = { inAlbum },
+            superseded = { startSuperseded(4, commands) },
         )
-        assertTrue(!startSuperseded(PlaybackSnapshot(), remote))
-        assertTrue(!startSuperseded(local, remote))
-        // The reconnect placeholder restored: same track, playing again.
-        val placeholder = local.copy(status = PlaybackStatus.PAUSED)
-        assertTrue(!startSuperseded(placeholder, placeholder.copy(status = PlaybackStatus.PLAYING)))
-        // Nothing to compare with (empty snapshot): a local load can't be told from a restore.
-        assertTrue(!startSuperseded(PlaybackSnapshot(), local))
-    }
-
-    @Test
-    fun aPreviousSingleTrackStartLandingDoesNotSupersedeTheNewerTap() {
-        val landed = local.copy(context = PlaybackContext(uri = "spotify:album:tileA"), track = t("spotify:track:A"))
-        assertTrue(!startSuperseded(local, landed, ownTargets = setOf("spotify:album:tileA", "spotify:track:A")))
-        assertTrue(startSuperseded(local, landed, ownTargets = emptySet()))
+        assertEquals(TrackStartPlan.Superseded, waited)
+        // Nothing issued meanwhile (snapshots of the session coming online don't count): it plays.
+        val quiet = planTrackStart(
+            trackUri = track.uri,
+            known = null,
+            downloaded = false,
+            reach = EngineReach.CONNECTING,
+            awaitOnline = { true },
+            lookup = { inAlbum },
+            superseded = { startSuperseded(7, 7) },
+        )
+        assertEquals(TrackStartPlan.Play(track.uri, album.uri), quiet)
     }
 }
