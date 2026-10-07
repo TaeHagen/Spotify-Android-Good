@@ -1,5 +1,7 @@
 package com.taehagen.spotifygood.ui.components
 
+import android.content.Context
+import androidx.annotation.StringRes
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -50,6 +52,19 @@ internal open class SessionMessageBus(
     private companion object {
         const val CAPACITY = 16
         const val MAX_AGE_MS = 10_000L
+    }
+}
+
+/**
+ * Posts one ViewModel's write results to [BackgroundMessages] for the signed-in session it was
+ * created in (ViewModels live in that session's store): shown whichever page is visible, and
+ * dropped once that session has ended.
+ */
+internal class SessionMessenger(private val context: Context) {
+    private val generation = BackgroundMessages.currentGeneration()
+
+    fun post(@StringRes res: Int, vararg args: Any) {
+        BackgroundMessages.post(context.getString(res, *args), generation)
     }
 }
 

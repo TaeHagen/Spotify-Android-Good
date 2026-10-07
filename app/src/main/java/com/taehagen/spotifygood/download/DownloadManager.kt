@@ -328,6 +328,7 @@ class DownloadManager(
                 deleteRows(toDelete)
             }
             deleteFiles(files)
+            cancelWorkIfIdleLocked()
             Removal(toDelete, index.next())
         }
         afterRemoval(listOf(removed))
@@ -376,6 +377,7 @@ class DownloadManager(
             val files = fileRows(targets)
             database.withTransaction { deleteRows(targets) }
             deleteFiles(files)
+            cancelWorkIfIdleLocked()
             Removal(files.map { it.uri }, index.next())
         }
         afterRemoval(listOf(removed))
@@ -582,7 +584,7 @@ class DownloadManager(
                     added += result.added
                     removed += result.removal
                 }
-                revalidate()
+                added += revalidate()
                 afterRemoval(removed)
                 if (added > 0) scheduleExecution()
                 return true
@@ -654,10 +656,15 @@ class DownloadManager(
                 ),
             )
             insertRows(toQueue, quality, individual = false, now = now)
-            if (userInitiated) newItems.filter { it !in availability.unavailable }.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+            if (userInitiated) {
+                newItems.filter { it !in availability.unavailable }.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+            } else {
+                DownloadRules.requeueOnSync(toQueue.map { it.uri }, availability.revived).chunked(SQL_CHUNK).forEach { dao.requeueFailedOnly(it) }
+            }
             deleteRows(toDelete)
         }
         deleteFiles(files)
+        if (toDelete.isNotEmpty()) cancelWorkIfIdleLocked()
         return MembershipResult(toQueue.size, Removal(toDelete, index.next()))
     }
 
@@ -726,17 +733,24 @@ class DownloadManager(
         runner.collectGarbageIfIdle()
     }
 
-    private suspend fun revalidate() {
+    /**
+     * Re-validates downloads older than 30 days (unplayable ones are marked failed, keeping their
+     * file) and queues failed downloads that still own their file and are playable again (a filter
+     * turned off, back in the home country; also a key that became unreadable): `download.track`
+     * reuses the file. Returns how many were queued.
+     */
+    private suspend fun revalidate(): Int {
+        val requeued = requeuePlayableAgain()
         val now = System.currentTimeMillis()
         val stale = dao.completedUrisNotValidatedSince(now - DownloadRules.REVALIDATE_AFTER_MS)
-        if (stale.isEmpty()) return
+        if (stale.isEmpty()) return requeued
         val playable = try {
             resolver.playability(stale)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "Re-validation failed", e)
-            return
+            return requeued
         }
         val valid = stale.filter { playable[it] == true }
         val gone = stale.filter { playable[it] == false }
@@ -751,6 +765,40 @@ class DownloadManager(
             }
             index.remove(gone, seq)
         }
+        return requeued
+    }
+
+    /** See [revalidate]. Independent of collection syncs (an unchanged playlist revision skips those). */
+    private suspend fun requeuePlayableAgain(): Int {
+        // Only rows still failed by re-validation or the key check: a row that failed again when it
+        // was retried carries the attempt's reason and is not queued at every sync.
+        val reasons = listOf(appContext.getString(R.string.data_dl_error_unplayable), appContext.getString(R.string.data_dl_error_key))
+        val dormant = dao.failedWithFileUris(reasons)
+        if (dormant.isEmpty()) return 0
+        val playable = try {
+            resolver.playability(dormant)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Checking failed downloads failed", e)
+            return 0
+        }
+        val again = dormant.filter { playable[it] == true }
+        if (again.isEmpty()) return 0
+        val requeued = mutex.withLock { again.chunked(SQL_CHUNK).sumOf { dao.requeueFailedOnly(it) } }
+        if (requeued > 0) Log.i(TAG, "Queued $requeued failed downloads that are playable again")
+        return requeued
+    }
+
+    /**
+     * Must hold [mutex], after removals. Cancels download work scheduled for a queue that is now
+     * empty, so it does not later bring the session up (and post a notification) for nothing. A later
+     * enqueue inserts its rows under [mutex] and schedules again afterwards.
+     */
+    private suspend fun cancelWorkIfIdleLocked() {
+        if (!DownloadRules.cancelIdleWork(dao.pendingCount(), runner.isRunning, jobExecuting)) return
+        appContext.getSystemService(JobScheduler::class.java)?.cancel(JOB_ID)
+        cancelWorker()
     }
 
     private suspend fun syncIfStale() {

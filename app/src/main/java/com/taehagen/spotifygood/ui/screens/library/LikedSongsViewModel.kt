@@ -8,6 +8,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
+import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.download.CollectionRef
 import com.taehagen.spotifygood.download.CollectionType
@@ -15,6 +16,7 @@ import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.SavedTrack
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.playback.PlayRequest
+import com.taehagen.spotifygood.ui.components.SessionMessenger
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
@@ -62,7 +64,18 @@ data class LikedSongsUiState(
     val partial: Boolean = false,
 )
 
+/**
+ * Library page messages. Write results (download / removal) go through [SessionMessenger], so they
+ * are shown after the page was left too; only NOTHING_TO_PLAY is sent to the page itself.
+ */
 enum class LibraryMessage { DOWNLOAD_FAILED, DOWNLOAD_STARTED, DOWNLOAD_REMOVED, NOTHING_TO_PLAY }
+
+internal fun LibraryMessage.messageRes(): Int = when (this) {
+    LibraryMessage.DOWNLOAD_FAILED -> R.string.browse_download_failed
+    LibraryMessage.DOWNLOAD_STARTED -> R.string.browse_download_started
+    LibraryMessage.DOWNLOAD_REMOVED -> R.string.browse_download_removed
+    LibraryMessage.NOTHING_TO_PLAY -> R.string.browse_nothing_to_play
+}
 
 /** Tracks shown in the list plus paging info. */
 private data class LikedSource(
@@ -95,6 +108,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     private val refreshing = MutableStateFlow(false)
     private val messages = Channel<LibraryMessage>(Channel.BUFFERED)
     val events: Flow<LibraryMessage> = messages.receiveAsFlow()
+    private val messenger = SessionMessenger(graph.app)
 
     private val contextUri: Flow<String?> = graph.engine.user.map { it?.username?.let(::likedSongsUri) }.distinctUntilChanged()
 
@@ -256,9 +270,10 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
                     graph.downloads.removeCollection(uri)
                 }
             }.onSuccess {
-                messages.trySend(if (download) LibraryMessage.DOWNLOAD_STARTED else LibraryMessage.DOWNLOAD_REMOVED)
+                // Shown also when the page was left meanwhile (resolving Liked Songs takes a while).
+                messenger.post((if (download) LibraryMessage.DOWNLOAD_STARTED else LibraryMessage.DOWNLOAD_REMOVED).messageRes())
             }.onFailure {
-                messages.trySend(LibraryMessage.DOWNLOAD_FAILED)
+                messenger.post(LibraryMessage.DOWNLOAD_FAILED.messageRes())
             }
         }
     }

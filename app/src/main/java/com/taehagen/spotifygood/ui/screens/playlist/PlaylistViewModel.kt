@@ -20,6 +20,10 @@ import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadUi
 import com.taehagen.spotifygood.ui.screens.album.DetailViewModel
+import com.taehagen.spotifygood.ui.screens.album.DownloadedPage
+import com.taehagen.spotifygood.ui.screens.album.FailureReason
+import com.taehagen.spotifygood.ui.screens.album.downloadedPageFlow
+import com.taehagen.spotifygood.ui.screens.album.remainingPlaylistItems
 import com.taehagen.spotifygood.ui.screens.album.LoadState
 import com.taehagen.spotifygood.ui.screens.album.PlaybackInfo
 import com.taehagen.spotifygood.ui.screens.album.RichText
@@ -49,6 +53,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
@@ -87,6 +92,8 @@ internal data class PlaylistData(
      * never kept in place of a fresh fetch, and the page offers a retry.
      */
     val partial: Boolean = false,
+    /** Some or all rows come from the download (offline: no cached page for them). */
+    val downloadedCopy: Boolean = false,
 ) {
     val allLoaded: Boolean get() = rows.size >= total
 }
@@ -220,7 +227,14 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val page = resource.dataOrNull
         if (page == null) {
             if (data.value !is LoadState.Ready) {
-                data.value = if (resource is Resource.Error) LoadState.Failed(failureReason(resource.error)) else LoadState.Loading
+                // No page and no cached copy (offline, cache cleared or pruned): a downloaded
+                // playlist still opens, from the download database.
+                val copy = if (resource is Resource.Error) downloadedCopy() else null
+                data.value = when {
+                    copy != null -> LoadState.Ready(downloadedData(copy), stale = true)
+                    resource is Resource.Error -> LoadState.Failed(failureReason(resource.error))
+                    else -> LoadState.Loading
+                }
             }
             return
         }
@@ -286,12 +300,43 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             return page.items.isNotEmpty() && rows.size < total
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            // Offline past the cached first page: the rest of a downloaded playlist is on disk.
+            if ((offline.value || failureReason(e) == FailureReason.OFFLINE) && appendDownloadedRows()) return false
             paging.update { it.copy(failed = true) }
             return false
         } finally {
             paging.update { it.copy(loading = false) }
         }
+    }
+
+    /** The downloaded copy of this playlist, or null when it is not downloaded. */
+    private suspend fun downloadedCopy(): DownloadedPage? = try {
+        graph.downloadedPageFlow(uri).first()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        null
+    }
+
+    /** The playlist as downloaded (read-only: no edits without the server). */
+    private fun downloadedData(copy: DownloadedPage): PlaylistData {
+        val meta = copy.toPlaylist()
+        return PlaylistData(meta.copy(items = emptyList()), RichText.EMPTY, buildRows(meta.items), meta.total, null, copy.partial, downloadedCopy = true)
+    }
+
+    /** Appends every downloaded row past the loaded ones; false when the playlist isn't downloaded. */
+    private suspend fun appendDownloadedRows(): Boolean {
+        val copy = downloadedCopy() ?: return false
+        val latest = data.value.dataOrNull() ?: return false
+        if (pendingMutations > 0 || dragging) return false
+        val used = latest.rows.mapTo(HashSet()) { it.key }
+        val rows = latest.rows + buildRows(copy.remainingPlaylistItems(latest.rows.size), used)
+        data.value = LoadState.Ready(
+            latest.copy(rows = rows, total = rows.size, partial = latest.partial || copy.partial, downloadedCopy = true),
+            stale = true,
+        )
+        return true
     }
 
     /** Loads every remaining page (used by the in-playlist filter). */

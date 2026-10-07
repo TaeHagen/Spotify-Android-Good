@@ -5,7 +5,7 @@ import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.PlaybackStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.max
 import kotlin.math.min
 
 sealed interface SleepTimerState {
@@ -23,11 +24,59 @@ sealed interface SleepTimerState {
 }
 
 /**
+ * Wakes the device for the sleep timer (installed by [PlaybackCoordinator]): coroutine delays run
+ * on the monotonic clock, which stops while the CPU is suspended — and nothing keeps the CPU up
+ * while a remote Connect device plays.
+ */
+interface SleepWakeups {
+    /** Arms the wake-up alarm for a timer ending at [endsAtElapsedMs] (replaces the previous one). */
+    fun schedule(endsAtElapsedMs: Long)
+
+    /** Disarms the alarm. */
+    fun cancel()
+
+    /** Keeps the CPU awake for at most [ms] (replaces a previous hold). */
+    fun holdAwake(ms: Long)
+
+    /** Releases the hold. */
+    fun release()
+}
+
+/** When to wake the device for a sleep timer, and for how long (pure, see [SleepWakeups]). */
+internal object SleepSchedule {
+    /**
+     * The wake-up alarm is a window ending at the timer's end (inexact alarms need no special
+     * permission; Android 12+ makes windows at least 10 minutes long anyway). Once it fires the CPU
+     * is kept awake until the end, so the pause is on time.
+     */
+    const val LEAD_MS = 10 * 60_000L
+
+    /** Extra awake time after the end, for the pause request to reach the device. */
+    const val PAUSE_SLACK_MS = 30_000L
+
+    /** Start of the alarm window for [endsAt]: [LEAD_MS] before it, never in the past. */
+    fun windowStart(endsAt: Long, now: Long): Long = max(now, endsAt - LEAD_MS)
+
+    /** Length of the alarm window (ending at [endsAt]; at least 1 ms). */
+    fun windowLength(endsAt: Long, now: Long): Long = max(1L, endsAt - windowStart(endsAt, now))
+
+    /** How long to keep the CPU awake when the alarm fires at [now]: until the end plus slack. */
+    fun awakeMs(endsAt: Long, now: Long): Long = (endsAt - now).coerceIn(0L, LEAD_MS) + PAUSE_SLACK_MS
+
+    /** End (elapsed clock) of the current track for "end of track", slightly before its last sample. */
+    fun trackEndsAt(now: Long, durationMs: Long, positionMs: Long, marginMs: Long = SleepTimer.END_MARGIN_MS): Long =
+        now + (durationMs - positionMs - marginMs).coerceAtLeast(0)
+}
+
+/**
  * Pauses playback after a delay or at the end of the current track (fades out the last 10 s).
  *
- * The timer sleeps (no polling) until the fade starts, re-checking the elapsed-realtime clock after
- * each sleep so device deep sleep cannot make it late. The fade only touches the local AudioTrack
- * gain ([fader]); remote devices are simply paused. Manual pauses do not cancel the timer.
+ * The timer sleeps (no polling) until the fade starts and re-checks the elapsed-realtime clock
+ * whenever it wakes. A sleeping coroutine does not count time while the CPU is suspended, so a
+ * wake-up alarm ([wakeups], `ELAPSED_REALTIME_WAKEUP`) pokes it ([onWakeupAlarm]) and keeps the CPU
+ * awake until the end; for local playback the playback wake lock keeps the CPU up anyway. The fade
+ * only touches the local AudioTrack gain ([fader]); remote devices are simply paused. Manual pauses
+ * do not cancel the timer.
  */
 class SleepTimer(
     private val scope: CoroutineScope,
@@ -40,14 +89,27 @@ class SleepTimer(
     /** Sets the local fade gain (0..1); installed by the playback coordinator. */
     @Volatile var fader: ((Float) -> Unit)? = null
 
+    /** Device wake-ups; installed by the playback coordinator. */
+    @Volatile var wakeups: SleepWakeups? = null
+
+    /** Elapsed-realtime clock (counts deep sleep); replaceable in tests. */
+    internal var clock: () -> Long = { SystemClock.elapsedRealtime() }
+
     private val lock = Any()
     private var job: Job? = null
     private var generation = 0
 
+    /** Wakes a sleeping wait so it re-reads [clock] (conflated: a poke is never lost). */
+    private val pokes = Channel<Unit>(Channel.CONFLATED)
+
+    /** The end the alarm is armed for (null: none). */
+    @Volatile private var wakeTarget: Long? = null
+
     fun start(minutes: Int) {
         val totalMs = minutes.coerceAtLeast(1) * 60_000L
-        val endsAt = SystemClock.elapsedRealtime() + totalMs
+        val endsAt = clock() + totalMs
         launch(SleepTimerState.Running(endsAt, totalMs)) {
+            arm(endsAt)
             fadeUntil(endsAt)
             pauseAndRestore()
         }
@@ -65,12 +127,15 @@ class SleepTimer(
                     return@transformLatest
                 }
                 if (!s.isPlaying) {
-                    // Paused (manually) mid-fade: restore the gain and wait for playback to resume.
+                    // Paused (manually) mid-fade: restore the gain, no wake-up until it resumes.
                     setFade(1f)
+                    disarm()
                     return@transformLatest
                 }
                 val durationMs = s.durationMs.takeIf { it > 0 } ?: track.durationMs ?: return@transformLatest
-                val endsAt = SystemClock.elapsedRealtime() + (durationMs - s.positionAt() - END_MARGIN_MS)
+                // Re-armed on every snapshot (seek, resume, remote position updates).
+                val endsAt = SleepSchedule.trackEndsAt(clock(), durationMs, s.positionAt())
+                arm(endsAt)
                 fadeUntil(endsAt)
                 emit(Unit)
             }.first()
@@ -85,7 +150,15 @@ class SleepTimer(
             job = null
             _state.value = SleepTimerState.Off
         }
+        disarm()
         setFade(1f)
+    }
+
+    /** The wake-up alarm fired: keep the CPU up until the end and let the wait re-check the clock. */
+    fun onWakeupAlarm() {
+        val target = wakeTarget ?: return
+        wakeups?.holdAwake(SleepSchedule.awakeMs(target, clock()))
+        pokes.trySend(Unit)
     }
 
     private fun launch(state: SleepTimerState, block: suspend () -> Unit) {
@@ -98,37 +171,59 @@ class SleepTimer(
                     block()
                 } finally {
                     setFade(1f)
-                    synchronized(lock) {
-                        if (generation == gen) {
-                            _state.value = SleepTimerState.Off
-                            job = null
+                    val current = synchronized(lock) {
+                        (generation == gen).also { current ->
+                            if (current) {
+                                _state.value = SleepTimerState.Off
+                                job = null
+                            }
                         }
                     }
+                    // A replacing timer armed its own alarm already.
+                    if (current) disarm()
                 }
             }
         }
     }
 
+    private fun arm(endsAt: Long) {
+        wakeTarget = endsAt
+        wakeups?.schedule(endsAt)
+    }
+
+    private fun disarm() {
+        wakeTarget = null
+        wakeups?.cancel()
+        wakeups?.release()
+    }
+
+    /** Sleeps (interruptibly, see [pokes]) for at most [ms]. */
+    private suspend fun sleep(ms: Long) {
+        withTimeoutOrNull(ms) { pokes.receive() }
+    }
+
     /** Sleeps until [FADE_MS] before [endsAt], then fades the local output to silence. */
     private suspend fun fadeUntil(endsAt: Long) {
         while (true) {
-            val remaining = endsAt - SystemClock.elapsedRealtime()
+            val remaining = endsAt - clock()
             if (remaining <= FADE_MS) break
-            delay(remaining - FADE_MS)
+            sleep(remaining - FADE_MS)
         }
         val s = playback.snapshot.value
         val fade = fader.takeIf { s.source == PlaybackSource.LOCAL && s.isPlaying }
         while (true) {
-            val remaining = endsAt - SystemClock.elapsedRealtime()
+            val remaining = endsAt - clock()
             if (remaining <= 0) break
             fade?.invoke(fadeGain(remaining, FADE_MS))
-            delay(if (fade != null) min(FADE_STEP_MS, remaining) else remaining)
+            sleep(if (fade != null) min(FADE_STEP_MS, remaining) else remaining)
         }
         fade?.invoke(0f)
     }
 
     private suspend fun pauseAndRestore() {
-        player.pause()
+        // A remote device's pause is a network request: keep the CPU up until it went out.
+        if (playback.snapshot.value.source != PlaybackSource.LOCAL) wakeups?.holdAwake(PAUSE_AWAKE_MS)
+        withTimeoutOrNull(PAUSE_AWAKE_MS) { player.pauseAsync().await() }
         // Keep the output silent until the pause has taken effect, then restore the gain.
         withTimeoutOrNull(RESTORE_TIMEOUT_MS) { playback.snapshot.first { !it.isPlaying } }
         setFade(1f)
@@ -143,6 +238,8 @@ class SleepTimer(
         const val FADE_STEP_MS = 200L
         const val END_MARGIN_MS = 400L
         const val RESTORE_TIMEOUT_MS = 3_000L
+        /** Awake time around a remote pause request. */
+        const val PAUSE_AWAKE_MS = 15_000L
 
         /** Perceptually smooth fade: quadratic in the remaining fraction. */
         fun fadeGain(remainingMs: Long, fadeMs: Long): Float {

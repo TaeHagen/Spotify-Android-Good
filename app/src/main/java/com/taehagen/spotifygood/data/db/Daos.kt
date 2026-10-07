@@ -160,6 +160,20 @@ interface DownloadDao {
     )
     suspend fun requeueFailed(uris: List<String>): Int
 
+    /** Like [requeueFailed] for failed items only: one the user cancelled stays cancelled. */
+    @Query(
+        "UPDATE downloads SET state = 'queued', attempts = 0, retryAt = NULL, error = NULL " +
+            "WHERE uri IN (:uris) AND state = 'failed'",
+    )
+    suspend fun requeueFailedOnly(uris: List<String>): Int
+
+    /**
+     * Failed downloads that still own their finished file and were failed for one of [errors] (by
+     * re-validation or the key check, not by a download attempt).
+     */
+    @Query("SELECT uri FROM downloads WHERE state = 'failed' AND path IS NOT NULL AND error IN (:errors)")
+    suspend fun failedWithFileUris(errors: List<String>): List<String>
+
     @Query("UPDATE downloads SET individual = :individual WHERE uri IN (:uris)")
     suspend fun setIndividual(uris: List<String>, individual: Boolean)
 

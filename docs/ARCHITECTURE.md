@@ -491,7 +491,11 @@ Calls without `seq` apply unconditionally.
 `OfflineTrackRecord`:
 `{"uri","playedUri","fileId","format","keyHex","path","sizeBytes","normalisation":{"trackGainDb","trackPeak","albumGainDb","albumPeak"},"track":Track|"episode":Episode,"imagePath":"…"}`.
 Kotlin persists it in Room (key encrypted with the Keystore key) and sends the decrypted
-records to `offline.setIndex` each time the engine starts.
+records to `offline.setIndex` as soon as the engine starts, whatever the session state (the
+index needs no session; downloads must play while the session is still connecting, e.g. behind
+a captive portal), retrying until it went through. Natively, a `player.load` while the session
+is not online waits (at most 8 s) until the first `offline.setIndex` of the process applied, so
+a load right after a cold start (a Bluetooth resume of a downloaded track) can't overtake it.
 
 ### 6.5 Catalog JSON shapes
 
@@ -647,6 +651,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `DOWNLOAD` (DownloadWorker while running), `PRESENCE` (opt-in Connect presence).
 * When the first holder is acquired and credentials exist → `session.start`.
   When the last holder is released → after `IDLE_GRACE` (60 s) `session.stop`.
+* With every start, the offline index (`offline.setIndex`, §6.4) is pushed right away,
+  independent of the session state, and retried until it went through.
 * `NetworkMonitor` (ConnectivityManager default-network callback, registered only while
   the engine is running) → `session.setNetworkAvailable`.
 * `state: StateFlow<EngineState>` mirrors `session` events; `user: StateFlow<User?>`.
@@ -664,7 +670,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   stop on `expired_token`/`access_denied`) only while the login screen is visible: polling
   pauses when the app goes to the background or the screen leaves composition (e.g. while the
   code is approved in the Custom Tab) and resumes when it is shown again, and stops when the
-  screen is left for good (activity finished) before a token arrived. The device code is
+  screen is left for good (activity finished) before a token arrived. The same applies when a
+  silent refresh-token login fails and the flow falls back to a code: hidden or closed meanwhile,
+  it pauses or stops instead of polling without a screen. The device code is
   persisted (≤ expiry) so polling resumes after process death. No local server.
 * **Fallback:** OAuth Authorization Code + PKCE with the desktop client id
   `65b708073fc0480ea92a077233ca87bd`, redirect `http://127.0.0.1:5588/login` (fallback
@@ -756,6 +764,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * `BecomingNoisyReceiver`: registered only while playing locally → `player.pause`.
 * Wake locks: Media3 `WakeLockManager` + `WifiLockManager` `setStayAwake(true)` only while
   local status is playing/loading; false otherwise.
+* Sleep timer (`SleepTimer`): coroutine delays stop while the CPU sleeps (remote playback holds
+  no wake lock), so an inexact `ELAPSED_REALTIME_WAKEUP` alarm window ending at the timer's end
+  (≤ 10 min earlier; plus an allow-while-idle alarm at the end for Doze) reaches the non-exported
+  `SleepTimerAlarmReceiver`, which pokes the timer and holds a timed partial wake lock until the
+  end + 30 s. "End of track" arms it for the snapshot's track end and re-arms on every snapshot.
+  Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
 
@@ -812,7 +826,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   attempt and pauses the whole queue for the server's `retryAfterMs` (else 1 min, doubling);
   three consecutive connectivity failures while the session is online (CDN unreachable) pause
   it for 1, 4, 16 min …; at most 30 min. Every pending row is held back (`retryAt`), so the run
-  waits inline (≤ 2 min) or reschedules; a completed download resets the breaker.
+  waits inline (≤ 2 min) or reschedules; a completed download resets the breaker. A Keystore that
+  cannot seal a finished download's key (after ~15 s of retries) requeues it without an attempt
+  (the file stays) and pauses the queue 30 s, doubling. A job or worker that starts for an empty
+  queue finishes at once, and removals that empty the queue cancel the scheduled work.
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
   of another downloaded collection). Liked Songs are listed with `library.tracks
@@ -823,7 +840,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   doubling up to 24 h (`lastAttemptAt`, `syncFailures`), instead of at every reconnect.
   Members the catalog resolves as not playable here (`playable:false` with a name) stay members
   but are not queued and do not count in the collection status (`unavailableUrisJson`); they
-  are queued once they become playable.
+  are queued once they become playable (also from a failed row). Each sync also queues failed
+  downloads that still own their file (failed by re-validation or the key check) and are playable
+  again; `download.track` reuses the file.
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
   `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks start at 2 MiB and adapt between 1 and
   4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all";
