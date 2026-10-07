@@ -413,7 +413,7 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
 | `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` | `SearchResults` |
-| `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection]}` |
+| `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
 | `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
 | `catalog.recentlyPlayed` | `{"limit":50}` | `{"items":[MediaRef]}` |
@@ -817,7 +817,8 @@ Repositories call the native catalog RPCs and expose `suspend` functions / `Flow
 successful response of browse calls (home, library lists, album/artist/playlist pages) so
 the app opens instantly and works offline; stale-while-revalidate. A `partial` response
 (§6.3) is shown but never stored as fresh: it only fills a missing row (stored stale) and is
-refetched twice while on screen (after 15 s and 30 s). Paged lists advance by whole windows
+refetched twice while on screen (after 15 s and 30 s). The home feed is treated the same way
+when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
 app scope, so they complete even if their screen closes. Liked-state of the

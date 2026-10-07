@@ -2,6 +2,8 @@ package com.taehagen.spotifygood.data
 
 import com.taehagen.spotifygood.data.db.ResponseCacheDao
 import com.taehagen.spotifygood.data.db.ResponseCacheEntity
+import com.taehagen.spotifygood.model.HomeFeed
+import com.taehagen.spotifygood.model.HomeSection
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
@@ -12,6 +14,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
@@ -115,6 +118,26 @@ class ResponseCacheTest {
         assertEquals(listOf(Resource.Loading("complete"), Resource.Success("partial")), emissions)
         assertEquals("\"complete\"", dao.rows["full"]?.json)
         assertTrue(dao.rows["full"]!!.fetchedAt < 0)
+    }
+
+    @Test
+    fun anEmptyOrPartialHomeFeedIsNeverCachedAsFresh() = runBlocking {
+        val section = HomeSection("s", "S")
+        assertTrue(HomeRepository.fill(HomeFeed()).partial)
+        assertTrue(HomeRepository.fill(HomeFeed(listOf(section), partial = true)).partial)
+        assertFalse(HomeRepository.fill(HomeFeed(listOf(section))).partial)
+
+        // A good feed from earlier stays; the empty one is shown but leaves the row alone.
+        val quick = ResponseCache(dao, Json, partialRetryDelayMs = 1)
+        quick.put(CacheKeys.HOME, HomeFeed.serializer(), HomeFeed(listOf(section)))
+        quick.invalidate(CacheKeys.HOME)
+        val emissions = quick.resourceOf(CacheKeys.HOME, HomeFeed.serializer(), CacheKeys.TTL_HOME) {
+            HomeRepository.fill(HomeFeed())
+        }.toList()
+        assertEquals(Resource.Success(HomeFeed()), emissions.last())
+        val (stored, fetchedAt) = quick.get(CacheKeys.HOME, HomeFeed.serializer())!!
+        assertEquals(listOf(section), stored.sections)
+        assertTrue("still stale: the next visit refetches", fetchedAt <= 0)
     }
 
     @Test
