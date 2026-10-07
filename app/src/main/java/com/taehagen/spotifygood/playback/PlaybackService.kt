@@ -46,7 +46,6 @@ import com.taehagen.spotifygood.Notifications
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.engine.EngineHolder
 import com.taehagen.spotifygood.engine.HolderType
-import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import kotlinx.coroutines.CancellationException
@@ -60,7 +59,6 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flatMapLatest
-import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
@@ -302,14 +300,8 @@ class PlaybackService : MediaLibraryService() {
             }
         }
         lifecycleScope.launch {
-            graph.downloads.items
-                .map { items ->
-                    items.asSequence()
-                        .filter { it.state == DownloadState.COMPLETED && it.imagePath != null }
-                        .associate { it.uri to it.imagePath!! }
-                }
-                .distinctUntilChanged()
-                .flowOn(Dispatchers.Default)
+            // Changes only with the set of completed downloads (not on download progress).
+            graph.downloads.downloadedImages
                 .catch { Log.w(TAG, "Downloaded artwork unavailable", it) }
                 .collect { images ->
                     downloadedImages = images

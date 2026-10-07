@@ -481,7 +481,7 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.artist` | `{"uri"}` | `Artist` |
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
-| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. A pathfinder answer whose `searchV2` failed (`null` with a GraphQL field error, or every requested section nulled) counts as a failed source; an error inside one item only drops that item. Then searchview is asked, and context-resolve only when tracks were requested (it finds nothing else); if they fail (or do not apply) the call fails instead of returning "no results". "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
+| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. `"partial": true` marks a degraded answer: a requested pathfinder section failed while others answered, or the tracks-only context-resolve answer to a request for other types too; clients show it but must not keep it as the query's answer. A pathfinder answer whose `searchV2` failed (`null` with a GraphQL field error, or every requested section nulled) counts as a failed source; an error inside one item only drops that item. Then searchview is asked, and context-resolve only when tracks were requested (it finds nothing else); if they fail (or do not apply) the call fails instead of returning "no results". "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
 | `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
 | `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
@@ -574,7 +574,7 @@ partial      present (true) only when some item metadata could not be fetched ri
              are placeholders with just `uri` (and `playable:false`). Artist: some top tracks,
              releases or related artists are missing. Do not cache as fresh; retry (§6.3).
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
-              "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n}}
+              "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
 HomeSection  {"id","title","items":[MediaRef]}
 RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit"}
@@ -906,7 +906,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `nativeCancel`), stores records (encrypted key), updates `offline.add`, retries failures
   with backoff (max 3), stops gracefully on `onStopped`/timeout (Android 15 6 h limit),
   re-enqueues itself if work remains. "Not enough storage" reschedules (the hosts require
-  storage not low) instead of stopping for good.
+  storage not low) instead of stopping for good. Progress is persisted on a state change and every
+  5 s (resume / crash recovery); live bytes reach the Downloads screens through the runner's
+  activity, so long-lived observers (the playback service observes `downloadedImages`, which
+  changes only with the completed set) are not woken twice a second. "N downloads complete" is
+  posted only when the queue is empty; a run that ends with items still queued after doing work
+  posts "Downloads paused" (x of y downloaded).
 * Scheduling: turning "Download using mobile data" off or on stops a running run (its item
   resumes from the `.part`) and re-creates the job / worker with the new network constraint;
   pending work whose constraint does not match the setting is re-created too, and the runner
@@ -923,7 +928,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   queue finishes at once, and removals that empty the queue cancel the scheduled work.
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
-  of another downloaded collection). Liked Songs are listed with `library.tracks
+  of another downloaded collection). Likes and playlist edits made in the app
+  (`LibraryRepository.edits`) re-sync the affected downloaded collection 5 s after the last edit
+  (coalesced; after a sync that is running; marked due when offline). A sync waits ≤ 10 s for the
+  session's country and is postponed without it: the catalog's `playable` is per country, and
+  re-validation must not fail good downloads. Liked Songs are listed with `library.tracks
   {urisOnly:true}`; members without a row and members whose row failed get metadata and their
   playability from `catalog.tracks` (batched, ≤ 60 s; completed and pending rows are not looked up
   again; placeholders are stored without metadata). Re-validation adds a member found not playable
