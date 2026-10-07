@@ -44,6 +44,14 @@ class MediaIdsTest {
     }
 
     @Test
+    fun uriOnlyPlaceholdersAreNotBrowseRows() {
+        assertEquals(true, LibraryTree.isPlaceholder(""))
+        assertEquals(true, LibraryTree.isPlaceholder("  "))
+        assertEquals(true, LibraryTree.isPlaceholder(null))
+        assertEquals(false, LibraryTree.isPlaceholder("Song"))
+    }
+
+    @Test
     fun planPlaysTrackInsideItsContext() {
         val plan = MediaIds.plan(listOf(MediaIds.inContext(playlist, t2)), 0) { error("unused") }
         assertEquals(LoadPlan(contextUri = playlist, startUri = t2), plan)
