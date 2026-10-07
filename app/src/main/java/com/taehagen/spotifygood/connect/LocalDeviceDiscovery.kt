@@ -69,13 +69,44 @@ internal data class ServiceTarget(val url: String, val scopeId: Int?)
 /** Pure address handling for resolved services (JVM-testable). */
 internal object ServiceAddress {
     /**
-     * The address to use: IPv4 first (always routable on the LAN), then a non-link-local IPv6,
-     * then a link-local one (only usable with a scope).
+     * Mirrors Rust `zeroconf_client::http::is_local_ip`, the only hosts `connect.local*` accepts:
+     * IPv4 loopback / RFC 1918 / link-local (169.254/16), IPv6 loopback / unique-local
+     * (fc00::/7) / link-local (fe80::/10, which also needs a scope, see [target]), and
+     * IPv4-mapped IPv6 by its IPv4 address. Global addresses are always refused there.
      */
-    fun pick(addresses: List<InetAddress>): InetAddress? =
-        addresses.firstOrNull { it is Inet4Address }
-            ?: addresses.firstOrNull { !it.isLinkLocalAddress }
-            ?: addresses.firstOrNull()
+    fun isLocal(address: InetAddress): Boolean = when (address) {
+        is Inet4Address -> address.isLoopbackAddress || address.isSiteLocalAddress || address.isLinkLocalAddress
+        is Inet6Address -> {
+            val b = address.address
+            val mapped = b.size == 16 && (0 until 10).all { b[it].toInt() == 0 } &&
+                b[10].toInt() == -1 && b[11].toInt() == -1
+            when {
+                mapped -> isLocal(InetAddress.getByAddress(b.copyOfRange(12, 16)))
+                else -> address.isLoopbackAddress || isUniqueLocal(address) || address.isLinkLocalAddress
+            }
+        }
+        else -> false
+    }
+
+    private fun isUniqueLocal(address: Inet6Address): Boolean = (address.address[0].toInt() and 0xFE) == 0xFC
+
+    /** Preference rank of an accepted address (lower first); null when Rust would refuse it. */
+    private fun rank(address: InetAddress): Int? = when {
+        !isLocal(address) -> null
+        address is Inet4Address -> 0
+        address.isLinkLocalAddress -> 2 // only usable with a scope
+        else -> 1 // unique-local, loopback, IPv4-mapped
+    }
+
+    /**
+     * The addresses worth probing, best first: IPv4 (always routable on the LAN), then a
+     * unique-local IPv6, then a link-local one. Never a global IPv6 (or a public IPv4).
+     */
+    fun candidates(addresses: List<InetAddress>): List<InetAddress> =
+        addresses.mapNotNull { a -> rank(a)?.let { a to it } }.sortedBy { it.second }.map { it.first }.distinct()
+
+    /** The best address to use, or null when none is acceptable. */
+    fun pick(addresses: List<InetAddress>): InetAddress? = candidates(addresses).firstOrNull()
 
     /** The `CPath` TXT record as a URL path (`/` when absent or blank). */
     fun path(cpath: String?): String {
@@ -181,6 +212,8 @@ class LocalDeviceDiscovery(
         val probed = HashMap<String, String>()
         /** serviceNames with a probe in flight. */
         val probing = HashSet<String>()
+        /** The latest update that arrived while its service was being probed (run if that fails). */
+        val pendingProbe = HashMap<String, Pair<NsdServiceInfo, List<InetAddress>>>()
         /** API 34+: serviceName → registered info callback, to unregister on loss/stop. */
         val infoCallbacks = HashMap<String, Any>()
     }
@@ -260,6 +293,7 @@ class LocalDeviceDiscovery(
                 s.byDeviceId.clear()
                 s.unconfirmed.clear()
                 s.probed.clear()
+                s.pendingProbe.clear()
             }
             _devices.value = emptyList()
         }
@@ -431,30 +465,48 @@ class LocalDeviceDiscovery(
 
     private fun probe(s: Session, serviceInfo: NsdServiceInfo, addresses: List<InetAddress>) {
         val name = serviceInfo.serviceName
-        val host = ServiceAddress.pick(addresses) ?: return
         val cpath = runCatching { serviceInfo.attributes }.getOrNull()?.let(ServiceAddress::cPath)
-        val target = ServiceAddress.target(host, serviceInfo.port, cpath, ::lanInterfaceIndex) ?: run {
-            Log.d(TAG, "no usable address for $name")
+        val targets = ServiceAddress.candidates(addresses)
+            .mapNotNull { ServiceAddress.target(it, serviceInfo.port, cpath, ::lanInterfaceIndex) }
+        if (targets.isEmpty()) {
+            Log.d(TAG, "no usable address for $name yet")
             return
         }
         synchronized(lock) {
-            if (!isCurrent(s) || s.probed.containsKey(name) || !s.probing.add(name)) return
+            if (!isCurrent(s) || s.probed.containsKey(name)) return
+            if (!s.probing.add(name)) {
+                // A probe with older addresses is running: keep this update for when it fails.
+                s.pendingProbe[name] = serviceInfo to addresses
+                return
+            }
         }
         s.scope.launch {
             try {
-                val info = rpc.call<LocalDeviceInfo>(
-                    "connect.localInfo",
-                    buildJsonObject {
-                        put("url", target.url)
-                        putScope(target.scopeId)
-                    },
-                )
-                publish(s, name, info, target)
-            } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) throw e
-                Log.d(TAG, "localInfo failed for ${target.url}: ${e.message}")
+                // Best address first; the next one if a host refuses or doesn't answer.
+                for (target in targets) {
+                    val info = try {
+                        rpc.call<LocalDeviceInfo>(
+                            "connect.localInfo",
+                            buildJsonObject {
+                                put("url", target.url)
+                                putScope(target.scopeId)
+                            },
+                        )
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.d(TAG, "localInfo failed for ${target.url}: ${e.message}")
+                        continue
+                    }
+                    publish(s, name, info, target)
+                    break
+                }
             } finally {
-                synchronized(lock) { s.probing.remove(name) }
+                val pending = synchronized(lock) {
+                    s.probing.remove(name)
+                    s.pendingProbe.remove(name)?.takeIf { session === s && !s.probed.containsKey(name) }
+                }
+                if (pending != null) probe(s, pending.first, pending.second)
             }
         }
     }
@@ -491,6 +543,7 @@ class LocalDeviceDiscovery(
                 }
             }
             legacyQueue.removeAll { it.session === s && it.info.serviceName == serviceName }
+            s.pendingProbe.remove(serviceName)
             val deviceId = s.probed.remove(serviceName)
             // Another service (a second interface) may still announce the same device.
             if (deviceId != null && deviceId !in s.probed.values) s.byDeviceId.remove(deviceId)
