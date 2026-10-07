@@ -1,6 +1,10 @@
+// SPOTIFYGOOD: + Context, ContextPage, ContextTrack (finish_transfer_without_context)
 use crate::{
     core::Error,
-    protocol::{player::ProvidedTrack, transfer_state::TransferState},
+    protocol::{
+        context::Context, context_page::ContextPage, context_track::ContextTrack,
+        player::ProvidedTrack, transfer_state::TransferState,
+    },
     state::{
         context::ContextType,
         metadata::Metadata,
@@ -82,10 +86,13 @@ impl ConnectState {
 
             initial_track = session.context.get_initial_track().cloned();
 
-            if let Some(mut ctx) = session.context.take() {
+            // SPOTIFYGOOD: the context stays in the transfer (only its restrictions are taken):
+            // its pages are the fallback when it can't be resolved, see
+            // finish_transfer_without_context
+            if let Some(ctx) = session.context.as_mut() {
                 player.restrictions = ctx.restrictions.take().map(Into::into).into();
-                for (key, value) in ctx.metadata {
-                    player.context_metadata.insert(key, value);
+                for (key, value) in &ctx.metadata {
+                    player.context_metadata.insert(key.clone(), value.clone());
                 }
             }
         }
@@ -115,6 +122,50 @@ impl ConnectState {
         self.clear_prev_track();
         self.clear_next_tracks();
         self.update_queue_revision()
+    }
+
+    // SPOTIFYGOOD: see ContextResolver::finish_after_failure
+    /// Completes a transfer whose context couldn't be resolved: without a default context, it
+    /// is made of the tracks the transfer brought, or just of the current track
+    pub fn finish_transfer_without_context(
+        &mut self,
+        transfer: TransferState,
+    ) -> Result<(), Error> {
+        if self.get_context(ContextType::Default).is_err() {
+            let mut pages = transfer
+                .current_session
+                .context
+                .pages
+                .iter()
+                .filter(|page| !page.tracks.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            if pages.is_empty() {
+                let track = match self.player().track.as_ref() {
+                    Some(track) => track.clone(),
+                    None => self.current_track_from_transfer(&transfer)?,
+                };
+                pages.push(ContextPage {
+                    tracks: vec![ContextTrack {
+                        uri: Some(track.uri),
+                        uid: Some(track.uid),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            }
+
+            let uri = self.context_uri().clone();
+            let context = Context {
+                url: Some(format!("context://{uri}")),
+                uri: Some(uri),
+                pages,
+                ..Default::default()
+            };
+            self.update_context(context, ContextType::Default)?;
+        }
+
+        self.finish_transfer(transfer)
     }
 
     /// completes the transfer, loading the queue and updating metadata

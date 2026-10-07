@@ -1084,7 +1084,7 @@ impl SpircTask {
                             .collect::<Vec<_>>()
                     }).await
                 }, if allow_context_resolving && self.context_resolver.has_next() => {
-                    let update_state = self.handle_next_context(next_context);
+                    let update_state = self.handle_next_context(next_context, true);
                     if update_state {
                         // SPOTIFYGOOD: next to the loop, see StatePuts
                         self.put_state(StatePut::State);
@@ -1167,18 +1167,40 @@ impl SpircTask {
         self.snapshot_tx.send_replace(final_snapshot);
     }
 
-    fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
+    // SPOTIFYGOOD: `background`: a resolve of the loop, not the one a load waits for (a failed
+    // load reports its error, the user loads again)
+    fn handle_next_context(
+        &mut self,
+        next_context: Result<Context, Error>,
+        background: bool,
+    ) -> bool {
         let next_context = match next_context {
             Err(why) => {
-                // SPOTIFYGOOD: only a context that can't be resolved is skipped for a while, a
-                // transient failure (network, rate limit, server error) is retried by the next
-                // request for it
-                if ContextResolver::is_unavailable(&why) {
+                // SPOTIFYGOOD: only a context that can't be resolved is skipped for a while
+                let unavailable = ContextResolver::is_unavailable(&why);
+                if unavailable {
                     self.context_resolver.mark_next_unavailable();
+                } else if background && self.context_resolver.retry_next_later() {
+                    // SPOTIFYGOOD: a transient failure (network, timeout, rate limit, server
+                    // error) is retried a few times with a delay; it was dropped, and nothing asked
+                    // again for the resolve a transfer or the shuffle of a load waits for
+                    warn!("resolving failed, trying again later: {why}");
+                    return false;
                 }
-                self.context_resolver.remove_used_and_invalid();
                 error!("{why}");
-                return false;
+
+                // SPOTIFYGOOD: the state is still set up with what there is, see
+                // ContextResolver::finish_after_failure
+                let finished = background
+                    && self
+                        .context_resolver
+                        .finish_after_failure(&mut self.connect_state, &mut self.transfer_state);
+                self.context_resolver.remove_used_and_invalid();
+                if finished {
+                    self.add_autoplay_resolving_when_required();
+                    self.handle_next_tracks_changed();
+                }
+                return finished;
             }
             Ok(ctx) => ctx,
         };
@@ -2286,7 +2308,7 @@ impl SpircTask {
             self.context_resolver.forget_unavailable(&resolve);
             self.context_resolver.add(resolve);
             let context = self.context_resolver.get_next_context(Vec::new).await;
-            self.handle_next_context(context);
+            self.handle_next_context(context, false);
         }
 
         Ok(())
