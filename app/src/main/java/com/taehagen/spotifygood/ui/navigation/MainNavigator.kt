@@ -32,6 +32,7 @@ import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.MediaRef
 import com.taehagen.spotifygood.model.MediaType
+import com.taehagen.spotifygood.ui.screens.library.startTrack
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -210,17 +211,17 @@ class MainNavigator internal constructor(
         }
     }
 
-    /** Plays a single track inside its album context when known (so playback continues naturally). */
+    /**
+     * Plays a single track (deep link, Home tile, recent search) inside its album context when known
+     * (so playback continues naturally). A track the catalog marks unplayable, or one that isn't
+     * downloaded while the session can't stream, is not started: a different track would play.
+     */
     fun playTrack(trackUri: String) {
         graph.appScope.launch {
-            val albumUri = withTimeoutOrNull(ALBUM_LOOKUP_TIMEOUT_MS) {
-                runCatching { graph.catalog.tracks(listOf(trackUri)).firstOrNull()?.album?.uri }.getOrNull()
+            val track = withTimeoutOrNull(TRACK_LOOKUP_TIMEOUT_MS) {
+                runCatching { graph.catalog.tracks(listOf(trackUri)).firstOrNull() }.getOrNull()
             }
-            if (albumUri != null) {
-                graph.player.playContext(albumUri, startUri = trackUri)
-            } else {
-                graph.player.playTracks(listOf(trackUri))
-            }
+            graph.startTrack(trackUri, track)
         }
     }
 
@@ -250,7 +251,7 @@ class MainNavigator internal constructor(
     private fun normalized(uri: String): String = SpotifyLinks.canonicalUri(uri) ?: uri
 
     companion object {
-        private const val ALBUM_LOOKUP_TIMEOUT_MS = 3_000L
+        private const val TRACK_LOOKUP_TIMEOUT_MS = 3_000L
 
         fun tabOf(backStack: List<NavBackStackEntry>): MainTab =
             backStack.asReversed().firstNotNullOfOrNull { entry ->
