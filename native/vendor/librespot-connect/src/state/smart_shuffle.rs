@@ -372,7 +372,7 @@ impl ConnectState {
     }
 
     /// a default context track, no queued track, suggestion or delimiter
-    fn is_plain_context_track(track: &ProvidedTrack) -> bool {
+    pub(super) fn is_plain_context_track(track: &ProvidedTrack) -> bool {
         track.is_context() && !track.is_suggestion() && !track.uid.starts_with(IDENTIFIER_DELIMITER)
     }
 }

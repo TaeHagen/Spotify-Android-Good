@@ -9,16 +9,23 @@ use crate::{
         context_track::ContextTrack,
     },
     state::{
-        ConnectState, context::ContextType, metadata::Metadata, provider::IsProvider,
-        smart_shuffle::SMART_SHUFFLE_INTERVAL, tracks::IDENTIFIER_DELIMITER,
+        ConnectState, SPOTIFY_MAX_NEXT_TRACKS_SIZE,
+        context::ContextType,
+        metadata::Metadata,
+        provider::IsProvider,
+        smart_shuffle::{SMART_SHUFFLE_BATCH_SIZE, SMART_SHUFFLE_INTERVAL},
+        tracks::IDENTIFIER_DELIMITER,
     },
 };
+use std::collections::HashSet;
+
 const CONTEXT_URI: &str = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
 
-fn track_uri(n: u8, salt: u8) -> String {
+fn track_uri(n: usize, salt: u8) -> String {
     let mut raw = [0u8; 16];
     raw[0] = salt;
-    raw[15] = n;
+    raw[14] = (n >> 8) as u8;
+    raw[15] = n as u8;
     SpotifyUri::Track {
         id: SpotifyId::from_raw(&raw).unwrap(),
     }
@@ -26,7 +33,7 @@ fn track_uri(n: u8, salt: u8) -> String {
     .unwrap()
 }
 
-fn context(len: u8, salt: u8) -> Context {
+fn context(len: usize, salt: u8) -> Context {
     Context {
         uri: Some(CONTEXT_URI.to_string()),
         url: Some(format!("context://{CONTEXT_URI}")),
@@ -45,7 +52,7 @@ fn context(len: u8, salt: u8) -> Context {
 }
 
 /// a state with an active default context of `len` tracks, playing the first one
-fn state(len: u8) -> (tokio::runtime::Runtime, ConnectState) {
+fn state(len: usize) -> (tokio::runtime::Runtime, ConnectState) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -158,7 +165,7 @@ fn skip_to_keeps_the_queue_and_moves_skipped_to_prev() {
     assert_queue_contiguous(&state);
 }
 
-fn suggestions(len: u8) -> Context {
+fn suggestions(len: usize) -> Context {
     let mut ctx = context(len, 7);
     // two tracks that are already part of the context are ignored
     ctx.pages[0].tracks.push(ContextTrack {
@@ -587,6 +594,85 @@ fn smart_shuffle_with_repeat_plays_each_suggestion_once() {
     let (_rt, mut state) = self::state(10);
     state.handle_smart_shuffle(true).unwrap();
     assert_eq!(state.add_suggestions(suggestions(10)).unwrap(), 3);
+}
+
+fn is_suggestion_uid(uid: &str) -> bool {
+    uid.starts_with('s')
+}
+
+/// plays through the whole context like spirc does with smart shuffle: suggestions are fetched
+/// whenever they run low, returns the played uids and the uids of all assigned suggestions
+fn play_smart_shuffle_to_the_end(state: &mut ConnectState) -> (Vec<String>, HashSet<String>) {
+    let mut assigned = HashSet::new();
+    let mut played = Vec::new();
+    let mut salt = 10;
+    loop {
+        if state.needs_suggestions() && state.prune_suggestions() {
+            state
+                .add_suggestions(context(SMART_SHUFFLE_BATCH_SIZE, salt))
+                .unwrap();
+            salt += 1;
+            assigned.extend(state.suggestions.values().map(|s| s.uid.clone()));
+            assert!(state.next_tracks().len() <= SPOTIFY_MAX_NEXT_TRACKS_SIZE);
+        }
+        if state.next_track().unwrap().is_none() {
+            break;
+        }
+        played.push(state.current_track(|t| t.uid.clone()));
+    }
+    (played, assigned)
+}
+
+#[test]
+fn smart_shuffle_suggestion_at_the_end_of_the_next_tracks_is_not_lost() {
+    let (_rt, mut state) = state(400);
+    state.handle_smart_shuffle(true).unwrap();
+
+    let (played, assigned) = play_smart_shuffle_to_the_end(&mut state);
+    let played_suggestions = played
+        .iter()
+        .filter(|uid| is_suggestion_uid(uid))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(assigned.len() > 100, "{}", assigned.len());
+    assert_eq!(
+        played_suggestions.iter().collect::<HashSet<_>>().len(),
+        played_suggestions.len(),
+        "a suggestion was played twice"
+    );
+    let missing = assigned
+        .iter()
+        .filter(|uid| !played_suggestions.contains(uid))
+        .count();
+    assert_eq!(missing, 0, "assigned suggestions that were never played");
+    // every context track once
+    assert_eq!(played.len() - played_suggestions.len(), 399);
+}
+
+#[test]
+fn smart_shuffle_suggestion_dropped_from_the_end_comes_back() {
+    // a queue add drops the last entry of the next tracks
+    let (_rt, mut state) = state(200);
+    state.handle_smart_shuffle(true).unwrap();
+    assert_eq!(state.add_suggestions(suggestions(20)).unwrap(), 20);
+    assert!(state.next_tracks().last().unwrap().is_suggestion());
+    state.queue_add_uri(&track_uri(1, 9)).unwrap();
+    assert_queue_contiguous(&state);
+    assert!(state.next_tracks().len() <= SPOTIFY_MAX_NEXT_TRACKS_SIZE);
+    let played = play_through(&mut state, 100);
+    assert_eq!(played[0], "q0");
+    assert_eq!(played.iter().filter(|uid| is_suggestion_uid(uid)).count(), 20);
+
+    // so does a prev
+    let (_rt, mut state) = self::state(200);
+    state.handle_smart_shuffle(true).unwrap();
+    play_through(&mut state, 1);
+    assert_eq!(state.add_suggestions(suggestions(20)).unwrap(), 20);
+    assert!(state.next_tracks().last().unwrap().is_suggestion());
+    state.prev_track().unwrap();
+    assert!(state.next_tracks().len() <= SPOTIFY_MAX_NEXT_TRACKS_SIZE);
+    let played = play_through(&mut state, 100);
+    assert_eq!(played.iter().filter(|uid| is_suggestion_uid(uid)).count(), 20);
 }
 
 /// compile time check: the engine spawns the task and shares the handle between threads

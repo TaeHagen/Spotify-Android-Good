@@ -355,8 +355,16 @@ impl<'ct> ConnectState {
                     continue;
                 }
                 Some(ct) => {
-                    // SPOTIFYGOOD: smart shuffle
+                    // SPOTIFYGOOD: smart shuffle. The context track and its suggestion go in
+                    // together: when only the context track fits, the fill up stops before it
+                    // and continues there next time. A suggestion that didn't fit used to be
+                    // lost, the next fill up continued after the context track it follows.
                     suggestion = self.suggestion_after(iteration, new_index, ct);
+                    if suggestion.is_some()
+                        && self.next_tracks().len() + 2 > SPOTIFY_MAX_NEXT_TRACKS_SIZE
+                    {
+                        break;
+                    }
                     new_index += 1;
                     ct.clone()
                 }
@@ -364,11 +372,9 @@ impl<'ct> ConnectState {
 
             self.next_tracks_mut().push(track);
 
-            // SPOTIFYGOOD: smart shuffle, the suggestion never displaces a context track
+            // SPOTIFYGOOD: smart shuffle, there is room for it (see above)
             if let Some(suggestion) = suggestion {
-                if self.next_tracks().len() < SPOTIFY_MAX_NEXT_TRACKS_SIZE {
-                    self.next_tracks_mut().push(suggestion)
-                }
+                self.next_tracks_mut().push(suggestion)
             }
         }
 
@@ -503,7 +509,8 @@ impl<'ct> ConnectState {
     ///
     /// The fill up continues at the earliest dropped context (or autoplay) track, so that the
     /// dropped tracks are filled in again later. Upstream only popped them, and because the fill
-    /// up index already pointed past them, they were never played.
+    /// up index already pointed past them, they were never played. A dropped smart shuffle
+    /// suggestion takes the context track it follows along (so at most `max - 1` may be left).
     fn truncate_next_tracks(&mut self, max: usize) {
         while self.next_tracks().len() > max {
             let Some(dropped) = self.next_tracks_mut().pop() else {
@@ -535,7 +542,25 @@ impl<'ct> ConnectState {
             return;
         }
         if dropped.is_suggestion() {
-            // injected again by the fill up after the (dropped) context track it follows
+            // the fill up only inserts a suggestion together with the context track it follows
+            // (its anchor), so drop the anchor as well and continue the fill up there
+            let anchor_is_last = matches!(
+                self.next_tracks().last(),
+                Some(t) if Self::is_plain_context_track(t)
+                    && t.get_context_index() == dropped.get_context_index()
+            );
+            if anchor_is_last {
+                let anchor = self
+                    .next_tracks_mut()
+                    .pop()
+                    .expect("item that was prechecked");
+                self.rewind_fill_up(&anchor);
+            } else {
+                debug!(
+                    "dropped the suggestion <{}>, the track it follows was already played",
+                    dropped.uri
+                );
+            }
             return;
         }
 
