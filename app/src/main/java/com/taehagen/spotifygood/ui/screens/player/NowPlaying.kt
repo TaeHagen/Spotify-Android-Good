@@ -117,6 +117,8 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
     val snapshot by viewModel.snapshot.collectAsStateWithLifecycle()
     val liked by viewModel.isLiked.collectAsStateWithLifecycle()
     val indicator by viewModel.indicator.collectAsStateWithLifecycle()
+    // The downloaded cover while offline, so there is artwork without a network.
+    val artwork by viewModel.artwork.collectAsStateWithLifecycle()
     val remoteVolumeSupported by viewModel.remoteVolumeSupported.collectAsStateWithLifecycle()
     val lyricsPreview by viewModel.lyricsPreview.collectAsStateWithLifecycle()
     // Ungated by the preview setting: decides whether the lyrics button can open anything.
@@ -173,7 +175,7 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
 
     val track = snapshot.track
     // Read only in the draw phase / leaf composables: the colour animates on every track change.
-    val artworkColor = rememberArtworkColor(track?.imageUrl)
+    val artworkColor = rememberArtworkColor(artwork)
 
     PlayerSurfaceTheme {
         Box(
@@ -201,6 +203,7 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
                 NowPlayingBody(
                     snapshot = snapshot,
                     track = track,
+                    artwork = artwork,
                     liked = liked,
                     indicator = indicator,
                     remoteVolumeSupported = remoteVolumeSupported,
@@ -240,6 +243,7 @@ private fun NothingPlaying(onCollapse: () -> Unit) {
 private fun NowPlayingBody(
     snapshot: PlaybackSnapshot,
     track: PlaybackTrack,
+    artwork: String?,
     liked: Boolean,
     indicator: DeviceIndicator,
     remoteVolumeSupported: Boolean,
@@ -289,6 +293,7 @@ private fun NowPlayingBody(
     val artwork: @Composable (Modifier) -> Unit = { artworkModifier ->
         NowPlayingArtwork(
             track = track,
+            artwork = artwork,
             canNext = restrictions.canSkipNext,
             canPrevious = restrictions.canSkipPrev,
             onNext = viewModel::next,
@@ -691,6 +696,7 @@ private fun MainMenuItems(
 @Composable
 private fun NowPlayingArtwork(
     track: PlaybackTrack,
+    artwork: String?,
     canNext: Boolean,
     canPrevious: Boolean,
     onNext: () -> Unit,
@@ -713,7 +719,7 @@ private fun NowPlayingArtwork(
             }
         },
     ) {
-        Crossfade(targetState = track.imageUrl, animationSpec = tween(durationMillis = 450), label = "nowPlayingArtwork") { url ->
+        Crossfade(targetState = artwork, animationSpec = tween(durationMillis = 450), label = "nowPlayingArtwork") { url ->
             Artwork(
                 url = url,
                 contentDescription = artworkDescription,
