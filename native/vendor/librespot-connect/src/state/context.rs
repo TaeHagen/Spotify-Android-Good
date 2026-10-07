@@ -559,13 +559,6 @@ impl ConnectState {
         match ty {
             ContextType::Default => {
                 let ctx_len = self.context.as_ref().map(|c| c.tracks.len());
-                if self
-                    .context
-                    .as_ref()
-                    .is_some_and(|c| c.get_shuffle_seed().is_some())
-                {
-                    warn!("appending to the shuffled default context, it can't be unshuffled");
-                }
                 let context =
                     self.state_context_from_page(page, HashMap::new(), None, None, ctx_len, None);
 
@@ -574,9 +567,12 @@ impl ConnectState {
                     .as_mut()
                     .ok_or(StateError::NoContext(ContextType::Default))?;
 
-                for t in context.tracks {
-                    ctx.tracks.push(t)
-                }
+                // SPOTIFYGOOD: the context may already be shuffled (shuffle on while its pages
+                // still resolve), pushing made it impossible to unshuffle. The new tracks go at
+                // the end of the shuffled order too, so the positions the fill up and smart
+                // shuffle refer to stay valid; the last resolve shuffles the whole context
+                // (ContextResolver::try_finish).
+                ctx.tracks.extend_keep_shuffle(context.tracks);
             }
             ContextType::Autoplay => {
                 // the tracks of the autoplay context share its uri (not the default one)
