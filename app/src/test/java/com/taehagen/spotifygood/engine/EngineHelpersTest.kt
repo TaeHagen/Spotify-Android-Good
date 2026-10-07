@@ -1,6 +1,10 @@
 package com.taehagen.spotifygood.engine
 
+import com.taehagen.spotifygood.model.StoredCredentials
+import com.taehagen.spotifygood.model.User
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Test
 
 class EngineHelpersTest {
@@ -19,6 +23,25 @@ class EngineHelpersTest {
         assertEquals(0, connectVolume(5, 0))
         assertEquals(65_535, connectVolume(20, 15))
         assertEquals(0, connectVolume(-3, 15))
+    }
+
+    @Test
+    fun theStoredCredentialsNameTheUserBeforeASessionWasOnline() {
+        val creds = StoredCredentials(username = "alice", authType = 1, authData = "YWJj")
+        // Cold start without a network: only the username is known.
+        val seeded = knownUser(null, creds)
+        assertEquals(User(username = "alice"), seeded)
+        assertEquals(true, seeded?.isPremium) // no Premium screen for an unknown product
+        assertNull(seeded?.country) // downloads still wait for the online user's country
+        // The online user (from the session) is kept for the same account ...
+        val online = User(username = "alice", displayName = "Alice", product = "premium", country = "SE")
+        assertSame(online, knownUser(online, creds))
+        // ... and replaced for another one (a LAN login of another account).
+        assertEquals(User(username = "bob"), knownUser(online, creds.copy(username = "bob")))
+        // Nothing usable stored: as it is.
+        assertNull(knownUser(null, null))
+        assertSame(online, knownUser(online, null))
+        assertNull(knownUser(null, creds.copy(username = " ")))
     }
 
     @Test
