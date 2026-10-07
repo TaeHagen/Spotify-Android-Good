@@ -206,7 +206,9 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         viewModelScope.launch {
             if (offline.first()) return@launch
             refreshing.value = true
-            pager.reload()
+            // Drops the engine's and the app's cached library lists first, so the reload reaches
+            // the server; the pager reloads on the resulting library change.
+            graph.library.refresh()
         }
     }
 
