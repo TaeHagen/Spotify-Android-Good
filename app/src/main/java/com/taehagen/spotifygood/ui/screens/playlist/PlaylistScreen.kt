@@ -484,6 +484,7 @@ private fun PlaylistItemRow(
     val playable = (track?.playable ?: episode?.playable ?: false) &&
         (!state.offline || downloadState == DownloadState.COMPLETED)
     val onClick = { onPlay(visible) }
+    val editable = playlist.meta.canEdit && !playlist.downloadedCopy
     when {
         track != null -> {
             val showActions = {
@@ -491,9 +492,10 @@ private fun PlaylistItemRow(
                     MediaActionTarget.TrackTarget(
                         track = track,
                         contextUri = uri,
-                        playlistUri = uri.takeIf { playlist.meta.canEdit },
-                        playlistIndex = visible.index.takeIf { playlist.meta.canEdit },
-                        playlistRevision = playlist.revision.takeIf { playlist.meta.canEdit },
+                        // Positional "remove from playlist" only with server rows (not the download's).
+                        playlistUri = uri.takeIf { editable },
+                        playlistIndex = visible.index.takeIf { editable },
+                        playlistRevision = playlist.revision.takeIf { editable },
                     ),
                 )
             }

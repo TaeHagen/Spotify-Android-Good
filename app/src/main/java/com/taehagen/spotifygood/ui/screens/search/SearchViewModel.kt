@@ -36,6 +36,9 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.mapLatest
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
@@ -62,6 +65,24 @@ data class SearchUiState(
 )
 
 private data class SearchInput(val query: String, val filter: SearchFilter, val retry: Int, val offline: Boolean)
+
+/** Longest wait for the engine to apply a changed explicit filter (as Settings waits). */
+private const val EXPLICIT_APPLY_TIMEOUT_MS = 15_000L
+
+/**
+ * Emits each time "Hide explicit content" changed and the engine applies it, so results fetched
+ * under the old filter (their playable flags) can be dropped. Waiting for the engine keeps a
+ * refetch from caching results with the old flags again.
+ */
+private fun AppGraph.explicitFilterChanges(): Flow<Boolean> =
+    settings.settings
+        .map { it.hideExplicit }
+        .distinctUntilChanged()
+        .drop(1)
+        .mapLatest { hide ->
+            engine.awaitSettingsApplied(EXPLICIT_APPLY_TIMEOUT_MS) { it.filterExplicit == hide }
+            hide
+        }
 
 class SearchViewModel(private val graph: AppGraph) : ViewModel() {
     /** Text field content: Compose state, so typing never races the UI (debounced below). */
@@ -107,6 +128,17 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         } else {
             typedResults(input.query, type)
         }
+    }
+
+    init {
+        // The in-memory results carry playable flags of the old explicit filter: drop them and
+        // fetch the visible results again (top and typed restart through [retry]).
+        graph.explicitFilterChanges()
+            .onEach {
+                cache.clear()
+                retry.update { it + 1 }
+            }
+            .launchIn(viewModelScope)
     }
 
     private val recent: Flow<List<RecentSearch>> = graph.search.recent
@@ -201,12 +233,16 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
     fun onOpened(ref: MediaRef) = saveRecent(RecentSearch.Item(ref))
 
     fun playTrack(track: Track) {
+        // Unplayable (explicit with the filter on, not available here): Spirc would skip to
+        // another track of the album.
+        if (!track.playable) return
         onOpened(track.toMediaRef())
         graph.playTrackInAlbum(track)
     }
 
     /** Plays a top-result reference (play button on the top result card). */
     fun playTop(ref: MediaRef, sections: TopSections) {
+        if (!sections.byUri[ref.uri].isPlayable) return
         onOpened(ref)
         when (ref.type) {
             MediaType.TRACK -> (sections.byUri[ref.uri] as? SearchItem.Song)?.let { graph.playTrackInAlbum(it.track) }
@@ -277,6 +313,8 @@ class SearchResultsViewModel(private val graph: AppGraph, private val query: Str
                 if (!isOffline && loader.state.value.items.isEmpty()) loader.loadMore()
             }
         }
+        // Loaded pages carry playable flags of the old explicit filter.
+        graph.explicitFilterChanges().onEach { loader.reload() }.launchIn(viewModelScope)
     }
 
     fun loadMore() = loader.loadMore()

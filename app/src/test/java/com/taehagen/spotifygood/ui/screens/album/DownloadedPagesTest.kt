@@ -73,7 +73,7 @@ class DownloadedPagesTest {
         // 300 downloaded rows, the cached first page holds 100: rows 101-300 come from the download.
         val uris = (1..300).map { "spotify:track:$it" }
         val copy = page(uris, uris.mapIndexed { i, uri -> uri to DownloadMetadata.OfTrack(track(i + 1)) }.toMap(), CollectionType.PLAYLIST, "spotify:playlist:p")
-        val rest = copy.remainingPlaylistItems(loaded = 100)
+        val rest = copy.remainingPlaylistItems(shown = uris.take(100).toSet())
         assertEquals(200, rest.size)
         assertEquals("spotify:track:101", rest.first().uri)
         assertEquals("spotify:track:300", rest.last().uri)
@@ -82,6 +82,25 @@ class DownloadedPagesTest {
         assertEquals(300, playlist.total)
         assertEquals(300, playlist.items.size)
         assertFalse(playlist.canEdit)
+    }
+
+    @Test
+    fun downloadedRowsAreMatchedByUriNotByCount() {
+        // The cached server page (100 rows) holds 2 local files, one song twice and an empty item,
+        // so it covers only 96 downloaded tracks: matching by count would skip 4 of them.
+        val uris = (1..300).map { "spotify:track:$it" }
+        val copy = page(uris, uris.mapIndexed { i, uri -> uri to DownloadMetadata.OfTrack(track(i + 1)) }.toMap(), CollectionType.PLAYLIST, "spotify:playlist:p")
+        val serverPage: List<String?> = uris.take(95) +
+            listOf("spotify:local:a:b:c:1", "spotify:local:d:e:f:2", uris[3], null) +
+            uris[95]
+        assertEquals(100, serverPage.size)
+        val rest = copy.remainingPlaylistItems(serverPage.filterNotNull().toSet())
+        val expected = uris.drop(96)
+        assertEquals(expected, rest.map { it.uri })
+        // Every downloaded track is then shown exactly once.
+        val shown = serverPage.filterNotNull().filter { it.startsWith("spotify:track:") }.toSet() + rest.mapNotNull { it.uri }
+        assertEquals(uris.toSet(), shown)
+        assertEquals(rest.size, rest.mapNotNull { it.uri }.toSet().size)
     }
 
     @Test
