@@ -1289,6 +1289,41 @@ fn pages_appended_while_shuffled_still_unshuffle() {
     assert_eq!(default_uids(&state), uids(0..35));
 }
 
+#[test]
+fn shuffled_transfer_keeps_a_queued_or_unknown_current_track() {
+    use crate::{protocol::transfer_state::TransferState, state::provider::Provider};
+
+    // a queued song, the same song that is also in the context, and a context track the context
+    // doesn't contain (e.g. a recommendation of the official smart shuffle)
+    for (provider, uri) in [
+        (Provider::Queue, track_uri(1, 9)),
+        (Provider::Queue, track_uri(5, 0)),
+        (Provider::Context, track_uri(2, 9)),
+    ] {
+        let (_rt, mut state) = state(30);
+        let mut track = ProvidedTrack {
+            uri: uri.clone(),
+            uid: "transferred".to_string(),
+            ..Default::default()
+        };
+        track.set_provider(provider);
+        state.set_track(track);
+        state.set_shuffle(true);
+
+        state.finish_transfer(TransferState::default()).unwrap();
+        assert!(state.shuffling_context());
+        assert_eq!(state.current_track(|t| t.uri.clone()), uri);
+        assert_eq!(state.current_track(|t| t.uid.clone()), "transferred");
+        // no context track is skipped in the first pass (nor goes to the prev tracks)
+        let mut next = next_uids(&state);
+        next.sort();
+        let mut all = uids(0..30);
+        all.sort();
+        assert_eq!(next, all);
+        assert!(state.prev_tracks().is_empty());
+    }
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(

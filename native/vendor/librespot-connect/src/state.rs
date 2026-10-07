@@ -458,6 +458,21 @@ impl ConnectState {
         self.player_mut().queue_revision = state.finish().to_string()
     }
 
+    // SPOTIFYGOOD: see reset_playback_to_position
+    /// Whether the current track isn't part of the active context: a queued track, a playing
+    /// smart shuffle suggestion, or a track the context doesn't contain (an update removed it, or
+    /// a transfer brought it). It stays the current track when the playback is set up again.
+    pub(super) fn keeps_current_track(&self) -> bool {
+        self.current_track(|t| {
+            t.is_queue()
+                || t.is_suggestion()
+                || (t.is_some()
+                    && self
+                        .get_context(self.active_context)
+                        .is_ok_and(|ctx| Self::position_in_context(ctx, t).is_none()))
+        })
+    }
+
     pub fn reset_playback_to_position(&mut self, new_index: Option<usize>) -> Result<(), Error> {
         debug!(
             "reset_playback with active ctx <{:?}> fill_up ctx <{:?}>",
@@ -483,14 +498,7 @@ impl ConnectState {
         // track, and `new_index` is the context track it follows: the fill up continues after
         // it, and it is the last prev track. Without `new_index` the context starts over at its
         // first track (upstream skipped that one, as if it was the current track).
-        let follows = self.current_track(|t| {
-            t.is_queue()
-                || t.is_suggestion()
-                || (t.is_some()
-                    && self
-                        .get_context(self.active_context)
-                        .is_ok_and(|ctx| Self::position_in_context(ctx, t).is_none()))
-        });
+        let follows = self.keeps_current_track();
         let (current_index, fill_up_index, prev_end) = match new_index {
             Some(i) if follows => (i, i + 1, i + 1),
             Some(i) => (i, i + 1, i),

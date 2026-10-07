@@ -185,7 +185,13 @@ impl ConnectState {
         }
 
         if self.shuffling_context() {
-            self.set_current_track(current_index.unwrap_or_default())?;
+            // SPOTIFYGOOD: a queued track, or one the context doesn't contain, stays the current
+            // track (handle_transfer already loaded it), like in reset_playback_to_position. It
+            // was replaced by a context track, so the state named another song than the one that
+            // played, and that one went to the prev tracks unplayed.
+            if !self.keeps_current_track() {
+                self.set_current_track(current_index.unwrap_or_default())?;
+            }
             self.set_shuffle(true);
 
             match self.transfer_shuffle.take() {
