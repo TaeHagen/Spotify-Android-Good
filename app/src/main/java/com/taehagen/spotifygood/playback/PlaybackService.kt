@@ -340,7 +340,9 @@ class PlaybackService : MediaLibraryService() {
                 .filter { it.source == PlaybackSource.LOCAL && it.track != null }
                 .distinctUntilChanged { a, b ->
                     a.track?.uri == b.track?.uri && a.context?.uri == b.context?.uri &&
-                        a.status == b.status && a.positionMs == b.positionMs
+                        a.status == b.status && a.positionMs == b.positionMs &&
+                        // A mode change (also while paused) is saved too, and restarts the loop.
+                        a.shuffle == b.shuffle && a.smartShuffle == b.smartShuffle && a.repeat == b.repeat
                 }
                 .transformLatest { s ->
                     emit(ResumeState.from(s))

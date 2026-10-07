@@ -164,4 +164,14 @@ class OfflineLoadsTest {
         // Still connecting: the engine may come online and play the context itself.
         assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(request, none, EngineReach.CONNECTING))
     }
+
+    @Test
+    fun offlineSmartShuffleBecomesAPlainShuffle() {
+        val smart = PlayRequest(contextUri = playlist, smartShuffle = true)
+        assertEquals(smart.copy(shuffle = true, smartShuffle = null), OfflineLoads.withoutSmartShuffle(smart, EngineReach.OFFLINE))
+        assertEquals(smart, OfflineLoads.withoutSmartShuffle(smart, EngineReach.CONNECTING))
+        assertEquals(smart, OfflineLoads.withoutSmartShuffle(smart, EngineReach.ONLINE))
+        val off = PlayRequest(contextUri = playlist, shuffle = false, smartShuffle = false)
+        assertEquals(off, OfflineLoads.withoutSmartShuffle(off, EngineReach.OFFLINE))
+    }
 }

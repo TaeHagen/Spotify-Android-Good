@@ -780,7 +780,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   (Spirc and remote devices keep the user queue across loads).
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
-  context, track, position, metadata) persisted on pause and every 15 s while playing.
+  context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
+  on a mode change and every 15 s while playing. Every resume of it (resumption, Tap to
+  resume, "play something", the Play fallback) loads with its modes, since a load without
+  them resets both to off (the Media3 resume item carries them as request extras). Offline the
+  load asks for a plain shuffle instead of smart shuffle. States from older versions read with
+  the modes off.
 * Foreground: Media3 default (10 min after pause, then notification becomes dismissable).
   Local audio never plays without it: local audio starting in the background with no service
   (remote "play on this phone" during the idle grace or a download) starts the service with
