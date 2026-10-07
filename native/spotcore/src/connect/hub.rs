@@ -47,6 +47,9 @@ pub(crate) struct HubState {
     pub reconnect: Option<restore::Frozen>,
     /// Commands holding the pending restore's decision (see `restore::hold`).
     pub restore_holds: u32,
+    /// The Spirc generation whose first cluster is overdue for the pending restore (see
+    /// `restore::schedule`).
+    pub restore_overdue: Option<u64>,
     /// Activate + load were sent to the attached Spirc (a local load or the restore) and its
     /// snapshot isn't active yet: commands go to it, not "nobody is active".
     pub activation: Option<Activation>,
@@ -135,12 +138,6 @@ pub(crate) fn activating_or_active(hub: &HubState) -> bool {
         || hub.activation.is_some_and(|a| {
             hub.link.as_ref().is_some_and(|l| l.generation == a.generation) && a.at.elapsed() < ACTIVATION_GRACE
         })
-}
-
-/// An activation was sent to the attached Spirc and it doesn't report itself active yet.
-pub(crate) fn activating() -> bool {
-    let hub = HUB.lock();
-    !hub.snapshot.as_ref().is_some_and(|s| s.is_active) && activating_or_active(&hub)
 }
 
 /// A local load with activation was sent to the attached Spirc.
@@ -354,12 +351,12 @@ fn on_cluster(generation: u64, cluster: Arc<Cluster>) {
         if hub.link.as_ref().map(|l| l.generation) != Some(generation) {
             return;
         }
-        hub.cluster = Some(cluster);
+        hub.cluster = Some(cluster.clone());
     }
     CLUSTER_CHANGED.notify_waiters();
     changed();
-    // A paused offline queue gives way to a device that became active.
-    offline::yield_to_active_device();
+    // A paused or finished offline queue gives way to a device that took over.
+    offline::on_cluster(&cluster);
     publish_devices();
     publish();
 }
@@ -392,13 +389,12 @@ pub(crate) fn compose() -> PlaybackSnapshot {
     let (local, cluster, placeholder, refused) = {
         let hub = HUB.lock();
         let local = hub.snapshot.clone().filter(|s| s.is_active);
-        let placeholder = hub.reconnect.as_ref().filter(|f| f.since.elapsed() < RECONNECT_PLACEHOLDER_MAX).cloned();
+        let (now, now_ms) = (Instant::now(), super::now_ms());
+        let placeholder = hub.reconnect.as_ref().filter(|f| f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned();
         (local, hub.cluster.clone(), placeholder, hub.refused_error.clone())
     };
-    // A paused or finished offline queue doesn't hide another active device.
-    let other_active = cluster.as_deref().is_some_and(|c| !c.active_device_id.is_empty() && c.active_device_id != device.id);
-    let offline = offline::snapshot(device.clone(), mixer_volume())
-        .filter(|s| !other_active || matches!(s.status, PlaybackStatus::Playing | PlaybackStatus::Loading));
+    // None once a paused or finished offline queue gave way to a device that took over.
+    let offline = offline::snapshot(device.clone(), mixer_volume());
     let mut snap = if let Some(s) = local {
         snapshot::map_local(&s, device.clone())
     } else if let Some(s) = offline {

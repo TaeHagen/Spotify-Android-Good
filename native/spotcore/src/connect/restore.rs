@@ -11,11 +11,15 @@
 //! * Once the new Spirc is online, `schedule` waits for its first cluster (never deciding without
 //!   one) while no command holds the restore. If no other device took over meanwhile and nothing
 //!   else was started (an explicit load or offline playback drops the restore point), it
-//!   activates and reloads context, track, position, options and user queue.
+//!   activates and reloads context, track, position, options and user queue. A first cluster
+//!   later than [`FIRST_CLUSTER_MAX`] still decides it; until then the restore is *overdue*:
+//!   commands no longer wait for it, and a play restores right away (the user asked for it here).
 //! * Commands consult the state instead of destroying it: play / pause set the restore's
-//!   [`intent`](set_intent) (whether it starts playing), other controls wait for the decision and
-//!   then go to the restored Spirc, a load or transfer [`hold`]s the decision while it is routed
-//!   and replaces the restore point only once it is known to be valid.
+//!   [`intent`](set_intent) (whether it starts playing; a play only for [`PLAY_INTENT_MAX`], and
+//!   not at all if it couldn't be answered, see [`answer`]), other controls wait for the decision
+//!   and then go to the restored Spirc, a load or transfer [`hold`]s the decision while it is
+//!   routed and replaces the restore point only once it is known to be valid.
+//! * Gaps are measured on the wall clock too ([`elapsed`]): `Instant` stops while the phone sleeps.
 //!
 //! The Player outlives the Spirc and nothing else controls it: `prepare_reconnect` pauses it, a
 //! dropped restore point stops the paused track nobody owns anymore (the offline queue or an
@@ -24,34 +28,76 @@
 use super::args::LoadArgs;
 use super::hub::{self, HubState, HUB};
 use super::{local, now_ms, offline, uri};
+use crate::error::{AppResult, ErrorCode};
 use crate::models::RepeatMode;
 use librespot_connect::{
     ConnectSnapshot, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack, SnapshotPlayStatus,
-    SnapshotTrack, TrackProvider as SpircProvider,
+    SnapshotTrack, Spirc, TrackProvider as SpircProvider,
 };
 use std::time::{Duration, Instant};
 
-/// How long the new Spirc may take to deliver its first cluster (its dealer start is bounded by
-/// 30 s); without one the restore never runs (another device may have taken over).
+/// The new Spirc's first cluster normally comes well within this (its dealer start and the
+/// announcement PUT are bounded by 30 s each). Without one the restore never runs on its own
+/// (another device may have taken over); past this it is overdue (see the module docs).
 const FIRST_CLUSTER_MAX: Duration = Duration::from_secs(60);
 /// Playback only resumes playing automatically if the interruption was shorter than this.
 const RESUME_PLAYING_MAX_GAP: Duration = Duration::from_secs(120);
+/// A play pressed while the restore was pending counts for this long (a pause always counts).
+const PLAY_INTENT_MAX: Duration = Duration::from_secs(30);
+/// Spirc's queue holds at most this many entries (its next tracks).
+const QUEUE_MAX: usize = super::snapshot::MAX_NEXT;
+/// A frozen session handed to another device as a track list carries at most this many next
+/// tracks (like the offline handover).
+const HANDOVER_NEXT: usize = 50;
+
+/// A play / pause pressed while the restore was pending (see [`set_intent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Intent {
+    pub play: bool,
+    pub since: Instant,
+    pub at_ms: i64,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Frozen {
     pub snap: ConnectSnapshot,
     pub position_ms: i64,
+    /// When the playback was interrupted, local epoch ms ...
     pub at_ms: i64,
+    /// ... and on the monotonic clock.
     pub since: Instant,
     pub was_playing: bool,
     /// A user's play / pause while the restore was pending: whether it starts playing.
-    pub intent: Option<bool>,
+    pub intent: Option<Intent>,
+}
+
+/// Time from `since` / `at_ms` (the same moment on both clocks) to `now` / `now_ms`. `Instant`
+/// (CLOCK_MONOTONIC on Android) stops while the phone sleeps, the wall clock doesn't: the longer
+/// of the two counts. A wall clock set back before that moment counts as a long time (so an old
+/// restore point never plays by itself).
+pub(crate) fn elapsed(since: Instant, at_ms: i64, now: Instant, now_ms: i64) -> Duration {
+    const CLOCK_SLACK_MS: i64 = 1000;
+    if now_ms.saturating_add(CLOCK_SLACK_MS) < at_ms {
+        return Duration::MAX;
+    }
+    let wall = Duration::from_millis(now_ms.saturating_sub(at_ms).max(0) as u64);
+    now.saturating_duration_since(since).max(wall)
 }
 
 impl Frozen {
-    /// Whether the restored playback starts playing after a gap of `gap`.
-    fn start_playing(&self, gap: Duration) -> bool {
-        self.intent.unwrap_or(self.was_playing && gap < RESUME_PLAYING_MAX_GAP)
+    /// Time since the playback was interrupted.
+    pub(crate) fn age(&self, now: Instant, now_ms: i64) -> Duration {
+        elapsed(self.since, self.at_ms, now, now_ms)
+    }
+
+    /// Whether the restored playback starts playing now: as a pause or a recent play asked while
+    /// it was pending, otherwise if it played and the interruption was short.
+    fn start_playing(&self, now: Instant, now_ms: i64) -> bool {
+        match self.intent {
+            Some(i) if !i.play => false,
+            Some(i) if elapsed(i.since, i.at_ms, now, now_ms) < PLAY_INTENT_MAX => true,
+            _ => self.was_playing && self.age(now, now_ms) < RESUME_PLAYING_MAX_GAP,
+        }
     }
 }
 
@@ -80,6 +126,8 @@ pub(crate) struct Plan {
     /// Skip to the first queued entry after that (a queued or suggested track was playing; the
     /// context was loaded at the track before it).
     pub then_next: bool,
+    /// Turn repeat-one on after the skip (a skip turns it off).
+    pub then_repeat_track: bool,
     /// Start playing after the skip (the load itself starts paused then).
     pub then_play: bool,
 }
@@ -97,39 +145,48 @@ fn options_of(s: &ConnectSnapshot) -> Options {
     }
 }
 
-/// What to load to get back to `f`. `gap`: time since the playback was interrupted.
-pub(crate) fn plan(f: &Frozen, gap: Duration) -> Option<Plan> {
+/// What to load to get back to `f`, starting to play or not.
+pub(crate) fn plan(f: &Frozen, start_playing: bool) -> Option<Plan> {
     let s = &f.snap;
     let current = s.track.as_ref().filter(|t| !t.hidden)?;
-    let start_playing = f.start_playing(gap);
-    let options = |playing_track, start_playing, seek_to| LoadRequestOptions {
+    let options = |playing_track, start_playing, seek_to, o| LoadRequestOptions {
         start_playing,
         seek_to,
         playing_track: Some(playing_track),
-        context_options: Some(LoadContextOptions::Options(options_of(s))),
+        context_options: Some(LoadContextOptions::Options(o)),
     };
     let seek_to = f.position_ms.clamp(0, u32::MAX as i64) as u32;
-    let queued: Vec<String> =
+    let mut queued: Vec<String> =
         s.next_tracks.iter().filter(visible).filter(|t| t.provider == SpircProvider::Queue).map(|t| t.uri.clone()).collect();
+    queued.truncate(QUEUE_MAX);
     let resolvable = uri::is_resolvable_context(&s.context_uri);
     if resolvable && current.provider == SpircProvider::Context {
         let request = LoadRequest::from_context_uri(
             s.context_uri.clone(),
-            options(PlayingTrack::Uri(current.uri.clone()), start_playing, seek_to),
+            options(PlayingTrack::Uri(current.uri.clone()), start_playing, seek_to, options_of(s)),
         );
-        return Some(Plan { request, queued, then_next: false, then_play: false });
+        return Some(Plan { request, queued, then_next: false, then_repeat_track: false, then_play: false });
     }
     // A queued or suggested track was playing: keep the context, loaded (paused) at the context
-    // track played before it, with the track queued in front of the user queue and skipped to.
-    // Its position is lost (it restarts), the playlist isn't.
+    // track played before it, with the track queued in front of the user queue (the tail of a
+    // full queue makes room for it) and skipped to. Its position is lost (it restarts), the
+    // playlist isn't. Repeat-one comes after the skip, which would turn it off.
     let anchor = s.prev_tracks.iter().rev().filter(visible).find(|t| t.provider == SpircProvider::Context);
     if resolvable && matches!(current.provider, SpircProvider::Queue | SpircProvider::Suggestion) {
         if let Some(anchor) = anchor {
+            let o = Options { repeat_track: false, ..options_of(s) };
             let request =
-                LoadRequest::from_context_uri(s.context_uri.clone(), options(PlayingTrack::Uri(anchor.uri.clone()), false, 0));
+                LoadRequest::from_context_uri(s.context_uri.clone(), options(PlayingTrack::Uri(anchor.uri.clone()), false, 0, o));
             let mut requeue = vec![current.uri.clone()];
             requeue.extend(queued);
-            return Some(Plan { request, queued: requeue, then_next: true, then_play: start_playing });
+            requeue.truncate(QUEUE_MAX);
+            return Some(Plan {
+                request,
+                queued: requeue,
+                then_next: true,
+                then_repeat_track: s.repeat_track,
+                then_play: start_playing,
+            });
         }
     }
     // Plain track lists (or nothing to anchor the context at): rebuild the visible window.
@@ -140,11 +197,14 @@ pub(crate) fn plan(f: &Frozen, gap: Duration) -> Option<Plan> {
     let mut tracks = prev;
     tracks.push(current.uri.clone());
     tracks.extend(next);
-    let request = LoadRequest::from_tracks(tracks, options(PlayingTrack::Index(index), start_playing, seek_to));
-    Some(Plan { request, queued, then_next: false, then_play: false })
+    let request = LoadRequest::from_tracks(tracks, options(PlayingTrack::Index(index), start_playing, seek_to, options_of(s)));
+    Some(Plan { request, queued, then_next: false, then_repeat_track: false, then_play: false })
 }
 
 /// The frozen session as a `player.load` (for another device: context, track, position, options).
+/// A queued or suggested track isn't part of the context (the target would start the context's
+/// first track at its position): then, like a plain track list, the visible window in play order
+/// (previous tracks, the current one, the user queue and the next tracks).
 pub(crate) fn load_args(f: &Frozen, play: bool) -> Option<LoadArgs> {
     let s = &f.snap;
     let current = s.track.as_ref().filter(|t| !t.hidden)?;
@@ -162,11 +222,14 @@ pub(crate) fn load_args(f: &Frozen, play: bool) -> Option<LoadArgs> {
         play,
         ..Default::default()
     };
-    Some(if uri::is_resolvable_context(&s.context_uri) {
-        LoadArgs { context_uri: Some(s.context_uri.clone()), start_uri: Some(current.uri.clone()), ..base }
-    } else {
-        LoadArgs { track_uris: Some(vec![current.uri.clone()]), start_index: Some(0), shuffle: Some(false), ..base }
-    })
+    if uri::is_resolvable_context(&s.context_uri) && current.provider == SpircProvider::Context {
+        return Some(LoadArgs { context_uri: Some(s.context_uri.clone()), start_uri: Some(current.uri.clone()), ..base });
+    }
+    let mut tracks: Vec<String> = s.prev_tracks.iter().filter(visible).map(|t| t.uri.clone()).collect();
+    let start_index = tracks.len() as u32;
+    tracks.push(current.uri.clone());
+    tracks.extend(s.next_tracks.iter().filter(visible).take(HANDOVER_NEXT).map(|t| t.uri.clone()));
+    Some(LoadArgs { track_uris: Some(tracks), start_index: Some(start_index), shuffle: Some(false), ..base })
 }
 
 /// Whether the attached Spirc still runs (and with that controls the Player it played on).
@@ -253,22 +316,104 @@ fn drop_restore() {
     }
 }
 
-/// Whether a restore point is pending.
-pub(crate) fn is_pending() -> bool {
-    HUB.lock().reconnect.is_some()
+/// The new Spirc's first cluster is overdue for the pending restore (see the module docs).
+fn overdue_in(hub: &HubState) -> bool {
+    hub.reconnect.is_some()
+        && hub.restore_overdue.is_some_and(|g| hub.link.as_ref().is_some_and(|l| l.generation == g))
+}
+
+pub(crate) fn overdue() -> bool {
+    overdue_in(&HUB.lock())
+}
+
+/// A restore is pending, nothing holds it and it isn't overdue: its decision is on its way
+/// (commands wait for it).
+pub(crate) fn deciding(hub: &HubState) -> bool {
+    hub.reconnect.is_some() && hub.restore_holds == 0 && !overdue_in(hub)
 }
 
 /// A play (`true`) or pause (`false`) while a restore is pending: the restored playback starts
-/// playing or paused. Returns whether a restore is pending.
-pub(crate) fn set_intent(play: bool) -> bool {
-    let mut hub = HUB.lock();
-    match hub.reconnect.as_mut() {
-        Some(f) => {
-            f.intent = Some(play);
-            true
-        }
-        None => false,
+/// playing or paused. Returns the previous intent if a restore is pending (see [`answer`]).
+pub(crate) fn set_intent(play: bool) -> Option<Option<Intent>> {
+    set_intent_in(&mut HUB.lock(), play, Instant::now(), now_ms())
+}
+
+fn set_intent_in(hub: &mut HubState, play: bool, now: Instant, now_ms: i64) -> Option<Option<Intent>> {
+    let f = hub.reconnect.as_mut()?;
+    let prev = f.intent;
+    f.intent = Some(Intent { play, since: now, at_ms: now_ms });
+    Some(prev)
+}
+
+/// What a pending restore does with a play / pause, once the command waited for its decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// It answers it: it comes back as asked once it decides (it is on its way, or held by a
+    /// load in flight), or a pause (it comes back paused whenever it runs).
+    Answered,
+    /// The new Spirc's first cluster is overdue: a play restores right away.
+    RestoreNow,
+    /// Not answered, routed as usual: the restore point is gone (restored, skipped, replaced),
+    /// or nothing will decide it soon (no session) and a play fails or falls back like any other.
+    Routed,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnswerInput {
+    pending: bool,
+    /// Online with a Spirc attached.
+    connected: bool,
+    overdue: bool,
+    play: bool,
+    /// A pause without a session counts as answered (`control`), or not (`transfer`).
+    offline_pause_answered: bool,
+}
+
+fn answer_for(i: AnswerInput) -> Answer {
+    if !i.pending {
+        return Answer::Routed;
     }
+    if !i.connected {
+        return if !i.play && i.offline_pause_answered { Answer::Answered } else { Answer::Routed };
+    }
+    if i.overdue && i.play { Answer::RestoreNow } else { Answer::Answered }
+}
+
+/// After a play / pause set the pending restore's intent (`prev`: what [`set_intent`] returned)
+/// and waited for its decision: whether the restore answered the command. A play it can't answer
+/// gets its intent put back, so that a failed play (no session) doesn't make an old restore
+/// point play whenever the network returns.
+pub(crate) fn answer(play: bool, prev: Option<Intent>, offline_pause_answered: bool) -> AppResult<bool> {
+    let online = crate::engine::is_online();
+    let (a, generation) = {
+        let mut hub = HUB.lock();
+        (answer_in(&mut hub, online, play, prev, offline_pause_answered), hub.link.as_ref().map(|l| l.generation))
+    };
+    match (a, generation) {
+        (Answer::Answered, _) => Ok(true),
+        (Answer::RestoreNow, Some(generation)) => {
+            log::info!("the restore's first cluster is overdue, restoring on play");
+            decide_and_restore(generation, true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// [`answer`] on the state: a routed play gets the previous intent back.
+fn answer_in(hub: &mut HubState, online: bool, play: bool, prev: Option<Intent>, offline_pause_answered: bool) -> Answer {
+    let a = answer_for(AnswerInput {
+        pending: hub.reconnect.is_some(),
+        connected: online && hub.link.is_some(),
+        overdue: overdue_in(hub),
+        play,
+        offline_pause_answered,
+    });
+    if a == Answer::Routed && play {
+        if let Some(f) = hub.reconnect.as_mut() {
+            f.intent = prev;
+        }
+    }
+    a
 }
 
 /// While held, the pending restore doesn't run (a load or transfer is being routed, it replaces
@@ -302,11 +447,15 @@ enum Decision {
     Restore(Plan),
 }
 
-/// Whether to restore now, after the new Spirc's first cluster.
-fn decide(hub: &mut HubState, me: &str, offline_active: bool) -> Decision {
+/// Whether to restore now, after the new Spirc's first cluster (`without_cluster`: a play asked
+/// for it while the cluster is overdue).
+fn decide(hub: &mut HubState, me: &str, offline_active: bool, now: Instant, now_ms: i64, without_cluster: bool) -> Decision {
     let Some(frozen) = hub.reconnect.as_ref() else { return Decision::Cancelled };
-    let Some(cluster) = hub.cluster.as_ref() else { return Decision::NoCluster };
-    let other_active = !cluster.active_device_id.is_empty() && cluster.active_device_id != me;
+    let cluster = hub.cluster.as_ref();
+    if cluster.is_none() && !without_cluster {
+        return Decision::NoCluster;
+    }
+    let other_active = cluster.is_some_and(|c| !c.active_device_id.is_empty() && c.active_device_id != me);
     if other_active || hub.snapshot.as_ref().is_some_and(|s| s.is_active) {
         return Decision::Skip("another device is active");
     }
@@ -314,19 +463,82 @@ fn decide(hub: &mut HubState, me: &str, offline_active: bool) -> Decision {
         // Started during the outage (a paused offline queue still owns the Player).
         return Decision::Skip("offline playback is in progress");
     }
-    let Some(plan) = plan(frozen, frozen.since.elapsed()) else { return Decision::Skip("nothing to restore") };
+    let Some(plan) = plan(frozen, frozen.start_playing(now, now_ms)) else { return Decision::Skip("nothing to restore") };
     hub.reconnect = None;
     hub.last_active = None;
     Decision::Restore(plan)
 }
 
-/// Called once the Spirc `generation` is online after a reconnect.
+/// Sends the restore to Spirc `generation`. Called while holding the hub, so that a command
+/// routed meanwhile reaches Spirc after the restore, not before it. A full queue drops the rest
+/// of the requeued tracks, not the skip and the play.
+fn send_plan(hub: &mut HubState, generation: u64, spirc: &Spirc, plan: Plan) -> AppResult<()> {
+    hub.activation = Some(hub::Activation { generation, at: Instant::now() });
+    local::sent(spirc.activate())?;
+    local::sent(spirc.load(plan.request))?;
+    for uri in &plan.queued {
+        match local::queue_add(spirc, uri) {
+            Ok(()) => {}
+            Err(e) if e.code == ErrorCode::NotConnected => return Err(e),
+            Err(e) => {
+                log::warn!("restore: {e}, the rest of the queue is dropped");
+                break;
+            }
+        }
+    }
+    if plan.then_next {
+        local::sent(spirc.next())?;
+        if plan.then_repeat_track {
+            local::sent(spirc.repeat_track(true))?;
+        }
+    }
+    if plan.then_play {
+        local::sent(spirc.play())?;
+    }
+    Ok(())
+}
+
+/// Decides the pending restore for the attached Spirc `generation` and sends it (see [`decide`]
+/// for `without_cluster`). Returns whether it restored; a skipped restore point is cleared.
+fn decide_and_restore(generation: u64, without_cluster: bool) -> AppResult<bool> {
+    let me = hub::me();
+    let offline_active = offline::is_active();
+    let skip = {
+        let mut hub = HUB.lock();
+        let Some(spirc) = hub.link.as_ref().filter(|l| l.generation == generation).map(|l| l.spirc.clone()) else {
+            return Ok(false); // superseded; a newer Spirc schedules its own restore
+        };
+        match decide(&mut hub, &me, offline_active, Instant::now(), now_ms(), without_cluster) {
+            Decision::Cancelled | Decision::NoCluster => return Ok(false),
+            Decision::Skip(reason) => reason,
+            Decision::Restore(plan) => {
+                log::info!("restoring local playback after reconnect");
+                let result = send_plan(&mut hub, generation, &spirc, plan);
+                drop(hub);
+                if let Err(e) = &result {
+                    log::warn!("restore failed: {e}");
+                }
+                hub::changed();
+                hub::publish();
+                return result.map(|_| true);
+            }
+        }
+    };
+    log::info!("not restoring playback: {skip}");
+    clear();
+    Ok(false)
+}
+
+/// Called once the Spirc `generation` is online after a reconnect. Waits for its first cluster as
+/// long as the Spirc is attached and the restore point pending (both changes wake it); past
+/// [`FIRST_CLUSTER_MAX`] the restore is overdue.
 pub(crate) fn schedule(generation: u64) {
     if HUB.lock().reconnect.is_none() {
         return;
     }
     crate::runtime::handle().spawn(async move {
-        let deadline = tokio::time::Instant::now() + FIRST_CLUSTER_MAX;
+        let overdue_at = tokio::time::Instant::now() + FIRST_CLUSTER_MAX;
+        let mut overdue = false;
         loop {
             let notified = hub::CHANGED.notified();
             tokio::pin!(notified);
@@ -337,52 +549,25 @@ pub(crate) fn schedule(generation: u64) {
                     return; // superseded; a newer Spirc schedules its own restore
                 }
                 if hub.reconnect.is_none() {
-                    return; // replaced meanwhile
+                    return; // restored on play, or replaced meanwhile
                 }
                 if hub.cluster.is_some() && hub.restore_holds == 0 {
                     break;
                 }
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                // Without a cluster another device may have taken over: never restore blind.
-                // The restore point stays for the next Spirc (this one most likely died).
-                log::warn!("no cluster from spirc {generation}, not restoring for now");
-                return;
+            if overdue {
+                notified.await;
+            } else if tokio::time::timeout_at(overdue_at, notified).await.is_err() {
+                // Without a cluster another device may have taken over: never restore blind. A
+                // late cluster still decides it; meanwhile commands don't wait for it and a play
+                // restores right away.
+                log::warn!("no cluster from spirc {generation} yet, the restore waits for a play or the cluster");
+                overdue = true;
+                HUB.lock().restore_overdue = Some(generation);
+                hub::changed();
             }
         }
-        let me = hub::me();
-        let offline_active = offline::is_active();
-        let skip = {
-            let mut hub = HUB.lock();
-            let Some(spirc) = hub.link.as_ref().filter(|l| l.generation == generation).map(|l| l.spirc.clone())
-            else {
-                return; // superseded; a newer Spirc schedules its own restore
-            };
-            match decide(&mut hub, &me, offline_active) {
-                Decision::Cancelled | Decision::NoCluster => return,
-                Decision::Skip(reason) => reason,
-                Decision::Restore(plan) => {
-                    // Sent while holding the hub, so that a command routed meanwhile reaches Spirc
-                    // after the restore, not before it.
-                    log::info!("restoring local playback after reconnect");
-                    hub.activation = Some(hub::Activation { generation, at: Instant::now() });
-                    let result = local::sent(spirc.activate())
-                        .and_then(|_| local::sent(spirc.load(plan.request)))
-                        .and_then(|_| plan.queued.into_iter().try_for_each(|q| local::sent(spirc.add_to_queue(q))))
-                        .and_then(|_| if plan.then_next { local::sent(spirc.next()) } else { Ok(()) })
-                        .and_then(|_| if plan.then_play { local::sent(spirc.play()) } else { Ok(()) });
-                    drop(hub);
-                    if let Err(e) = result {
-                        log::warn!("restore failed: {e}");
-                    }
-                    hub::changed();
-                    hub::publish();
-                    return;
-                }
-            }
-        };
-        log::info!("not restoring playback: {skip}");
-        clear();
+        let _ = decide_and_restore(generation, false);
     });
 }
 
@@ -426,11 +611,25 @@ mod tests {
         assert_eq!(position_now(&paused, 2_000_000), 10_000);
     }
 
+    /// Whether `f` starts playing `secs` after it was frozen (both clocks advancing alike).
+    fn playing_after(f: &Frozen, secs: u64) -> bool {
+        f.start_playing(f.since + Duration::from_secs(secs), f.at_ms + secs as i64 * 1000)
+    }
+
+    fn intent(play: bool, f: &Frozen) -> Option<Intent> {
+        Some(Intent { play, since: f.since, at_ms: f.at_ms })
+    }
+
+    fn dec(hub: &mut HubState, offline_active: bool) -> Decision {
+        let (since, at_ms) = hub.reconnect.as_ref().map(|f| (f.since, f.at_ms)).unwrap_or((Instant::now(), 0));
+        decide(hub, "me", offline_active, since + Duration::from_secs(1), at_ms + 1000, false)
+    }
+
     #[test]
     fn plan_context_restore() {
         let f = freeze(snap("spotify:album:a", SpircProvider::Context), 1_002_000, Instant::now());
         assert!(f.was_playing);
-        let p = plan(&f, Duration::from_secs(5)).expect("plan");
+        let p = plan(&f, playing_after(&f, 5)).expect("plan");
         assert!(p.request.start_playing);
         assert_eq!(p.request.seek_to, 12_000);
         assert!(matches!(p.request.playing_track, Some(PlayingTrack::Uri(ref u)) if u == "spotify:track:cur"));
@@ -438,14 +637,101 @@ mod tests {
         assert!(format!("{:?}", p.request).contains("Uri(\"spotify:album:a\")"));
         assert_eq!(p.queued, vec!["spotify:track:q".to_string()]);
         // a long gap restores paused
-        let p = plan(&f, Duration::from_secs(600)).expect("plan");
+        let p = plan(&f, playing_after(&f, 600)).expect("plan");
         assert!(!p.request.start_playing);
+    }
+
+    #[test]
+    fn the_gap_counts_the_time_the_phone_slept() {
+        let t0 = Instant::now();
+        let f = freeze(snap("spotify:album:a", SpircProvider::Context), 1_000_000, t0);
+        assert!(f.start_playing(t0 + Duration::from_secs(5), 1_005_000));
+        // the monotonic clock counted 30 s while 45 minutes passed (suspended in a bag)
+        let (now, now_ms) = (t0 + Duration::from_secs(30), 1_000_000 + 45 * 60_000);
+        assert!(!f.start_playing(now, now_ms));
+        assert!(f.age(now, now_ms) >= Duration::from_secs(45 * 60), "the placeholder goes too");
+        // a wall clock set back: a long gap, never auto-played
+        assert!(!f.start_playing(t0 + Duration::from_secs(5), 1_000_000 - 10 * 60_000));
+        // a wall clock off by less than the slack doesn't matter
+        assert!(f.start_playing(t0 + Duration::from_secs(5), 999_500));
+    }
+
+    #[test]
+    fn a_play_intent_only_counts_for_a_while() {
+        let t0 = Instant::now();
+        let mut f = freeze(snap("spotify:album:a", SpircProvider::Context), 1_000_000, t0);
+        f.was_playing = false;
+        f.intent = Some(Intent { play: true, since: t0, at_ms: 1_000_000 });
+        assert!(f.start_playing(t0 + Duration::from_secs(10), 1_010_000));
+        // a play long ago falls back to the gap rule (paused before), also across a sleep
+        assert!(!f.start_playing(t0 + Duration::from_secs(40), 1_040_000));
+        assert!(!f.start_playing(t0 + Duration::from_secs(10), 1_000_000 + 3_600_000));
+        // a pause always counts
+        f.was_playing = true;
+        f.intent = Some(Intent { play: false, since: t0, at_ms: 1_000_000 });
+        assert!(!f.start_playing(t0 + Duration::from_secs(10), 1_010_000));
+        assert!(!f.start_playing(t0 + Duration::from_secs(100), 1_100_000));
+    }
+
+    #[test]
+    fn a_play_that_cant_be_answered_keeps_no_intent() {
+        // pending during an outage (no session): the play fails / falls back, its intent goes
+        let mut hub = frozen_hub();
+        let f = hub.reconnect.clone().unwrap();
+        let prev = set_intent_in(&mut hub, true, f.since, f.at_ms).expect("pending");
+        assert_eq!(prev, None);
+        assert_eq!(answer_in(&mut hub, false, true, prev, true), Answer::Routed);
+        assert_eq!(hub.reconnect.as_ref().unwrap().intent, None);
+        // an earlier pause stays
+        let prev = set_intent_in(&mut hub, false, f.since, f.at_ms).expect("pending");
+        assert_eq!(answer_in(&mut hub, false, false, prev, true), Answer::Answered, "a pause needs no session");
+        let prev = set_intent_in(&mut hub, true, f.since, f.at_ms).expect("pending");
+        assert_eq!(answer_in(&mut hub, false, true, prev, true), Answer::Routed);
+        assert!(hub.reconnect.as_ref().unwrap().intent.is_some_and(|i| !i.play));
+        // a transfer's pause isn't answered without a session (NOT_CONNECTED), the intent stays
+        let prev = set_intent_in(&mut hub, false, f.since, f.at_ms).expect("pending");
+        assert_eq!(answer_in(&mut hub, false, false, prev, false), Answer::Routed);
+        assert!(hub.reconnect.as_ref().unwrap().intent.is_some_and(|i| !i.play));
+        // nothing pending: routed, nothing recorded
+        hub.reconnect = None;
+        assert_eq!(set_intent_in(&mut hub, true, f.since, f.at_ms), None);
+    }
+
+    #[test]
+    fn commands_and_the_restore() {
+        let i = AnswerInput { pending: true, connected: true, overdue: false, play: true, offline_pause_answered: true };
+        // deciding (or held by a load in flight): it comes back as asked
+        assert_eq!(answer_for(i), Answer::Answered);
+        assert_eq!(answer_for(AnswerInput { play: false, ..i }), Answer::Answered);
+        // the first cluster is overdue: a play restores now, a pause is recorded
+        assert_eq!(answer_for(AnswerInput { overdue: true, ..i }), Answer::RestoreNow);
+        assert_eq!(answer_for(AnswerInput { overdue: true, play: false, ..i }), Answer::Answered);
+        // gone (restored, skipped, replaced): routed
+        assert_eq!(answer_for(AnswerInput { pending: false, ..i }), Answer::Routed);
+        // no session
+        assert_eq!(answer_for(AnswerInput { connected: false, ..i }), Answer::Routed);
+    }
+
+    #[test]
+    fn an_overdue_restore_runs_on_play_without_the_cluster() {
+        let mut hub = frozen_hub();
+        hub.cluster = None;
+        let (since, at_ms) = { let f = hub.reconnect.as_ref().unwrap(); (f.since, f.at_ms) };
+        let now = since + Duration::from_secs(70);
+        assert!(matches!(decide(&mut hub, "me", false, now, at_ms + 70_000, false), Decision::NoCluster));
+        hub.reconnect.as_mut().unwrap().intent = Some(Intent { play: true, since: now, at_ms: at_ms + 70_000 });
+        let Decision::Restore(p) = decide(&mut hub, "me", false, now, at_ms + 70_000, true) else { panic!("restore") };
+        assert!(p.request.start_playing);
+        // a cluster that came meanwhile still decides
+        let mut hub = frozen_hub();
+        hub.cluster = cluster("speaker");
+        assert!(matches!(decide(&mut hub, "me", false, now, at_ms + 70_000, true), Decision::Skip(_)));
     }
 
     #[test]
     fn plan_track_list_restore() {
         let f = freeze(snap("spotify:web-api", SpircProvider::Context), 1_000_000, Instant::now());
-        let p = plan(&f, Duration::ZERO).expect("plan");
+        let p = plan(&f, true).expect("plan");
         assert!(matches!(p.request.playing_track, Some(PlayingTrack::Index(1))));
         let dbg = format!("{:?}", p.request);
         assert!(dbg.contains("Tracks([\"spotify:track:p\", \"spotify:track:cur\", \"spotify:track:n\"])"), "{dbg}");
@@ -472,7 +758,7 @@ mod tests {
     fn never_restores_without_the_first_cluster() {
         let mut hub = frozen_hub();
         hub.cluster = None;
-        assert!(matches!(decide(&mut hub, "me", false), Decision::NoCluster));
+        assert!(matches!(dec(&mut hub, false), Decision::NoCluster));
         assert!(hub.reconnect.is_some(), "kept for when the cluster comes (or the next Spirc)");
     }
 
@@ -480,14 +766,15 @@ mod tests {
     fn play_and_pause_while_pending_decide_how_it_comes_back() {
         let mut hub = frozen_hub();
         // a pause while pending: back paused, even after a short gap
-        hub.reconnect.as_mut().unwrap().intent = Some(false);
-        let p = plan(hub.reconnect.as_ref().unwrap(), Duration::from_secs(1)).expect("plan");
-        assert!(!p.request.start_playing);
-        // a play: playing, even after a long gap
-        hub.reconnect.as_mut().unwrap().intent = Some(true);
-        let p = plan(hub.reconnect.as_ref().unwrap(), Duration::from_secs(3600)).expect("plan");
-        assert!(p.request.start_playing);
-        let Decision::Restore(p) = decide(&mut hub, "me", false) else { panic!("restore") };
+        let f = hub.reconnect.clone().unwrap();
+        hub.reconnect.as_mut().unwrap().intent = intent(false, &f);
+        assert!(!playing_after(hub.reconnect.as_ref().unwrap(), 1));
+        // a (recent) play: playing, even after a long gap
+        let mut late = f.clone();
+        late.intent = Some(Intent { play: true, since: f.since + Duration::from_secs(3590), at_ms: f.at_ms + 3_590_000 });
+        assert!(playing_after(&late, 3600));
+        hub.reconnect.as_mut().unwrap().intent = intent(true, &f);
+        let Decision::Restore(p) = dec(&mut hub, false) else { panic!("restore") };
         assert!(p.request.start_playing);
     }
 
@@ -515,7 +802,7 @@ mod tests {
     fn a_queued_or_suggested_track_keeps_the_context() {
         for provider in [SpircProvider::Queue, SpircProvider::Suggestion] {
             let f = freeze(snap("spotify:playlist:x", provider.clone()), 1_000_000, Instant::now());
-            let p = plan(&f, Duration::ZERO).expect("plan");
+            let p = plan(&f, true).expect("plan");
             let dbg = format!("{:?}", p.request);
             assert!(dbg.contains("Uri(\"spotify:playlist:x\")"), "{dbg}");
             // loaded paused at the context track before it, the track requeued first and skipped to
@@ -523,11 +810,25 @@ mod tests {
             assert!(!p.request.start_playing);
             assert_eq!(p.queued, vec!["spotify:track:cur".to_string(), "spotify:track:q".to_string()]);
             assert!(p.then_next && p.then_play, "{provider:?}");
+            assert!(!p.then_repeat_track);
         }
+        // repeat-one is turned on after the skip (which turns it off), not with the load
+        let mut s = snap("spotify:playlist:x", SpircProvider::Queue);
+        s.repeat_track = true;
+        let p = plan(&freeze(s, 1_000_000, Instant::now()), true).expect("plan");
+        assert!(p.then_repeat_track);
+        assert!(matches!(p.request.context_options, Some(LoadContextOptions::Options(ref o)) if !o.repeat_track));
+        // a full queue: the tail makes room for the current track, which comes first
+        let mut s = snap("spotify:playlist:x", SpircProvider::Queue);
+        s.next_tracks = (0..QUEUE_MAX).map(|i| st(&format!("spotify:track:q{i}"), &format!("q{i}"), SpircProvider::Queue)).collect();
+        let p = plan(&freeze(s, 1_000_000, Instant::now()), true).expect("plan");
+        assert_eq!(p.queued.len(), QUEUE_MAX);
+        assert_eq!(p.queued[0], "spotify:track:cur");
+        assert_eq!(p.queued[QUEUE_MAX - 1], format!("spotify:track:q{}", QUEUE_MAX - 2));
         // without a track before it there is nothing to anchor the context at: the track list
         let mut s = snap("spotify:playlist:x", SpircProvider::Queue);
         s.prev_tracks.clear();
-        let p = plan(&freeze(s, 1_000_000, Instant::now()), Duration::ZERO).expect("plan");
+        let p = plan(&freeze(s, 1_000_000, Instant::now()), true).expect("plan");
         assert!(format!("{:?}", p.request).contains("Tracks("));
         assert!(!p.then_next);
     }
@@ -544,30 +845,45 @@ mod tests {
         assert_eq!(a.shuffle, Some(true));
         assert_eq!(a.repeat, Some(RepeatMode::Track));
         assert!(!a.play);
+        // a plain track list: the visible window, from the current track on
+        let window: Vec<String> =
+            ["spotify:track:p", "spotify:track:cur", "spotify:track:q", "spotify:track:n"].map(String::from).to_vec();
         let f = freeze(snap("spotify:web-api", SpircProvider::Context), 1_000_000, Instant::now());
         let a = load_args(&f, true).expect("load");
-        assert_eq!(a.track_uris, Some(vec!["spotify:track:cur".to_string()]));
+        assert_eq!(a.track_uris.as_ref(), Some(&window));
+        assert_eq!(a.start_index, Some(1));
+        assert_eq!(a.shuffle, Some(false), "in play order");
+        // a queued or suggested track isn't in the context: the same window, at its position
+        for provider in [SpircProvider::Queue, SpircProvider::Suggestion] {
+            let f = freeze(snap("spotify:playlist:x", provider), 1_002_000, Instant::now());
+            let a = load_args(&f, true).expect("load");
+            assert_eq!(a.context_uri, None);
+            assert_eq!(a.start_uri, None);
+            assert_eq!(a.track_uris.as_ref(), Some(&window));
+            assert_eq!(a.start_index, Some(1));
+            assert_eq!(a.position_ms, 12_000);
+        }
     }
 
     #[test]
     fn offline_playback_started_during_the_outage_is_not_replaced() {
         let mut hub = frozen_hub();
-        assert!(matches!(decide(&mut hub, "me", true), Decision::Skip(_)));
+        assert!(matches!(dec(&mut hub, true), Decision::Skip(_)));
         assert!(hub.reconnect.is_some(), "cleared (and the orphan stopped) by the caller");
         // without offline playback the restore takes the restore point
-        assert!(matches!(decide(&mut hub, "me", false), Decision::Restore(_)));
+        assert!(matches!(dec(&mut hub, false), Decision::Restore(_)));
         assert!(hub.reconnect.is_none() && hub.last_active.is_none());
         // a restore point dropped meanwhile (explicit load) cancels it
-        assert!(matches!(decide(&mut hub, "me", false), Decision::Cancelled));
+        assert!(matches!(dec(&mut hub, false), Decision::Cancelled));
     }
 
     #[test]
     fn restore_skipped_when_another_device_took_over() {
         let mut hub = frozen_hub();
         hub.cluster = cluster("speaker");
-        assert!(matches!(decide(&mut hub, "me", false), Decision::Skip(_)));
+        assert!(matches!(dec(&mut hub, false), Decision::Skip(_)));
         hub.cluster = cluster("me");
-        assert!(matches!(decide(&mut hub, "me", false), Decision::Restore(_)));
+        assert!(matches!(dec(&mut hub, false), Decision::Restore(_)));
     }
 
     #[test]
@@ -584,7 +900,7 @@ mod tests {
         assert!(f.was_playing);
         assert_eq!(f.since, now, "interrupted when frozen, not when the snapshot last changed");
         assert_eq!(f.position_ms, 15_000, "the Player played on until it was paused");
-        let p = plan(f, Duration::from_secs(5)).expect("plan");
+        let p = plan(f, playing_after(f, 5)).expect("plan");
         assert!(p.request.start_playing);
     }
 
@@ -616,6 +932,6 @@ mod tests {
     fn nothing_to_restore_without_track() {
         let mut s = snap("spotify:album:a", SpircProvider::Context);
         s.track = None;
-        assert!(plan(&freeze(s, 0, Instant::now()), Duration::ZERO).is_none());
+        assert!(plan(&freeze(s, 0, Instant::now()), true).is_none());
     }
 }

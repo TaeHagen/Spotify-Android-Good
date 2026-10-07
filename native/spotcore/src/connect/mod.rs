@@ -115,7 +115,7 @@ fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
         // An activation just sent (a load, the restore) counts: commands queue behind it.
         local_active: hub::local_active_or_activating(),
         offline_active: offline::is_active(),
-        offline_playing: offline::is_playing(),
+        offline_yields: offline::yields(),
         active_device: active.as_deref(),
         me: &me,
     };
@@ -130,7 +130,8 @@ struct WaitInput {
     spirc: bool,
     /// The attached Spirc's first cluster arrived (it tells which device is active).
     cluster_known: bool,
-    /// A reconnect restore is pending and nothing holds it: its decision is on its way.
+    /// A reconnect restore is pending, nothing holds it and it isn't overdue: its decision is on
+    /// its way.
     restore_deciding: bool,
     /// A connect attempt is in flight (`engine::is_connecting`).
     connecting: bool,
@@ -143,7 +144,7 @@ impl WaitInput {
     fn now() -> Self {
         let (spirc, cluster_known, restore_deciding) = {
             let hub = hub::HUB.lock();
-            (hub.link.is_some(), hub.cluster.is_some(), hub.reconnect.is_some() && hub.restore_holds == 0)
+            (hub.link.is_some(), hub.cluster.is_some(), restore::deciding(&hub))
         };
         WaitInput {
             online: engine::is_online(),
@@ -248,18 +249,23 @@ fn play_intent(cmd: &Ctl) -> Option<bool> {
     }
 }
 
-async fn control(cmd: Ctl) -> AppResult<Value> {
+async fn control(mut cmd: Ctl) -> AppResult<Value> {
     // A pending reconnect restore is this device's session: a play / pause decides whether it
     // comes back playing; other commands wait for it and then go to the restored Spirc.
     if let Some(play) = play_intent(&cmd).filter(|_| !offline::is_active()) {
-        if restore::set_intent(play) {
-            await_ready(cmd.kind(), true).await;
-            // Restored with the intent, or still pending (it keeps the intent). Otherwise (skipped,
-            // replaced) the command is routed as usual. Pending during an outage, a play is left
-            // to the app's fallback (downloads).
-            let applied = restore::is_pending() || hub::activating();
-            if applied && (engine::is_online() || !play) {
+        if let Some(prev) = restore::set_intent(play) {
+            if !restore::overdue() {
+                await_ready(cmd.kind(), true).await;
+            }
+            // Answered: it comes back as asked (or a play restored it right away, its first
+            // cluster being overdue). Otherwise the command is routed as usual: restored meanwhile
+            // (a toggle seen on the paused placeholder means play), skipped, replaced, or no
+            // session (a play is left to the app's fallback, without its intent).
+            if restore::answer(play, prev, true)? {
                 return ok();
+            }
+            if matches!(cmd, Ctl::Toggle) {
+                cmd = Ctl::Play;
             }
         }
     }
@@ -429,9 +435,12 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
     // or not, as asked), to another device it is handed over there.
     let mut frozen = None;
     if args.device_id == me {
-        if restore::set_intent(args.play) {
-            await_ready(CommandKind::Load, true).await;
-            if restore::is_pending() || hub::activating() {
+        if let Some(prev) = restore::set_intent(args.play) {
+            if !restore::overdue() {
+                await_ready(CommandKind::Load, true).await;
+            }
+            // Not answered without a session: NOT_CONNECTED below.
+            if restore::answer(args.play, prev, false)? {
                 return ok();
             }
         }
@@ -447,8 +456,8 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
         return Err(route::hidden());
     }
     let other_active = hub::active_device_id().is_some_and(|id| id != me);
-    // A paused or finished offline queue gives way to another active device (see `route`).
-    let offline_owns = offline::is_active() && (offline::is_playing() || !other_active);
+    // A paused or finished offline queue gives way to a device that took over (see `route`).
+    let offline_owns = offline::is_active() && !offline::yields();
     if args.device_id == me {
         let spirc = spirc()?;
         if hub::local_active_or_activating() {
@@ -546,6 +555,8 @@ pub(crate) fn clear_restore() {
 pub(crate) fn on_engine_state_changed() {
     if engine::is_online() {
         metadata::on_online();
+        // The first cluster can arrive before the session is declared online.
+        offline::yield_to_active_device();
         if hub::spirc().is_none() {
             // Online but hidden from Spotify Connect: nothing to restore into (the engine only
             // restores into a visible Spirc), so the frozen state goes.

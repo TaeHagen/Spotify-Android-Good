@@ -36,8 +36,9 @@ pub(crate) struct RouteInput<'a> {
     pub local_active: bool,
     /// The OfflineController currently owns local playback.
     pub offline_active: bool,
-    /// ... and it plays (or loads to play).
-    pub offline_playing: bool,
+    /// ... but gives way: it is paused or finished, and another device took the session over
+    /// since (see `offline::yields`).
+    pub offline_yields: bool,
     /// `cluster.active_device_id` (empty = none).
     pub active_device: Option<&'a str>,
     pub me: &'a str,
@@ -56,9 +57,9 @@ pub(crate) fn hidden() -> AppError {
 pub(crate) fn route(input: &RouteInput, kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     let other_active = input.active_device.filter(|id| !id.is_empty() && *id != input.me).map(str::to_string);
 
-    // The offline queue keeps playing until something else takes over; a paused or finished one
-    // gives way to another active device.
-    let offline_owns = input.offline_active && (input.offline_playing || other_active.is_none());
+    // The offline queue keeps the session until another device takes it over from a paused or
+    // finished queue; a device that only sits paused as the account's active one doesn't.
+    let offline_owns = input.offline_active && !input.offline_yields;
     if offline_owns && !input.local_active {
         return match kind {
             CommandKind::Load if input.online && input.spirc => Ok(Target::Local { activate: true }),
@@ -111,7 +112,7 @@ mod tests {
             spirc: online,
             local_active: local,
             offline_active: offline,
-            offline_playing: offline,
+            offline_yields: false,
             active_device: active,
             me: "me",
         }
@@ -171,14 +172,18 @@ mod tests {
     }
 
     #[test]
-    fn a_paused_offline_queue_gives_way_to_the_active_device() {
-        let paused = RouteInput { offline_playing: false, ..input(true, false, true, Some("tv")) };
-        for kind in [CommandKind::Control, CommandKind::Queue, CommandKind::Volume, CommandKind::Load] {
-            assert_eq!(route(&paused, kind, false).ok(), Some(Target::Remote("tv".into())), "{kind:?}");
+    fn a_paused_offline_queue_keeps_its_session_until_another_device_takes_over() {
+        // a device sitting paused as the active one: the paused queue keeps its controls
+        let paused = input(true, false, true, Some("tv"));
+        for kind in [CommandKind::Control, CommandKind::Queue, CommandKind::Volume] {
+            assert_eq!(route(&paused, kind, false).ok(), Some(Target::Offline), "{kind:?}");
         }
-        // with nobody else active it still owns its controls
-        let alone = RouteInput { offline_playing: false, ..input(true, false, true, None) };
-        assert_eq!(route(&alone, CommandKind::Control, false).ok(), Some(Target::Offline));
+        assert_eq!(route(&paused, CommandKind::Load, false).ok(), Some(Target::Local { activate: true }));
+        // the device took over (became active or started playing after the pause)
+        let taken = RouteInput { offline_yields: true, ..paused };
+        for kind in [CommandKind::Control, CommandKind::Queue, CommandKind::Volume, CommandKind::Load] {
+            assert_eq!(route(&taken, kind, false).ok(), Some(Target::Remote("tv".into())), "{kind:?}");
+        }
     }
 
     #[test]
