@@ -27,6 +27,8 @@
     <string name="detail_following">Following</string>
     <string name="detail_error_generic">Couldn’t load this page.</string>
     <string name="detail_error_offline">You’re offline. Connect to the internet to load this page.</string>
+    <string name="detail_showing_downloaded_tracks">Showing downloaded tracks</string>
+    <string name="detail_showing_downloaded_episodes">Showing downloaded episodes</string>
     <string name="detail_error_not_found">This page isn’t available.</string>
     <string name="detail_show_more">Show more</string>
     <string name="detail_show_less">Show less</string>

@@ -36,6 +36,8 @@ internal data class AlbumContent(
     val multiDisc: Boolean,
     val totalDurationMs: Long,
     val year: Int?,
+    /** Built from the download (offline without a cached page). */
+    val downloadedCopy: Boolean = false,
 )
 
 @Immutable
@@ -55,7 +57,18 @@ internal class AlbumViewModel(graph: AppGraph, private val uri: String) : Detail
 
     private val content: StateFlow<LoadState<AlbumContent>> = retryTrigger
         .flatMapLatest { graph.catalog.album(uri).catch { emit(Resource.Error(it)) } }
-        .map { resource -> resource.toLoadState(::toContent) }
+        .map { resource -> resource.toLoadState { toContent(it) } }
+        // No page and no cached copy (offline, cache cleared or pruned): a downloaded album still
+        // opens, from the download database.
+        .flatMapLatest { load ->
+            if (load !is LoadState.Failed) {
+                flowOf(load)
+            } else {
+                graph.downloadedPageFlow(uri).map { copy ->
+                    copy?.let { LoadState.Ready(toContent(it.toAlbum(), downloadedCopy = true), stale = true) } ?: load
+                }
+            }
+        }
         .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LoadState.Loading)
 
@@ -101,7 +114,7 @@ internal class AlbumViewModel(graph: AppGraph, private val uri: String) : Detail
         downloadCollection(CollectionRef(uri, CollectionType.ALBUM, album.name, album.images.best(300)))
     }
 
-    private fun toContent(album: Album): AlbumContent {
+    private fun toContent(album: Album, downloadedCopy: Boolean = false): AlbumContent {
         val discs = groupByDisc(album.tracks)
         return AlbumContent(
             album = album,
@@ -109,6 +122,7 @@ internal class AlbumViewModel(graph: AppGraph, private val uri: String) : Detail
             multiDisc = discs.size > 1,
             totalDurationMs = album.tracks.sumOf { it.durationMs },
             year = releaseYear(album.releaseDate),
+            downloadedCopy = downloadedCopy,
         )
     }
 

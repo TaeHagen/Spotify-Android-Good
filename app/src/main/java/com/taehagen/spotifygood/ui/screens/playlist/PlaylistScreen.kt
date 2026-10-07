@@ -70,6 +70,7 @@ import com.taehagen.spotifygood.ui.navigation.Route
 import com.taehagen.spotifygood.ui.screens.album.AddedButton
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadButton
 import com.taehagen.spotifygood.ui.screens.album.DetailActionRow
+import com.taehagen.spotifygood.ui.screens.album.DownloadedCopyNotice
 import com.taehagen.spotifygood.ui.screens.album.DetailScaffold
 import com.taehagen.spotifygood.ui.screens.album.ExpandableText
 import com.taehagen.spotifygood.ui.screens.album.HeaderMetaText
@@ -269,6 +270,11 @@ private fun PlaylistList(
     LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
         item(key = "header", contentType = "header") {
             PlaylistHeader(playlist, state, navigator, actions)
+        }
+        if (playlist.downloadedCopy) {
+            item(key = "downloaded", contentType = "notice") {
+                DownloadedCopyNotice(stringResource(R.string.detail_showing_downloaded_tracks))
+            }
         }
         if (playlist.partial && !state.editMode) {
             // Some rows are placeholders (their metadata failed right now).
