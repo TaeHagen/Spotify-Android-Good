@@ -285,6 +285,8 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
 
 // SPOTIFYGOOD: upper bound for the network calls during shutdown
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+// SPOTIFYGOOD: upper bound for starting the dealer, the task ends after it
+const DEALER_START_TIMEOUT: Duration = Duration::from_secs(30);
 // SPOTIFYGOOD: capacity of the command error broadcast, slow receivers lag (skip) old errors
 const ERROR_CHANNEL_CAPACITY: usize = 16;
 // SPOTIFYGOOD: smart shuffle fetch pacing
@@ -778,9 +780,41 @@ impl SpircTask {
             };
         }
 
-        if let Err(why) = self.session.dealer().start().await {
-            error!("starting dealer failed: {why}");
-            return;
+        // SPOTIFYGOOD: the dealer start (apresolve, token, connect, handshake) has no timeout of
+        // its own, and the commands weren't read meanwhile, so a shutdown waited for it (minutes
+        // on a black-holed network). It is raced against shutdown and bounded; dropping the start
+        // cancels it cleanly, nothing was put to spotify yet.
+        let session = self.session.clone();
+        let start = session.dealer().start();
+        tokio::pin!(start);
+        let deadline = sleep(DEALER_START_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut start => match result {
+                    Ok(()) => break,
+                    Err(why) => {
+                        error!("starting dealer failed: {why}");
+                        return;
+                    }
+                },
+                _ = &mut deadline => {
+                    error!("starting dealer timed out");
+                    return;
+                },
+                cmd = async { self.commands.as_mut()?.recv().await }, if self.commands.is_some() => match cmd {
+                    Some(SpircCommand::Shutdown) | None => {
+                        info!("shutdown while starting the dealer");
+                        self.shutdown = true;
+                        if let Some(rx) = self.commands.as_mut() {
+                            rx.close()
+                        }
+                        return;
+                    }
+                    Some(cmd) => self.pending_commands.push_back(cmd),
+                },
+            }
         }
 
         while !self.session.is_invalid() && !self.shutdown {
