@@ -217,7 +217,15 @@ fn spirc() -> AppResult<std::sync::Arc<librespot_connect::Spirc>> {
     hub::spirc().ok_or_else(AppError::not_connected)
 }
 
+/// The device a load names, unless it is this phone (see `LoadArgs::device_id`).
+fn load_target(args: &LoadArgs, me: &str) -> Option<String> {
+    args.device_id.as_deref().map(str::trim).filter(|d| !d.is_empty() && *d != me).map(str::to_string)
+}
+
 async fn load(args: LoadArgs) -> AppResult<Value> {
+    if let Some(device) = load_target(&args, &hub::me()) {
+        return load_on(&device, &args).await;
+    }
     player_events::on_user_load();
     // An explicit load replaces whatever a reconnect would restore, but only once it is known to
     // go through: the restore doesn't run meanwhile, and stays if the load fails.
@@ -255,6 +263,22 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
             offline::load(&args).await?
         }
     }
+    ok()
+}
+
+/// A load for another Connect device (picked while nothing played anywhere): a play command
+/// there, whatever is active (the same body as a transfer's resume: context or tracks, start,
+/// position, shuffle, repeat). Once it went through, this device lets go of its own playback
+/// (restore point, offline queue).
+async fn load_on(device: &str, args: &LoadArgs) -> AppResult<Value> {
+    let _hold = restore::hold();
+    await_ready(CommandKind::Load, false).await;
+    if !engine::is_online() || !engine::network_available() {
+        return Err(AppError::not_connected());
+    }
+    remote::send(device, remote::play(args, &uri::random_command_id())).await.map_err(remote::remote_error)?;
+    restore::clear();
+    offline::stop();
     ok()
 }
 
@@ -484,17 +508,12 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
                 return ok();
             }
         }
-    } else {
-        frozen = restore::take();
-        if frozen.as_ref().is_some_and(|t| t.applying) {
-            // The restore being applied here goes to the target instead: this device lets go
-            // once its Spirc got through the restore's commands.
-            if let Some(spirc) = hub::spirc() {
-                if let Err(e) = spirc.disconnect(true) {
-                    log::debug!("spirc gone: {e}");
-                }
-            }
-        }
+    }
+    // A push of a pending restore holds its decision and takes the restore point only once the
+    // target accepted it (a failed push leaves it, or the restore being applied, as it was).
+    let _hold = (args.device_id != me).then(restore::hold);
+    if args.device_id != me {
+        frozen = restore::peek();
     }
     await_ready(CommandKind::Load, false).await;
     if !engine::is_online() || (args.device_id != me && !engine::network_available()) {
@@ -533,6 +552,25 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
         }
         return ok();
     }
+    push(&args, other_active, offline_owns, frozen.as_ref()).await?;
+    if let Some(taken) = frozen {
+        // The target took it: the restore point goes, a restore being applied here lets go
+        // (after the restore's commands: its Spirc handles them in order; also if it took
+        // meanwhile).
+        restore::clear();
+        if taken.applying {
+            if let Some(spirc) = hub::spirc() {
+                if let Err(e) = spirc.disconnect(true) {
+                    log::debug!("spirc gone: {e}");
+                }
+            }
+        }
+    }
+    ok()
+}
+
+/// The push of `transfer` to another device.
+async fn push(args: &TransferArgs, other_active: bool, offline_owns: bool, frozen: Option<&restore::Taken>) -> AppResult<()> {
     if offline_owns {
         // The offline queue has no Connect state to transfer: hand its tracks over as a play
         // command, then stop locally.
@@ -546,15 +584,14 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
             }
             remote::send_all(&args.device_id, bodies).await.map_err(remote::remote_error)?;
             offline::stop();
-            return ok();
+            return Ok(());
         }
     }
-    let applying = frozen.as_ref().is_some_and(|t| t.applying);
+    let applying = frozen.is_some_and(|t| t.applying);
     if applying || (!hub::local_active_or_activating() && !other_active) {
         // Nothing to transfer (or a restore still being applied here): start the frozen (or the
         // given) session on the target.
         let resume = frozen
-            .as_ref()
             .and_then(|t| restore::load_args(&t.frozen, args.play))
             .or_else(|| args.resume.as_ref().and_then(|r| r.load_args(args.play)))
             .ok_or_else(nothing_active)?;
@@ -562,10 +599,9 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
         remote::send(&args.device_id, remote::play(&resume, &uri::random_command_id()))
             .await
             .map_err(remote::remote_error)?;
-        return ok();
+        return Ok(());
     }
-    remote::transfer(&args.device_id, args.play).await.map_err(remote::remote_error)?;
-    ok()
+    remote::transfer(&args.device_id, args.play).await.map_err(remote::remote_error)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -602,10 +638,10 @@ pub(crate) fn clear_restore() {
     restore::clear();
 }
 
-/// The session of the Spirc `generation` is lost (no network, or it died) while this device plays
-/// a downloaded track: the OfflineController takes the playback over without a gap instead of a
-/// restore point being frozen. Called before the teardown pauses anything; returns whether it
-/// did (docs/ARCHITECTURE.md §4.6).
+/// The session of the Spirc `generation` goes away without a network, or offline mode was turned
+/// on, while this device plays a downloaded track: the OfflineController takes the playback over
+/// without a gap instead of a restore point being frozen. Called before the teardown pauses
+/// anything; returns whether it did (docs/ARCHITECTURE.md §4.6).
 pub(crate) fn hand_off_to_offline(generation: u64) -> bool {
     offline::take_over(generation)
 }
@@ -613,6 +649,13 @@ pub(crate) fn hand_off_to_offline(generation: u64) -> bool {
 /// The Player's thread died (see `offline::player_lost`).
 pub(crate) fn on_player_lost() {
     offline::player_lost();
+}
+
+/// Android's network availability changed: commands waiting for a cluster or a restore check
+/// again (nothing comes without a network, see `should_wait`). Called by
+/// `engine::set_network_available`.
+pub(crate) fn on_network_changed() {
+    hub::changed();
 }
 
 /// The engine's session state changed (online / offline …): recompute what is shown.
@@ -802,6 +845,16 @@ mod tests {
         assert!(!stopped_with_track(Some(&ConnectSnapshot { is_active: false, ..halted.clone() })));
         assert!(!stopped_with_track(Some(&ConnectSnapshot { track: None, ..halted })));
         assert!(!stopped_with_track(None));
+    }
+
+    #[test]
+    fn a_load_for_another_device_goes_there() {
+        let args = |device: Option<&str>| LoadArgs { device_id: device.map(str::to_string), ..Default::default() };
+        assert_eq!(load_target(&args(Some("speaker")), "me").as_deref(), Some("speaker"));
+        // absent, blank or this phone: routed as usual
+        assert_eq!(load_target(&args(None), "me"), None);
+        assert_eq!(load_target(&args(Some(" ")), "me"), None);
+        assert_eq!(load_target(&args(Some("me")), "me"), None);
     }
 
     #[test]

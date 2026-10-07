@@ -332,20 +332,18 @@ pub(crate) struct Taken {
     pub applying: bool,
 }
 
-/// Takes the pending restore point out (it won't run here): a transfer of this session to
-/// another device. The paused track is stopped like by [`clear`]. Also a restore being applied.
-pub(crate) fn take() -> Option<Taken> {
-    let taken = {
-        let hub = HUB.lock();
-        hub.reconnect
-            .clone()
-            .map(|frozen| Taken { frozen, applying: false })
-            .or_else(|| hub.restoring.as_ref().map(|r| Taken { frozen: r.frozen.clone(), applying: true }))
-    };
-    if taken.is_some() {
-        drop_restore();
-    }
-    taken
+/// The pending restore point, or the one being applied, without touching it: a transfer of this
+/// session to another device sends it there first (holding the decision), and only then drops it
+/// ([`clear`]).
+pub(crate) fn peek() -> Option<Taken> {
+    peek_in(&HUB.lock())
+}
+
+fn peek_in(hub: &HubState) -> Option<Taken> {
+    hub.reconnect
+        .clone()
+        .map(|frozen| Taken { frozen, applying: false })
+        .or_else(|| hub.restoring.as_ref().map(|r| Taken { frozen: r.frozen.clone(), applying: true }))
 }
 
 fn drop_restore() {
@@ -457,7 +455,9 @@ fn answer_for(i: AnswerInput) -> Answer {
 /// gets its intent put back, so that a failed play (no session) doesn't make an old restore
 /// point play whenever the network returns.
 pub(crate) fn answer(play: bool, prev: Option<Intent>, offline_pause_answered: bool) -> AppResult<bool> {
-    let online = crate::engine::is_online();
+    // In its network-loss grace the session still reads online, but no cluster (no decision)
+    // can come, and a restore now couldn't load: not connected.
+    let online = crate::engine::is_online() && crate::engine::network_available();
     let (a, generation) = {
         let mut hub = HUB.lock();
         (answer_in(&mut hub, online, play, prev, offline_pause_answered), hub.link.as_ref().map(|l| l.generation))
@@ -1130,6 +1130,19 @@ mod tests {
         let (mut hub, _) = restoring_hub();
         hub::forget_previous_link(&mut hub);
         assert!(hub.restoring.is_none());
+    }
+
+    #[test]
+    fn a_transfer_peeks_without_dropping() {
+        let mut hub = frozen_hub();
+        let t = peek_in(&hub).expect("pending");
+        assert!(!t.applying);
+        assert!(hub.reconnect.is_some(), "kept until the push went through");
+        let (restoring, _) = restoring_hub();
+        let t = peek_in(&restoring).expect("being applied");
+        assert!(t.applying && restoring.restoring.is_some());
+        hub.reconnect = None;
+        assert!(peek_in(&hub).is_none());
     }
 
     #[test]

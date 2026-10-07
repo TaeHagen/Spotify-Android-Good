@@ -23,6 +23,10 @@ pub(crate) struct LoadArgs {
     pub repeat: Option<RepeatMode>,
     #[serde(default = "yes")]
     pub play: bool,
+    /// Play on this Connect device (one picked while nothing played anywhere); absent or this
+    /// phone: routed as usual.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 impl LoadArgs {
@@ -124,32 +128,41 @@ pub(crate) struct ResumeArgs {
     pub track_uri: String,
     #[serde(default)]
     pub position_ms: u64,
+    /// The session's modes (absent: off, like a load without them).
+    #[serde(default)]
+    pub shuffle: Option<bool>,
+    #[serde(default)]
+    pub smart_shuffle: Option<bool>,
+    #[serde(default)]
+    pub repeat: Option<RepeatMode>,
 }
 
 impl ResumeArgs {
     /// The load that starts this session: the track in its context, or the bare track when there
-    /// is no (resolvable) context. `None` without a track.
+    /// is no (resolvable) context, with the session's shuffle / smart shuffle / repeat (a remote
+    /// play turns smart shuffle into a plain shuffle, see `remote::play`). `None` without a
+    /// track.
     pub fn load_args(&self, play: bool) -> Option<LoadArgs> {
         let track = self.track_uri.trim();
         if track.is_empty() {
             return None;
         }
+        let modes = LoadArgs {
+            shuffle: self.shuffle,
+            smart_shuffle: self.smart_shuffle,
+            repeat: self.repeat,
+            position_ms: self.position_ms,
+            play,
+            ..Default::default()
+        };
         let context = self.context_uri.as_deref().map(str::trim).filter(|c| super::uri::is_resolvable_context(c));
         Some(match context {
             Some(context) => LoadArgs {
                 context_uri: Some(context.to_string()),
                 start_uri: Some(track.to_string()),
-                position_ms: self.position_ms,
-                play,
-                ..Default::default()
+                ..modes
             },
-            None => LoadArgs {
-                track_uris: Some(vec![track.to_string()]),
-                start_index: Some(0),
-                position_ms: self.position_ms,
-                play,
-                ..Default::default()
-            },
+            None => LoadArgs { track_uris: Some(vec![track.to_string()]), start_index: Some(0), ..modes },
         })
     }
 }
@@ -209,15 +222,59 @@ mod tests {
         assert!(!load.play);
         assert!(load.clone().validate().is_ok());
 
+        // no modes given: off, like a load without them
+        assert_eq!((load.shuffle, load.smart_shuffle, load.repeat), (None, None, None));
+
         // the track itself (or no context): a one-track list
-        let r = ResumeArgs { context_uri: Some("spotify:track:t".into()), track_uri: "spotify:track:t".into(), position_ms: 0 };
-        let load = r.load_args(true).expect("load");
+        let bare = |context: Option<&str>, track: &str| ResumeArgs {
+            context_uri: context.map(str::to_string),
+            track_uri: track.into(),
+            position_ms: 0,
+            shuffle: None,
+            smart_shuffle: None,
+            repeat: None,
+        };
+        let load = bare(Some("spotify:track:t"), "spotify:track:t").load_args(true).expect("load");
         assert_eq!(load.track_uris, Some(vec!["spotify:track:t".to_string()]));
         assert!(load.context_uri.is_none());
-        let r = ResumeArgs { context_uri: None, track_uri: " ".into(), position_ms: 0 };
-        assert!(r.load_args(true).is_none());
+        assert!(bare(None, " ").load_args(true).is_none());
 
         let plain: TransferArgs = serde_json::from_str(r#"{"deviceId":"d","play":false}"#).expect("parse");
         assert!(plain.resume.is_none() && !plain.play);
+    }
+
+    #[test]
+    fn a_load_can_name_its_device() {
+        let a: LoadArgs = serde_json::from_str(r#"{"contextUri":"spotify:album:a","deviceId":"speaker"}"#).expect("parse");
+        assert_eq!(a.validate().expect("valid").device_id.as_deref(), Some("speaker"));
+        let a: LoadArgs = serde_json::from_str(r#"{"contextUri":"spotify:album:a"}"#).expect("parse");
+        assert_eq!(a.device_id, None);
+    }
+
+    #[test]
+    fn a_resumed_session_keeps_its_modes() {
+        let t: TransferArgs = serde_json::from_str(
+            r#"{"deviceId":"d","resume":{"contextUri":"spotify:playlist:p","trackUri":"spotify:track:t","positionMs":5,
+                "shuffle":true,"smartShuffle":true,"repeat":"context"}}"#,
+        )
+        .expect("parse");
+        let load = t.resume.as_ref().and_then(|r| r.load_args(true)).expect("load");
+        assert_eq!((load.shuffle, load.smart_shuffle, load.repeat), (Some(true), Some(true), Some(RepeatMode::Context)));
+        // here: smart shuffle as such
+        let request = super::super::local::load_request(&load).expect("local request");
+        assert!(matches!(
+            request.context_options,
+            Some(librespot_connect::LoadContextOptions::Options(ref o)) if o.shuffle && o.smart_shuffle && o.repeat && !o.repeat_track
+        ));
+        // another device: a plain shuffle (remote smart shuffle isn't supported), repeat kept
+        let play = super::super::remote::play(&load, "id").to_string();
+        assert!(play.contains("\"shuffling_context\":true"), "{play}");
+        assert!(play.contains("\"repeating_context\":true"), "{play}");
+        assert!(!play.contains("smart"), "{play}");
+        // repeat one of a single track
+        let t: TransferArgs =
+            serde_json::from_str(r#"{"deviceId":"d","resume":{"trackUri":"spotify:track:t","repeat":"track"}}"#).expect("parse");
+        let load = t.resume.as_ref().and_then(|r| r.load_args(true)).expect("load");
+        assert_eq!(load.repeat, Some(RepeatMode::Track));
     }
 }

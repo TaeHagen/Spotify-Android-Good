@@ -434,6 +434,15 @@ fn on_spirc_error(err: SpircCommandError) {
         log::debug!("ignored inactive-device error for {}", err.command);
         return;
     }
+    if !err.remote && err.command == "load" {
+        // The restore's load failed: its placeholder goes (the error is shown).
+        let dropped = HUB.lock().restoring.take().is_some();
+        if dropped {
+            log::warn!("the restore's load failed");
+            changed();
+            publish();
+        }
+    }
     use librespot_core::error::ErrorKind;
     let code = match err.kind {
         ErrorKind::Unavailable | ErrorKind::DeadlineExceeded | ErrorKind::Aborted => ErrorCode::Network,
@@ -451,16 +460,25 @@ fn time_delta_s() -> i64 {
     engine::try_session().map(|s| s.time_delta()).unwrap_or(0)
 }
 
+/// The local side of [`compose`]: this device's active snapshot, and the reconnect placeholder
+/// (the frozen session, also while its restore is applied to Spirc `link`). Until the restored
+/// Spirc has its track, its activation's empty snapshot doesn't replace the placeholder (the
+/// notification and the media session would go away in between).
+fn local_view(hub: &HubState, link: Option<u64>, now: Instant, now_ms: i64) -> (Option<ConnectSnapshot>, Option<restore::Frozen>) {
+    let applying = restore_applying(hub.restoring.as_ref(), link, now);
+    let local = hub.snapshot.clone().filter(|s| s.is_active && (s.track.is_some() || !applying));
+    let frozen = hub.reconnect.as_ref().or(hub.restoring.as_ref().map(|r| &r.frozen));
+    let placeholder = frozen.filter(|f| f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned();
+    (local, placeholder)
+}
+
 /// Composes the snapshot from the current sources (without emitting).
 pub(crate) fn compose() -> PlaybackSnapshot {
     let device = this_device_ref();
     let (local, cluster, placeholder, refused) = {
         let hub = HUB.lock();
-        let local = hub.snapshot.clone().filter(|s| s.is_active);
-        let (now, now_ms) = (Instant::now(), super::now_ms());
-        // Also while the restore is applied, until the Spirc is active with its track.
-        let frozen = hub.reconnect.as_ref().or(hub.restoring.as_ref().map(|r| &r.frozen));
-        let placeholder = frozen.filter(|f| f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned();
+        let link = hub.link.as_ref().map(|l| l.generation);
+        let (local, placeholder) = local_view(&hub, link, Instant::now(), super::now_ms());
         (local, hub.cluster.clone(), placeholder, hub.refused_error.clone())
     };
     // None once a paused or finished offline queue gave way to a device that took over.
@@ -617,6 +635,47 @@ mod hub_tests {
 
     fn cluster(active: &str) -> Arc<Cluster> {
         Arc::new(Cluster { active_device_id: active.into(), ..Default::default() })
+    }
+
+    #[test]
+    fn the_placeholder_stays_until_the_restored_spirc_has_its_track() {
+        let now = Instant::now();
+        let s = ConnectSnapshot {
+            is_active: true,
+            status: librespot_connect::SnapshotPlayStatus::Playing,
+            track: Some(librespot_connect::SnapshotTrack {
+                uri: "spotify:track:a".into(),
+                uid: "a".into(),
+                provider: librespot_connect::TrackProvider::Context,
+                context_index: None,
+                hidden: false,
+                metadata: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let frozen = restore::freeze(s.clone(), 1_000_000, now);
+        let activation = ConnectSnapshot {
+            is_active: true,
+            status: librespot_connect::SnapshotPlayStatus::Stopped,
+            ..Default::default()
+        };
+        let mut hub = HubState {
+            snapshot: Some(activation),
+            restoring: Some(restore::Restoring { generation: 3, frozen, at: now }),
+            ..Default::default()
+        };
+        // the activation's empty snapshot: the frozen track stays shown
+        let (local, placeholder) = local_view(&hub, Some(3), now, 1_001_000);
+        assert!(local.is_none());
+        assert_eq!(placeholder.and_then(|f| f.snap.track).map(|t| t.uri).as_deref(), Some("spotify:track:a"));
+        // with its track the restored playback is shown
+        hub.snapshot = Some(s);
+        let (local, _) = local_view(&hub, Some(3), now, 1_001_000);
+        assert!(local.is_some());
+        // an empty active snapshot without a restore in flight is shown as it is (a real stop)
+        hub.snapshot = Some(ConnectSnapshot { is_active: true, ..Default::default() });
+        hub.restoring = None;
+        assert!(local_view(&hub, Some(3), now, 1_001_000).0.is_some());
     }
 
     #[test]

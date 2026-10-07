@@ -120,10 +120,10 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
     })
 }
 
-/// The session of the Spirc `generation` goes away (no network, or it died) while this device
-/// plays (or paused) a downloaded track: the queue takes the Player over as it is, without a
-/// gap (see [`handoff`]), before anything pauses it. The Spirc lets go of the Player first, no
-/// restore point is kept. Returns whether it did.
+/// The session of the Spirc `generation` goes away without a network (or offline mode was turned
+/// on) while this device plays (or paused) a downloaded track: the queue takes the Player over as
+/// it is, without a gap (see [`handoff`]), before anything pauses it. The Spirc lets go of the
+/// Player first, no restore point is kept. Returns whether it did.
 pub(crate) fn take_over(generation: u64) -> bool {
     let Some((spirc, snap)) = hub::link_snapshot(generation) else { return false };
     let now = now_ms();

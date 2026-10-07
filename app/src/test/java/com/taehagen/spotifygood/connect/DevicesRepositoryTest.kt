@@ -1,12 +1,19 @@
 package com.taehagen.spotifygood.connect
 
+import com.taehagen.spotifygood.model.ActiveDeviceRef
+import com.taehagen.spotifygood.model.DeviceList
+import com.taehagen.spotifygood.model.PlaybackSnapshot
+import com.taehagen.spotifygood.model.RepeatMode
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.playback.ResumeState
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DevicesRepositoryTest {
@@ -31,6 +38,40 @@ class DevicesRepositoryTest {
         assertEquals("spotify:playlist:p", resume["contextUri"]?.jsonPrimitive?.content)
         assertEquals("spotify:track:t", resume["trackUri"]?.jsonPrimitive?.content)
         assertEquals(42_000L, resume["positionMs"]?.jsonPrimitive?.long)
+        // modes off unless the session had them
+        assertEquals(false, resume["shuffle"]?.jsonPrimitive?.boolean)
+        assertEquals(false, resume["smartShuffle"]?.jsonPrimitive?.boolean)
+        assertEquals("off", resume["repeat"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun transferCarriesTheSessionModes() {
+        val session = state("spotify:playlist:p").copy(smartShuffle = true, repeat = RepeatMode.TRACK)
+        val resume = DevicesRepository.transferArgs("speaker", play = true, resume = session)["resume"]!!.jsonObject
+        assertEquals(true, resume["shuffle"]?.jsonPrimitive?.boolean)
+        assertEquals(true, resume["smartShuffle"]?.jsonPrimitive?.boolean)
+        assertEquals("track", resume["repeat"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun aDevicePickedWithNothingToPlayStaysPicked() {
+        val noResume = DevicesRepository.transferArgs("speaker", play = true, resume = null)
+        val pending = DevicesRepository.pendingAfterFailure(NativeErrorCode.NOT_ACTIVE_DEVICE, "speaker", false, noResume)
+        assertEquals("speaker", pending)
+        // other failures, this phone, or a session that was sent along: nothing pending
+        assertNull(DevicesRepository.pendingAfterFailure(NativeErrorCode.NETWORK, "speaker", false, noResume))
+        assertNull(DevicesRepository.pendingAfterFailure(NativeErrorCode.NOT_ACTIVE_DEVICE, "phone", true, noResume))
+        val withResume = DevicesRepository.transferArgs("speaker", play = true, resume = state("spotify:playlist:p"))
+        assertNull(DevicesRepository.pendingAfterFailure(NativeErrorCode.NOT_ACTIVE_DEVICE, "speaker", false, withResume))
+    }
+
+    @Test
+    fun anActiveDeviceEndsThePendingTarget() {
+        assertTrue(DevicesRepository.activeIn(DeviceList(activeDeviceId = "tv")))
+        assertFalse(DevicesRepository.activeIn(DeviceList(activeDeviceId = "")))
+        assertFalse(DevicesRepository.activeIn(DeviceList()))
+        assertTrue(DevicesRepository.activeIn(PlaybackSnapshot(activeDevice = ActiveDeviceRef(id = "me", name = "Phone"))))
+        assertFalse(DevicesRepository.activeIn(PlaybackSnapshot.EMPTY))
     }
 
     @Test

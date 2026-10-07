@@ -123,6 +123,8 @@ pub(crate) struct OfflineQueue {
     takeover_mark: Option<Elsewhere>,
     /// The Player's latest request id, whoever loaded it (see [`OfflineQueue::adopt`]).
     last_request: Option<u64>,
+    /// ... and its track ended while nobody (no active queue) handled the end.
+    ended_request: Option<u64>,
 }
 
 /// Playback the Player is already doing (Spirc's, on a downloaded track) that the queue takes
@@ -172,6 +174,7 @@ impl Default for OfflineQueue {
             elsewhere: None,
             takeover_mark: None,
             last_request: None,
+            ended_request: None,
         }
     }
 }
@@ -342,6 +345,7 @@ impl OfflineQueue {
             next_queue_id: self.next_queue_id,
             pending_loads: self.pending_loads,
             last_request: self.last_request,
+            ended_request: self.ended_request,
             ..Default::default()
         };
         self.pos = self.order.iter().position(|&i| i == start).unwrap_or(0);
@@ -602,6 +606,7 @@ impl OfflineQueue {
         self.pending_loads = 0;
         self.own_request = None;
         self.last_request = None;
+        self.ended_request = None;
         if self.active && self.status != PlaybackStatus::Stopped {
             self.position_ms = self.position_at(now_ms);
             self.position_ts = now_ms;
@@ -616,6 +621,9 @@ impl OfflineQueue {
     /// Without a known request the track is loaded at the position (a short gap).
     pub fn adopt(&mut self, a: Adoption, now_ms: i64) -> Option<Action> {
         let request = self.last_request;
+        // Its track ended before the takeover (the dying Spirc no longer handled the end): the
+        // end is handled now, a Play would do nothing on an ended track.
+        let ended = request.is_some() && request == self.ended_request;
         let spec = LoadSpec {
             context_uri: a.context_uri,
             uris: a.uris,
@@ -648,6 +656,9 @@ impl OfflineQueue {
         self.position_ms = a.position_ms;
         self.position_ts = now_ms;
         self.duration_ms = a.duration_ms;
+        if ended {
+            return Some(self.advance(true, true, now_ms));
+        }
         a.playing.then_some(Action::Play)
     }
 
@@ -655,8 +666,8 @@ impl OfflineQueue {
     pub fn reset(&mut self) {
         let next_queue_id = self.next_queue_id;
         let pending_loads = self.pending_loads;
-        let last_request = self.last_request;
-        *self = OfflineQueue { next_queue_id, pending_loads, last_request, ..Default::default() };
+        let (last_request, ended_request) = (self.last_request, self.ended_request);
+        *self = OfflineQueue { next_queue_id, pending_loads, last_request, ended_request, ..Default::default() };
     }
 
     fn own(&self, id: u64) -> bool {
@@ -679,6 +690,7 @@ impl OfflineQueue {
         let mut out = Outcome::default();
         if let Event::RequestId(id) = event {
             self.last_request = Some(id);
+            self.ended_request = None;
             // Bookkeeping also while inactive, so that ids of loads we sent before a reset are
             // never mistaken for later (foreign) loads.
             if self.own(id) {
@@ -694,6 +706,11 @@ impl OfflineQueue {
             return out;
         }
         if !self.active {
+            if let Event::EndOfTrack(id) = event {
+                if self.last_request == Some(id) {
+                    self.ended_request = Some(id);
+                }
+            }
             return out;
         }
         match event {
@@ -1357,6 +1374,29 @@ mod tests {
         let mut q = OfflineQueue::default();
         let action = q.adopt(adoption(2, 0), 0);
         assert!(matches!(action, Some(Action::Load { ref uri, play: true, position_ms: 42_000 }) if uri == "spotify:track:0"));
+    }
+
+    #[test]
+    fn a_track_that_ended_before_the_takeover_moves_on() {
+        // the dying Spirc's track ended during its epilogue: nobody handled the end
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.on_event(Event::EndOfTrack(7), 0);
+        let a = q.adopt(adoption(3, 1), 1_000);
+        assert_eq!(load_uri(&a).as_deref(), Some("spotify:track:2"), "the next one, not a dead Play");
+        assert_eq!(q.status(), PlaybackStatus::Loading);
+        // at the end without repeat: stopped
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.on_event(Event::EndOfTrack(7), 0);
+        assert_eq!(q.adopt(adoption(3, 2), 1_000), Some(Action::Stop));
+        assert_eq!(q.status(), PlaybackStatus::Stopped);
+        // a newer load since: an ordinary takeover
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.on_event(Event::EndOfTrack(7), 0);
+        q.on_event(Event::RequestId(8), 0);
+        assert_eq!(q.adopt(adoption(3, 1), 1_000), Some(Action::Play));
     }
 
     #[test]

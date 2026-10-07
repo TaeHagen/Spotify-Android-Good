@@ -535,6 +535,8 @@ fn set_network_available(args: NetworkArgs) -> AppResult<Value> {
         _ => log::info!("the default network changed"),
     }
     state::send_to_supervisor(msg);
+    // Commands waiting for a cluster or a restore re-check at once (none comes without a network).
+    crate::connect::on_network_changed();
     ok()
 }
 

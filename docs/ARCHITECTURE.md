@@ -208,15 +208,17 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   every 5 s instead, for at most 60 s after the loss (a suspended mobile network keeps the AP
   socket open, so librespot alone would notice only after its 80 s keep-alive). A load of
   downloads without a network ends that wait at once (the session goes offline without a
-  restore point, see §4.6). When the session is lost (no network, or it died) while this
-  device plays or paused a downloaded track, that playback is not frozen for the reconnect
-  but handed to the OfflineController (§4.6). The network changes when it comes back, or
-  when Android makes another network the default while one stays available (the `network`
-  handle of `session.setNetworkAvailable` changes, e.g. a Wi-Fi without internet stays
-  connected and mobile data takes over: the sockets librespot opened on the Wi-Fi stay bound
-  to it and fail silently). Then a backoff wait or a connect attempt starts over at once; while
-  Online the AP connection must answer a Mercury request within 5 s, else the session
-  reconnects (restoring local playback); a working one is kept. Backoff
+  restore point, see §4.6). When the session goes away without a network, or Offline mode is
+  turned on, while this device plays or paused a downloaded track, that playback is not frozen
+  for the reconnect but handed to the OfflineController (§4.6); a session that dies while the
+  network is up is frozen and restored through Spirc. A dead Player while visible always
+  rebuilds Player and Spirc. The network changes when it comes back, or when Android makes
+  another network the default while one stays available (the `network` handle of
+  `session.setNetworkAvailable` changes, e.g. a Wi-Fi without internet stays connected and
+  mobile data takes over: the sockets librespot opened on the Wi-Fi stay bound to it and fail
+  silently). Then a backoff wait or a connect attempt starts over at once; while Online the AP
+  connection must answer a Mercury request within 5 s, else the session reconnects (restoring
+  local playback); a working one is kept. Backoff
   1→60 s, reset once a connection stayed up 60 s (or when the network changes), so a
   connection that drops right after connecting keeps backing off; at most one attempt in
   flight; no attempts while the network is known to be down. At most 10 attempts per
@@ -300,13 +302,15 @@ Online and visible, `queue.add` may also queue a track that isn't downloaded (it
 Without a network a `player.load` of downloads plays offline also while the session still reads
 Online (its network-loss wait): Spirc lets go of the Player and the session goes offline; one
 of anything else fails with `UNAVAILABLE` "Not available offline".
-**Handoff**: when the session is lost (no network, or it died) while this device plays (or
-paused) a downloaded track through Spirc, the OfflineController takes that playback over as it
-is, before anything pauses the Player: the track keeps playing without a reload, with the
+**Handoff**: when the session goes away without a network, or Offline mode is turned on, while
+this device plays (or paused) a downloaded track through Spirc, the OfflineController takes that
+playback over as it is, before anything pauses the Player (a track that ended meanwhile moves
+on to the next one): the track keeps playing without a reload, with the
 visible tracks around it in play order (user queue included) up to the first one on either side
 that isn't downloaded (the queue ends there), the position, repeat mode, shuffle flag and play
 state. No restore point is kept for that session; when it is back, the queue plays on as above.
-A streamed current track is frozen for the reconnect as before (§8).
+A streamed current track is frozen for the reconnect as before (§8), and so is any playback
+when the session dies while the network is up (the reconnect follows within seconds).
 The OfflineController notices a Player whose thread died: the queue stops where it was (so its
 snapshot no longer shows playing), and the next control starts a new Player (a play loads the
 track there again at that position). A paused or finished
@@ -404,8 +408,10 @@ becoming visible isn't routed offline or as "nothing is active". Right after a l
 restore activated this device, commands go to it although its state doesn't say active yet.
 A pending reconnect restore (§8) is this device's session: a play / pause decides whether it
 comes back playing, other controls wait for it and then act on the restored session, a load
-replaces it only once the load goes through, a transfer to another device hands it over. A play
-without a session (no network, backoff) isn't answered by the restore: it fails or falls back as
+replaces it only once the load goes through, a transfer to another device hands it over (and
+drops it here only once the target accepted it). A play without a session (no network, also
+while the session still reads online in its network-loss grace; backoff) isn't answered by the
+restore: it fails or falls back as
 usual and leaves no intent behind; a play reported as handled counts for that connection's
 restore decision. Once the new Spirc's first cluster is overdue (60 s), commands no longer wait
 for the restore and a play restores right away (one already answered restores then).
@@ -433,7 +439,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 
 | method | args |
 |---|---|
-| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true}` |
+| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual |
 | `player.play` / `player.pause` / `player.togglePlay` | `{}` |
 | `player.next` / `player.prev` | `{}` |
 | `player.seek` | `{"positionMs":0}` |
@@ -448,7 +454,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
-| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs"}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE`. Pushing offline playback hands over its tracks (in play order), current position and repeat mode, and keeps it paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as the visible track window in play order) |
+| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs","shuffle"?,"smartShuffle"?,"repeat"?}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session, with its modes; smart shuffle becomes a plain shuffle on another device) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE` (Kotlin then keeps the device as the pending target for the next play, see §8). Pushing offline playback hands over its tracks (in play order), current position and repeat mode, and keeps it paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as the visible track window in play order) |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
@@ -643,8 +649,9 @@ For a remote active device, smart shuffle is not supported (the command reports
   Gaps count the time the phone slept (wall clock, never less than the monotonic clock; a clock
   set back counts as a long gap). Without a first cluster after 60 s a play restores right away
   (the user asked for it here). Until the restored session is active with its track, the
-  restore point stays (shown as the paused placeholder): a connection lost meanwhile freezes it
-  again, and a play / pause meanwhile is recorded on it too. A queued or suggested current
+  restore point stays (shown as the paused placeholder, also over the Spirc's empty activation
+  snapshot; commands queue behind the restore): a connection lost meanwhile freezes it again, a
+  play / pause meanwhile is recorded on it too, and a failed restore load drops it. A queued or suggested current
   track keeps its context (the track is requeued, restarts, and gets repeat-one back; a full
   queue loses its tail, not the track); handed to another device it goes as the visible track
   window in play order instead. An explicit `player.load` (local, remote or offline) or running
@@ -851,7 +858,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   other system audio outputs not yet connected (the app does not cast). Never use `setCommunicationDevice` for media.
 * Device sheet (one UI for everything, like Spotify's): **This phone** (with current output
   name + icon and local output choices), then **Spotify Connect devices**, then
-  "More devices…". Selecting a Connect device → `connect.transfer`.
+  "More devices…". Selecting a Connect device → `connect.transfer`. With nothing playing
+  anywhere and no session to resume, the picked device becomes the pending target
+  (`DevicesRepository.pendingTarget`): the next play goes there (`player.load {deviceId}`),
+  the standard Connect "send". It is used once, and cleared when any device becomes active,
+  when this phone is picked, and on logout.
 * On BT disconnect: `ACTION_AUDIO_BECOMING_NOISY` pauses; route listener updates UI and
   reports `player.setAudioOutput`. AudioTrack `ERROR_DEAD_OBJECT` → recreate track.
 
