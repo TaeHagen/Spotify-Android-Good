@@ -5,10 +5,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.data.dataOrNull
-import com.taehagen.spotifygood.model.MediaRef
-import com.taehagen.spotifygood.model.MediaType
+import com.taehagen.spotifygood.model.PlaylistOwner
+import com.taehagen.spotifygood.model.PlaylistRef
 import com.taehagen.spotifygood.model.Rootlist
 import com.taehagen.spotifygood.model.User
+import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.screens.library.BrowseError
 import com.taehagen.spotifygood.ui.screens.library.attempt
 import com.taehagen.spotifygood.ui.screens.library.offlineFlow
@@ -35,10 +36,12 @@ data class ProfileUiState(
     val user: User? = null,
     val isLoading: Boolean = true,
     val error: BrowseError? = null,
-    /** Playlists owned by this user (only known for the logged-in user, from the rootlist). */
-    val playlists: List<MediaRef> = emptyList(),
+    /** My own playlists (from the rootlist), or another user's public playlists (up to 50). */
+    val playlists: List<PlaylistRef> = emptyList(),
     val followedArtists: Int? = null,
     val loggingOut: Boolean = false,
+    /** The logged-in user, to tell which playlists are mine (rename / delete). */
+    val myUsername: String? = null,
 )
 
 private data class Fetched(val user: User?, val error: Throwable?, val loading: Boolean)
@@ -63,7 +66,8 @@ class ProfileViewModel(private val graph: AppGraph, private val username: String
                 .onFailure { emit(Fetched(cached, it, loading = false)) }
         }
 
-    private val playlists: Flow<List<MediaRef>> = combine(isMe, me, ::Pair).flatMapLatest { (isMe, user) ->
+    /** My playlists from the rootlist (another user's come with their profile, [publicPlaylistsOf]). */
+    private val myPlaylists: Flow<List<PlaylistRef>> = combine(isMe, me, ::Pair).flatMapLatest { (isMe, user) ->
         if (!isMe || user == null) {
             flowOf(emptyList())
         } else {
@@ -75,15 +79,24 @@ class ProfileViewModel(private val graph: AppGraph, private val username: String
         if (!isMe) flowOf(null) else graph.library.artists().map { it.dataOrNull?.size }
     }.catch { emit(null) }.onStart { emit(null) }.distinctUntilChanged()
 
-    val state: StateFlow<ProfileUiState> = combine(isMe, fetched, playlists, followed, loggingOut) { isMe, fetched, playlists, followed, loggingOut ->
+    private val myUsername: Flow<String?> = me.map { it?.username }.distinctUntilChanged()
+
+    val state: StateFlow<ProfileUiState> = combine(
+        isMe,
+        fetched,
+        myPlaylists,
+        followed,
+        combine(loggingOut, myUsername, ::Pair),
+    ) { isMe, fetched, myPlaylists, followed, (loggingOut, myUsername) ->
         ProfileUiState(
             isMe = isMe,
             user = fetched.user,
             isLoading = fetched.loading,
             error = if (fetched.user == null) fetched.error?.toBrowseError() else null,
-            playlists = playlists,
+            playlists = if (isMe) myPlaylists else fetched.user?.let(::publicPlaylistsOf).orEmpty(),
             followedArtists = followed,
             loggingOut = loggingOut,
+            myUsername = myUsername,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ProfileUiState(isMe = username == null))
 
@@ -101,7 +114,25 @@ class ProfileViewModel(private val graph: AppGraph, private val username: String
 }
 
 /** Playlists in the rootlist owned by [username], folders flattened. */
-fun Rootlist.ownedBy(username: String): List<MediaRef> = flatPlaylists().mapNotNull { entry ->
+fun Rootlist.ownedBy(username: String): List<PlaylistRef> = flatPlaylists().mapNotNull { entry ->
     val uri = entry.uri
-    if (uri == null || entry.owner?.username != username) null else MediaRef(MediaType.PLAYLIST, uri, entry.name, entry.owner.displayName, entry.images)
+    if (uri == null || entry.owner?.username != username) null else PlaylistRef(uri = uri, name = entry.name, images = entry.images, owner = entry.owner)
 }.distinctBy { it.uri }
+
+/** Most public playlists listed for another user (`catalog.user` sends up to this many). */
+const val MAX_PUBLIC_PLAYLISTS = 50
+
+/** Another user's public playlists; ones without an owner are attributed to [user] (their profile). */
+fun publicPlaylistsOf(user: User): List<PlaylistRef> =
+    user.publicPlaylists
+        .filter { it.uri.isNotBlank() }
+        .distinctBy { it.uri }
+        .take(MAX_PUBLIC_PLAYLISTS)
+        .map { ref -> if (ref.owner != null) ref else ref.copy(owner = PlaylistOwner(user.username, user.displayName)) }
+
+/**
+ * Action sheet target of a profile playlist. Rename / delete are offered only for a playlist I own:
+ * another user's profile lists their playlists, not mine.
+ */
+fun profilePlaylistTarget(playlist: PlaylistRef, myUsername: String?): MediaActionTarget.PlaylistTarget =
+    MediaActionTarget.PlaylistTarget(playlist, isOwned = myUsername != null && playlist.owner?.username == myUsername)
