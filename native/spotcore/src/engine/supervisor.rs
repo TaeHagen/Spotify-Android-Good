@@ -6,20 +6,26 @@
 //! PREMIUM_REQUIRED) park in `Halted`; more than 10 reconnects in 10 minutes park in `Throttled`
 //! until the network changes. Every phase reacts to messages (stop, network, settings, player
 //! death) without waiting for timers; the connect attempt itself is cancellable.
+//!
+//! The backoff is reset only once a connection stayed up for `backoff::STABLE_AFTER` (or the
+//! network changes): a connection that fails right after connecting keeps backing off. The
+//! reconnect limit is process-wide (`state::Shared::reconnects`), and the first attempt of a
+//! new supervisor counts too, so Kotlin restarting the session can't undo the throttle.
 
 use super::backoff::{Backoff, RateLimiter};
-use super::connector::{self, Live};
+use super::connector::{self, Device, Live};
 use super::state::{self, shared, update_status};
 use super::{config, player_host};
-use crate::connect;
 use crate::error::{AppError, ErrorCode};
+use crate::{connect, events};
 use crate::models::{EngineSettings, SessionState, User};
 use futures_util::FutureExt;
+use librespot_connect::SnapshotPlayStatus;
 use librespot_core::authentication::Credentials;
 use librespot_core::Session;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, interval_at, Instant, MissedTickBehavior};
 
@@ -31,7 +37,14 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 const OUTAGE_RECONNECT: Duration = Duration::from_secs(5);
 const RECONNECTS_PER_WINDOW: usize = 10;
 const RECONNECT_WINDOW: Duration = Duration::from_secs(10 * 60);
-const STOP_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a stopping supervisor may take for its graceful teardown before it is aborted.
+/// Its longest step is one connection teardown (`connector::TEARDOWN_BOUND`).
+pub(crate) const STOP_TIMEOUT: Duration = Duration::from_secs(7);
+/// After an abort: how long to wait for the aborted task to actually end.
+pub(crate) const ABORT_GRACE: Duration = Duration::from_millis(500);
+// A Stop that arrives during a reconnect teardown is handled right after it (the next connect
+// attempt is abandoned at once), so one teardown must fit into the graceful stop.
+const _: () = assert!(connector::TEARDOWN_BOUND.as_millis() < STOP_TIMEOUT.as_millis());
 
 pub(crate) enum Msg {
     Network { available: bool, outage: Option<Duration> },
@@ -39,7 +52,7 @@ pub(crate) enum Msg {
     Reconnect,
     Settings { old: EngineSettings },
     PlayerDead(u64),
-    Stop { reply: oneshot::Sender<()> },
+    Stop,
 }
 
 pub(crate) struct SupervisorHandle {
@@ -56,20 +69,25 @@ impl SupervisorHandle {
         let _ = self.tx.send(msg);
     }
 
-    /// Stops the supervisor (graceful teardown, bounded), then forgets it.
+    /// Stops the supervisor and waits until its task ended: a graceful teardown of at most
+    /// [`STOP_TIMEOUT`], then an abort (plus [`ABORT_GRACE`] for the task to end) and a forced
+    /// cleanup. Nothing of this supervisor runs afterwards, so a new one can start safely.
     pub async fn stop(self) {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let delivered = self.tx.send(Msg::Stop { reply: reply_tx }).is_ok();
+        let delivered = self.tx.send(Msg::Stop).is_ok();
         *shared().supervisor_tx.lock() = None;
         let mut join = self.join;
-        if delivered && matches!(tokio::time::timeout(STOP_TIMEOUT, reply_rx).await, Ok(Ok(()))) {
-            let _ = tokio::time::timeout(Duration::from_secs(1), &mut join).await;
+        if delivered && tokio::time::timeout(STOP_TIMEOUT, &mut join).await.is_ok() {
+            return;
         }
-        if !join.is_finished() {
-            log::error!("supervisor did not stop in time, aborting it");
-            join.abort();
-            force_cleanup();
+        if join.is_finished() {
+            return;
         }
+        log::error!("supervisor did not stop in time, aborting it");
+        join.abort();
+        if tokio::time::timeout(ABORT_GRACE, &mut join).await.is_err() {
+            log::error!("aborted supervisor did not end in time");
+        }
+        force_cleanup();
     }
 }
 
@@ -82,16 +100,21 @@ fn force_cleanup() {
     player_host::detach_session();
 }
 
+/// The process-wide reconnect limit (`state::Shared::reconnects`).
+pub(crate) fn reconnect_limiter() -> RateLimiter {
+    RateLimiter::new(RECONNECTS_PER_WINDOW, RECONNECT_WINDOW)
+}
+
 pub(crate) fn spawn() -> SupervisorHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     *shared().supervisor_tx.lock() = Some(tx.clone());
     let supervisor = Supervisor {
         rx,
         backoff: Backoff::default(),
-        limiter: RateLimiter::new(RECONNECTS_PER_WINDOW, RECONNECT_WINDOW),
         first: true,
+        intentional: false,
         prefer_token: false,
-        stop_reply: None,
+        login_generation: state::login_generation(),
     };
     let join = crate::runtime::handle().spawn(async move {
         if AssertUnwindSafe(supervisor.run()).catch_unwind().await.is_err() {
@@ -126,12 +149,25 @@ enum AttemptEnd {
 struct Supervisor {
     rx: mpsc::UnboundedReceiver<Msg>,
     backoff: Backoff,
-    limiter: RateLimiter,
     /// No attempt finished yet (state `connecting` instead of `reconnecting`).
     first: bool,
+    /// The next attempt is a deliberate reconnect (becoming visible to Spotify Connect, a device
+    /// rename): it isn't counted by the reconnect limit.
+    intentional: bool,
     /// Stored credentials were rejected: try the OAuth access token.
     prefer_token: bool,
-    stop_reply: Option<oneshot::Sender<()>>,
+    /// The login this supervisor was started with (`state::Login::generation`).
+    login_generation: u64,
+}
+
+/// Resolves when the Spirc task of `device` ended; never for a hidden session.
+async fn spirc_ended(device: &mut Option<Device>) {
+    match device {
+        Some(device) => {
+            let _ = (&mut device.task).await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn no_network() -> AppError {
@@ -148,7 +184,8 @@ fn user_of(session: &Session) -> Option<User> {
         images: Vec::new(),
         product: Some(product),
         country,
-        explicit_filter: session.filter_explicit_content(),
+        // The account's own filter; "Hide explicit content" may force the session's on.
+        explicit_filter: super::explicit::account_filter(session),
     })
 }
 
@@ -166,18 +203,12 @@ impl Supervisor {
                 Phase::Exit => break,
             };
         }
-        if let Some(reply) = self.stop_reply.take() {
-            let _ = reply.send(());
-        }
     }
 
+    /// `None` when the supervisor must exit (stop requested, or the handle is gone).
     fn stop_requested(&mut self, msg: Option<Msg>) -> Option<Msg> {
         match msg {
-            None => None,
-            Some(Msg::Stop { reply }) => {
-                self.stop_reply = Some(reply);
-                None
-            }
+            None | Some(Msg::Stop) => None,
             Some(other) => Some(other),
         }
     }
@@ -214,8 +245,10 @@ impl Supervisor {
     }
 
     fn credentials(&self) -> Option<(Credentials, bool)> {
-        let stored = shared().credentials.lock().clone();
-        let token = shared().access_token.lock().clone();
+        let (stored, token) = {
+            let login = shared().login.lock();
+            (login.credentials.clone(), login.access_token.clone())
+        };
         if !self.prefer_token {
             if let Some(c) = stored.as_ref().and_then(|s| config::to_librespot(s).ok()) {
                 return Some((c, true));
@@ -236,7 +269,21 @@ impl Supervisor {
         if super::settings().offline || !state::network_available() {
             return Phase::Gate;
         }
-        if !self.first && !self.limiter.try_acquire(std::time::Instant::now()) {
+        let intentional = std::mem::take(&mut self.intentional);
+        let allowed = {
+            let mut limiter = shared().reconnects.lock();
+            let now = std::time::Instant::now();
+            if intentional {
+                true
+            } else if self.first {
+                // Always allowed (an explicit start), but counted.
+                limiter.record(now);
+                true
+            } else {
+                limiter.try_acquire(now)
+            }
+        };
+        if !allowed {
             return Phase::Throttled(AppError::new(
                 ErrorCode::Network,
                 "Too many reconnects; retrying when the network changes",
@@ -259,8 +306,15 @@ impl Supervisor {
                 return self.retry_after(e);
             }
         };
+        let visible = settings.connect_visible;
         let end = {
-            let attempt = connector::connect(&session, credentials, &settings);
+            let attempt = async {
+                if visible {
+                    connector::connect(&session, credentials, &settings).await
+                } else {
+                    connector::connect_hidden(&session, credentials).await
+                }
+            };
             tokio::pin!(attempt);
             loop {
                 tokio::select! {
@@ -284,7 +338,7 @@ impl Supervisor {
                 log::warn!("connect failed: {e}");
                 connector::abandon(session).await;
                 self.first = false;
-                if e.code == ErrorCode::BadCredentials && used_stored && shared().access_token.lock().is_some() {
+                if e.code == ErrorCode::BadCredentials && used_stored && shared().login.lock().access_token.is_some() {
                     self.prefer_token = true;
                     return Phase::Connect;
                 }
@@ -324,8 +378,11 @@ impl Supervisor {
     }
 
     fn declare_online(&mut self, live: &Live, user: Option<User>) {
+        state::record_username(self.login_generation, &live.session);
         state::set_online(Some(live.session.clone()));
-        self.backoff.reset();
+        // ProductInfo is in (that's what declares): now the account's filter is known.
+        super::sync_explicit_filter();
+        // No backoff reset here: only a connection that proves stable resets it (`online`).
         self.first = false;
         self.prefer_token = false;
         update_status(|s| {
@@ -338,22 +395,65 @@ impl Supervisor {
             }
             s.epoch += 1;
         });
-        log::info!("session online");
-        connect::after_online(live.generation);
+        log::info!("session online{}", if live.device.is_some() { "" } else { " (hidden from Spotify Connect)" });
+        if live.device.is_some() {
+            connect::after_online(live.generation);
+        }
     }
 
-    /// Intentional teardown followed by an immediate attempt (playback is restored).
+    /// Intentional teardown followed by an immediate attempt (local playback is restored).
     async fn reconnect(&mut self, live: Live) -> Phase {
         log::info!("reconnecting");
-        connector::teardown(live, true).await;
+        let restore = live.device.is_some();
+        connector::teardown(live, restore).await;
         Phase::Connect
     }
 
-    async fn online(&mut self, mut live: Live) -> Phase {
-        let used = shared().credentials.lock().clone();
-        if let Some(stored) = connector::harvest_credentials(&live.session, used.as_ref()).await {
-            *shared().credentials.lock() = Some(stored);
+    /// Brings the Spotify Connect side in line with the settings: hides (Spirc shut down, the
+    /// Session kept) or asks for a reconnect (returns true) to become visible, or to apply a
+    /// device rename once this device isn't the active one playing.
+    async fn sync_device(&mut self, live: &mut Live, rename_pending: &mut bool) -> bool {
+        let visible = super::settings().connect_visible;
+        let Some(device) = live.device.as_ref() else {
+            // A hidden session gets the current name when it becomes visible.
+            *rename_pending = false;
+            if visible {
+                log::info!("becoming visible to Spotify Connect");
+                self.intentional = true;
+            }
+            return visible;
+        };
+        if !visible {
+            log::info!("hiding from Spotify Connect");
+            *rename_pending = false;
+            connector::hide(live).await;
+            return false;
         }
+        if !*rename_pending {
+            return false;
+        }
+        let busy = {
+            let state = device.spirc.subscribe_state();
+            let snapshot = state.borrow();
+            snapshot.is_active && !matches!(snapshot.status, SnapshotPlayStatus::Stopped)
+        };
+        if busy {
+            return false; // applied once this device stops playing or isn't active any more
+        }
+        log::info!("reconnecting to apply the new device name");
+        self.intentional = true;
+        true
+    }
+
+    async fn online(&mut self, mut live: Live) -> Phase {
+        if let Some(harvested) = connector::session_credentials(&live.session) {
+            if state::store_harvested(self.login_generation, harvested.clone()) {
+                events::emit(events::CREDENTIALS, &harvested);
+            }
+        }
+        let connected_at = std::time::Instant::now();
+        let mut stable = false;
+        let mut rename_pending = false;
         let mut declared = false;
         let mut user_known = false;
         let mut verify_ticks = 0u32;
@@ -363,7 +463,8 @@ impl Supervisor {
         health.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = &mut live.task => {
+                _ = spirc_ended(&mut live.device) => {
+                    self.backoff.note_uptime(connected_at, std::time::Instant::now());
                     let premium = connector::premium_error(&live.session);
                     log::warn!("spirc task ended (session invalid: {})", live.session.is_invalid());
                     connector::teardown_finished(live, premium.is_none()).await;
@@ -383,6 +484,10 @@ impl Supervisor {
                         declared = true;
                         user_known = user.is_some();
                         self.declare_online(&live, user);
+                        // The visibility may have changed while connecting.
+                        if self.sync_device(&mut live, &mut rename_pending).await {
+                            return self.reconnect(live).await;
+                        }
                     }
                 }
                 _ = health.tick(), if declared => {
@@ -390,7 +495,23 @@ impl Supervisor {
                         connector::teardown(live, false).await;
                         return Phase::Halted(e);
                     }
-                    if live.session.is_invalid() || player_host::dead_generation().is_some() {
+                    if !stable {
+                        stable = self.backoff.note_uptime(connected_at, std::time::Instant::now());
+                    }
+                    if live.device.is_some() && player_host::dead_generation().is_some() {
+                        return self.reconnect(live).await;
+                    }
+                    if live.session.is_invalid() {
+                        if stable {
+                            return self.reconnect(live).await;
+                        }
+                        // Lost right after connecting: back off like a failed attempt.
+                        connector::teardown(live, true).await;
+                        return self.retry_after(AppError::new(ErrorCode::Network, "Connection to Spotify lost"));
+                    }
+                    // Spirc may have overwritten the forced filter (a server attribute push).
+                    super::sync_explicit_filter();
+                    if self.sync_device(&mut live, &mut rename_pending).await {
                         return self.reconnect(live).await;
                     }
                     if !user_known {
@@ -424,17 +545,25 @@ impl Supervisor {
                             return Phase::Gate;
                         }
                         if old.autoplay != new.autoplay {
-                            if let Err(e) = live.spirc.set_autoplay(new.autoplay) {
-                                log::warn!("autoplay setting not applied: {e}");
+                            if let Some(device) = &live.device {
+                                if let Err(e) = device.spirc.set_autoplay(new.autoplay) {
+                                    log::warn!("autoplay setting not applied: {e}");
+                                }
                             }
                         }
-                    }
-                    Some(Msg::PlayerDead(generation)) => {
-                        if player_host::dead_generation() == Some(generation) {
+                        if old.device_name != new.device_name && live.device.is_some() {
+                            rename_pending = true;
+                        }
+                        if declared && self.sync_device(&mut live, &mut rename_pending).await {
                             return self.reconnect(live).await;
                         }
                     }
-                    Some(Msg::Stop { .. }) => {}
+                    Some(Msg::PlayerDead(generation)) => {
+                        if live.device.is_some() && player_host::dead_generation() == Some(generation) {
+                            return self.reconnect(live).await;
+                        }
+                    }
+                    Some(Msg::Stop) => {}
                 },
             }
         }
@@ -454,12 +583,12 @@ impl Supervisor {
             match self.stop_requested(msg) {
                 None => return Phase::Exit,
                 Some(Msg::Network { available: true, .. }) if throttled => {
-                    self.limiter.reset();
+                    shared().reconnects.lock().reset();
                     self.backoff.reset();
                     return Phase::Connect;
                 }
                 Some(Msg::Reconnect) => {
-                    self.limiter.reset();
+                    shared().reconnects.lock().reset();
                     self.backoff.reset();
                     return Phase::Connect;
                 }

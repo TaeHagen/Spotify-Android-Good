@@ -554,6 +554,10 @@ data class EngineSettings(
     val deviceName: String = "Android",
     val streamingCacheMb: Int = 1024,
     val offline: Boolean = false,
+    /** "Hide explicit content": OR-ed natively into the account's own explicit filter. */
+    val filterExplicit: Boolean = false,
+    /** Listed as a Spotify Connect target (Spirc runs); set by [com.taehagen.spotifygood.engine.SpotifyEngine]. */
+    val connectVisible: Boolean = true,
 )
 
 // ---------------------------------------------------------------------------------------------

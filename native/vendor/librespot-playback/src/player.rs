@@ -7,7 +7,8 @@ use std::{
     mem,
     pin::Pin,
     // SPOTIFYGOOD: `process::exit` removed. No code path may end the host (Android app) process.
-    sync::Mutex,
+    // `MutexGuard` / `PoisonError` for `lock_load_handles()`.
+    sync::{Mutex, MutexGuard, PoisonError},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -56,7 +57,9 @@ pub const PCM_AT_0DBFS: f64 = 1.0;
 // otherwise expect in Vorbis comments. This packet isn't well-formed and players may balk at it.
 const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 
-const LOAD_HANDLES_POISON_MSG: &str = "load handles mutex should not be poisoned";
+// SPOTIFYGOOD: `LOAD_HANDLES_POISON_MSG` removed. `load_handles` is locked with
+// `lock_load_handles()`, which ignores poisoning: a panic elsewhere must never turn into a
+// second panic in `PlayerInternal::drop` (a double panic aborts the host process).
 
 // SPOTIFYGOOD: audio-key retry policy for transient failures (librespot #1649 / PR #1763).
 const AUDIO_KEY_RETRIES: u32 = 3;
@@ -67,6 +70,16 @@ const AUDIO_KEY_RETRY_DELAY: Duration = Duration::from_secs(1);
 // on it). One worker is enough. It must stay a multi-thread runtime: with a current-thread
 // runtime nothing drives I/O or timers while the player thread is blocked in `Sink::write`.
 const PLAYER_RUNTIME_WORKER_THREADS: usize = 1;
+
+// SPOTIFYGOOD: bounded player shutdown. Stock `PlayerInternal::drop` joins every loader thread
+// (superseded loads included) and the runtime drop waits for its blocking tasks (hyper's
+// getaddrinfo). Loaders have no network timeout, so a stalled request kept `Player::drop`
+// (and the engine's stop/logout) waiting for minutes. Loaders still running after
+// `LOADER_JOIN_TIMEOUT` are detached (their results are discarded anyway); the runtime is shut
+// down with `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT`, which also cancels the I/O of detached loaders.
+const LOADER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+const LOADER_JOIN_POLL: Duration = Duration::from_millis(10);
+const PLAYER_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub type PlayerResult = Result<(), Error>;
 
@@ -210,6 +223,7 @@ enum PlayerCommand {
     SetOfflineSource(Option<OfflineSourceRef>),
     SetBitrate(Bitrate),
     SetNormalisation(NormalisationSettings),
+    SetGapless(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -601,6 +615,9 @@ impl Player {
                 .build()
                 .expect("Failed to create Tokio runtime");
             runtime.block_on(internal);
+            // SPOTIFYGOOD: bounded (see PLAYER_RUNTIME_SHUTDOWN_TIMEOUT); a plain drop waits for
+            // every blocking task without a limit.
+            runtime.shutdown_timeout(PLAYER_RUNTIME_SHUTDOWN_TIMEOUT);
 
             debug!("PlayerInternal thread finished.");
         })
@@ -753,6 +770,12 @@ impl Player {
     // and the current track's gain factor is recomputed from its normalisation data.
     pub fn set_normalisation(&self, settings: NormalisationSettings) {
         self.command(PlayerCommand::SetNormalisation(settings));
+    }
+
+    // SPOTIFYGOOD: change gapless playback at runtime. `config.gapless` is only read when a load
+    // starts (`handle_command_load`), so it applies from the next track change on.
+    pub fn set_gapless(&self, gapless: bool) {
+        self.command(PlayerCommand::SetGapless(gapless));
     }
 }
 
@@ -2628,12 +2651,15 @@ impl PlayerInternal {
             }
 
             // SPOTIFYGOOD: runtime settings. `load_track` clones `self.config` for every new
-            // loader, so the source and bitrate apply to loads and preloads started from now on.
+            // loader, so the source and bitrate apply to loads and preloads started from now on;
+            // `gapless` is read by `handle_command_load`, so it applies from the next load.
             PlayerCommand::SetOfflineSource(source) => self.config.offline_source = source,
 
             PlayerCommand::SetBitrate(bitrate) => self.config.bitrate = bitrate,
 
             PlayerCommand::SetNormalisation(settings) => self.handle_set_normalisation(settings),
+
+            PlayerCommand::SetGapless(gapless) => self.config.gapless = gapless,
 
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => {
                 self.send_event(PlayerEvent::FilterExplicitContentChanged { filter });
@@ -2703,24 +2729,32 @@ impl PlayerInternal {
         // SPOTIFYGOOD: hold the lock while spawning and inserting. Otherwise a fast loader
         // (e.g. an offline file) could remove its entry before it was inserted, leaving an
         // un-joined handle in the map until the player is dropped.
-        let mut load_handles = self.load_handles.lock().expect(LOAD_HANDLES_POISON_MSG);
+        let mut load_handles = lock_load_handles(&self.load_handles);
 
         // SPOTIFYGOOD: named thread; the result (including the failure reason) is always sent.
-        let load_handle = thread::Builder::new()
+        // A failed spawn (EAGAIN: thread limit or memory pressure) must not panic while the
+        // guard is held: that poisoned the mutex and the unwind's `PlayerInternal::drop` then
+        // panicked again, aborting the process. The closure (and `result_tx` with it) is
+        // dropped, so the load ends as `Unavailable(Other)` below.
+        let spawned = thread::Builder::new()
             .name("lrs-loader".to_string())
             .spawn(move || {
                 let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
                 let _ = result_tx.send(data);
 
-                let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
-                load_handles.remove(&thread::current().id());
-            })
-            .expect("Failed to spawn loader thread");
+                lock_load_handles(&load_handles_clone).remove(&thread::current().id());
+            });
 
-        load_handles.insert(load_handle.thread().id(), load_handle);
+        match spawned {
+            Ok(load_handle) => {
+                load_handles.insert(load_handle.thread().id(), load_handle);
+            }
+            Err(e) => error!("Failed to spawn loader thread: {e}"),
+        }
         drop(load_handles);
 
-        // SPOTIFYGOOD: a dropped sender (the loader thread panicked) is reported as `Other`.
+        // SPOTIFYGOOD: a dropped sender (the loader thread panicked or could not be spawned) is
+        // reported as `Other`.
         result_rx.map(|result| result.unwrap_or(Err(UnavailableReason::Other)))
     }
 
@@ -2747,13 +2781,22 @@ impl PlayerInternal {
     }
 }
 
+// SPOTIFYGOOD: locks `load_handles` even if a thread panicked while holding it. The map stays
+// consistent (single insert / remove / drain operations), so the poison flag carries no
+// information here, and panicking on it in `Drop` would abort the process.
+type LoadHandles = HashMap<thread::ThreadId, thread::JoinHandle<()>>;
+
+fn lock_load_handles(handles: &Mutex<LoadHandles>) -> MutexGuard<'_, LoadHandles> {
+    handles.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl Drop for PlayerInternal {
     fn drop(&mut self) {
         debug!("drop PlayerInternal[{}]", self.player_id);
 
         let handles: Vec<thread::JoinHandle<()>> = {
             // waiting for the thread while holding the mutex would result in a deadlock
-            let mut load_handles = self.load_handles.lock().expect(LOAD_HANDLES_POISON_MSG);
+            let mut load_handles = lock_load_handles(&self.load_handles); // SPOTIFYGOOD
 
             load_handles
                 .drain()
@@ -2761,8 +2804,17 @@ impl Drop for PlayerInternal {
                 .collect()
         };
 
+        // SPOTIFYGOOD: join for at most LOADER_JOIN_TIMEOUT in total, then detach the rest.
+        let deadline = Instant::now() + LOADER_JOIN_TIMEOUT;
         for handle in handles {
-            let _ = handle.join();
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(LOADER_JOIN_POLL);
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                warn!("Loader thread still running at player shutdown, detaching it");
+            }
         }
     }
 }
@@ -2858,6 +2910,9 @@ impl fmt::Debug for PlayerCommand {
                 .debug_tuple("SetNormalisation")
                 .field(&settings)
                 .finish(),
+            PlayerCommand::SetGapless(gapless) => {
+                f.debug_tuple("SetGapless").field(&gapless).finish()
+            }
         }
     }
 }

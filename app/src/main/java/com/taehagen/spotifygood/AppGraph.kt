@@ -1,6 +1,8 @@
 package com.taehagen.spotifygood
 
 import android.app.Application
+import android.util.Log
+import coil3.SingletonImageLoader
 import com.taehagen.spotifygood.auth.AuthRepository
 import com.taehagen.spotifygood.auth.CredentialStore
 import com.taehagen.spotifygood.connect.DevicesRepository
@@ -27,8 +29,10 @@ import com.taehagen.spotifygood.playback.ResumeStore
 import com.taehagen.spotifygood.playback.SleepTimer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
@@ -75,10 +79,12 @@ class AppGraph(val app: Application) {
     val resumeStore: ResumeStore by lazy { ResumeStore(app) }
     val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore) }
     val devices: DevicesRepository by lazy { DevicesRepository(appScope, rpc, events, resumeStore::read) }
-    /** Spotify Connect local-network discovery (the "send" side); runs only while the sheet is up. */
-    val localDiscovery: LocalDeviceDiscovery by lazy {
+    private val localDiscoveryLazy = lazy {
         LocalDeviceDiscovery(app, rpc) { devices.devices.value.devices.map { it.id }.toSet() }
     }
+
+    /** Spotify Connect local-network discovery (the "send" side); runs only while the sheet is up. */
+    val localDiscovery: LocalDeviceDiscovery by localDiscoveryLazy
     val outputs: OutputRouteManager by lazy {
         OutputRouteManager(app, appScope, audioSink, rpc).also { manager ->
             appScope.launch(Dispatchers.Main) {
@@ -104,16 +110,45 @@ class AppGraph(val app: Application) {
     }
 
     /**
-     * Logs the user out and wipes all account data: native session + credentials, downloads,
-     * caches and the database. Settings are kept.
+     * Logs the user out and wipes all account data (docs/ARCHITECTURE.md §9.3): the login flow and
+     * its pending device code, the native session and credentials, downloads, the resume state,
+     * the response and image caches, the database and the settings.
+     *
+     * Failure-safe: every step runs even if an earlier one failed, and the first failure is
+     * rethrown at the end (callers report "Logout failed"). Not cancellable. No new login can
+     * reach the engine before the wipe is done ([AuthRepository.whileLoggingOut]).
      */
-    suspend fun logout() {
-        engine.logout()
-        downloads.removeAll()
-        // The playback service clears it too, but only while it runs.
-        resumeStore.clear()
-        responseCache.clear()
-        kotlinx.coroutines.withContext(Dispatchers.IO) { database.clearAllTables() }
-        events.reset()
+    suspend fun logout(): Unit = withContext(NonCancellable) {
+        auth.whileLoggingOut {
+            var failure: Throwable? = null
+            suspend fun step(name: String, block: suspend () -> Unit) {
+                try {
+                    block()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Logout: $name failed", t)
+                    if (failure == null) failure = t
+                }
+            }
+            // Browsing the LAN for the old account's Connect targets ends with it.
+            step("local discovery") { if (localDiscoveryLazy.isInitialized()) localDiscovery.stop() }
+            step("engine") { engine.logout() }
+            step("downloads") { downloads.removeAll() }
+            // The playback service clears it too, but only while it runs.
+            step("resume state") { resumeStore.clear() }
+            step("response cache") { responseCache.clear() }
+            step("database") { withContext(Dispatchers.IO) { database.clearAllTables() } }
+            step("image cache") {
+                val loader = SingletonImageLoader.get(app)
+                loader.memoryCache?.clear()
+                withContext(Dispatchers.IO) { loader.diskCache?.clear() }
+            }
+            step("settings") { settings.reset() }
+            step("events") { events.reset() }
+            failure?.let { throw it }
+        }
+    }
+
+    private companion object {
+        const val TAG = "AppGraph"
     }
 }

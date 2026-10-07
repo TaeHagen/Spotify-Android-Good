@@ -77,20 +77,31 @@ impl From<librespot_core::Error> for AppError {
     fn from(e: librespot_core::Error) -> Self {
         let msg = e.to_string();
         // AP login errors live in a private module; classify by message (see research/core.md §2.4).
+        // They are the only source of BAD_CREDENTIALS, which makes Kotlin delete the stored
+        // credentials.
         let code = match e.kind {
-            ErrorKind::PermissionDenied if msg.contains("Bad credentials") => ErrorCode::BadCredentials,
+            ErrorKind::PermissionDenied if is_rejected_credentials(&msg) => ErrorCode::BadCredentials,
             ErrorKind::PermissionDenied if msg.contains("Premium account required") => ErrorCode::PremiumRequired,
-            ErrorKind::Unauthenticated => ErrorCode::BadCredentials,
             ErrorKind::NotFound => ErrorCode::NotFound,
             ErrorKind::ResourceExhausted => ErrorCode::RateLimited,
             ErrorKind::InvalidArgument | ErrorKind::OutOfRange => ErrorCode::InvalidArgument,
-            ErrorKind::Unavailable | ErrorKind::DeadlineExceeded | ErrorKind::Aborted => ErrorCode::Network,
+            // `Unauthenticated` is an HTTP 401/407/511 from any request (client-token, login5,
+            // apresolve, spclient): a rejected bearer token or proxy authentication, not the
+            // account credentials. It is retryable.
+            ErrorKind::Unavailable | ErrorKind::DeadlineExceeded | ErrorKind::Aborted | ErrorKind::Unauthenticated => {
+                ErrorCode::Network
+            }
             ErrorKind::Cancelled => ErrorCode::Cancelled,
             ErrorKind::PermissionDenied | ErrorKind::FailedPrecondition => ErrorCode::Unavailable,
             _ => ErrorCode::Internal,
         };
         AppError::new(code, msg)
     }
+}
+
+/// An AP login refusal of the credentials themselves (`AuthenticationError::LoginFailed`).
+pub(crate) fn is_rejected_credentials(msg: &str) -> bool {
+    msg.contains("Bad credentials") || msg.contains("Could not validate credentials")
 }
 
 impl From<serde_json::Error> for AppError {
@@ -114,5 +125,46 @@ impl From<std::io::Error> for AppError {
 impl From<tokio::time::error::Elapsed> for AppError {
     fn from(_: tokio::time::error::Elapsed) -> Self {
         AppError::new(ErrorCode::Network, "Timed out")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use librespot_core::Error;
+
+    fn code(e: Error) -> ErrorCode {
+        AppError::from(e).code
+    }
+
+    #[test]
+    fn http_auth_failures_are_retryable() {
+        // HTTP 401/407/511 (rejected token, proxy authentication) never mean bad credentials.
+        assert_eq!(code(Error::unauthenticated("Upstream responded with status code 401")), ErrorCode::Network);
+    }
+
+    #[test]
+    fn ap_login_refusals() {
+        assert_eq!(code(Error::permission_denied("Login failed with reason: Bad credentials")), ErrorCode::BadCredentials);
+        assert_eq!(
+            code(Error::permission_denied("Login failed with reason: Could not validate credentials")),
+            ErrorCode::BadCredentials
+        );
+        assert_eq!(
+            code(Error::permission_denied("Login failed with reason: Premium account required")),
+            ErrorCode::PremiumRequired
+        );
+        assert_eq!(code(Error::permission_denied("audio key error 0x0001")), ErrorCode::Unavailable);
+    }
+
+    #[test]
+    fn other_kinds() {
+        assert_eq!(code(Error::unavailable("x")), ErrorCode::Network);
+        assert_eq!(code(Error::deadline_exceeded("x")), ErrorCode::Network);
+        assert_eq!(code(Error::not_found("x")), ErrorCode::NotFound);
+        assert_eq!(code(Error::resource_exhausted("x")), ErrorCode::RateLimited);
+        assert_eq!(code(Error::invalid_argument("x")), ErrorCode::InvalidArgument);
+        assert_eq!(code(Error::cancelled("x")), ErrorCode::Cancelled);
+        assert_eq!(code(Error::internal("x")), ErrorCode::Internal);
     }
 }

@@ -93,12 +93,17 @@ object NativeBridge {
 
 * `nativeInit` — once per process (from `App.onCreate`). Creates the tokio runtime,
   stores global refs and installs the logger. No network. `configJson`:
-  `{"filesDir","cacheDir","noBackupDir","deviceId","deviceName","logLevel"}`.
+  `{"filesDir","cacheDir","noBackupDir","deviceId","deviceName","logLevel"}`. `deviceName` (the
+  phone model) is the Connect / zeroconf name when `EngineSettings.deviceName` is empty.
 * `nativeCall` — never blocks. Result delivered later via
   `NativeCallbacks.onResult(requestId, ok, json)`. `requestId == 0` means
   fire-and-forget. `argsJson` is a JSON object (`{}` when no args).
 * `nativeCancel` — aborts the tokio task of an in-flight call. A cancelled call delivers
-  `onResult(id, false, {"code":"CANCELLED","message":"…"})`.
+  `onResult(id, false, {"code":"CANCELLED","message":"…"})`. Exception: engine lifecycle work
+  always runs to the end (`session.stop`, `session.logout`, and the configuration step of
+  `session.start`, which runs in its own task); cancelling those only stops the wait. Kotlin
+  registers its cancellation handler after `nativeCall` returned, so a call cancelled before
+  it was dispatched is still cancelled natively.
 
 ### 3.2 Rust → Kotlin
 
@@ -132,7 +137,10 @@ Error results and error events use
 `{"code":"…","message":"…","retryAfterMs":<optional>}` with `code` one of
 `NOT_LOGGED_IN, NOT_CONNECTED, BAD_CREDENTIALS, PREMIUM_REQUIRED, NETWORK, NOT_FOUND,
 RATE_LIMITED, INVALID_ARGUMENT, UNAVAILABLE, NOT_ACTIVE_DEVICE, PLAYBACK_REFUSED, CANCELLED,
-INTERNAL`. `PLAYBACK_REFUSED` = Spotify permanently refused audio keys for this account
+INTERNAL`. `BAD_CREDENTIALS` = the access point refused the login credentials (AP
+`LoginFailed` "Bad credentials" / "Could not validate credentials"); Kotlin then deletes the
+stored credentials. An HTTP 401/407/511 (rejected bearer token, proxy authentication) is
+`NETWORK` and retried. `PLAYBACK_REFUSED` = Spotify permanently refused audio keys for this account
 (librespot #1649; AesKeyError 0x0001). The engine stops after 3 consecutive refused loads
 instead of skipping through the queue, and the app shows a dedicated explanation screen. Only
 loads count: a refused preload never stops the playing track. 3 loads failing transiently
@@ -180,25 +188,55 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   task, subscribes to `subscribe_state()`, `subscribe_cluster()`, `subscribe_errors()`.
 * Credentials: first login uses `Credentials::with_access_token(oauthToken)`; afterwards
   always the stored reusable credentials (JSON, `{"username","authType","authData"}`)
-  passed in by Kotlin. When librespot produces new reusable credentials (read from the
-  Cache `credentials.json` after connect, then that file is deleted), Rust emits a
-  `credentials` event; Kotlin stores them encrypted.
+  passed in by Kotlin. A `session.start` with only `accessToken` is a fresh login: reusable
+  credentials still stored natively (possibly another account's) are dropped first, so the
+  token is what logs in. A start with only `credentials` drops an earlier access token, so a
+  rejection can't fall back on another account's token. When the account changes, the OAuth
+  token (`session.setOAuthToken`) and the username are dropped too. A supervisor that is
+  being stopped or replaced can't store or report credentials any more (login generation). When librespot produces new reusable credentials (taken from the
+  Session after connect; the librespot `Cache` has no credentials location, so they are never
+  written to disk in plaintext, and a `credentials.json` left by an older build is deleted),
+  Rust emits a `credentials` event; Kotlin stores them encrypted.
 * Reconnect supervisor: awaits the spirc task end / polls `session.is_invalid()` every 5 s
   while Online (cheap, no network), reacts to `session.setNetworkAvailable`. Backoff
-  1→60 s, reset on success; at most one attempt in flight; no attempts while the network
-  is known to be down. On reconnect: `Session::new`, `player.set_session`, `Spirc::new`.
-* `session.stop`: `spirc.shutdown()`, await task ≤ 10 s (abort + `dealer().close()` on
-  timeout), `session.shutdown()`, drop Spirc/Session; the Player is dropped on a blocking
-  thread (its Drop joins the player thread) only on `session.stop {releasePlayer:true}`
-  (logout / process trim); otherwise kept for the offline mode.
+  1→60 s, reset once a connection stayed up 60 s (or when the network comes back), so a
+  connection that drops right after connecting keeps backing off; at most one attempt in
+  flight; no attempts while the network is known to be down. At most 10 attempts per
+  10 minutes, counted process-wide (the first attempt after a Kotlin restart is always made
+  but counts), then `Error`/`NETWORK` until the network changes. On reconnect:
+  `Session::new`, `player.set_session`, `Spirc::new`.
+* `session.stop`: `spirc.shutdown()`, await task ≤ 4 s (abort + `dealer().close()` ≤ 2 s on
+  timeout), `session.shutdown()`, drop Spirc/Session; the supervisor gets 7 s for this, then it
+  is aborted (+ 0.5 s) and cleaned up by force. The Player is dropped on a blocking thread
+  (its Drop joins the player thread, which joins its loaders for at most 1 s) only on
+  `session.stop {releasePlayer:true}` (logout / process trim), awaited at most 1.5 s;
+  otherwise kept for the offline mode. Whole stop ≤ 10 s (checked at compile time). Start,
+  stop and logout are serialised by the supervisor lock, held for the whole teardown, so a
+  `session.start` after a stop always finds the old session completely gone. Kotlin waits up
+  to 15 s for `session.stop` and 30 s for `session.logout`.
+* `session.logout`: forgets the account first (credentials, access token, OAuth token,
+  username), then stops as above with `releasePlayer:true`, resets `connect`, and deletes the
+  credentials dir, the streaming cache and `librespot-tmp`, all under the supervisor lock: a
+  following login waits until it is done. Kotlin clears its `CredentialStore` before calling
+  it, so a process death mid-logout doesn't log the account back in.
 
 ### 4.3 Playback configuration
 
-`PlayerConfig { bitrate: from settings (96/160/320), gapless: true, normalisation:
+`PlayerConfig { bitrate: from settings (96/160/320), gapless: settings.gapless, normalisation:
 settings.normalize, normalisation_type: Auto, normalisation_pregain_db: settings
 (quiet −5, normal 0, loud +5), position_update_interval: None, ditherer: None, .. }`.
-Changing the bitrate/normalisation requires `player.applySettings`, which recreates the
-Player only while nothing is playing (otherwise applied at the next idle point).
+Changes (`player.applySettings` or `session.updateSettings`) are applied to the running Player
+through the patched runtime setters, without recreating it: bitrate and gapless from the next
+load (track change), normalisation from the next audio packet.
+
+Explicit filter: `EngineSettings.filterExplicit` is OR-ed into the session's own
+`filter-explicit-content` user attribute (the account's value is kept in a private attribute
+and restored when the setting goes off). librespot reads that attribute everywhere: the Player
+refuses explicit tracks (Spirc skips them) and skips a loaded one when the filter turns on,
+the catalog returns them with `playable:false` (its cached metadata is dropped when the
+effective filter changes), and downloads refuse them. It is applied to the live session (when
+it is declared online and on every health tick, since Spirc can overwrite it) and to the
+offline session the Player uses while not online. `User.explicitFilter` stays the account's.
 
 ### 4.4 Audio output
 
@@ -319,17 +357,20 @@ restore (§8).
 
 | method | args | result |
 |---|---|---|
-| `session.start` | `{"credentials":{…}?,"accessToken":"…"?,"settings":EngineSettings,"initialVolume":0..65535}` | `{}` once Online (or error). `initialVolume` = current `STREAM_MUSIC` volume mapped to 0..65535 (used for the mixer and Connect so startup never changes the system volume) |
-| `session.stop` | `{"releasePlayer":false}` | `{}` |
+| `session.start` | `{"credentials":{…}?,"accessToken":"…"?,"settings":EngineSettings,"initialVolume":0..65535}` | `{}` once Online (or error). `initialVolume` = current `STREAM_MUSIC` volume mapped to 0..65535 (used for the mixer and Connect so startup never changes the system volume). `accessToken` without `credentials` is a fresh login (§4.2). Cancelling only stops the wait |
+| `session.stop` | `{"releasePlayer":false}` | `{}` (≤ 10 s; runs to the end even if cancelled) |
 | `session.setNetworkAvailable` | `{"available":true,"metered":false}` | `{}` |
 | `session.updateSettings` | `EngineSettings` | `{}` |
-| `session.logout` | `{}` | `{}` (stops, clears caches/credentials file) |
-| `session.zeroconfLogin` | `{"timeoutMs":180000}` | `{"credentials":{…}}` when another Spotify app hands over credentials (libmdns discovery; Kotlin holds a MulticastLock meanwhile) |
+| `session.logout` | `{}` | `{}` (forgets the account, stops, deletes the caches; runs to the end even if cancelled) |
+| `session.zeroconfLogin` | `{"timeoutMs":180000,"deviceName":"…"}` | `{"credentials":{…}}` when another Spotify app hands over credentials (libmdns discovery; Kotlin holds a MulticastLock meanwhile). `deviceName` is advertised (the setting, else the phone model); without it the Connect name below is used |
 | `session.token` | `{}` | `{"accessToken","expiresAtMs"}` login5 token (for Kotlin-side HTTP such as artwork never needs it; reserved) |
 | `session.setOAuthToken` | `{"accessToken","expiresAtMs"}` | `{}` (lets pathfinder fall back to the OAuth token) |
 
 `EngineSettings`: `{"bitrate":96|160|320,"normalize":true,"normalizePregain":"quiet|normal|loud",
-"autoplay":true,"gapless":true,"deviceName":"…","streamingCacheMb":1024,"offline":false}`.
+"autoplay":true,"gapless":true,"deviceName":"…","streamingCacheMb":1024,"offline":false,
+"filterExplicit":false,"connectVisible":true}`. `connectVisible`: listed as a Spotify Connect
+target (Spirc runs), see §8. `filterExplicit` ("Hide explicit content") is OR-ed into the account's
+own explicit filter (see §4.3); it can never turn the account's filter off.
 
 ### 6.2 Player (routed local/remote)
 
@@ -344,7 +385,7 @@ restore (§8).
 | `player.setRepeat` | `{"mode":"off|context|track"}` |
 | `player.setVolume` | `{"volume":0..65535,"fromSystem":false}` |
 | `player.setAudioOutput` | `{"type":"speaker|bluetooth|line_out|car|unknown","name":"…"}` (local only; reported to Connect) |
-| `player.applySettings` | `EngineSettings` subset (bitrate/normalisation) |
+| `player.applySettings` | `EngineSettings` subset (`bitrate`, `normalize`, `normalizePregain`, `gapless`), applied to the running Player (§4.3) |
 | `queue.add` | `{"uri":"spotify:track:…"}` — on this device at most 80 tracks can be queued (Connect's next-tracks window); a further add fails with `UNAVAILABLE` "The queue is full" |
 | `queue.remove` | `{"uid":"…"}` |
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
@@ -481,8 +522,21 @@ For a remote active device, smart shuffle is not supported (the command reports
 ## 8. Spotify Connect
 
 * **This phone as a target**: Spirc registers the device via the dealer; other devices see
-  it while the engine is Online. Remote commands, transfers and volume arrive through
-  Spirc. `auto_takeover` is off: the phone never starts audio on its own at launch.
+  it while the engine is Online **and** `EngineSettings.connectVisible` is true. Remote
+  commands, transfers and volume arrive through Spirc. `auto_takeover` is off: the phone never
+  starts audio on its own at launch.
+* **Visibility**: the phone is listed only while it can play. Kotlin sets `connectVisible`
+  while a UI (app in the foreground), PLAYBACK or PRESENCE holder is held; a DOWNLOAD holder
+  alone and the idle grace keep it hidden. Hidden, the supervisor connects the Session without
+  Spirc (catalog, downloads and tokens keep working, `connect` routes as if not online).
+  Becoming hidden shuts Spirc down (it disconnects, deletes its connect state and closes the
+  dealer, so the device leaves the cluster) and keeps the Session. Becoming visible reconnects
+  with a new Session + Spirc: `Spirc::new` performs the login itself and a Session's dealer
+  can be launched only once, so Spirc can't be added to a connected Session. These reconnects
+  don't count against the reconnect limit.
+* **Device name**: a rename (`EngineSettings.deviceName`) reconnects Session + Spirc so other
+  devices see the new name, at once unless this phone is the active device and playing (then
+  as soon as it isn't); a hidden session uses the new name when it becomes visible.
 * **Controlling others**: device list and remote player state come from
   `Spirc::subscribe_cluster()`. Commands go to
   `POST /connect-state/v1/player/command/from/{me}/to/{target}` with bodies
@@ -558,8 +612,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `verification_uri_complete` in a Custom Tab (explicit browser package) and also show the
   code (for approving from another device); poll `POST https://accounts.spotify.com/api/token`
   (`grant_type=urn:ietf:params:oauth:grant-type:device_code`, honour `interval`/`slow_down`,
-  stop on `expired_token`/`access_denied`) only while the login screen is alive. The device
-  code is persisted (≤ expiry) so polling resumes after process death. No local server.
+  stop on `expired_token`/`access_denied`) only while the login screen is visible: polling
+  pauses when the app goes to the background or the screen leaves composition (e.g. while the
+  code is approved in the Custom Tab) and resumes when it is shown again, and stops when the
+  screen is left for good (activity finished) before a token arrived. The device code is
+  persisted (≤ expiry) so polling resumes after process death. No local server.
 * **Fallback:** OAuth Authorization Code + PKCE with the desktop client id
   `65b708073fc0480ea92a077233ca87bd`, redirect `http://127.0.0.1:5588/login` (fallback
   port 8898), desktop scope list, `state` verified. `LoopbackServer` binds 127.0.0.1 only,
@@ -569,11 +626,18 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `https://accounts.spotify.com/api/token` with OkHttp. The access token goes to
   `session.start {accessToken}`; the refresh token is stored encrypted as a fallback.
 * Alternative login: "Use another device" → `session.zeroconfLogin` (mDNS, MulticastLock
-  only while that screen is visible).
+  only while that screen is visible: hiding the screen cancels it).
+* A finished login (`LoginState.Success`) goes back to the options as soon as the engine
+  reports logged out (logout, rejected credentials).
 * `CredentialStore`: AES-256-GCM key in AndroidKeyStore; ciphertext in
-  `noBackupFilesDir/credentials.bin`. Also encrypts per-download audio keys.
-* Logout: `session.logout`, delete credentials, downloads, caches, DB, settings
-  (with confirmation).
+  `noBackupFilesDir/credentials.bin`. Also encrypts per-download audio keys. The key is only
+  replaced when it is permanently invalid (`KeyPermanentlyInvalidatedException`, a corrupted or
+  missing key); transient Keystore failures are retried and then reported as
+  `KeystoreUnavailableException` without deleting anything.
+* Logout (with confirmation): stops the login flows and deletes the pending device code, then
+  `session.logout`, credentials, downloads, the resume state, the response and image caches,
+  the DB and the settings. Every step runs even if an earlier one failed; no new login reaches
+  the engine until the wipe is done.
 
 ### 9.4 Playback service
 
@@ -768,16 +832,16 @@ current track is cached in memory (LRU) and refreshed via `library.contains`.
 
 ## 10. Lifecycle & battery policy (summary)
 
-| Situation | Native session | FGS | Locks |
-|---|---|---|---|
-| App visible | Online | none unless playing | none |
-| Playing locally | Online (or offline mode) | mediaPlayback | wake + Wi-Fi |
-| Paused < 10 min | Online | mediaPlayback (Media3 timeout) | none |
-| Paused ≥ 10 min, app background | stopped 60 s after release | none | none |
-| Remote device playing, our session mirrors | Online | mediaPlayback | none |
-| Downloading | Online | dataSync (WorkManager) | Worker's |
-| Presence opt-in, idle | Online | connectedDevice (low-importance) | none |
-| Nothing | stopped | none | none |
+| Situation | Native session | Connect target | FGS | Locks |
+|---|---|---|---|---|
+| App visible | Online | yes | none unless playing | none |
+| Playing locally | Online (or offline mode) | yes | mediaPlayback | wake + Wi-Fi |
+| Paused < 10 min | Online | yes | mediaPlayback (Media3 timeout) | none |
+| Paused ≥ 10 min, app background | hidden, stopped 60 s after release | no | none | none |
+| Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
+| Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
+| Presence opt-in, idle | Online | yes | connectedDevice (low-importance) | none |
+| Nothing | stopped | no | none | none |
 
 ## 11. Feature checklist
 

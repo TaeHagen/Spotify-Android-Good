@@ -3,7 +3,8 @@
 //! `status` is the single source of truth of the session state machine; every change that is
 //! visible in the `SessionEvent` JSON is emitted exactly once (`update_status`).
 
-use super::supervisor::Msg;
+use super::backoff::RateLimiter;
+use super::supervisor::{self, Msg};
 use crate::error::AppError;
 use crate::models::{EngineSettings, SessionEvent, SessionState, StoredCredentials, User};
 use crate::{bridge, connect, events, runtime};
@@ -39,6 +40,20 @@ impl Status {
     }
 }
 
+/// What the supervisor logs in with (docs/ARCHITECTURE.md §4.2).
+#[derive(Debug, Default)]
+pub(crate) struct Login {
+    /// The latest reusable credentials (from Kotlin or harvested after a login).
+    pub credentials: Option<StoredCredentials>,
+    /// The OAuth access token of a fresh login (until reusable credentials exist).
+    pub access_token: Option<String>,
+    /// Incremented whenever a supervisor is retired (stop, restart, logout). A supervisor
+    /// stores and reports what it harvested, and records its username, only while the
+    /// generation it was started with is current: one that is being stopped can never bring the
+    /// previous account back (or hand its credentials to the next login).
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NetworkState {
     pub available: bool,
@@ -55,10 +70,9 @@ pub(crate) struct Shared {
     pub username: RwLock<Option<String>>,
     /// The session while the engine is online.
     pub live_session: RwLock<Option<Session>>,
-    /// The latest reusable credentials (from Kotlin or harvested after a login).
-    pub credentials: Mutex<Option<StoredCredentials>>,
-    /// The OAuth access token for the first login (until reusable credentials exist).
-    pub access_token: Mutex<Option<String>>,
+    pub login: Mutex<Login>,
+    /// Reconnect attempts of all supervisors (a restart by Kotlin doesn't start a new burst).
+    pub reconnects: Mutex<RateLimiter>,
     pub network: Mutex<NetworkState>,
     /// Message channel of the running supervisor (quick access without the supervisor slot).
     pub supervisor_tx: Mutex<Option<mpsc::UnboundedSender<Msg>>>,
@@ -74,8 +88,8 @@ pub(crate) static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     oauth: Mutex::new(None),
     username: RwLock::new(None),
     live_session: RwLock::new(None),
-    credentials: Mutex::new(None),
-    access_token: Mutex::new(None),
+    login: Mutex::new(Login::default()),
+    reconnects: Mutex::new(supervisor::reconnect_limiter()),
     network: Mutex::new(NetworkState { available: true, metered: false, lost_at: None }),
     supervisor_tx: Mutex::new(None),
     supervisor: tokio::sync::Mutex::new(None),
@@ -110,16 +124,65 @@ pub(crate) fn update_status(f: impl FnOnce(&mut Status)) {
     }
 }
 
+/// The current login generation (see [`Login::generation`]).
+pub(crate) fn login_generation() -> u64 {
+    shared().login.lock().generation
+}
+
+/// Retires the running supervisor (see [`Login::generation`]).
+pub(crate) fn bump_login_generation() {
+    shared().login.lock().generation += 1;
+}
+
+/// Stores credentials harvested by the supervisor of `generation`, unless it was retired
+/// meanwhile. Returns whether they are new (the caller then emits the `credentials` event).
+pub(crate) fn store_harvested(generation: u64, credentials: StoredCredentials) -> bool {
+    let mut login = shared().login.lock();
+    if login.generation != generation {
+        log::info!("discarding credentials harvested by a retired supervisor");
+        return false;
+    }
+    let changed = login.credentials.as_ref() != Some(&credentials);
+    login.credentials = Some(credentials);
+    changed
+}
+
+/// Records the username of the session of the supervisor of `generation` (unless retired).
+pub(crate) fn record_username(generation: u64, session: &Session) {
+    let username = session.username();
+    if username.is_empty() {
+        return;
+    }
+    // Checked under the login lock: `forget_account` clears the username after bumping.
+    let login = shared().login.lock();
+    if login.generation == generation {
+        *shared().username.write() = Some(username);
+    }
+}
+
+/// Forgets everything that belongs to the logged-in account: the login (credentials and access
+/// token, with a new generation), the OAuth token and the username.
+pub(crate) fn forget_account() {
+    {
+        let mut login = shared().login.lock();
+        login.credentials = None;
+        login.access_token = None;
+        login.generation += 1;
+        forget_account_state();
+    }
+    shared().reconnects.lock().reset();
+}
+
+/// The per-account state besides the login (a new account starts without it).
+pub(crate) fn forget_account_state() {
+    *shared().oauth.lock() = None;
+    *shared().username.write() = None;
+}
+
 /// Sets (or clears) the online session.
 pub(crate) fn set_online(session: Option<Session>) {
     let s = shared();
     let online = session.is_some();
-    if let Some(session) = &session {
-        let username = session.username();
-        if !username.is_empty() {
-            *s.username.write() = Some(username);
-        }
-    }
     *s.live_session.write() = session;
     s.online.send_if_modified(|v| {
         let changed = *v != online;
@@ -136,5 +199,33 @@ pub(crate) fn send_to_supervisor(msg: Msg) -> bool {
     match shared().supervisor_tx.lock().as_ref() {
         Some(tx) => tx.send(msg).is_ok(),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn creds(blob: &str) -> StoredCredentials {
+        StoredCredentials { username: "a".into(), auth_type: 1, auth_data: blob.into() }
+    }
+
+    #[test]
+    fn a_retired_supervisor_cannot_store_credentials() {
+        let mine = login_generation();
+        assert!(store_harvested(mine, creds("A1")), "new credentials are reported");
+        assert!(!store_harvested(mine, creds("A1")), "unchanged credentials are not");
+        assert_eq!(shared().login.lock().credentials, Some(creds("A1")));
+
+        // Stop / restart / logout retires the supervisor: what it harvests now is dropped (and
+        // not reported, so Kotlin can't take it for the next login's credentials).
+        bump_login_generation();
+        assert!(!store_harvested(mine, creds("A2")));
+        assert_eq!(shared().login.lock().credentials, Some(creds("A1")));
+
+        // The next supervisor stores normally.
+        assert!(store_harvested(login_generation(), creds("B1")));
+        assert_eq!(shared().login.lock().credentials, Some(creds("B1")));
+        shared().login.lock().credentials = None;
     }
 }
