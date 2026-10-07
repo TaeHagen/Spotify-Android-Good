@@ -181,6 +181,9 @@ pub(super) struct ConnectState {
     /// the default context isn't all there: made of what a transfer brought, or a resolve of it
     /// (or of one of its pages) failed for good
     default_context_incomplete: bool,
+    // SPOTIFYGOOD: see ConnectState::place_current_track_when_resolved
+    /// the current track plays outside the default context until the page with it is there
+    place_current_track: bool,
 }
 
 impl ConnectState {
