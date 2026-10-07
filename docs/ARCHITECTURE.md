@@ -483,7 +483,11 @@ Calls without `seq` apply unconditionally.
 `OfflineTrackRecord`:
 `{"uri","playedUri","fileId","format","keyHex","path","sizeBytes","normalisation":{"trackGainDb","trackPeak","albumGainDb","albumPeak"},"track":Track|"episode":Episode,"imagePath":"…"}`.
 Kotlin persists it in Room (key encrypted with the Keystore key) and sends the decrypted
-records to `offline.setIndex` each time the engine starts.
+records to `offline.setIndex` as soon as the engine starts, whatever the session state (the
+index needs no session; downloads must play while the session is still connecting, e.g. behind
+a captive portal), retrying until it went through. Natively, a `player.load` while the session
+is not online waits (at most 8 s) until the first `offline.setIndex` of the process applied, so
+a load right after a cold start (a Bluetooth resume of a downloaded track) can't overtake it.
 
 ### 6.5 Catalog JSON shapes
 
@@ -633,6 +637,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `DOWNLOAD` (DownloadWorker while running), `PRESENCE` (opt-in Connect presence).
 * When the first holder is acquired and credentials exist → `session.start`.
   When the last holder is released → after `IDLE_GRACE` (60 s) `session.stop`.
+* With every start, the offline index (`offline.setIndex`, §6.4) is pushed right away,
+  independent of the session state, and retried until it went through.
 * `NetworkMonitor` (ConnectivityManager default-network callback, registered only while
   the engine is running) → `session.setNetworkAvailable`.
 * `state: StateFlow<EngineState>` mirrors `session` events; `user: StateFlow<User?>`.
