@@ -22,6 +22,18 @@ class EngineHelpersTest {
     }
 
     @Test
+    fun networkArgsCarryTheDefaultNetwork() {
+        assertEquals(
+            """{"available":true,"metered":true,"network":432902426637}""",
+            networkArgs(NetworkStatus(available = true, metered = true, handle = 432_902_426_637L)).toString(),
+        )
+        assertEquals(
+            """{"available":false,"metered":false}""",
+            networkArgs(NetworkStatus(available = false, metered = false)).toString(),
+        )
+    }
+
+    @Test
     fun connectVisibilityFollowsTheHolders() {
         assertEquals(false, connectVisibleFor(ui = 0, playback = 0, presence = 0))
         assertEquals(true, connectVisibleFor(ui = 1, playback = 0, presence = 0))

@@ -646,7 +646,7 @@ class SpotifyEngine(
         updateState { it.copy(networkAvailable = status.available) }
         if (status == previous) return
         lastSentNetwork = status
-        Log.d(TAG, "network available=${status.available} metered=${status.metered}")
+        Log.d(TAG, "network available=${status.available} metered=${status.metered} handle=${status.handle}")
         callQuietly("session.setNetworkAvailable", networkArgs(status))
         if (status.available && previous?.available == false) {
             lifecycle.withLock {
@@ -822,11 +822,6 @@ class SpotifyEngine(
         }
     }
 
-    private fun networkArgs(status: NetworkStatus): JsonObject = buildJsonObject {
-        put("available", status.available)
-        put("metered", status.metered)
-    }
-
     private inline fun updateState(transform: (EngineState) -> EngineState) {
         synchronized(stateLock) {
             val next = transform(_state.value)
@@ -908,6 +903,13 @@ class SpotifyEngine(
         private fun nativeUnavailableInfo() =
             NativeErrorInfo(NativeErrorCode.INTERNAL, "The playback engine could not be loaded", context = "session")
     }
+}
+
+/** `session.setNetworkAvailable` args (docs/ARCHITECTURE.md §6.1); `network` only when known. */
+internal fun networkArgs(status: NetworkStatus): JsonObject = buildJsonObject {
+    put("available", status.available)
+    put("metered", status.metered)
+    status.handle?.let { put("network", it) }
 }
 
 /**

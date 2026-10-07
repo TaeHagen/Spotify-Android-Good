@@ -88,8 +88,10 @@ async fn route(method: &str, args: Value) -> AppResult<Value> {
     match namespace {
         "session" => engine::handle(method, args).await,
         "player" | "queue" | "connect" => {
-            if method == "player.load" && !engine::is_online() {
-                // A load that may be routed offline needs the downloads index.
+            if method == "player.load" {
+                // A load that may be routed offline (no session online, or no network, also
+                // while the session still reads Online) needs the downloads index; returns at
+                // once while streaming is possible.
                 engine::await_offline_index(engine::OFFLINE_INDEX_WAIT).await;
             }
             connect::handle(method, args).await

@@ -11,7 +11,7 @@ use crate::{bridge, connect, events, runtime};
 use librespot_core::Session;
 use parking_lot::{Mutex, RwLock};
 use std::sync::LazyLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone, Default)]
@@ -59,6 +59,32 @@ pub(crate) struct NetworkState {
     pub available: bool,
     pub metered: bool,
     pub lost_at: Option<Instant>,
+    /// Android's handle of the default network (`Network.getNetworkHandle`), when Kotlin sent one.
+    pub handle: Option<i64>,
+}
+
+impl NetworkState {
+    /// Applies a report from Android (`session.setNetworkAvailable`) made at `now`. Returns what
+    /// the supervisor must hear: `Msg::Network` when the availability flipped (with the outage
+    /// when it came back), `Msg::NetworkChanged` when another network became the default while
+    /// one stayed available (the connections opened on the previous one may be dead without
+    /// any error, docs/ARCHITECTURE.md §4.2), else nothing (`metered` only sets the bitrate).
+    pub(crate) fn report(&mut self, available: bool, metered: bool, handle: Option<i64>, now: Instant) -> Option<Msg> {
+        self.metered = metered;
+        let previous = std::mem::replace(&mut self.handle, handle);
+        if available == self.available {
+            let switched = available && previous.is_some() && handle.is_some() && previous != handle;
+            return switched.then_some(Msg::NetworkChanged);
+        }
+        self.available = available;
+        let outage = if available {
+            Some(self.lost_at.take().map_or(Duration::MAX, |lost| now.saturating_duration_since(lost)))
+        } else {
+            self.lost_at = Some(now);
+            None
+        };
+        Some(Msg::Network { available, outage })
+    }
 }
 
 pub(crate) struct Shared {
@@ -74,6 +100,8 @@ pub(crate) struct Shared {
     /// Reconnect attempts of all supervisors (a restart by Kotlin doesn't start a new burst).
     pub reconnects: Mutex<RateLimiter>,
     pub network: Mutex<NetworkState>,
+    /// Marked changed whenever the network availability flipped (wakes `await_offline_index`).
+    pub network_changes: watch::Sender<()>,
     /// Message channel of the running supervisor (quick access without the supervisor slot).
     pub supervisor_tx: Mutex<Option<mpsc::UnboundedSender<Msg>>>,
     /// The running supervisor; serialises start / stop / logout.
@@ -90,7 +118,8 @@ pub(crate) static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     live_session: RwLock::new(None),
     login: Mutex::new(Login::default()),
     reconnects: Mutex::new(supervisor::reconnect_limiter()),
-    network: Mutex::new(NetworkState { available: true, metered: false, lost_at: None }),
+    network: Mutex::new(NetworkState { available: true, metered: false, lost_at: None, handle: None }),
+    network_changes: watch::Sender::new(()),
     supervisor_tx: Mutex::new(None),
     supervisor: tokio::sync::Mutex::new(None),
 });
@@ -208,6 +237,28 @@ mod tests {
 
     fn creds(blob: &str) -> StoredCredentials {
         StoredCredentials { username: "a".into(), auth_type: 1, auth_data: blob.into() }
+    }
+
+    #[test]
+    fn network_reports() {
+        let t0 = Instant::now();
+        let mut net = NetworkState { available: true, metered: false, lost_at: None, handle: Some(1) };
+        // Nothing new for the supervisor: the same network, or only the metered flag changed.
+        assert!(net.report(true, false, Some(1), t0).is_none());
+        assert!(net.report(true, true, Some(1), t0).is_none());
+        assert!(net.metered);
+        // Another default network while one stayed available (Wi-Fi without internet -> LTE).
+        assert!(matches!(net.report(true, true, Some(2), t0), Some(Msg::NetworkChanged)));
+        assert_eq!(net.handle, Some(2));
+        // Not knowing the previous network is no change.
+        net.handle = None;
+        assert!(net.report(true, true, Some(3), t0).is_none());
+        // Lost, then back after 30 s on another network: a return with the outage.
+        assert!(matches!(net.report(false, false, None, t0), Some(Msg::Network { available: false, outage: None })));
+        assert!(net.report(false, false, None, t0 + Duration::from_secs(10)).is_none());
+        let back = net.report(true, false, Some(4), t0 + Duration::from_secs(30));
+        assert!(matches!(back, Some(Msg::Network { available: true, outage: Some(d) }) if d == Duration::from_secs(30)));
+        assert!(net.lost_at.is_none());
     }
 
     #[test]

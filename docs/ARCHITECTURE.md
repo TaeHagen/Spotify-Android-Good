@@ -210,8 +210,14 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   downloads without a network ends that wait at once (the session goes offline without a
   restore point, see §4.6). When the session is lost (no network, or it died) while this
   device plays or paused a downloaded track, that playback is not frozen for the reconnect
-  but handed to the OfflineController (§4.6). Backoff
-  1→60 s, reset once a connection stayed up 60 s (or when the network comes back), so a
+  but handed to the OfflineController (§4.6). The network changes when it comes back, or
+  when Android makes another network the default while one stays available (the `network`
+  handle of `session.setNetworkAvailable` changes, e.g. a Wi-Fi without internet stays
+  connected and mobile data takes over: the sockets librespot opened on the Wi-Fi stay bound
+  to it and fail silently). Then a backoff wait or a connect attempt starts over at once; while
+  Online the AP connection must answer a Mercury request within 5 s, else the session
+  reconnects (restoring local playback); a working one is kept. Backoff
+  1→60 s, reset once a connection stayed up 60 s (or when the network changes), so a
   connection that drops right after connecting keeps backing off; at most one attempt in
   flight; no attempts while the network is known to be down. At most 10 attempts per
   10 minutes, counted process-wide (the first attempt after a Kotlin restart is always made
@@ -410,7 +416,7 @@ for the restore and a play restores right away (one already answered restores th
 |---|---|---|
 | `session.start` | `{"credentials":{…}?,"accessToken":"…"?,"settings":EngineSettings,"initialVolume":0..65535}` | `{}` once Online (or error). `initialVolume` = current `STREAM_MUSIC` volume mapped to 0..65535 (used for the mixer and Connect so startup never changes the system volume). `accessToken` without `credentials` is a fresh login (§4.2). Cancelling only stops the wait |
 | `session.stop` | `{"releasePlayer":false}` | `{}` (≤ 10 s; runs to the end even if cancelled) |
-| `session.setNetworkAvailable` | `{"available":true,"metered":false}` | `{}` |
+| `session.setNetworkAvailable` | `{"available":true,"metered":false,"network":432902426637?}` | `{}` (`network`: the default network's `Network.getNetworkHandle`; another handle while available is a network change, §4.2) |
 | `session.updateSettings` | `EngineSettings` | `{}` |
 | `session.logout` | `{}` | `{}` (forgets the account, stops, deletes the caches; runs to the end even if cancelled) |
 | `session.zeroconfLogin` | `{"timeoutMs":180000,"deviceName":"…"}` | `{"credentials":{…}}` when another Spotify app hands over credentials (libmdns discovery; Kotlin holds a MulticastLock meanwhile). `deviceName` is advertised (the setting, else the phone model); without it the Connect name below is used |
@@ -531,8 +537,10 @@ Kotlin persists it in Room (key encrypted with the Keystore key) and sends the d
 records to `offline.setIndex` as soon as the engine starts, whatever the session state (the
 index needs no session; downloads must play while the session is still connecting, e.g. behind
 a captive portal), retrying until it went through. Natively, a `player.load` while the session
-is not online waits (at most 8 s) until the first `offline.setIndex` of the process applied, so
-a load right after a cold start (a Bluetooth resume of a downloaded track) can't overtake it.
+is not online, or without a network (also while the session still reads Online), waits (at
+most 8 s) until the first `offline.setIndex` of the process applied, so a load right after a
+cold start (a Bluetooth resume of a downloaded track, or the network lost before the first push
+finished) can't overtake it; it goes on at once when the session is online with a network.
 
 ### 6.5 Catalog JSON shapes
 
@@ -696,7 +704,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * With every start, the offline index (`offline.setIndex`, §6.4) is pushed right away,
   independent of the session state, and retried until it went through.
 * `NetworkMonitor` (ConnectivityManager default-network callback, registered only while
-  the engine is running) → `session.setNetworkAvailable`.
+  the engine is running) → `session.setNetworkAvailable` `{available, metered, network}`, where
+  `network` is the default network's handle (`Network.getNetworkHandle`, absent without one),
+  so a switch of the default network without an outage reaches the engine (§4.2).
 * `state: StateFlow<EngineState>` mirrors `session` events; `user: StateFlow<User?>`.
 * Writes reusable credentials from `credentials` events to `CredentialStore`.
 
