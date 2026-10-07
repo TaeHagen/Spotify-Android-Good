@@ -160,6 +160,8 @@ class SpotifyEngine(
     private var startCall: Deferred<Unit>? = null
     @Volatile private var lastSentNetwork: NetworkStatus? = null
     @Volatile private var lastSentSettings: EngineSettings? = null
+    /** The settings the native engine runs with (null while stopped), see [awaitSettingsApplied]. */
+    private val appliedSettings = MutableStateFlow<EngineSettings?>(null)
     @Volatile private var offlineIndexPushed = false
     @Volatile private var offlineIndexProvider: (suspend () -> List<OfflineTrackRecord>)? = null
 
@@ -418,11 +420,22 @@ class SpotifyEngine(
             offlineIndexPushed = false
             lastSentNetwork = null
             lastSentSettings = null
+            appliedSettings.value = null
             accountError = null
             updateState { EngineState(networkAvailable = it.networkAvailable) }
             _running.value = false
         }
         Log.i(TAG, "Logged out")
+    }
+
+    /**
+     * Suspends until the native engine runs with settings matching [predicate] (it confirmed a
+     * `session.updateSettings`, or started with them), at most [timeoutMs]. Returns at once while
+     * the engine is stopped: it starts with the current settings. For work that must see a
+     * setting applied first, e.g. refetching catalog pages after the explicit filter changed.
+     */
+    suspend fun awaitSettingsApplied(timeoutMs: Long, predicate: (EngineSettings) -> Boolean) {
+        withTimeoutOrNull(timeoutMs) { appliedSettings.first { it == null || predicate(it) } }
     }
 
     /** Re-issues `session.start` after a retryable error (e.g. from a "Retry" button). */
@@ -519,6 +532,8 @@ class SpotifyEngine(
         val engineSettings = settings.awaitLoaded().toEngineSettings(network.metered, deviceName)
             .copy(connectVisible = connectVisibility.snap())
         lastSentSettings = engineSettings
+        // session.start applies its settings before anything else runs on the new session.
+        appliedSettings.value = engineSettings
         runningJob?.cancel()
         runningJob = launchRunningCollectors()
         val args = SessionStartArgs(
@@ -539,6 +554,7 @@ class SpotifyEngine(
         val network = networkMonitor.status.value
         val engineSettings = (lastSentSettings ?: settings.awaitLoaded().toEngineSettings(network.metered, deviceName))
             .copy(connectVisible = connectVisibility.visible.value)
+        appliedSettings.value = engineSettings
         updateState { it.copy(session = SessionState.CONNECTING, error = accountError, nextRetryMs = null) }
         val args = SessionStartArgs(credentials = creds, settings = engineSettings, initialVolume = initialVolume())
         Log.i(TAG, "session.start (retry)")
@@ -562,6 +578,7 @@ class SpotifyEngine(
         offlineIndexPushed = false
         lastSentNetwork = null
         lastSentSettings = null
+        appliedSettings.value = null
         updateState { it.copy(session = SessionState.STOPPED, error = accountError, nextRetryMs = null) }
         _running.value = false
     }
@@ -609,7 +626,9 @@ class SpotifyEngine(
                     if (engineSettings == lastSentSettings) return@collect
                     lastSentSettings = engineSettings
                     Log.d(TAG, "session.updateSettings")
-                    callQuietly("session.updateSettings", rpc.args(engineSettings))
+                    if (callQuietly("session.updateSettings", rpc.args(engineSettings))) {
+                        appliedSettings.value = engineSettings
+                    }
                 }
         }
         launchLogged("offline-index") {
