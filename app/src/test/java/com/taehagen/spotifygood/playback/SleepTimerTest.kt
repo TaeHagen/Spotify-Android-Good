@@ -90,8 +90,10 @@ class SleepTimerTest {
     }
 
     @Test
-    fun anEarlyAlarmKeepsTheCpuAwakeUntilTheEnd() = runTest {
+    fun anEarlyAlarmKeepsTheCpuAwakeUntilTheEndWhileARemoteDevicePlays() = runTest {
         val h = Harness(this)
+        h.snapshot(remotePlaying)
+        runCurrent()
         h.timer.start(30)
         runCurrent()
         // The inexact window fired 6 minutes early.
@@ -106,6 +108,40 @@ class SleepTimerTest {
         // Within the last seconds no further stage.
         h.now = endsAt - 5_000
         h.timer.onWakeupAlarm()
+        assertEquals(2, h.wakeups.scheduled.size)
+    }
+
+    @Test
+    fun earlyStagesOnlyHoldTheCpuBrieflyWhenNoRemoteDevicePlays() = runTest {
+        val h = Harness(this)
+        // Local playback paused (BECOMING_NOISY): nothing needs the CPU before the end.
+        h.snapshot(remotePlaying.copy(source = PlaybackSource.LOCAL, status = PlaybackStatus.PAUSED))
+        runCurrent()
+        h.timer.start(60)
+        runCurrent()
+        val endsAt = h.now + 60 * 60_000L
+        h.now += 34 * 60_000L
+        h.timer.onWakeupAlarm()
+        h.now = endsAt - 4 * 60_000L
+        h.timer.onWakeupAlarm()
+        assertEquals(listOf(SleepSchedule.POKE_AWAKE_MS, SleepSchedule.POKE_AWAKE_MS), h.wakeups.holds)
+        assertEquals("each early stage re-arms", 3, h.wakeups.scheduled.size)
+        // The final stage covers the end and the pause.
+        h.now = endsAt - 5_000
+        h.timer.onWakeupAlarm()
+        assertEquals(5_000 + SleepSchedule.PAUSE_SLACK_MS, h.wakeups.holds.last())
+    }
+
+    @Test
+    fun aRemoteDeviceGetsNoLongHoldMoreThanTheLeadBeforeTheEnd() = runTest {
+        val h = Harness(this)
+        h.snapshot(remotePlaying)
+        runCurrent()
+        h.timer.start(60)
+        runCurrent()
+        h.now += 34 * 60_000L
+        h.timer.onWakeupAlarm()
+        assertEquals(listOf(SleepSchedule.POKE_AWAKE_MS), h.wakeups.holds)
         assertEquals(2, h.wakeups.scheduled.size)
     }
 
