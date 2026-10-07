@@ -34,7 +34,6 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
@@ -216,7 +215,10 @@ class SpotifyEngine(
         return withContext(Dispatchers.IO) { credentialStore.loadCredentials() }
     }
 
-    /** Supplies decrypted download records pushed to `offline.setIndex` whenever the engine starts. */
+    /**
+     * Supplies decrypted download records pushed to `offline.setIndex` as soon as the engine
+     * starts, whatever the session state (docs/ARCHITECTURE.md §6.4).
+     */
     fun setOfflineIndexProvider(provider: suspend () -> List<OfflineTrackRecord>) {
         offlineIndexProvider = provider
     }
@@ -631,12 +633,11 @@ class SpotifyEngine(
                     }
                 }
         }
+        // At once, whatever the session state: the native index needs no session, and downloads
+        // must play while the session is still connecting (a captive portal, a dead mobile link)
+        // or reconnecting. Retried until it went through; cancelled with the engine run.
         launchLogged("offline-index") {
-            combine(state.map { it.session }, settings.persisted.map { it.offlineMode }) { session, offlineMode ->
-                offlineMode || session == SessionState.ONLINE || session == SessionState.OFFLINE
-            }
-                .distinctUntilChanged()
-                .collectLatest { due -> if (due && !offlineIndexPushed) pushOfflineIndex() }
+            if (!offlineIndexPushed) pushOfflineIndex()
         }
     }
 

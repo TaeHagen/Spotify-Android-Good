@@ -483,7 +483,11 @@ Calls without `seq` apply unconditionally.
 `OfflineTrackRecord`:
 `{"uri","playedUri","fileId","format","keyHex","path","sizeBytes","normalisation":{"trackGainDb","trackPeak","albumGainDb","albumPeak"},"track":Track|"episode":Episode,"imagePath":"…"}`.
 Kotlin persists it in Room (key encrypted with the Keystore key) and sends the decrypted
-records to `offline.setIndex` each time the engine starts.
+records to `offline.setIndex` as soon as the engine starts, whatever the session state (the
+index needs no session; downloads must play while the session is still connecting, e.g. behind
+a captive portal), retrying until it went through. Natively, a `player.load` while the session
+is not online waits (at most 8 s) until the first `offline.setIndex` of the process applied, so
+a load right after a cold start (a Bluetooth resume of a downloaded track) can't overtake it.
 
 ### 6.5 Catalog JSON shapes
 
@@ -633,6 +637,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `DOWNLOAD` (DownloadWorker while running), `PRESENCE` (opt-in Connect presence).
 * When the first holder is acquired and credentials exist → `session.start`.
   When the last holder is released → after `IDLE_GRACE` (60 s) `session.stop`.
+* With every start, the offline index (`offline.setIndex`, §6.4) is pushed right away,
+  independent of the session state, and retried until it went through.
 * `NetworkMonitor` (ConnectivityManager default-network callback, registered only while
   the engine is running) → `session.setNetworkAvailable`.
 * `state: StateFlow<EngineState>` mirrors `session` events; `user: StateFlow<User?>`.
@@ -650,7 +656,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   stop on `expired_token`/`access_denied`) only while the login screen is visible: polling
   pauses when the app goes to the background or the screen leaves composition (e.g. while the
   code is approved in the Custom Tab) and resumes when it is shown again, and stops when the
-  screen is left for good (activity finished) before a token arrived. The device code is
+  screen is left for good (activity finished) before a token arrived. The same applies when a
+  silent refresh-token login fails and the flow falls back to a code: hidden or closed meanwhile,
+  it pauses or stops instead of polling without a screen. The device code is
   persisted (≤ expiry) so polling resumes after process death. No local server.
 * **Fallback:** OAuth Authorization Code + PKCE with the desktop client id
   `65b708073fc0480ea92a077233ca87bd`, redirect `http://127.0.0.1:5588/login` (fallback

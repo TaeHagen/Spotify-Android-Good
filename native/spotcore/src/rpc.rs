@@ -87,9 +87,21 @@ async fn route(method: &str, args: Value) -> AppResult<Value> {
     let namespace = method.split('.').next().unwrap_or_default();
     match namespace {
         "session" => engine::handle(method, args).await,
-        "player" | "queue" | "connect" => connect::handle(method, args).await,
+        "player" | "queue" | "connect" => {
+            if method == "player.load" && !engine::is_online() {
+                // A load that may be routed offline needs the downloads index.
+                engine::await_offline_index(engine::OFFLINE_INDEX_WAIT).await;
+            }
+            connect::handle(method, args).await
+        }
         "catalog" | "library" | "playlist" => catalog::handle(method, args).await,
-        "download" | "offline" => offline::handle(method, args).await,
+        "download" | "offline" => {
+            let result = offline::handle(method, args).await;
+            if method == "offline.setIndex" && result.is_ok() {
+                engine::offline_index_received();
+            }
+            result
+        }
         _ => Err(AppError::invalid(format!("unknown method {method}"))),
     }
 }

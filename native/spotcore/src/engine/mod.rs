@@ -31,6 +31,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use state::{shared, update_status};
 use std::future::Future;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use supervisor::Msg;
 use tokio::sync::watch;
@@ -70,6 +71,50 @@ pub fn is_online() -> bool {
 /// Becomes `true` whenever a session is online. Useful for work that must wait for a connection.
 pub fn online_watch() -> watch::Receiver<bool> {
     shared().online.subscribe()
+}
+
+/// `true` once the first `offline.setIndex` of the process applied. Kotlin pushes the index at
+/// every engine start, whatever the session state (docs/ARCHITECTURE.md §6.4).
+static OFFLINE_INDEX_READY: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::Sender::new(false));
+
+/// How long a `player.load` that may be routed offline waits for the offline index.
+pub(crate) const OFFLINE_INDEX_WAIT: Duration = Duration::from_secs(8);
+
+/// `offline.setIndex` applied (called by the RPC dispatch).
+pub(crate) fn offline_index_received() {
+    OFFLINE_INDEX_READY.send_replace(true);
+}
+
+/// Holds a `player.load` until it can be routed knowing the downloads: the offline index of
+/// this process arrived, or the session is online (then Spirc plays everything). At most
+/// `bound`. Right after a cold start (a Bluetooth resume of a downloaded track with no network)
+/// the load can otherwise overtake Kotlin's first index push and fail as "not available offline".
+pub(crate) async fn await_offline_index(bound: Duration) {
+    wait_for_offline_index(OFFLINE_INDEX_READY.subscribe(), online_watch(), is_online, bound).await;
+}
+
+async fn wait_for_offline_index(
+    mut ready: watch::Receiver<bool>,
+    mut online: watch::Receiver<bool>,
+    is_online: impl Fn() -> bool,
+    bound: Duration,
+) -> bool {
+    let wait = async {
+        loop {
+            if *ready.borrow_and_update() || is_online() {
+                return;
+            }
+            tokio::select! {
+                r = ready.changed() => if r.is_err() { return },
+                r = online.changed() => if r.is_err() { return },
+            }
+        }
+    };
+    let arrived = tokio::time::timeout(bound, wait).await.is_ok();
+    if !arrived {
+        log::info!("the offline index hasn't arrived yet, routing the load anyway");
+    }
+    arrived
 }
 
 /// Whether a connect attempt is in flight: `Connecting`, `Reconnecting` outside a backoff wait,
@@ -659,6 +704,33 @@ mod tests {
             s.state = SessionState::Stopped;
             s.stopping = false;
         });
+    }
+
+    #[tokio::test]
+    async fn a_load_waits_for_the_offline_index() {
+        let bound = Duration::from_millis(500);
+        // Already there: no wait.
+        let (ready, _) = watch::channel(true);
+        let (_online_tx, online) = watch::channel(false);
+        assert!(wait_for_offline_index(ready.subscribe(), online.clone(), || false, bound).await);
+
+        // Cold start without network: the load waits until Kotlin's first push applied.
+        let (ready, _) = watch::channel(false);
+        let waiter = tokio::spawn(wait_for_offline_index(ready.subscribe(), online.clone(), || false, bound));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+        ready.send_replace(true);
+        assert!(waiter.await.expect("join"));
+
+        // Online: Spirc plays everything, no wait for the index.
+        let (ready, _) = watch::channel(false);
+        assert!(wait_for_offline_index(ready.subscribe(), online.clone(), || true, bound).await);
+
+        // Never pushed: bounded.
+        let (ready, _) = watch::channel(false);
+        let started = std::time::Instant::now();
+        assert!(!wait_for_offline_index(ready.subscribe(), online, || false, Duration::from_millis(100)).await);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

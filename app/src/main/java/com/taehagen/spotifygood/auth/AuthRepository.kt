@@ -117,6 +117,12 @@ class AuthRepository(
     private var tokenObtained = false
     /** The device flow was paused by [onLoginScreenHidden]; [onLoginScreenShown] resumes it. */
     private var devicePaused = false
+    /**
+     * What the login screen last reported. A device flow that has no token (yet, or again after
+     * its refresh-token login failed) only requests and polls a code while it is visible.
+     */
+    private var screenVisible = true
+    private var screenGone = false
 
     /** Held by [whileLoggingOut]; a flow waits for it before handing a login to the engine. */
     private val logoutGate = Mutex()
@@ -205,6 +211,10 @@ class AuthRepository(
      * that was paused, or one persisted before process death.
      */
     fun onLoginScreenShown() {
+        synchronized(lock) {
+            screenVisible = true
+            screenGone = false
+        }
         scope.launch {
             val idle = synchronized(lock) {
                 if (devicePaused && flowJob?.isActive != true) {
@@ -229,6 +239,8 @@ class AuthRepository(
      */
     fun onLoginScreenHidden() {
         synchronized(lock) {
+            // Also applies later to a flow that holds a token now, should its login fail.
+            screenVisible = false
             when (flowKind) {
                 FlowKind.ZEROCONF -> if (_state.value == LoginState.WaitingForDevice) {
                     Log.i(TAG, "Login screen hidden: stopping zeroconf")
@@ -248,8 +260,41 @@ class AuthRepository(
 
     /** The login screen is gone for good (activity finished): cancels flows without a token. */
     fun onLoginScreenLeft() {
-        val abandon = synchronized(lock) { devicePaused || (flowKind != null && !tokenObtained) }
+        val abandon = synchronized(lock) {
+            screenVisible = false
+            screenGone = true
+            devicePaused || (flowKind != null && !tokenObtained)
+        }
         if (abandon) cancel()
+    }
+
+    /**
+     * For a device flow [id] without a token, about to request or poll a code: applies what the
+     * screen did meanwhile (e.g. while a refresh-token login was in progress). Gone: the flow is
+     * cancelled and its code forgotten. Hidden: paused, resumed by [onLoginScreenShown]. Returns
+     * whether the flow may go on.
+     */
+    private fun deviceFlowMayPoll(id: Long): Boolean {
+        val action = synchronized(lock) {
+            if (id != flowId) return false
+            when (val action = deviceFlowAction(screenVisible, screenGone)) {
+                DeviceFlowAction.CONTINUE -> return true
+                DeviceFlowAction.PAUSE -> {
+                    Log.i(TAG, "Login screen hidden: pausing the device login")
+                    stopFlowLocked()
+                    devicePaused = true
+                    action
+                }
+                DeviceFlowAction.ABANDON -> {
+                    Log.i(TAG, "Login screen gone: stopping the device login")
+                    stopFlowLocked()
+                    _state.value = LoginState.Idle
+                    action
+                }
+            }
+        }
+        if (action == DeviceFlowAction.ABANDON) scope.launch(Dispatchers.IO) { clearPendingDeviceLogin() }
+        return false
     }
 
     /**
@@ -334,12 +379,15 @@ class AuthRepository(
             return
         }
         if (tryRefreshLogin(id)) return
+        // The screen may have been hidden or closed while a refresh-token login ran.
+        if (!deviceFlowMayPoll(id)) return
         val resumed = withContext(Dispatchers.IO) { pendingStore.load() }
             ?.takeIf { it.expiresAtMs - System.currentTimeMillis() > MIN_REMAINING_MS }
         val login = resumed ?: run {
             setState(id, LoginState.Connecting)
             accounts.requestDeviceAuthorization().also { withContext(Dispatchers.IO) { pendingStore.save(it) } }
         }
+        if (!deviceFlowMayPoll(id)) return
         Log.i(TAG, if (resumed != null) "Resuming device login" else "Device login started")
         setState(
             id,
@@ -519,3 +567,15 @@ internal fun isAccountRejection(code: String?): Boolean =
  * engine refused a logged-out account, or every later "Log in" would silently reuse it.
  */
 internal fun keepsRefreshToken(code: String?, loggedIn: Boolean): Boolean = loggedIn || !isAccountRejection(code)
+
+internal enum class DeviceFlowAction { CONTINUE, PAUSE, ABANDON }
+
+/**
+ * What a device flow without a token does before requesting or polling a code, given what the
+ * login screen reported: poll only while it is visible (docs/ARCHITECTURE.md §9.3).
+ */
+internal fun deviceFlowAction(screenVisible: Boolean, screenGone: Boolean): DeviceFlowAction = when {
+    screenGone -> DeviceFlowAction.ABANDON
+    !screenVisible -> DeviceFlowAction.PAUSE
+    else -> DeviceFlowAction.CONTINUE
+}
