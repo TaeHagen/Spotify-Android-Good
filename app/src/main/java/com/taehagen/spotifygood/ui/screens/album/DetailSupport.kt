@@ -24,6 +24,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -152,7 +153,7 @@ internal abstract class DetailViewModel(
     protected val playbackInfo: Flow<PlaybackInfo> =
         graph.playback.snapshot.map { it.toPlaybackInfo() }.distinctUntilChanged()
 
-    protected val offline: Flow<Boolean> = graph.offlineFlow()
+    protected val offline: StateFlow<Boolean> = graph.offlineFlow()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     fun retry() {
@@ -206,8 +207,15 @@ internal abstract class DetailViewModel(
         }
     }
 
-    /** Smart shuffle button: toggles it for the current context, otherwise starts the context with it. */
+    /**
+     * Smart shuffle button: toggles it for the current context, otherwise starts the context with it.
+     * Offline the engine rejects smart shuffle (no recommendations), so plain shuffle is used.
+     */
     fun smartShuffleContext() {
+        if (offline.value) {
+            shuffleContext()
+            return
+        }
         val playback = currentPlayback()
         if (playback.isContext(contextUri)) {
             graph.player.setSmartShuffle(!playback.smartShuffle)

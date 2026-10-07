@@ -5,11 +5,13 @@ import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
+import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Lyrics
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.playback.SleepTimerState
+import com.taehagen.spotifygood.ui.screens.album.offlineFlow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -31,6 +33,7 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -94,6 +97,7 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
     private val outputs = graph.outputs
     private val devices = graph.devices
     private val resumeStore = graph.resumeStore
+    private val downloads = graph.downloads
 
     /**
      * The last local session (ResumeStore) as a paused placeholder, while the engine has nothing
@@ -162,6 +166,38 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
     val isLiked: StateFlow<Boolean> = currentUri
         .flatMapLatest { uri -> if (uri == null) flowOf(false) else library.isSaved(uri).catch { emit(false) } }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), false)
+
+    /**
+     * (uri, downloaded cover path) of the current item; the path is null until it is downloaded.
+     * Watches only the current item's download state and reads its cover once it is complete (a
+     * cover never changes), instead of mapping every download row on each progress update.
+     */
+    private val downloadedCover: Flow<Pair<String, String?>?> = currentUri
+        .flatMapLatest { uri ->
+            if (uri == null) {
+                flowOf(null)
+            } else {
+                downloads.state(uri)
+                    .map { it == DownloadState.COMPLETED }
+                    .distinctUntilChanged()
+                    .mapLatest { done -> uri to if (done) coverPath(uri) else null }
+            }
+        }
+        .catch { emit(null) }
+
+    private suspend fun coverPath(uri: String): String? =
+        downloads.items.first().firstOrNull { it.uri == uri }?.imagePath?.takeIf { it.isNotBlank() }
+
+    /** Artwork of the current item: its downloaded cover offline, else the CDN image ([playerArtwork]). */
+    val artwork: StateFlow<String?> = combine(
+        snapshot.map { s -> s.track?.let { it.uri to it.imageUrl } }.distinctUntilChanged(),
+        downloadedCover,
+        graph.offlineFlow(),
+    ) { current, cover, offline ->
+        current?.let { (uri, imageUrl) -> playerArtwork(imageUrl, cover?.takeIf { it.first == uri }?.second, offline) }
+    }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), snapshot.value.track?.imageUrl)
 
     val indicator: StateFlow<DeviceIndicator> = combine(snapshot, outputs.current) { s, output -> deviceIndicator(s, output) }
         .distinctUntilChanged()

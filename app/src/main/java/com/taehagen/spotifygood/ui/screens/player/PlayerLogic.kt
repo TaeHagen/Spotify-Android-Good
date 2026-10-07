@@ -50,6 +50,15 @@ internal fun formatPlaybackTime(ms: Long): String {
     }
 }
 
+/**
+ * Image of the current item for the player surfaces. Offline (or without a CDN image) a downloaded
+ * item shows its downloaded cover ([downloadedCover], an absolute file path, see
+ * [com.taehagen.spotifygood.ui.components.imageData]), so there is artwork without a network;
+ * otherwise the CDN image.
+ */
+internal fun playerArtwork(imageUrl: String?, downloadedCover: String?, offline: Boolean): String? =
+    if (downloadedCover != null && (offline || imageUrl.isNullOrBlank())) downloadedCover else imageUrl
+
 /** Duration of the snapshot's current item, preferring the engine's value. */
 internal fun PlaybackSnapshot.effectiveDurationMs(): Long =
     if (durationMs > 0) durationMs else track?.durationMs ?: 0L

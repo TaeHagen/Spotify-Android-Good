@@ -56,6 +56,8 @@ internal fun MiniPlayerContent(onExpand: () -> Unit, modifier: Modifier = Modifi
     val snapshot by viewModel.snapshot.collectAsStateWithLifecycle()
     val liked by viewModel.isLiked.collectAsStateWithLifecycle()
     val indicator by viewModel.indicator.collectAsStateWithLifecycle()
+    // The downloaded cover while offline, so there is artwork without a network.
+    val artwork by viewModel.artwork.collectAsStateWithLifecycle()
     val navigator = LocalAppNavigator.current
     val context = LocalContext.current
 
@@ -69,7 +71,7 @@ internal fun MiniPlayerContent(onExpand: () -> Unit, modifier: Modifier = Modifi
 
     val track = snapshot.track ?: return
     // Read only in the draw phase: the colour animates on every track change.
-    val artworkColor = rememberArtworkColor(track.imageUrl)
+    val artworkColor = rememberArtworkColor(artwork)
     val restrictions = snapshot.restrictions
     val title = track.name ?: stringResource(R.string.player_track_loading)
     val artists = track.artistLine
@@ -117,7 +119,7 @@ internal fun MiniPlayerContent(onExpand: () -> Unit, modifier: Modifier = Modifi
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Artwork(
-                                url = track.imageUrl,
+                                url = artwork,
                                 contentDescription = null,
                                 modifier = Modifier.size(40.dp),
                             )
