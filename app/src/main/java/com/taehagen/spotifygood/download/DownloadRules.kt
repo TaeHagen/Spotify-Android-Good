@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.download
 
 import com.taehagen.spotifygood.auth.KeystoreUnavailableException
+import com.taehagen.spotifygood.data.db.RetryRow
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import kotlinx.coroutines.flow.Flow
@@ -253,6 +254,17 @@ internal object DownloadRules {
         val unavailable = if (complete) listedUnavailable else (old - listed) + listedUnavailable
         return Availability(unavailable, old.filterTo(HashSet()) { it in listed && it !in listedUnavailable })
     }
+
+    /**
+     * The failed and cancelled downloads "Retry failed" puts back into the queue: all of them except
+     * members a downloaded collection records as not playable here ([unavailable]) and downloads that
+     * re-validation failed as no longer playable (error [unplayableReason]). Those would only fail
+     * again; a sync queues them once the catalog reports them playable.
+     */
+    fun retryable(rows: List<RetryRow>, unavailable: Set<String>, unplayableReason: String): List<String> =
+        rows.filter { row ->
+            row.uri !in unavailable && !(row.state == DownloadState.FAILED && row.error == unplayableReason)
+        }.map { it.uri }
 
     /**
      * Members queued by a sync ([queued]) that must also leave a failed row: the ones that became

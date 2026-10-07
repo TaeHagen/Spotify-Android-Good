@@ -405,12 +405,17 @@ class DownloadManager(
 
     /**
      * Puts failed and cancelled downloads back into the queue and (re)starts the queue, also when only
-     * pending items wait (a run stopped because storage was full).
+     * pending items wait (a run stopped because storage was full). Downloads that are not playable
+     * here ([DownloadRules.retryable]) stay failed: they would only fail again.
      */
     suspend fun retryFailed(): Unit = scope.detached { retryFailedNow() }
 
     private suspend fun retryFailedNow() {
-        dao.requeueFailed()
+        mutex.withLock {
+            val unavailable = collectionDao.unavailableUrisJsons().flatMapTo(HashSet()) { decodeItems(it) }
+            val uris = DownloadRules.retryable(dao.retryRows(), unavailable, appContext.getString(R.string.data_dl_error_unplayable))
+            uris.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+        }
         scheduleExecution(kick = true)
     }
 
