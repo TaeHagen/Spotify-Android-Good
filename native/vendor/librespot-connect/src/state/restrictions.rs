@@ -5,6 +5,9 @@ use crate::state::provider::IsProvider;
 use librespot_protocol::player::Restrictions;
 use protobuf::MessageField;
 
+// SPOTIFYGOOD: module level for the snapshot (can_skip_prev)
+pub(super) const NO_PREV: &str = "no previous tracks";
+
 impl ConnectState {
     pub fn clear_restrictions(&mut self) {
         let player = self.player_mut();
@@ -14,7 +17,6 @@ impl ConnectState {
     }
 
     pub fn update_restrictions(&mut self) {
-        const NO_PREV: &str = "no previous tracks";
         const AUTOPLAY: &str = "autoplay";
 
         let prev_tracks_is_empty = self.prev_tracks().is_empty();

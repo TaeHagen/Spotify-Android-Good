@@ -17,6 +17,7 @@ use crate::{
         tracks::IDENTIFIER_DELIMITER,
     },
 };
+use protobuf::MessageField;
 use std::collections::HashSet;
 
 const CONTEXT_URI: &str = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
@@ -319,7 +320,8 @@ fn snapshot_maps_tracks() {
     assert_eq!(snapshot.playback_speed, 0.);
     assert_eq!(snapshot.last_error.as_deref(), Some("x: y"));
     assert!(snapshot.repeat_context);
-    assert!(!snapshot.can_skip_prev);
+    // previous restarts the first track
+    assert!(snapshot.can_skip_prev);
     assert!(snapshot.can_skip_next);
 
     let track = snapshot.track.unwrap();
@@ -1016,6 +1018,34 @@ fn repeat_toggle_keeps_the_autoplay_tracks_that_were_in_the_next_tracks() {
     state.handle_set_repeat_context(false).unwrap();
     let played = play_through(&mut state, 4);
     assert_eq!(played, ["uid1", "uid2", "a0", "a1"]);
+}
+
+#[test]
+fn previous_is_available_whenever_a_track_plays() {
+    let can_skip_prev =
+        |state: &ConnectState| state.snapshot(SnapshotPlayStatus::Playing, 0, None).can_skip_prev;
+
+    // the first track of a load
+    let (_rt, mut state) = state(20);
+    state.reset_playback_to_position(Some(0)).unwrap();
+    assert!(state.prev_tracks().is_empty());
+    assert!(can_skip_prev(&state));
+
+    // after a shuffle, which clears the prev tracks
+    state.shuffle_new().unwrap();
+    assert!(state.prev_tracks().is_empty());
+    assert!(can_skip_prev(&state));
+
+    // without a previous track nothing changes (spirc restarts the current track)
+    let current = state.current_track(|t| t.uid.clone());
+    let next = next_uids(&state);
+    assert!(state.prev_track().unwrap().is_none());
+    assert_eq!(state.current_track(|t| t.uid.clone()), current);
+    assert_eq!(next_uids(&state), next);
+
+    // nothing to restart without a track
+    state.player_mut().track = MessageField::none();
+    assert!(!can_skip_prev(&state));
 }
 
 /// compile time check: the engine spawns the task and shares the handle between threads

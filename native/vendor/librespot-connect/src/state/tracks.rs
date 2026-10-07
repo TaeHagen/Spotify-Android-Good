@@ -169,6 +169,17 @@ impl<'ct> ConnectState {
     /// to next tracks (when from the context) and fills up the prev tracks from the
     /// current context
     pub fn prev_track(&mut self) -> Result<Option<&MessageField<ProvidedTrack>>, Error> {
+        // SPOTIFYGOOD: without a previous track nothing changes, so that the caller can restart
+        // the current track. The current track was moved to the next tracks, which left the
+        // state without one.
+        if self
+            .prev_tracks()
+            .iter()
+            .all(|t| t.uid.starts_with(IDENTIFIER_DELIMITER))
+        {
+            return Ok(None);
+        }
+
         let old_track = self.player_mut().track.take();
 
         // SPOTIFYGOOD: entries go back in after the queued tracks (they were inserted in front
