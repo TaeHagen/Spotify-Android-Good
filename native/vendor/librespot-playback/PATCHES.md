@@ -97,7 +97,7 @@ arm), which needed no change.
 | `src/lib.rs` | `pub mod offline;` |
 | `src/config.rs` | `PlayerConfig::offline_source` (+ default `None`); `NormalisationSettings` + helpers. |
 | `player.rs` imports | `process::exit` removed; `FutureExt` instead of `TryFutureExt`; new imports. |
-| `player.rs` consts | `AUDIO_KEY_RETRIES = 3`, `AUDIO_KEY_RETRY_DELAY = 1 s`, `PLAYER_RUNTIME_WORKER_THREADS = 1`, `LOADER_JOIN_TIMEOUT = 1 s`, `LOADER_JOIN_POLL = 10 ms`, `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT = 250 ms`. |
+| `player.rs` consts | `AUDIO_KEY_RETRIES = 3`, `AUDIO_KEY_RETRY_DELAY = 1 s`, `PLAYER_RUNTIME_WORKER_THREADS = 1`, `LOADER_JOIN_TIMEOUT = 1 s`, `LOADER_JOIN_POLL = 10 ms`, `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT = 250 ms`, `AUDIO_KEY_COOLDOWN = 30 s`. |
 | `UnavailableReason`, `KeyFailure`, `classify_audio_key_error` | New. Classification: `is_permanent_denial` → abort; session invalid / `SessionError::NotConnected` → no retry; everything else → retry. |
 | `PlayerCommand` | `SetOfflineSource`, `SetBitrate`, `SetNormalisation`, `SetGapless` (+ `Debug` arms). |
 | `PlayerEvent::Unavailable` | `reason` field. |
@@ -106,7 +106,9 @@ arm), which needed no change.
 | `Player::set_*` | New methods. |
 | `PlayerPreload::Loading`, `PlayerState::Loading` | loader output `Result<_, UnavailableReason>` instead of `Result<_, ()>`. |
 | `PlayerTrackLoader::load_track` / `load_remote_track` / `load_local_track` | Return `Result<PlayerLoadedTrackData, UnavailableReason>`. Offline hook. Key retry. No cache deletion after a key failure. Local files: `duration.as_secs().max(1)` (stock divides by zero for files < 1 s). |
-| `PlayerTrackLoader::request_audio_key` | New: request with retries. |
+| `PlayerTrackLoader::request_audio_key` | New: request with retries. While the cool-down runs, a single attempt. |
+| `KeyRetryBrake`, `AUDIO_KEY_BRAKE`, `audio_key_brake` | New: the process-wide key-retry cool-down. Retries that run out on a transient failure start `AUDIO_KEY_COOLDOWN`; a key ends it. |
+| `mod spotifygood_tests` | New: unit tests for the cool-down (`cargo test -p librespot-playback --lib spotifygood`). |
 | poll loop | `Unavailable` carries the reason (load and preload). The `else { exit(1) }` after a failed sink start is now a debug log; the player is already paused. |
 | `PlayerState::{is_playing, decoder, playing_to_end_of_track, paused_to_playing, playing_to_paused}`, start-playback check, `handle_player_stop`, `handle_packet` | `exit(1)` → `panic!`. A panic only ends the player thread: `Player::is_invalid()` becomes true and the engine can create a new Player. |
 | `ensure_sink_stopped` | `sink.stop()` error: log, mark the sink closed, call the sink callback (was `exit(1)`). |
@@ -146,6 +148,10 @@ arm), which needed no change.
   * Up to 4 attempts (1 + 3 retries) with 1 s between them. Each attempt has core's 1.5 s
     timeout, so worst case ≈ 9 s before the load finishes.
   * A superseded load keeps retrying in its own thread; the result is discarded.
+  * Cool-down: once the retries ran out on a transient failure, every key request of the
+    process (all loaders and Players) makes a single attempt for `AUDIO_KEY_COOLDOWN` (30 s); a
+    failed single attempt starts it again, and any key that arrives ends it. So a run of skips
+    after throttling costs one request per track instead of four.
   * Permanent denial → `Unavailable(KeyDenied)` at once, with no "without decryption" attempt.
   * Transient exhaustion → the file is still tried without decryption (some files are not
     encrypted). If that fails → `Unavailable(KeyTemporarilyDenied)`. A cached file is never
