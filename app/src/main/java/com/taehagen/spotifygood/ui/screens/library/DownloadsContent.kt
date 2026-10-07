@@ -62,6 +62,7 @@ import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.download.CollectionType
 import com.taehagen.spotifygood.model.DownloadState
+import com.taehagen.spotifygood.ui.screens.album.canStartNow
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.MediaType
 import com.taehagen.spotifygood.model.Track
@@ -290,6 +291,8 @@ private fun DownloadsList(
                     isPlaying = state.nowPlaying.isPlaying,
                     subtitleOverride = entryStatusText(entry),
                     downloadState = entry.state,
+                    // Not downloaded yet while the session isn't online: another download would play.
+                    enabled = canStartNow(playable = true, online = state.online, downloadState = entry.state),
                     onMoreClick = { onEntryMore(entry) },
                     onLongClick = { onEntryMore(entry) },
                     trailing = if (entry.state == DownloadState.FAILED) {
@@ -320,6 +323,7 @@ private fun DownloadsList(
                     isPlaying = state.nowPlaying.isPlaying,
                     downloadState = entry.state,
                     onLongClick = { onEntryMore(entry) },
+                    enabled = canStartNow(playable = true, online = state.online, downloadState = entry.state),
                     onMoreClick = { onEntryMore(entry) },
                 )
             }

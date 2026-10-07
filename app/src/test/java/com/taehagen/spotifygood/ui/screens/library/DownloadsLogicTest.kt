@@ -98,4 +98,29 @@ class DownloadsLogicTest {
         assertEquals(listOf("a", "c"), c.playableUris(setOf("a", "c"), offline = true))
         assertEquals(listOf("a", "b", "c"), c.playableUris(setOf("a"), offline = false))
     }
+
+    private fun entry(uri: String, state: DownloadState, explicit: Boolean = false) =
+        DownloadEntry(uri, state, 0, 0, null, Track(uri, uri, explicit = explicit), null)
+
+    private val a = entry("spotify:track:a", DownloadState.COMPLETED)
+    private val b = entry("spotify:track:b", DownloadState.FAILED)
+    private val c = entry("spotify:track:c", DownloadState.COMPLETED)
+    private val e = entry("spotify:track:e", DownloadState.COMPLETED, explicit = true)
+
+    @Test
+    fun whileConnectingATapOnAnEntryThatIsntDownloadedLoadsNothing() {
+        // The offline queue would skip b and start c.
+        assertEquals(EntryPlay.NotDownloaded, planEntryPlay(b, listOf(a, b, c), online = false, filterExplicit = false))
+        assertEquals(EntryPlay.Tracks(listOf(a.uri, c.uri), 1), planEntryPlay(c, listOf(a, b, c), online = false, filterExplicit = false))
+        assertEquals(EntryPlay.Tracks(listOf(a.uri, b.uri, c.uri), 1), planEntryPlay(b, listOf(a, b, c), online = true, filterExplicit = false))
+    }
+
+    @Test
+    fun explicitEntriesDontStartWhileFiltered() {
+        assertEquals(EntryPlay.Unavailable, planEntryPlay(e, listOf(a, e, c), online = true, filterExplicit = true))
+        assertEquals(EntryPlay.Tracks(listOf(a.uri, c.uri), 1), planEntryPlay(c, listOf(a, e, c), online = true, filterExplicit = true))
+        assertEquals(EntryPlay.Tracks(listOf(a.uri, e.uri, c.uri), 1), planEntryPlay(e, listOf(a, e, c), online = true, filterExplicit = false))
+        val shown = DownloadsContent(songs = listOf(a, e)).withExplicitFilter(true)
+        assertEquals(listOf(true, false), shown.songs.map { it.track!!.playable })
+    }
 }
