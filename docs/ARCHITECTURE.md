@@ -791,7 +791,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   set-media-items (Auto/Assistant/resumption), device volume only when remote (relative
   steps accumulate from the last sent target for 2 s), seek back/forward 15 s for episodes.
   Handlers complete once the next snapshot arrives (≤ 2 s); set-media-items only once a snapshot
-  shows a track or remote playback, or the start failed (≤ 15 s after the load went through), so
+  shows a local track (never another device's remote snapshot, which a cold pull passes
+  through), or the start failed (≤ 15 s after the load went through), so
   Media3's BUFFERING placeholder, and with it the notification and the foreground, lasts over a
   cold session's trackless snapshots (engine start, Spirc activation before the context resolved).
   With an empty timeline Media3 drops the notification and the foreground, so the service does
@@ -904,7 +905,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `OnRoutingChangedListener`, and listens with `AudioDeviceCallback` (registered only
   while the engine runs).
 * User selection → `AudioSinkBridge.setPreferredDevice(AudioDeviceInfo?)` (`null` =
-  system default; best effort — verify with `routedDevice()`). "More devices…" opens the
+  system default; best effort — verify with `routedDevice()`). A pick is temporary, like the
+  system switcher's (`OutputPick`): it lasts until that device goes away, a new external output
+  connects (Bluetooth, wired, USB, hearing aid, car, HDMI not present at the pick: it takes
+  over), the engine stops or logs out, or the user picks "Automatic". "More devices…" opens the
   system output switcher via `androidx.mediarouter.app.SystemOutputSwitcherDialogController
   .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — lists Bluetooth and
   other system audio outputs not yet connected (the app does not cast). Never use `setCommunicationDevice` for media.

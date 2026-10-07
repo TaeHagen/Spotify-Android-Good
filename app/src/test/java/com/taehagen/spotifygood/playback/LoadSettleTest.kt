@@ -40,8 +40,32 @@ class LoadSettleTest {
         assertTrue(settled.await())
     }
 
+    /** Another device of the account, active (paused) before this phone activates. */
+    private val desktop = PlaybackSnapshot(
+        source = PlaybackSource.REMOTE,
+        status = PlaybackStatus.PAUSED,
+        activeDevice = ActiveDeviceRef("desk", "Desktop"),
+        track = PlaybackTrack(uri = "spotify:track:d"),
+    )
+
     @Test
-    fun aFailedStartOrRemotePlaybackSettlesToo() = runTest {
+    fun aColdPullPastAnotherActiveDeviceSettlesOnlyOnItsOwnTrack() = runTest {
+        val snapshots = MutableStateFlow(cold)
+        val failure = MutableStateFlow<PlaybackFailure?>(null)
+        val settled = async { LoadSettle.await(cold, snapshots, failure, timeoutMs = 15_000) }
+        runCurrent()
+        for (s in listOf(none, desktop, activated)) {
+            snapshots.value = s
+            runCurrent()
+            assertFalse(settled.isCompleted)
+        }
+        snapshots.value = loading
+        runCurrent()
+        assertTrue(settled.await())
+    }
+
+    @Test
+    fun aFailedStartSettlesRemotePlaybackDoesNot() = runTest {
         val snapshots = MutableStateFlow(none)
         val failure = MutableStateFlow<PlaybackFailure?>(null)
         val failed = async { LoadSettle.await(cold, snapshots, failure, timeoutMs = 15_000) }
@@ -51,7 +75,10 @@ class LoadSettleTest {
         runCurrent()
         assertTrue(failed.await())
 
-        assertTrue(LoadSettle.isSettled(cold, PlaybackSnapshot(source = PlaybackSource.REMOTE), failed = false))
+        assertFalse(LoadSettle.isSettled(cold, PlaybackSnapshot(source = PlaybackSource.REMOTE), failed = false))
+        assertFalse(LoadSettle.isSettled(cold, desktop, failed = false))
+        // The offline queue's snapshots are local.
+        assertTrue(LoadSettle.isSettled(cold, loading.copy(offline = true), failed = false))
         // The snapshot from before the load does not count, even with a track.
         assertFalse(LoadSettle.isSettled(loading, loading, failed = false))
         // Hidden entries are not a track to show.
