@@ -211,6 +211,9 @@ interface DownloadDao {
     @Query("SELECT uri FROM downloads WHERE uri IN (:uris)")
     suspend fun existingUris(uris: List<String>): List<String>
 
+    @Query("SELECT uri, state FROM downloads WHERE uri IN (:uris)")
+    suspend fun statesOf(uris: List<String>): List<DownloadStateRow>
+
     /** Completed downloads not validated since [before] (re-validation of availability). */
     @Query("SELECT uri FROM downloads WHERE state = 'completed' AND COALESCE(lastValidatedAt, completedAt, addedAt) < :before")
     suspend fun completedUrisNotValidatedSince(before: Long): List<String>

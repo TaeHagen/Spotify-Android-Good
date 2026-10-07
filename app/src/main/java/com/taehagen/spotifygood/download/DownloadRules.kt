@@ -223,6 +223,27 @@ internal object DownloadRules {
     data class Availability(val unavailable: Set<String>, val revived: Set<String>)
 
     /**
+     * The availability a resolution knows: the members that came with catalog metadata ([checked];
+     * URI-only listings such as Liked Songs only for the members that were looked up) and whether that
+     * covers every member ([complete]: a complete resolution whose members all came with metadata).
+     */
+    fun availabilityOf(items: List<CollectionResolver.Item>, resolutionComplete: Boolean): Pair<List<CollectionResolver.Item>, Boolean> {
+        val checked = items.filter { it.metadataJson != null }
+        return checked to (resolutionComplete && checked.size == items.size)
+    }
+
+    /**
+     * A collection's unavailable members after re-validation found [gone] not playable here and
+     * [playableAgain] playable again; only its own [members] are added (an unchanged playlist revision
+     * or a URI-only listing would never report them). Null when nothing changes.
+     */
+    fun adjustUnavailable(members: Collection<String>, unavailable: Set<String>, gone: Set<String>, playableAgain: Set<String>): Set<String>? {
+        val memberSet = members.toHashSet()
+        val updated = (unavailable + gone.filter { it in memberSet }) - playableAgain
+        return updated.takeIf { it != unavailable }
+    }
+
+    /**
      * Updates the [old] set of unavailable members with a resolution listing [listed] items, of which
      * [listedUnavailable] are not playable here. A [complete] resolution decides for every member; an
      * incomplete one only for the members it lists. [Availability.revived] members were unavailable
