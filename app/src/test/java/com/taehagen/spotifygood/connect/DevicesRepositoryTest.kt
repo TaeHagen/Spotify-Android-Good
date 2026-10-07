@@ -13,6 +13,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
@@ -57,6 +58,27 @@ class DevicesRepositoryTest {
         assertEquals(true, resume["shuffle"]?.jsonPrimitive?.boolean)
         assertEquals(true, resume["smartShuffle"]?.jsonPrimitive?.boolean)
         assertEquals("track", resume["repeat"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun transferCarriesTheTrackListForm() {
+        // a queued or autoplay track: its list, in play order, without the context or a shuffle
+        val session = state(null).copy(
+            shuffle = true,
+            repeat = RepeatMode.CONTEXT,
+            trackUris = listOf("spotify:track:t", "spotify:track:n"),
+        )
+        val resume = DevicesRepository.transferArgs("speaker", play = true, resume = session)["resume"]!!.jsonObject
+        assertEquals(listOf("spotify:track:t", "spotify:track:n"), resume["trackUris"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertFalse(resume.containsKey("contextUri"))
+        assertEquals(false, resume["shuffle"]?.jsonPrimitive?.boolean)
+        assertEquals("context", resume["repeat"]?.jsonPrimitive?.content)
+        // the context form sends none, nor does a list that doesn't start at the track
+        assertFalse(DevicesRepository.transferArgs("speaker", true, state("spotify:playlist:p"))["resume"]!!.jsonObject.containsKey("trackUris"))
+        val stale = state("spotify:playlist:p").copy(trackUris = listOf("spotify:track:x"))
+        val staleResume = DevicesRepository.transferArgs("speaker", true, stale)["resume"]!!.jsonObject
+        assertFalse(staleResume.containsKey("trackUris"))
+        assertEquals("spotify:playlist:p", staleResume["contextUri"]?.jsonPrimitive?.content)
     }
 
     @Test
@@ -114,6 +136,36 @@ class DevicesRepositoryTest {
         now += PendingTarget.TTL_MS / 2
         assertTrue(pending.expire("speaker"))
         assertNull(pending.value.value)
+    }
+
+    @Test
+    fun aPendingTargetNeedsItsDeviceListed() {
+        val speaker = com.taehagen.spotifygood.model.ConnectDevice(id = "speaker", name = "Living Room")
+        val phone = com.taehagen.spotifygood.model.ConnectDevice(id = "me", name = "Phone", isThisDevice = true)
+        val tv = com.taehagen.spotifygood.model.ConnectDevice(id = "tv", name = "TV")
+        assertTrue(DevicesRepository.listed("speaker", DeviceList(devices = listOf(phone, speaker))))
+        assertFalse(DevicesRepository.listed("speaker", DeviceList(devices = listOf(phone, tv))))
+        assertFalse(DevicesRepository.listed("me", DeviceList(devices = listOf(phone, speaker))))
+        assertFalse(DevicesRepository.listed("speaker", DeviceList(devices = listOf(speaker.copy(name = " ")))))
+    }
+
+    @Test
+    fun theExpiryCountsDeepSleep() = runTest {
+        // the clock jumps past the expiry while the coroutine time barely moves (the phone slept)
+        var now = 0L
+        val repo = DevicesRepository(backgroundScope, NativeRpc(Json), NativeEvents(Json), clock = { now })
+        runCurrent()
+        repo.pick("speaker")
+        runCurrent()
+        now += PendingTarget.TTL_MS
+        advanceTimeBy(DevicesRepository.EXPIRY_CHECK_MS)
+        runCurrent()
+        assertNull(repo.pendingTarget.value)
+        // and right away when the app comes back
+        repo.pick("speaker")
+        now += PendingTarget.TTL_MS
+        repo.expirePendingTarget()
+        assertNull(repo.pendingTarget.value)
     }
 
     @Test

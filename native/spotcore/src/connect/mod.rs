@@ -106,9 +106,15 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
     }
 }
 
+/// The active device per the cluster, or the one a play was just sent to (see
+/// `hub::remote_activating`).
+fn active_device() -> Option<String> {
+    hub::active_device_id().or_else(hub::remote_activating)
+}
+
 fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     let me = hub::me();
-    let active = hub::active_device_id();
+    let active = active_device();
     let input = RouteInput {
         online: engine::is_online(),
         network: engine::network_available(),
@@ -217,6 +223,14 @@ fn spirc() -> AppResult<std::sync::Arc<librespot_connect::Spirc>> {
     hub::spirc().ok_or_else(AppError::not_connected)
 }
 
+/// An explicit pull to this phone (`LoadArgs::local`, e.g. a media-session resume): with a
+/// network and a visible session it plays here whatever another device does, taking its
+/// session over like a transfer to this phone. Otherwise (no network, offline, hidden) the load
+/// is routed as usual.
+fn explicit_local(local: bool, online: bool, network: bool, spirc: bool, local_active: bool) -> Option<Target> {
+    (local && online && network && spirc).then_some(Target::Local { activate: !local_active })
+}
+
 /// The device a load names, unless it is this phone (see `LoadArgs::device_id`).
 fn load_target(args: &LoadArgs, me: &str) -> Option<String> {
     args.device_id.as_deref().map(str::trim).filter(|d| !d.is_empty() && *d != me).map(str::to_string)
@@ -233,7 +247,18 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
     await_ready(CommandKind::Load, false).await;
     // Without a network downloads play offline, also while the session still reads online.
     let downloaded = (!engine::is_online() || !engine::network_available()) && offline::has_downloaded(&args);
-    match decide(CommandKind::Load, downloaded)? {
+    let local = explicit_local(
+        args.local,
+        engine::is_online(),
+        engine::network_available(),
+        hub::spirc().is_some(),
+        hub::local_active_or_activating(),
+    );
+    let target = match local {
+        Some(target) => target,
+        None => decide(CommandKind::Load, downloaded)?,
+    };
+    match target {
         Target::Local { activate } => {
             let spirc = spirc()?;
             let request = local::load_request(&args)?;
@@ -277,6 +302,8 @@ async fn load_on(device: &str, args: &LoadArgs) -> AppResult<Value> {
         return Err(AppError::not_connected());
     }
     remote::send(device, remote::play(args, &uri::random_command_id())).await.map_err(remote::remote_error)?;
+    // Commands right after it follow it there (the cluster naming it comes later).
+    hub::set_remote_activating(device);
     restore::clear();
     offline::stop();
     ok()
@@ -319,6 +346,11 @@ async fn control(mut cmd: Ctl) -> AppResult<Value> {
     }
     await_ready(cmd.kind(), true).await;
     match decide(cmd.kind(), false)? {
+        // Active with nothing loaded (a load failed after its activation): nothing to play there,
+        // the app's own resume loads its session instead.
+        Target::Local { activate: false } if matches!(cmd, Ctl::Play | Ctl::Toggle) && hub::local_active_empty() => {
+            return Err(nothing_active());
+        }
         Target::Local { activate } => local_control(&cmd, activate)?,
         Target::Remote(device) => remote_control(&cmd, &device).await.map_err(remote::remote_error)?,
         Target::Offline => offline::control(&cmd).await?,
@@ -523,12 +555,12 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
         // Online but hidden from Spotify Connect: no cluster to tell what is active.
         return Err(route::hidden());
     }
-    let other_active = hub::active_device_id().is_some_and(|id| id != me);
+    let other_active = active_device().is_some_and(|id| id != me);
     // A paused or finished offline queue gives way to a device that took over (see `route`).
     let offline_owns = offline::is_active() && !offline::yields();
     if args.device_id == me {
         let spirc = spirc()?;
-        if hub::local_active_or_activating() {
+        if hub::local_active_or_activating() && !hub::local_active_empty() {
             if args.play {
                 local::sent(spirc.play())?;
             }
@@ -599,6 +631,7 @@ async fn push(args: &TransferArgs, other_active: bool, offline_owns: bool, froze
         remote::send(&args.device_id, remote::play(&resume, &uri::random_command_id()))
             .await
             .map_err(remote::remote_error)?;
+        hub::set_remote_activating(&args.device_id);
         return Ok(());
     }
     remote::transfer(&args.device_id, args.play).await.map_err(remote::remote_error)
@@ -845,6 +878,18 @@ mod tests {
         assert!(!stopped_with_track(Some(&ConnectSnapshot { is_active: false, ..halted.clone() })));
         assert!(!stopped_with_track(Some(&ConnectSnapshot { track: None, ..halted })));
         assert!(!stopped_with_track(None));
+    }
+
+    #[test]
+    fn an_explicit_pull_plays_here() {
+        // another device active, this one not yet: activated here
+        assert_eq!(explicit_local(true, true, true, true, false), Some(Target::Local { activate: true }));
+        assert_eq!(explicit_local(true, true, true, true, true), Some(Target::Local { activate: false }));
+        // no network, offline, hidden, or not asked for: routed as usual
+        assert_eq!(explicit_local(true, true, false, true, false), None);
+        assert_eq!(explicit_local(true, false, true, true, false), None);
+        assert_eq!(explicit_local(true, true, true, false, false), None);
+        assert_eq!(explicit_local(false, true, true, true, false), None);
     }
 
     #[test]

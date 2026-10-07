@@ -91,6 +91,8 @@ pub(crate) struct Frozen {
     pub was_playing: bool,
     /// A user's play / pause while the restore was pending: whether it starts playing.
     pub intent: Option<Intent>,
+    /// Restore loads of this point that failed (see [`on_load_failed`]).
+    pub failed_loads: u8,
 }
 
 /// Time from `since` / `at_ms` (the same moment on both clocks) to `now` / `now_ms`. `Instant`
@@ -142,7 +144,7 @@ pub(crate) fn position_now(s: &ConnectSnapshot, now_ms: i64) -> i64 {
 
 pub(crate) fn freeze(snap: ConnectSnapshot, now_ms: i64, since: Instant) -> Frozen {
     let was_playing = matches!(snap.status, SnapshotPlayStatus::Playing | SnapshotPlayStatus::LoadingPlay);
-    Frozen { position_ms: position_now(&snap, now_ms), at_ms: now_ms, since, was_playing, snap, intent: None }
+    Frozen { position_ms: position_now(&snap, now_ms), at_ms: now_ms, since, was_playing, snap, intent: None, failed_loads: 0 }
 }
 
 #[derive(Debug)]
@@ -330,6 +332,51 @@ pub(crate) struct Taken {
     pub frozen: Frozen,
     /// Its restore was being applied to the attached Spirc (see [`Restoring`]).
     pub applying: bool,
+}
+
+/// A failed restore load may run again this many times (a Play while the restore is overdue);
+/// after that the restore point goes (the app's own resume then loads the session).
+const RESTORE_LOAD_RETRIES: u8 = 1;
+
+/// This device's Spirc reported a failed load. If it was the restore's, the restore point comes
+/// back as pending and overdue (a Play restores right away, a connection lost meanwhile freezes it
+/// again), at most [`RESTORE_LOAD_RETRIES`] times, and the Spirc, active with nothing loaded,
+/// goes inactive (a Play there did nothing, and other devices saw it active).
+pub(crate) fn on_load_failed() {
+    let spirc = {
+        let mut hub = HUB.lock();
+        let Some((generation, spirc)) = hub.link.as_ref().map(|l| (l.generation, l.spirc.clone())) else { return };
+        if load_failed_in(&mut hub, generation).is_none() {
+            return;
+        }
+        spirc
+    };
+    if let Err(e) = spirc.disconnect(false) {
+        log::debug!("spirc gone: {e}");
+    }
+    hub::changed();
+    hub::publish();
+}
+
+/// [`on_load_failed`] on the state for the attached Spirc `generation`: `None` if no restore was
+/// being applied to it, else whether the restore point was kept.
+fn load_failed_in(hub: &mut HubState, generation: u64) -> Option<bool> {
+    let r = hub.restoring.take()?;
+    if r.generation != generation {
+        return None;
+    }
+    hub.activation = None;
+    let mut frozen = r.frozen;
+    frozen.failed_loads = frozen.failed_loads.saturating_add(1);
+    let kept = frozen.failed_loads <= RESTORE_LOAD_RETRIES && hub.reconnect.is_none();
+    if kept {
+        hub.reconnect = Some(frozen);
+        hub.restore_overdue = Some(generation);
+        log::warn!("the restore's load failed, a play tries again");
+    } else {
+        log::warn!("the restore's load failed again, not restoring");
+    }
+    Some(kept)
 }
 
 /// The pending restore point, or the one being applied, without touching it: a transfer of this
@@ -1113,6 +1160,26 @@ mod tests {
         assert!(hub.restoring.is_none());
         freeze_restore_point(&mut hub, 1_010_000, frozen.since + Duration::from_secs(10));
         assert_eq!(hub.reconnect.as_ref().expect("frozen").position_ms, 20_000);
+    }
+
+    #[test]
+    fn a_failed_restore_load_keeps_the_session_once() {
+        let (mut hub, frozen) = restoring_hub();
+        assert_eq!(load_failed_in(&mut hub, 8), None, "another Spirc's restore");
+        let (mut hub, _) = restoring_hub();
+        assert_eq!(load_failed_in(&mut hub, 7), Some(true));
+        let kept = hub.reconnect.clone().expect("pending again");
+        assert_eq!((kept.position_ms, kept.failed_loads), (frozen.position_ms, 1));
+        assert_eq!(hub.restore_overdue, Some(7), "a play restores right away");
+        assert!(hub.restoring.is_none());
+        // a connection lost now keeps it for the next Spirc
+        freeze_restore_point(&mut hub, 1_010_000, frozen.since + Duration::from_secs(10));
+        assert!(hub.reconnect.is_some());
+        // the retry failed too: not restoring any more (the app's own resume loads it)
+        let Decision::Restore(_, again) = dec(&mut hub, false) else { panic!("restore") };
+        begin_restoring(&mut hub, 7, *again, frozen.since);
+        assert_eq!(load_failed_in(&mut hub, 7), Some(false));
+        assert!(hub.reconnect.is_none() && hub.restoring.is_none());
     }
 
     #[test]
