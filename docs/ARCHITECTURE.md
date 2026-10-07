@@ -827,7 +827,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
-  on a mode change and every 15 s while playing. Every resume of it (resumption, Tap to
+  on a mode change and every 15 s while playing, from local snapshots only (`ResumeSaver`):
+  when playback leaves the phone (transfer, takeover, the engine's reset) it is saved once more
+  at that moment and then stays frozen; logging out clears it, through the same writer, so a
+  save in progress never lands after the clear. Every resume of it (resumption, Tap to
   resume, "play something", the Play fallback) loads with its modes, since a load without
   them resets both to off (the Media3 resume item carries them as request extras). Offline the
   load asks for a plain shuffle instead of smart shuffle. States from older versions read with

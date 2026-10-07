@@ -51,21 +51,17 @@ import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
-import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onStart
-import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.guava.future
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -336,32 +332,15 @@ class PlaybackService : MediaLibraryService() {
             }
         }
         lifecycleScope.launch {
-            // Resume state: on every relevant change (pause, seek, track) and every 15 s while
-            // playing; the periodic part only exists while playing (transformLatest cancels it).
-            playback.snapshot
-                .filter { it.source == PlaybackSource.LOCAL && it.track != null }
-                .distinctUntilChanged { a, b ->
-                    a.track?.uri == b.track?.uri && a.context?.uri == b.context?.uri &&
-                        a.status == b.status && a.positionMs == b.positionMs &&
-                        // A mode change (also while paused) is saved too, and restarts the loop.
-                        a.shuffle == b.shuffle && a.smartShuffle == b.smartShuffle && a.repeat == b.repeat
+            // Resume state: the local session on every relevant change and every 15 s while it
+            // plays, frozen once playback leaves the phone; logging out forgets it. One collector,
+            // so a save in progress never lands after the clear.
+            ResumeSaver.actions(playback.snapshot, graph.engine.isLoggedIn, RESUME_SAVE_INTERVAL_MS).collect { action ->
+                when (action) {
+                    is ResumeSaver.Action.Save -> resumeStore.save(action.state)
+                    ResumeSaver.Action.Clear -> resumeStore.clear()
                 }
-                .transformLatest { s ->
-                    emit(ResumeState.from(s))
-                    if (s.isPlaying) {
-                        while (true) {
-                            delay(RESUME_SAVE_INTERVAL_MS)
-                            emit(ResumeState.from(s))
-                        }
-                    }
-                }
-                .filterNotNull()
-                .distinctUntilChanged()
-                .collect { resumeStore.save(it) }
-        }
-        lifecycleScope.launch {
-            // Logging out forgets what to resume.
-            graph.engine.isLoggedIn.drop(1).filter { !it }.collect { resumeStore.clear() }
+            }
         }
         lifecycleScope.launch {
             combine(
