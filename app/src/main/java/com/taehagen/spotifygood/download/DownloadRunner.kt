@@ -235,6 +235,7 @@ internal class DownloadRunner(
         _activity.value = DownloadActivity(running = true)
         try {
             host.updateNotification(notifications.progress(null, 0, 0, 0f))
+            notifications.clearDone()
             if (settings.awaitLoaded().offlineMode) return RunOutcome.STOPPED // resumed when offline mode ends
             if (!engine.awaitOnline(ONLINE_TIMEOUT_MS)) {
                 // Logged out: nothing will ever come online (logout wipes the queue anyway).
@@ -292,7 +293,14 @@ internal class DownloadRunner(
             withContext(NonCancellable) {
                 notifications.unregister(receiver)
                 holder.release()
-                if (stats.stopMessage == null) notifications.showSummary(stats.completed, stats.failed)
+                // The user's Cancel marks the queue cancelled after this block (runSession).
+                val pending = dao.pendingCount()
+                when (DownloadRules.runNotice(stats.stopMessage != null, cancelRequested, pending, stats.processed)) {
+                    DownloadRules.RunNotice.COMPLETE -> notifications.showSummary(stats.completed, stats.failed)
+                    DownloadRules.RunNotice.PAUSED ->
+                        notifications.showStopped(context.getString(R.string.data_dl_paused, stats.completed, stats.completed + pending))
+                    DownloadRules.RunNotice.NONE -> Unit
+                }
                 _activity.value = DownloadActivity(lastError = stats.stopMessage)
             }
         }
@@ -447,6 +455,7 @@ internal class DownloadRunner(
 
     private suspend fun trackProgress(uri: String, title: String?, total: Int, host: DownloadHost, stats: RunStats) {
         var lastDbWrite = 0L
+        var lastDbState: DownloadState? = null
         var lastUiUpdate = 0L
         var fileRecorded = false
         events.downloads.collect { p ->
@@ -458,8 +467,11 @@ internal class DownloadRunner(
                 recordFileId(uri)
             }
             val now = SystemClock.elapsedRealtime()
-            if (now - lastDbWrite >= DB_THROTTLE_MS) {
+            // Persisted on a state change and every few seconds only (resume / crash recovery): each
+            // write wakes every observer of the table. Live bytes go through [activity].
+            if (p.state != lastDbState || now - lastDbWrite >= DB_THROTTLE_MS) {
                 lastDbWrite = now
+                lastDbState = p.state
                 try {
                     dao.updateActiveProgress(uri, p.state, p.bytes, p.totalBytes)
                 } catch (e: CancellationException) {
@@ -632,7 +644,7 @@ internal class DownloadRunner(
         const val ONLINE_TIMEOUT_MS = 60_000L
         const val MAX_INLINE_WAIT_MS = 2 * 60_000L
         const val MIN_WAIT_MS = 250L
-        const val DB_THROTTLE_MS = 500L
+        const val DB_THROTTLE_MS = 5_000L
         const val UI_THROTTLE_MS = 1_000L
         const val NATIVE_CALL_TIMEOUT_MS = 10_000L
         const val FILE_ID_CANCEL_TIMEOUT_MS = 2_000L

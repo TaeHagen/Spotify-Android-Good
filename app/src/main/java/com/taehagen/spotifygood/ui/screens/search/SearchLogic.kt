@@ -83,6 +83,12 @@ fun SearchResults.itemsOf(type: SearchType): List<SearchItem> = when (type) {
 /** Something to show (the Top tab is "No results" otherwise); only such results are cached. */
 fun SearchResults.hasAnyResult(): Boolean = !isEmpty || topResult != null
 
+/**
+ * Whether these results may stand for their query for the rest of the session: not empty and not
+ * `partial` (a failed source, docs §6.3). Both can be transient, so they are asked for again.
+ */
+fun SearchResults.cacheable(): Boolean = hasAnyResult() && !partial
+
 fun SearchResults.topResultOrBest(): MediaRef? = topResult?.takeIf { isPlayableRef(it) }
     ?: artists.firstOrNull()?.toMediaRef()
     ?: tracks.firstOrNull { it.playable }?.toMediaRef()
