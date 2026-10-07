@@ -206,8 +206,9 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                // Offline past the cached episodes: list the downloaded ones instead of failing.
-                val copy = if (offline.value || failureReason(e) == FailureReason.OFFLINE) downloadedCopy() else null
+                // Offline past the cached episodes: list the downloaded ones instead of failing. Only
+                // when actually offline: a transient error online keeps the Retry footer.
+                val copy = if (offline.value) downloadedCopy() else null
                 list.update { latest ->
                     when {
                         latest.sort != sort -> latest

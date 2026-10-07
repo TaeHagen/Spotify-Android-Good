@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.download
 
 import com.taehagen.spotifygood.auth.KeystoreUnavailableException
+import com.taehagen.spotifygood.data.db.RetryRow
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import kotlinx.coroutines.flow.Flow
@@ -223,6 +224,27 @@ internal object DownloadRules {
     data class Availability(val unavailable: Set<String>, val revived: Set<String>)
 
     /**
+     * The availability a resolution knows: the members that came with catalog metadata ([checked];
+     * URI-only listings such as Liked Songs only for the members that were looked up) and whether that
+     * covers every member ([complete]: a complete resolution whose members all came with metadata).
+     */
+    fun availabilityOf(items: List<CollectionResolver.Item>, resolutionComplete: Boolean): Pair<List<CollectionResolver.Item>, Boolean> {
+        val checked = items.filter { it.metadataJson != null }
+        return checked to (resolutionComplete && checked.size == items.size)
+    }
+
+    /**
+     * A collection's unavailable members after re-validation found [gone] not playable here and
+     * [playableAgain] playable again; only its own [members] are added (an unchanged playlist revision
+     * or a URI-only listing would never report them). Null when nothing changes.
+     */
+    fun adjustUnavailable(members: Collection<String>, unavailable: Set<String>, gone: Set<String>, playableAgain: Set<String>): Set<String>? {
+        val memberSet = members.toHashSet()
+        val updated = (unavailable + gone.filter { it in memberSet }) - playableAgain
+        return updated.takeIf { it != unavailable }
+    }
+
+    /**
      * Updates the [old] set of unavailable members with a resolution listing [listed] items, of which
      * [listedUnavailable] are not playable here. A [complete] resolution decides for every member; an
      * incomplete one only for the members it lists. [Availability.revived] members were unavailable
@@ -232,6 +254,17 @@ internal object DownloadRules {
         val unavailable = if (complete) listedUnavailable else (old - listed) + listedUnavailable
         return Availability(unavailable, old.filterTo(HashSet()) { it in listed && it !in listedUnavailable })
     }
+
+    /**
+     * The failed and cancelled downloads "Retry failed" puts back into the queue: all of them except
+     * members a downloaded collection records as not playable here ([unavailable]) and downloads that
+     * re-validation failed as no longer playable (error [unplayableReason]). Those would only fail
+     * again; a sync queues them once the catalog reports them playable.
+     */
+    fun retryable(rows: List<RetryRow>, unavailable: Set<String>, unplayableReason: String): List<String> =
+        rows.filter { row ->
+            row.uri !in unavailable && !(row.state == DownloadState.FAILED && row.error == unplayableReason)
+        }.map { it.uri }
 
     /**
      * Members queued by a sync ([queued]) that must also leave a failed row: the ones that became

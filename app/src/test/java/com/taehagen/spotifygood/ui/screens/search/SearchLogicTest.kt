@@ -103,6 +103,30 @@ class SearchLogicTest {
     }
 
     @Test
+    fun anUnplayableSongOrEpisodeIsNeverTheTopResult() {
+        // Explicit with the filter on, or not available in this country: its card would start the
+        // album at it and Spirc would play another track.
+        val blocked = track.copy(uri = "spotify:track:blocked", playable = false)
+        val other = track.copy(uri = "spotify:track:ok")
+        val serverTop = MediaRef(MediaType.TRACK, blocked.uri, blocked.name)
+        assertEquals(other.uri, SearchResults(topResult = serverTop, tracks = listOf(blocked, other)).topResultOrBest()?.uri)
+        // Only fallback candidates (context-resolve: tracks only): the first playable one.
+        assertEquals(other.uri, SearchResults(tracks = listOf(blocked, other)).topResultOrBest()?.uri)
+        assertNull(SearchResults(tracks = listOf(blocked)).topResultOrBest())
+        val episode = com.taehagen.spotifygood.model.Episode("spotify:episode:e", "E", playable = false)
+        assertNull(SearchResults(episodes = listOf(episode)).topResultOrBest())
+    }
+
+    @Test
+    fun onlySongsAndEpisodesCanBeUnplayable() {
+        assertTrue(SearchItem.Song(track).isPlayable)
+        assertEquals(false, SearchItem.Song(track.copy(playable = false)).isPlayable)
+        assertTrue(SearchItem.ArtistItem(ArtistRef("spotify:artist:a", "A")).isPlayable)
+        val missing: SearchItem? = null
+        assertTrue(missing.isPlayable)
+    }
+
+    @Test
     fun topSectionsAreDistinctAndIndexed() {
         val results = SearchResults(tracks = List(8) { track.copy(uri = "spotify:track:$it") } + track.copy(uri = "spotify:track:0")).distinct()
         assertEquals(8, results.tracks.size)

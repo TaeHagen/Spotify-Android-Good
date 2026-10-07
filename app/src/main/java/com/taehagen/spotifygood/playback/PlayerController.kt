@@ -275,7 +275,18 @@ class PlayerController internal constructor(
     }
 
     fun clearQueue() {
-        send("queue.clear")
+        clearQueueAsync()
+    }
+
+    /** `queue.clear`; bulk adds queued before it stop (their remaining items would refill the queue). */
+    internal fun clearQueueAsync(): Deferred<Boolean> {
+        val cancelled: List<BulkAdd>
+        val done = synchronized(lock) {
+            cancelled = cancelBulkAddsLocked()
+            send("queue.clear")
+        }
+        completeCancelled(cancelled)
+        return done
     }
 
     fun skipTo(uid: String) {
@@ -285,6 +296,8 @@ class PlayerController internal constructor(
     /** Starts a radio station seeded by [uri] (track/artist/album/playlist). */
     fun startRadio(uri: String) {
         onPlaybackRequested?.invoke()
+        val cancelled = synchronized(lock) { cancelBulkAddsLocked() }
+        completeCancelled(cancelled)
         enqueue("catalog.radio", timeoutMs = LOAD_TIMEOUT_MS, startsPlayback = true) {
             val radio = json.decodeFromJsonElement<RadioContext>(transport("catalog.radio", buildJsonObject { put("uri", uri) }))
             // The station is normally a playlist context; the fallback station may be a bare track list.
@@ -312,16 +325,23 @@ class PlayerController internal constructor(
     internal fun playAsync(request: PlayRequest): Deferred<Boolean> {
         if (request.play) onPlaybackRequested?.invoke()
         lateinit var self: Command
-        return enqueue(
-            "player.load",
-            timeoutMs = LOAD_TIMEOUT_MS,
-            startsPlayback = true,
-            onQueued = { command ->
-                self = command
-                command.request = request
-                latestLoad = command
-            },
-        ) { sendLoad(self) }
+        val cancelled: List<BulkAdd>
+        // Something else is loaded: bulk adds still running belong to what was playing.
+        val done = synchronized(lock) {
+            cancelled = cancelBulkAddsLocked()
+            enqueue(
+                "player.load",
+                timeoutMs = LOAD_TIMEOUT_MS,
+                startsPlayback = true,
+                onQueued = { command ->
+                    self = command
+                    command.request = request
+                    latestLoad = command
+                },
+            ) { sendLoad(self) }
+        }
+        completeCancelled(cancelled)
+        return done
     }
 
     /** Also used by the media session (play button, Bluetooth play after a cold start). */
@@ -416,6 +436,25 @@ class PlayerController internal constructor(
         val result = CompletableDeferred<QueueAddResult>()
         /** Index of the next item (guarded by [lock]). */
         var next = 0
+        /** A queue clear or a load came after it: no further items (guarded by [lock]). */
+        var cancelled = false
+    }
+
+    /**
+     * Must hold [lock]. Cancels every bulk add queued so far: the running one stops after its
+     * current item (already queued ahead, so it keeps its place before the clear / load); waiting
+     * ones are removed and returned, to be completed outside the lock ([completeCancelled]).
+     */
+    private fun cancelBulkAddsLocked(): List<BulkAdd> {
+        if (bulkAdds.isEmpty()) return emptyList()
+        bulkAdds.forEach { it.cancelled = true }
+        val waiting = bulkAdds.drop(1)
+        while (bulkAdds.size > 1) bulkAdds.removeLast()
+        return waiting
+    }
+
+    private fun completeCancelled(bulks: List<BulkAdd>) {
+        bulks.forEach { it.result.complete(QueueAddResult(it.next, QUEUE_CHANGED)) }
     }
 
     /** Running (first) and waiting bulk adds (guarded by [lock]). */
@@ -450,9 +489,11 @@ class PlayerController internal constructor(
 
     private fun onBulkItemDone(bulk: BulkAdd, ok: Boolean, error: NativeErrorInfo?) {
         val next: BulkAdd?
+        val cancelled: Boolean
         synchronized(lock) {
             if (ok) bulk.next++
-            if (ok && bulk.next < bulk.items.size) {
+            cancelled = bulk.cancelled
+            if (ok && !cancelled && bulk.next < bulk.items.size) {
                 enqueueBulkItem(bulk)
                 return
             }
@@ -460,6 +501,7 @@ class PlayerController internal constructor(
             next = bulkAdds.firstOrNull()
         }
         val failure = when {
+            cancelled -> QUEUE_CHANGED
             !ok -> error ?: NativeErrorInfo(NativeErrorCode.NETWORK, "The device didn't respond")
             // More than a queue holds: what is left would be refused anyway.
             bulk.capped -> NativeErrorInfo(NativeErrorCode.UNAVAILABLE, "The queue is full")
@@ -772,6 +814,9 @@ class PlayerController internal constructor(
 
         /** Most items one add-to-queue sends: Connect's queue window holds no more. */
         const val MAX_QUEUE_ADD = 80
+
+        /** Result error of a bulk add stopped by a queue clear or a load (callers stay silent). */
+        private val QUEUE_CHANGED = NativeErrorInfo(NativeErrorCode.CANCELLED, "The queue changed")
 
         /** Nothing is (or can be) playing: nothing to pause / skip / seek, not worth a message. */
         private val INACTIVE_CODES = setOf(NativeErrorCode.NOT_ACTIVE_DEVICE, NativeErrorCode.NOT_CONNECTED)

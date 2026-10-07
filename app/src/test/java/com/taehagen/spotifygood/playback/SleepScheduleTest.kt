@@ -1,33 +1,63 @@
 package com.taehagen.spotifygood.playback
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SleepScheduleTest {
     private val now = 1_000_000L
+    private val minute = 60_000L
 
-    @Test
-    fun theAlarmWindowEndsAtTheTimersEnd() {
-        val endsAt = now + 30 * 60_000L
-        assertEquals(endsAt - SleepSchedule.LEAD_MS, SleepSchedule.windowStart(endsAt, now))
-        assertEquals(SleepSchedule.LEAD_MS, SleepSchedule.windowLength(endsAt, now))
+    /** AlarmManager may round the 0.75 factor down: the window ends by the end, at most 1 ms early. */
+    private fun assertWindowEndsAt(endsAt: Long, from: Long = now) {
+        val end = SleepSchedule.windowEnd(SleepSchedule.stageTrigger(endsAt, from), from)
+        assertTrue("window end $end vs $endsAt", end in (endsAt - 2)..endsAt)
     }
 
     @Test
-    fun aShortTimerStartsTheWindowNow() {
-        val endsAt = now + 5 * 60_000L
-        assertEquals(now, SleepSchedule.windowStart(endsAt, now))
-        assertEquals(5 * 60_000L, SleepSchedule.windowLength(endsAt, now))
-        // Already due: a minimal window, never a negative one.
-        assertEquals(now, SleepSchedule.windowStart(now - 10, now))
-        assertEquals(1L, SleepSchedule.windowLength(now - 10, now))
+    fun theInexactWindowEndsAtTheTimersEnd() {
+        // The 5-minute option, the usual ones, end of track and a very long timer.
+        for (length in listOf(5 * minute, 15 * minute, 30 * minute, 60 * minute, 150_000L, 3 * 60 * minute)) {
+            assertWindowEndsAt(now + length)
+        }
+        assertEquals(now + 30 * minute * 4 / 7, SleepSchedule.stageTrigger(now + 30 * minute, now))
+    }
+
+    @Test
+    fun longTimersStartTheCappedWindowAnHourBeforeTheEnd() {
+        val endsAt = now + 3 * 60 * minute
+        assertEquals(endsAt - SleepSchedule.MAX_WINDOW_MS, SleepSchedule.stageTrigger(endsAt, now))
+    }
+
+    @Test
+    fun theLastSecondsAreExact() {
+        assertEquals(now + 9_000, SleepSchedule.stageTrigger(now + 9_000, now))
+        assertEquals(now + 9_000, SleepSchedule.windowEnd(now + 9_000, now))
+        assertEquals("never in the past", now, SleepSchedule.stageTrigger(now - 5, now))
+        assertFalse(SleepSchedule.needsAnotherStage(now + 10_000, now))
+        assertTrue(SleepSchedule.needsAnotherStage(now + 10_001, now))
+    }
+
+    @Test
+    fun earlyDeliveriesConvergeInAFewStages() {
+        // Worst case: every stage is delivered at the start of its window.
+        val endsAt = now + 60 * minute
+        var t = now
+        var stages = 0
+        while (SleepSchedule.needsAnotherStage(endsAt, t)) {
+            t = SleepSchedule.stageTrigger(endsAt, t)
+            stages++
+            assertTrue(t <= endsAt)
+        }
+        assertTrue("well within the allow-while-idle quota: $stages", stages <= 10)
     }
 
     @Test
     fun awakeTimeCoversTheRestPlusThePauseRequestAndIsBounded() {
-        assertEquals(4 * 60_000L + SleepSchedule.PAUSE_SLACK_MS, SleepSchedule.awakeMs(now + 4 * 60_000L, now))
+        assertEquals(4 * minute + SleepSchedule.PAUSE_SLACK_MS, SleepSchedule.awakeMs(now + 4 * minute, now))
         assertEquals(SleepSchedule.PAUSE_SLACK_MS, SleepSchedule.awakeMs(now - 1_000, now))
-        assertEquals(SleepSchedule.LEAD_MS + SleepSchedule.PAUSE_SLACK_MS, SleepSchedule.awakeMs(now + 3_600_000L, now))
+        assertEquals(SleepSchedule.LEAD_MS + SleepSchedule.PAUSE_SLACK_MS, SleepSchedule.awakeMs(now + 60 * minute, now))
     }
 
     @Test

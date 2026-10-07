@@ -89,6 +89,24 @@ impl<T> ShuffleVec<T> {
         }
     }
 
+    // SPOTIFYGOOD: pushing onto a shuffled vec (through DerefMut) made it longer than its
+    // `indices`, so `unshuffle` stopped at its first lookup and left the order shuffled
+    /// Appends the items at the end, also of the shuffled order, so that [ShuffleVec::unshuffle]
+    /// still restores the original order (with the items at its end)
+    ///
+    /// The shuffle swapped the positions `len - 1` down to `1` with the recorded `indices`,
+    /// newest position first. Every new position is recorded as swapped with itself, which keeps
+    /// the existing ones in place.
+    pub fn extend_keep_shuffle(&mut self, items: impl IntoIterator<Item = T>) {
+        let old_len = self.vec.len();
+        self.vec.extend(items);
+        let new_len = self.vec.len();
+
+        if let Some(old) = self.indices.take() {
+            self.indices = Some((old_len..new_len).rev().chain(old).collect());
+        }
+    }
+
     pub fn unshuffle(&mut self) {
         let indices = match self.indices.take() {
             Some(indices) => indices,
@@ -194,5 +212,43 @@ mod test {
             shuffled_without_first[switched_positions[0]],
             "the switched values should be equal"
         )
+    }
+
+    // SPOTIFYGOOD: see ShuffleVec::extend_keep_shuffle
+    #[test]
+    fn test_extend_keeps_unshuffle_working() {
+        for (len, added) in [(3, 2), (100, 1), (100, 57), (2, 10)] {
+            let (base_vec, seed) = base(0..len);
+            let first = rand::rng().random_range(0..len);
+
+            let mut vec = base_vec.clone();
+            vec.shuffle_with_seed(seed, |i| i == &first);
+            let shuffled = vec.to_vec();
+
+            vec.extend_keep_shuffle(len..len + added);
+            assert_eq!(vec[..len], shuffled, "the shuffled order is kept");
+            assert_eq!(
+                vec[len..],
+                (len..len + added).collect::<Vec<_>>(),
+                "the items are appended"
+            );
+
+            vec.unshuffle();
+            assert_eq!(*vec, (0..len + added).collect::<Vec<_>>());
+
+            // and it shuffles again from the right order
+            let mut reshuffled = vec.clone();
+            reshuffled.shuffle_with_seed(seed, |_| false);
+            let mut fresh: ShuffleVec<_> = (0..len + added).collect::<Vec<_>>().into();
+            fresh.shuffle_with_seed(seed, |_| false);
+            assert_eq!(reshuffled, fresh);
+        }
+
+        // nothing to keep for a vec that was never shuffled (or had a single item)
+        let mut single: ShuffleVec<usize> = vec![0].into();
+        single.shuffle_with_seed(1, |_| false);
+        single.extend_keep_shuffle(1..4);
+        single.unshuffle();
+        assert_eq!(*single, vec![0, 1, 2, 3]);
     }
 }

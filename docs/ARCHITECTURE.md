@@ -416,7 +416,9 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 
 `scopeId` is the interface index for a link-local IPv6 host (`fe80::/10`), which a URL cannot
 carry; such a host is connected through that interface and rejected (`INVALID_ARGUMENT`) without
-one. Kotlin prefers an IPv4 address when the service has one.
+one. Kotlin probes only addresses this allowlist accepts (IPv4 first, then unique-local, then
+scoped link-local IPv6; never a global address), and re-probes with an address update that
+arrived while an earlier probe of the same service was failing.
 
 `LocalDeviceInfo`: `{"deviceId","remoteName","deviceType":<DeviceList type>,"activeUser"?,"tokenTypes":[…],"supportsAccessToken":bool,"version","brand"?,"model"?,"isGroup":bool,"availability"?}`.
 Key material (the device's DH public key, client id) never crosses the JNI boundary; Rust keeps it
@@ -772,11 +774,17 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Wake locks: Media3 `WakeLockManager` + `WifiLockManager` `setStayAwake(true)` only while
   local status is playing/loading; false otherwise.
 * Sleep timer (`SleepTimer`): coroutine delays stop while the CPU sleeps (remote playback holds
-  no wake lock), so an inexact `ELAPSED_REALTIME_WAKEUP` alarm window ending at the timer's end
-  (≤ 10 min earlier; plus an allow-while-idle alarm at the end for Doze) reaches the non-exported
-  `SleepTimerAlarmReceiver`, which pokes the timer and holds a timed partial wake lock until the
-  end + 30 s. "End of track" arms it for the snapshot's track end and re-arms on every snapshot.
-  Disarmed on cancel, replace, finish and manual pause (end of track).
+  no wake lock), so an `ELAPSED_REALTIME_WAKEUP` allow-while-idle alarm (also delivered, with
+  network, in Doze) reaches the non-exported `SleepTimerAlarmReceiver`, which pokes the timer and
+  holds a timed partial wake lock until the end + 30 s (≤ 10 min). Exact at the end where no
+  runtime grant is needed (API < 31, or SCHEDULE_EXACT_ALARM already allowed; never requested;
+  not USE_EXACT_ALARM). Otherwise inexact and staged: its heuristic window
+  [t, t + 0.75 × (t − now)] (≤ 1 h) is placed to end at the timer's end
+  (t = now + (end − now) / 1.75), Android 12+ delivers at the window end unless woken earlier, and
+  an early delivery arms the next stage until < 10 s remain (a handful of stages, within the
+  allow-while-idle quota). A remote timer ending within 10 min also holds the wake lock from the
+  start (honoured outside Doze). "End of track" arms the snapshot's track end and re-arms on every
+  snapshot. Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
 
@@ -840,8 +848,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
   of another downloaded collection). Liked Songs are listed with `library.tracks
-  {urisOnly:true}`; new rows get metadata from `catalog.tracks` (also placeholders: they are stored
-  without metadata). Only a *complete* resolution removes items (not `partial`, not empty, and for
+  {urisOnly:true}`; members without a row and members whose row failed get metadata and their
+  playability from `catalog.tracks` (batched, ≤ 60 s; completed and pending rows are not looked up
+  again; placeholders are stored without metadata). Re-validation adds a member found not playable
+  to the unavailable set of every collection containing it (and removes it when playable again). Only a *complete* resolution removes items (not `partial`, not empty, and for
   playlists / Liked Songs every slot listed): an empty, short or partial one only adds, and is
   retried. A collection whose sync fails or is incomplete is retried after 1 h,
   doubling up to 24 h (`lastAttemptAt`, `syncFailures`), instead of at every reconnect.

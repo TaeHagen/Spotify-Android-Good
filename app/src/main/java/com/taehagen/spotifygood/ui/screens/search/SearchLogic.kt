@@ -6,6 +6,7 @@ import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.ArtistRef
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.MediaRef
+import com.taehagen.spotifygood.model.MediaType
 import com.taehagen.spotifygood.model.PlaylistRef
 import com.taehagen.spotifygood.model.SearchResults
 import com.taehagen.spotifygood.model.ShowRef
@@ -74,14 +75,33 @@ fun SearchResults.itemsOf(type: SearchType): List<SearchItem> = when (type) {
     SearchType.EPISODE -> episodes.map(SearchItem::EpisodeItem)
 }
 
-/** The server's top result, else the most likely intent (artist, then song, album, ...). */
-fun SearchResults.topResultOrBest(): MediaRef? = topResult
+/**
+ * The server's top result, else the most likely intent (artist, then song, album, ...). A song or
+ * episode the results mark unplayable (explicit with the filter on, not available here) is never
+ * the top result: its card would start a different track.
+ */
+fun SearchResults.topResultOrBest(): MediaRef? = topResult?.takeIf { isPlayableRef(it) }
     ?: artists.firstOrNull()?.toMediaRef()
-    ?: tracks.firstOrNull()?.toMediaRef()
+    ?: tracks.firstOrNull { it.playable }?.toMediaRef()
     ?: albums.firstOrNull()?.toMediaRef()
     ?: playlists.firstOrNull()?.toMediaRef()
     ?: shows.firstOrNull()?.toMediaRef()
-    ?: episodes.firstOrNull()?.toMediaRef()
+    ?: episodes.firstOrNull { it.playable }?.toMediaRef()
+
+/** False for a track / episode that these results list as unplayable. */
+fun SearchResults.isPlayableRef(ref: MediaRef): Boolean = when (ref.type) {
+    MediaType.TRACK -> tracks.firstOrNull { it.uri == ref.uri }?.playable != false
+    MediaType.EPISODE -> episodes.firstOrNull { it.uri == ref.uri }?.playable != false
+    else -> true
+}
+
+/** False for a song / episode result that is not playable (anything else can be opened). */
+val SearchItem?.isPlayable: Boolean
+    get() = when (this) {
+        is SearchItem.Song -> track.playable
+        is SearchItem.EpisodeItem -> episode.playable
+        else -> true
+    }
 
 /** De-duplicates every list of a results page by URI (the server sometimes repeats items). */
 fun SearchResults.distinct(): SearchResults = copy(

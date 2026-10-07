@@ -292,20 +292,28 @@ private fun TopResults(
                 ) {
                     sections.top?.let { ref ->
                         item(key = "top", contentType = "top") {
+                            // A song / episode marked unplayable must not start (a different track
+                            // would play): the card is dimmed and only offers its actions.
+                            val playable = sections.byUri[ref.uri].isPlayable
                             Column(Modifier.padding(horizontal = 16.dp)) {
                                 SectionHeader(title = stringResource(R.string.browse_search_top_result))
                                 TopResultCard(
                                     ref = ref,
                                     onClick = {
                                         val song = sections.byUri[ref.uri] as? SearchItem.Song
-                                        if (song != null) onPlayTrack(song.track) else onOpen(ref)
+                                        when {
+                                            !playable -> actionsFor(ref)
+                                            song != null -> onPlayTrack(song.track)
+                                            else -> onOpen(ref)
+                                        }
                                     },
                                     onLongClick = { actionsFor(ref) },
-                                    onPlay = if (ref.type == MediaType.SHOW || ref.type == MediaType.COLLECTION) {
+                                    onPlay = if (!playable || ref.type == MediaType.SHOW || ref.type == MediaType.COLLECTION) {
                                         null
                                     } else {
                                         { onPlayTop(ref, sections) }
                                     },
+                                    unavailable = !playable,
                                     isPlaying = state.nowPlaying.isPlaying &&
                                         (state.nowPlaying.contextUri == ref.uri || state.nowPlaying.trackUri == ref.uri),
                                     modifier = Modifier.padding(top = 8.dp),
