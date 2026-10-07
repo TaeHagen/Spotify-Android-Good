@@ -27,8 +27,11 @@ pub(crate) enum Target {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RouteInput<'a> {
-    /// The engine session is online and a Spirc is attached.
+    /// The engine session is online.
     pub online: bool,
+    /// A Spirc is attached: this device is visible to Spotify Connect. An online session can be
+    /// hidden (no UI or playback holder), then there is no Spirc and no fresh cluster.
+    pub spirc: bool,
     /// This device is the active Connect device (Spirc snapshot `is_active`).
     pub local_active: bool,
     /// The OfflineController currently owns local playback.
@@ -42,6 +45,11 @@ fn not_offline() -> AppError {
     AppError::unavailable("Not available offline")
 }
 
+/// Online, but not visible to Spotify Connect (the app makes the engine visible before playback).
+pub(crate) fn hidden() -> AppError {
+    AppError::new(ErrorCode::NotConnected, "This device isn't connected to Spotify Connect right now")
+}
+
 /// Decides the target. `downloaded`: for `Load`, whether every requested item is downloaded.
 pub(crate) fn route(input: &RouteInput, kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     let other_active = input.active_device.filter(|id| !id.is_empty() && *id != input.me).map(str::to_string);
@@ -49,7 +57,9 @@ pub(crate) fn route(input: &RouteInput, kind: CommandKind, downloaded: bool) -> 
     // The offline queue keeps playing until something else takes over.
     if input.offline_active && !input.local_active {
         return match kind {
-            CommandKind::Load if input.online => Ok(Target::Local { activate: true }),
+            CommandKind::Load if input.online && input.spirc => Ok(Target::Local { activate: true }),
+            // Never start offline playback while online.
+            CommandKind::Load if input.online => Err(hidden()),
             CommandKind::Load if downloaded => Ok(Target::Offline),
             CommandKind::Load => Err(not_offline()),
             _ => Ok(Target::Offline),
@@ -62,6 +72,13 @@ pub(crate) fn route(input: &RouteInput, kind: CommandKind, downloaded: bool) -> 
             CommandKind::Load => Err(not_offline()),
             CommandKind::Volume => Ok(Target::Offline),
             _ => Err(AppError::not_connected()),
+        };
+    }
+
+    if !input.spirc {
+        return match kind {
+            CommandKind::Volume => Ok(Target::Offline),
+            _ => Err(hidden()),
         };
     }
 
@@ -85,7 +102,22 @@ mod tests {
     use super::*;
 
     fn input<'a>(online: bool, local: bool, offline: bool, active: Option<&'a str>) -> RouteInput<'a> {
-        RouteInput { online, local_active: local, offline_active: offline, active_device: active, me: "me" }
+        RouteInput { online, spirc: online, local_active: local, offline_active: offline, active_device: active, me: "me" }
+    }
+
+    #[test]
+    fn hidden_from_connect_while_online() {
+        // online without Spirc (no UI or playback holder): nothing is routed offline
+        let hidden = |offline| RouteInput { spirc: false, ..input(true, false, offline, Some("tv")) };
+        let i = hidden(false);
+        for kind in [CommandKind::Load, CommandKind::Control, CommandKind::Queue] {
+            assert_eq!(route(&i, kind, true).err().map(|e| e.code), Some(ErrorCode::NotConnected), "{kind:?}");
+        }
+        assert_eq!(route(&i, CommandKind::Volume, false).ok(), Some(Target::Offline), "the local mixer");
+        // a running offline queue still owns the Player, but a load doesn't start a new one
+        let i = hidden(true);
+        assert_eq!(route(&i, CommandKind::Control, false).ok(), Some(Target::Offline));
+        assert_eq!(route(&i, CommandKind::Load, true).err().map(|e| e.code), Some(ErrorCode::NotConnected));
     }
 
     #[test]

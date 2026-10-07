@@ -528,7 +528,12 @@ For a remote active device, smart shuffle is not supported (the command reports
 * **Visibility**: the phone is listed only while it can play. Kotlin sets `connectVisible`
   while a UI (app in the foreground), PLAYBACK or PRESENCE holder is held; a DOWNLOAD holder
   alone and the idle grace keep it hidden. Hidden, the supervisor connects the Session without
-  Spirc (catalog, downloads and tokens keep working, `connect` routes as if not online).
+  Spirc (catalog, downloads and tokens keep working). `connect` then never starts offline
+  playback: `player.load`, control, queue and `connect.transfer` fail with `NOT_CONNECTED`
+  (controls still reach a running offline queue, volume the local mixer), except while
+  `connectVisible` is already true (Spirc is on its way), when they wait up to 10 s like during
+  a connect attempt. The device list omits this phone, the playback snapshot shows the remote
+  player state of the last cluster (never a local one), and no reconnect restore runs.
   Becoming hidden shuts Spirc down (it disconnects, deletes its connect state and closes the
   dealer, so the device leaves the cluster) and keeps the Session. Becoming visible reconnects
   with a new Session + Spirc: `Spirc::new` performs the login itself and a Session's dealer

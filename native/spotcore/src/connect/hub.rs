@@ -129,14 +129,19 @@ pub(crate) fn attach(a: Attachment) {
     runtime::handle().spawn(observe(generation, session, state, cluster, errors));
 }
 
-/// Called by the engine when a Spirc goes away (teardown or death).
+/// Called by the engine when a Spirc goes away (teardown or death, or hiding from Spotify
+/// Connect while the session stays online).
 pub(crate) fn detach(generation: u64) {
+    // Hidden (the session stays online): keep the last cluster for the remote player state.
+    let hiding = engine::is_online();
     {
         let mut hub = HUB.lock();
         if hub.link.as_ref().is_some_and(|l| l.generation == generation) {
             hub.link = None;
             hub.snapshot = None;
-            hub.cluster = None;
+            if !hiding {
+                hub.cluster = None;
+            }
         }
     }
     publish();
@@ -322,14 +327,19 @@ pub(crate) fn publish() {
     }
 }
 
-/// The current device list.
+/// The current device list. While the online session is hidden from Spotify Connect, this
+/// device isn't listed (it can't be controlled or transferred to).
 pub(crate) fn device_list() -> DeviceList {
-    let (cluster, audio_output) = {
+    let (cluster, audio_output, attached) = {
         let hub = HUB.lock();
-        (hub.cluster.clone(), hub.audio_output.clone())
+        (hub.cluster.clone(), hub.audio_output.clone(), hub.link.is_some())
     };
     let me = ThisDevice { id: me(), name: engine::device_name(), volume: mixer_volume(), audio_output };
-    devices::device_list(cluster.as_deref(), &me)
+    let mut list = devices::device_list(cluster.as_deref(), &me);
+    if !attached && engine::is_online() {
+        list.devices.retain(|d| !d.is_this_device);
+    }
+    list
 }
 
 /// Emits a `devices` event if the list changed; returns the list.

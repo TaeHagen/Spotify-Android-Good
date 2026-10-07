@@ -110,7 +110,8 @@ fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     let me = hub::me();
     let active = hub::active_device_id();
     let input = RouteInput {
-        online: engine::is_online() && hub::spirc().is_some(),
+        online: engine::is_online(),
+        spirc: hub::spirc().is_some(),
         local_active: hub::local_active(),
         offline_active: offline::is_active(),
         active_device: active.as_deref(),
@@ -119,11 +120,45 @@ fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     route::route(&input, kind, downloaded)
 }
 
+/// What [`should_wait`] looks at.
+#[derive(Debug, Clone, Copy)]
+struct WaitInput {
+    online: bool,
+    /// A Spirc is attached (visible to Spotify Connect).
+    spirc: bool,
+    /// A connect attempt is in flight (`engine::is_connecting`).
+    connecting: bool,
+    /// The settings want this device visible to Spotify Connect.
+    visible: bool,
+    offline_active: bool,
+}
+
+impl WaitInput {
+    fn now() -> Self {
+        WaitInput {
+            online: engine::is_online(),
+            spirc: hub::spirc().is_some(),
+            connecting: engine::is_connecting(),
+            visible: engine::settings().connect_visible,
+            offline_active: offline::is_active(),
+        }
+    }
+}
+
 /// Whether a command waits for the session: a connect attempt is in flight (cold start,
-/// reconnect) and the command would otherwise be routed offline. A running offline queue answers
-/// controls right away; a load replaces it, so it waits too.
-fn should_wait(kind: CommandKind, online: bool, connecting: bool, offline_active: bool) -> bool {
-    !online && connecting && (kind == CommandKind::Load || !offline_active)
+/// reconnect, or the engine logging in again to become visible to Spotify Connect) and the
+/// command would otherwise fail or be routed offline. A running offline queue answers controls
+/// right away; a load replaces it, so it waits too.
+fn should_wait(kind: CommandKind, i: WaitInput) -> bool {
+    if kind != CommandKind::Load && i.offline_active {
+        return false;
+    }
+    if i.online {
+        // Online but hidden while the settings already want it visible: Spirc is on its way.
+        !i.spirc && i.visible
+    } else {
+        i.connecting
+    }
 }
 
 /// Holds a command for at most [`CONNECTING_WAIT`] while the session is connecting; stops early
@@ -132,7 +167,7 @@ async fn await_online_if_connecting(kind: CommandKind) {
     let mut status = engine::status_watch();
     let mut online = engine::online_watch();
     let wait = async {
-        while should_wait(kind, engine::is_online(), engine::is_connecting(), offline::is_active()) {
+        while should_wait(kind, WaitInput::now()) {
             tokio::select! {
                 r = online.changed() => if r.is_err() { break },
                 r = status.changed() => if r.is_err() { break },
@@ -331,6 +366,10 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
     if !engine::is_online() {
         return Err(AppError::not_connected());
     }
+    if hub::spirc().is_none() {
+        // Online but hidden from Spotify Connect: no cluster to tell what is active.
+        return Err(route::hidden());
+    }
     // An explicit choice of the device: a pending reconnect restore doesn't run anymore.
     restore::cancel();
     let me = hub::me();
@@ -432,6 +471,11 @@ pub(crate) fn clear_restore() {
 pub(crate) fn on_engine_state_changed() {
     if engine::is_online() {
         metadata::on_online();
+        if hub::spirc().is_none() {
+            // Online but hidden from Spotify Connect: nothing to restore into (the engine only
+            // restores into a visible Spirc), so the frozen state goes.
+            restore::clear();
+        }
     }
     hub::publish();
     hub::publish_devices();
@@ -489,15 +533,32 @@ mod tests {
     #[test]
     fn commands_wait_only_for_an_attempt_in_flight() {
         use CommandKind::*;
-        assert!(should_wait(Load, false, true, false));
-        assert!(should_wait(Control, false, true, false));
-        assert!(should_wait(Queue, false, true, false));
+        let connecting = WaitInput { online: false, spirc: false, connecting: true, visible: true, offline_active: false };
+        assert!(should_wait(Load, connecting));
+        assert!(should_wait(Control, connecting));
+        assert!(should_wait(Queue, connecting));
         // a running offline queue answers controls, a load replaces it
-        assert!(!should_wait(Control, false, true, true));
-        assert!(should_wait(Load, false, true, true));
+        let offline_queue = WaitInput { offline_active: true, ..connecting };
+        assert!(!should_wait(Control, offline_queue));
+        assert!(should_wait(Load, offline_queue));
         // online, or no attempt in flight (offline mode, no network, backoff, error)
-        assert!(!should_wait(Load, true, true, false));
-        assert!(!should_wait(Load, false, false, false));
-        assert!(!should_wait(Control, false, false, false));
+        let online = WaitInput { online: true, spirc: true, connecting: false, ..connecting };
+        assert!(!should_wait(Load, online));
+        let idle = WaitInput { connecting: false, ..connecting };
+        assert!(!should_wait(Load, idle));
+        assert!(!should_wait(Control, idle));
+    }
+
+    #[test]
+    fn commands_wait_while_the_engine_becomes_visible() {
+        use CommandKind::*;
+        // online and hidden, the settings want it visible: the engine logs in again with Spirc
+        let becoming_visible = WaitInput { online: true, spirc: false, connecting: false, visible: true, offline_active: false };
+        assert!(should_wait(Load, becoming_visible));
+        assert!(should_wait(Control, becoming_visible));
+        // staying hidden: no wait, the command fails right away
+        assert!(!should_wait(Load, WaitInput { visible: false, ..becoming_visible }));
+        // the re-login itself is an attempt in flight
+        assert!(should_wait(Load, WaitInput { online: false, connecting: true, ..becoming_visible }));
     }
 }
