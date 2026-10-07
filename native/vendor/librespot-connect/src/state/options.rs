@@ -67,6 +67,23 @@ impl ConnectState {
         }
     }
 
+    // SPOTIFYGOOD: for the shuffle (and smart shuffle) commands
+    /// Whether shuffle may be turned on now
+    ///
+    /// Not while autoplay is the active context: shuffling starts the default context over,
+    /// which was played to its end, and the autoplay tracks after it again. Checked directly as
+    /// well, the restrictions are only updated with the state. A transfer
+    /// ([ConnectState::shuffle_restore]) still shuffles.
+    pub(super) fn validate_shuffle_toggle(&self) -> Result<(), Error> {
+        if matches!(self.active_context, ContextType::Autoplay) {
+            Err(StateError::CurrentlyDisallowed {
+                action: "shuffle",
+                reason: "autoplay".to_string(),
+            })?
+        }
+        self.validate_shuffle_allowed()
+    }
+
     pub fn shuffle_restore(&mut self, shuffle_state: ShuffleState) -> Result<(), Error> {
         self.validate_shuffle_allowed()?;
 

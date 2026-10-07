@@ -900,13 +900,44 @@ fn shuffle_and_repeat_toggles_while_autoplay_plays() {
         .collect::<Vec<_>>();
     assert_eq!(default_uids, uids(0..3));
 
-    // a queued track that plays during autoplay can't toggle repeat either
+    // a queued track that plays during autoplay can't toggle repeat or shuffle either
     state.queue_add_uri(&track_uri(1, 9)).unwrap();
     state.next_track().unwrap();
     assert!(state.current_track(|t| t.is_queue()));
     let snapshot = state.snapshot(SnapshotPlayStatus::Playing, 0, None);
     assert!(!snapshot.can_toggle_repeat);
+    assert!(!snapshot.can_toggle_shuffle);
     assert!(state.handle_set_repeat_context(true).is_err());
+
+    // shuffling would start the played default context over, and autoplay after it
+    let next = next_uids(&state);
+    let prev = state
+        .prev_tracks()
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    let autoplay_index = |state: &ConnectState| {
+        state
+            .get_context(ContextType::Autoplay)
+            .unwrap()
+            .index
+            .track
+    };
+    let index = autoplay_index(&state);
+    assert!(index > 0);
+    assert!(state.handle_shuffle(true).is_err());
+    assert!(state.handle_smart_shuffle(true).is_err());
+    assert!(!state.shuffling_context());
+    assert!(!state.smart_shuffle());
+    assert_eq!(next_uids(&state), next);
+    let prev_now = state
+        .prev_tracks()
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(prev_now, prev);
+    assert_eq!(autoplay_index(&state), index);
+    assert!(matches!(state.active_context, ContextType::Autoplay));
 }
 
 /// a playlist modification: the same context is resolved again, then the state is set up like
