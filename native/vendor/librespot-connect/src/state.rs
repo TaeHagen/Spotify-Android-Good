@@ -177,6 +177,10 @@ pub(super) struct ConnectState {
     suggestions: BTreeMap<(u32, usize), ProvidedTrack>,
     /// uris that were already suggested for the current context
     used_suggestion_uris: HashSet<String>,
+    // SPOTIFYGOOD: see ConnectState::is_current_context
+    /// the default context isn't all there: made of what a transfer brought, or a resolve of it
+    /// (or of one of its pages) failed for good
+    default_context_incomplete: bool,
 }
 
 impl ConnectState {

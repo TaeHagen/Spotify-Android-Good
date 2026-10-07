@@ -1631,6 +1631,56 @@ fn a_transient_resolve_failure_is_retried_a_few_times() {
     }
 }
 
+#[test]
+fn only_a_resolved_complete_context_is_the_current_one() {
+    use crate::protocol::{
+        session::Session as PlayingSession, transfer_state::TransferState,
+    };
+
+    let (_rt, mut state) = state(3);
+    assert!(state.is_current_context(CONTEXT_URI));
+    assert!(!state.is_current_context("spotify:album:0"));
+
+    // a page of it failed for good: a load of it resolves it again
+    state.mark_default_context_incomplete();
+    assert!(!state.is_current_context(CONTEXT_URI));
+    assert!(state.reset_context(ResetContext::WhenDifferent(CONTEXT_URI)));
+
+    // a transfer of it, still resolving it: no context
+    let mut transfer = TransferState {
+        current_session: MessageField::some(PlayingSession {
+            context: MessageField::some(Context {
+                uri: Some(CONTEXT_URI.to_string()),
+                pages: vec![default_page(0..2)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    state.handle_initial_transfer(&mut transfer, Some(CONTEXT_URI.to_string()));
+    assert_eq!(state.context_uri(), CONTEXT_URI);
+    assert!(!state.is_current_context(CONTEXT_URI));
+
+    // the stand-in after the resolve failed
+    state.set_track(ProvidedTrack {
+        uri: track_uri(1, 0),
+        uid: "uid1".to_string(),
+        provider: "context".to_string(),
+        ..Default::default()
+    });
+    state.finish_transfer_without_context(transfer).unwrap();
+    assert!(state.get_context(ContextType::Default).is_ok());
+    assert!(!state.is_current_context(CONTEXT_URI));
+
+    // resolved for real
+    state
+        .update_context(context(3, 0), ContextType::Default)
+        .unwrap();
+    assert!(state.is_current_context(CONTEXT_URI));
+    assert!(!state.reset_context(ResetContext::WhenDifferent(CONTEXT_URI)));
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(

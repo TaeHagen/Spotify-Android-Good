@@ -1269,6 +1269,11 @@ impl SpircTask {
                     return false;
                 }
                 error!("{why}");
+                // SPOTIFYGOOD: a load of it resolves it again, see
+                // ConnectState::is_current_context
+                if self.context_resolver.next_update() == Some(ContextType::Default) {
+                    self.connect_state.mark_default_context_incomplete();
+                }
 
                 // SPOTIFYGOOD: the state is still set up with what there is, see
                 // ContextResolver::finish_after_failure
@@ -2369,10 +2374,14 @@ impl SpircTask {
             None => &context_uri,
         };
 
-        let current_context_uri = self.connect_state.context_uri();
-
-        if current_context_uri == &context_uri && fallback == context_uri {
-            debug!("context <{current_context_uri}> didn't change, no resolving required")
+        // SPOTIFYGOOD: only a context that was resolved, and is all there, is kept (see
+        // ConnectState::is_current_context): the same uri skipped the resolve also without a
+        // context (a transfer still resolving it) or with the stand-in of a failed transfer
+        if self.connect_state.is_current_context(&context_uri)
+            && fallback == context_uri
+            && self.connect_state.get_context(update_context).is_ok()
+        {
+            debug!("context <{context_uri}> didn't change, no resolving required")
         } else {
             debug!("resolving context for load command");
             self.context_resolver.clear();
