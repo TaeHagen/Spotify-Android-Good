@@ -236,6 +236,13 @@ prev/next semantics identical to Spirc (prev restarts if position > 3 s). It dri
 same Player and emits the same `playback` snapshots with `source:"local"`,
 `isActiveDevice:true`, `offline:true`. When the session comes back Online, the offline
 queue keeps playing; the next `player.load` goes through Spirc again.
+The engine cannot know which downloads belong to a playlist or Liked Songs, so while the
+session is not Online Kotlin's `PlayerController` sends context loads of a playlist / Liked
+Songs / album / show with `trackUris` = that context's downloads in context order (Room
+collection membership; albums/shows not downloaded as a whole by metadata), keeping
+`contextUri`/`startUri`/`startUid` for Spirc. Nothing downloaded while offline → "not
+available offline" without a native call. Smart shuffle is not offered for `offline:true`
+snapshots.
 
 ## 5. Events (Rust → Kotlin `onEvent(type, json)`)
 
@@ -502,16 +509,34 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   snapshot (extrapolating). Media items carry title/artist/album/artworkUri
   (`content://<app>.artwork/<urlhash>` served by `ArtworkProvider` from the Coil disk cache).
 * Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
-  set-media-items (Auto/Assistant/resumption), device volume only when remote.
-  Media button preferences: like/unlike, shuffle (3-state), repeat (3-state). `onSetRating`
-  (HeartRating) toggles like.
+  set-media-items (Auto/Assistant/resumption), device volume only when remote (relative
+  steps accumulate from the last sent target for 2 s), seek back/forward 15 s for episodes.
+  Media button preferences: like/unlike, shuffle (3-state), repeat (3-state); for episodes
+  −15 s / +15 s next to play/pause instead of shuffle/repeat. `onSetRating` (HeartRating)
+  toggles like. Remote playback: the current item's artist reads "<artists> • Playing on
+  <device>" on API 30+ (SysUI shows only title/artist), the notification text adds it below
+  API 30; the subtitle carries the device line. Downloaded tracks use their downloaded cover.
+* Player error (only while nothing plays; STATE_IDLE, playlist kept): logged out →
+  `AUTHENTICATION_EXPIRED` + "Sign in" action; `PREMIUM_REQUIRED`; `PLAYBACK_REFUSED`; else
+  the last failed attempt to start playback (`PlayerController.failure`, also native
+  `playback` error events). `prepare()` clears it. Browsing logged out / without Premium
+  returns the matching `SessionError`.
+* Cold start: commands that start playback wait (≤ 15 s, outside their timeout; a pause cancels
+  the wait) while the session is starting with a network; play/resume fall back to the
+  `ResumeStore` session on NOT_ACTIVE_DEVICE, NOT_CONNECTED (not while mirroring a remote
+  device) and UNAVAILABLE while connecting. Auto browse/search/voice wait the same way.
 * `onConnectAsync` grants commands to the notification, SysUI, Auto/AAOS, Wear and the
   app's own controller; others get read-only.
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata) persisted on pause and every 15 s while playing.
 * Foreground: Media3 default (10 min after pause, then notification becomes dismissable).
-  `onForegroundServiceStartNotAllowedException` → post a "Tap to resume" notification.
+  Local audio never plays without it: local audio starting in the background with no service
+  (remote "play on this phone" during the idle grace or a download) starts the service with
+  `startForegroundService` (focus waits for the foreground); refused, or not foreground within
+  5 s → pause + "Tap to resume" (`ResumeAlert`). `onForegroundServiceStartNotAllowedException`
+  → for local playback pause + "Tap to resume"; while mirroring a remote device the notification
+  is posted without the foreground (the remote device is never paused).
   `onTaskRemoved` default behaviour. Engine holder released when the service is destroyed.
 * **Opt-in Connect presence** (setting "Stay available for Spotify Connect", default off):
   when enabled and the app goes to background while idle, the service keeps itself in the
@@ -522,7 +547,7 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Audio focus (`AudioFocusController`, AudioManagerCompat): requested when local playback
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
-  0.2 → restore. Request failure → pause.
+  0.2 → restore (a duck keeps focus; a granted request clears the duck). Request failure → pause.
 * `BecomingNoisyReceiver`: registered only while playing locally → `player.pause`.
 * Wake locks: Media3 `WakeLockManager` + `WifiLockManager` `setStayAwake(true)` only while
   local status is playing/loading; false otherwise.
