@@ -276,11 +276,16 @@ shuffle (seeded), repeat context/track, user queue (add/remove/move/clear/skipTo
 prev/next semantics identical to Spirc (prev restarts if position > 3 s). It drives the
 same Player and emits the same `playback` snapshots with `source:"local"`,
 `isActiveDevice:true`, `offline:true`. When the session comes back Online, the offline
-queue keeps playing; the next `player.load` goes through Spirc again.
+queue keeps playing; the next `player.load` goes through Spirc again. A paused or finished
+offline queue gives way to another active device (it is stopped, commands and the snapshot
+follow that device). The user queue holds at most 80 tracks like Spirc's (`UNAVAILABLE` "The
+queue is full"); a manual next / skip leaves repeat-track like Spirc; a shuffle load without a
+start begins anywhere; a paused load stays paused through next / unavailable items.
 Native resolution of an offline `player.load`: `trackUris` queues the downloaded ones among
 them; a bare album / artist / show `contextUri` queues its downloads in context order (disc
 and track number; newest episode first); a playlist / Liked Songs / other `contextUri`
 without `trackUris` fails with `UNAVAILABLE` "Not available offline" (never "all downloads").
+`positionMs` applies only when the requested start item itself is downloaded.
 The engine cannot know which downloads belong to a playlist or Liked Songs, so while the
 session is not Online Kotlin's `PlayerController` sends context loads of a playlist / Liked
 Songs / album / show with `trackUris` = that context's downloads in context order (Room
@@ -395,7 +400,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
-| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs"}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE`. Pushing offline playback hands over its tracks and current position |
+| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs"}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE`. Pushing offline playback hands over its tracks (in play order), current position and repeat mode, and keeps it paused if it was |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>"}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…"}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |

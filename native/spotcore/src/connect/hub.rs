@@ -358,6 +358,8 @@ fn on_cluster(generation: u64, cluster: Arc<Cluster>) {
     }
     CLUSTER_CHANGED.notify_waiters();
     changed();
+    // A paused offline queue gives way to a device that became active.
+    offline::yield_to_active_device();
     publish_devices();
     publish();
 }
@@ -393,9 +395,13 @@ pub(crate) fn compose() -> PlaybackSnapshot {
         let placeholder = hub.reconnect.as_ref().filter(|f| f.since.elapsed() < RECONNECT_PLACEHOLDER_MAX).cloned();
         (local, hub.cluster.clone(), placeholder, hub.refused_error.clone())
     };
+    // A paused or finished offline queue doesn't hide another active device.
+    let other_active = cluster.as_deref().is_some_and(|c| !c.active_device_id.is_empty() && c.active_device_id != device.id);
+    let offline = offline::snapshot(device.clone(), mixer_volume())
+        .filter(|s| !other_active || matches!(s.status, PlaybackStatus::Playing | PlaybackStatus::Loading));
     let mut snap = if let Some(s) = local {
         snapshot::map_local(&s, device.clone())
-    } else if let Some(s) = offline::snapshot(device.clone(), mixer_volume()) {
+    } else if let Some(s) = offline {
         s
     } else if let Some(f) = placeholder {
         // Reconnecting: keep showing what was playing (paused) instead of flashing "nothing".

@@ -115,6 +115,7 @@ fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
         // An activation just sent (a load, the restore) counts: commands queue behind it.
         local_active: hub::local_active_or_activating(),
         offline_active: offline::is_active(),
+        offline_playing: offline::is_playing(),
         active_device: active.as_deref(),
         me: &me,
     };
@@ -404,6 +405,20 @@ fn set_audio_output(args: AudioOutputArgs) -> AppResult<Value> {
     ok()
 }
 
+/// The `play` of an offline queue handed over to another device: its items in play order (so no
+/// shuffle on the target), its repeat mode, paused unless it played.
+fn handover_load(h: offline_queue::Handover, play: bool) -> LoadArgs {
+    LoadArgs {
+        track_uris: Some(h.uris),
+        start_index: Some(0),
+        position_ms: h.position_ms,
+        shuffle: Some(false),
+        repeat: Some(h.repeat),
+        play,
+        ..Default::default()
+    }
+}
+
 fn nothing_active() -> AppError {
     AppError::new(ErrorCode::NotActiveDevice, "Nothing is playing on any device")
 }
@@ -432,6 +447,8 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
         return Err(route::hidden());
     }
     let other_active = hub::active_device_id().is_some_and(|id| id != me);
+    // A paused or finished offline queue gives way to another active device (see `route`).
+    let offline_owns = offline::is_active() && (offline::is_playing() || !other_active);
     if args.device_id == me {
         let spirc = spirc()?;
         if hub::local_active_or_activating() {
@@ -446,7 +463,7 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
                 },
             };
             local::sent(spirc.transfer(Some(request)))?;
-        } else if offline::is_active() {
+        } else if offline_owns {
             // Already playing here (downloads).
             if args.play {
                 offline::control(&Ctl::Play)?;
@@ -458,24 +475,20 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
         }
         return ok();
     }
-    if offline::is_active() {
+    if offline_owns {
         // The offline queue has no Connect state to transfer: hand its tracks over as a play
         // command, then stop locally.
-        if let Some((uris, position_ms)) = offline::handover(50) {
-            if !uris.is_empty() {
-                let load = LoadArgs {
-                    track_uris: Some(uris),
-                    start_index: Some(0),
-                    position_ms,
-                    play: args.play,
-                    ..Default::default()
-                };
-                remote::send(&args.device_id, remote::play(&load, &uri::random_command_id()))
-                    .await
-                    .map_err(remote::remote_error)?;
-                offline::stop();
-                return ok();
+        if let Some(handover) = offline::handover(50).filter(|h| !h.uris.is_empty()) {
+            let playing = args.play && handover.playing;
+            let load = handover_load(handover, playing);
+            let mut bodies = vec![remote::play(&load, &uri::random_command_id())];
+            if !playing {
+                // Spirc-based targets start playing whatever `initially_paused` says.
+                bodies.push(remote::simple("pause", &uri::random_command_id()));
             }
+            remote::send_all(&args.device_id, bodies).await.map_err(remote::remote_error)?;
+            offline::stop();
+            return ok();
         }
     }
     if !hub::local_active_or_activating() && !other_active {
@@ -660,6 +673,22 @@ mod tests {
         assert!(!should_wait(Load, WaitInput { visible: false, ..becoming_visible }, false));
         // the re-login itself is an attempt in flight
         assert!(should_wait(Load, WaitInput { online: false, connecting: true, ..becoming_visible }, false));
+    }
+
+    #[test]
+    fn offline_handover_keeps_order_repeat_and_pause() {
+        let h = offline_queue::Handover {
+            uris: vec!["spotify:track:a".into(), "spotify:track:b".into()],
+            position_ms: 42_000,
+            repeat: RepeatMode::Track,
+            playing: false,
+        };
+        let load = handover_load(h, false);
+        let body = remote::play(&load, "id").to_string();
+        assert!(body.contains("\"shuffling_context\":false"), "{body}");
+        assert!(body.contains("\"repeating_track\":true"), "{body}");
+        assert!(body.contains("\"initially_paused\":true"), "{body}");
+        assert!(body.contains("42000"), "{body}");
     }
 
     #[test]
