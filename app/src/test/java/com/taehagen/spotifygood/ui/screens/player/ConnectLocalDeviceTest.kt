@@ -55,3 +55,36 @@ class ConnectLocalDeviceTest {
         }
     }
 }
+
+class TransferFailureEventTest {
+    private fun native(code: String) = NativeException(NativeErrorInfo(code, "x"))
+
+    @Test
+    fun nothingToMoveIsNotADeviceFailure() {
+        // Nothing playing anywhere and no saved session: the speaker is fine.
+        assertEquals(
+            DevicesEvent.NothingToPlay("s", "Living Room", isThisDevice = false),
+            transferFailureEvent("s", "Living Room", isThisDevice = false, error = native(NativeErrorCode.NOT_ACTIVE_DEVICE)),
+        )
+        assertEquals(
+            DevicesEvent.NothingToPlay("s", "This phone", isThisDevice = true),
+            transferFailureEvent("s", "This phone", isThisDevice = true, error = native(NativeErrorCode.NOT_ACTIVE_DEVICE)),
+        )
+    }
+
+    @Test
+    fun realFailuresStayFailures() {
+        assertEquals(
+            DevicesEvent.TransferFailed("s", "Living Room", network = true),
+            transferFailureEvent("s", "Living Room", isThisDevice = false, error = native(NativeErrorCode.NETWORK)),
+        )
+        assertEquals(
+            DevicesEvent.TransferFailed("s", "Living Room", network = false),
+            transferFailureEvent("s", "Living Room", isThisDevice = false, error = native(NativeErrorCode.PLAYBACK_REFUSED)),
+        )
+        assertEquals(
+            DevicesEvent.TransferFailed("s", "Living Room", network = false),
+            transferFailureEvent("s", "Living Room", isThisDevice = false, error = IllegalStateException()),
+        )
+    }
+}
