@@ -45,6 +45,8 @@ pub(crate) struct HubState {
     pub last_active: Option<LastActive>,
     /// A reconnect with a pending restore is in progress (frozen playback state).
     pub reconnect: Option<restore::Frozen>,
+    /// The restore point while its restore is applied (see `restore::Restoring`).
+    pub restoring: Option<restore::Restoring>,
     /// Commands holding the pending restore's decision (see `restore::hold`).
     pub restore_holds: u32,
     /// The Spirc generation whose first cluster is overdue for the pending restore (see
@@ -182,6 +184,7 @@ pub(crate) fn forget_previous_link(hub: &mut HubState) {
     hub.cluster = None;
     hub.activation = None;
     hub.last_active = None;
+    hub.restoring = None;
 }
 
 /// [`detach`] on the state. `online`: the session stays (hidden from Spotify Connect), so the last
@@ -200,24 +203,25 @@ pub(crate) fn detach_state(hub: &mut HubState, generation: u64, online: bool) {
 
 /// The engine is done with the attached Spirc: it no longer touches the shared Player, not even
 /// while it shuts down (the offline queue may take the Player over right away, see
-/// `Spirc::release_player`). Returns whether it was the active device playing: then the Player
-/// is to be paused instead (unless the offline queue owns it).
+/// `Spirc::release_player`). Returns whether a Spirc was released: the Player is then paused
+/// here instead (see [`pauses_released`]).
 fn release_link(hub: &HubState) -> bool {
     let Some(link) = hub.link.as_ref() else { return false };
     link.spirc.release_player();
-    hub.snapshot.as_ref().is_some_and(|s| {
-        s.is_active
-            && matches!(
-                s.status,
-                librespot_connect::SnapshotPlayStatus::Playing | librespot_connect::SnapshotPlayStatus::LoadingPlay
-            )
-    })
+    true
 }
 
-fn pause_released(was_playing: bool) {
-    if was_playing && !offline::is_active() {
+/// Whether the Player is paused after a release. Not by the released Spirc's last snapshot: it
+/// can lag a whole handler (a resume whose state put hangs still shows paused). Only that Spirc
+/// or the offline queue drive the Player, and pausing an idle Player does nothing.
+fn pauses_released(released: bool, offline_active: bool) -> bool {
+    released && !offline_active
+}
+
+fn pause_released(released: bool) {
+    if pauses_released(released, offline::is_active()) {
         if let Some(player) = engine::player_host::player() {
-            log::info!("the detached spirc was playing, pausing its player");
+            log::info!("pausing the player of the detached spirc");
             player.pause();
         }
     }
@@ -229,14 +233,14 @@ pub(crate) fn detach(generation: u64) {
     // Hidden (the session stays online): keep the last cluster for the remote player state. A
     // later teardown of the hidden session (offline, stopped) drops it, there is no link then.
     let online = engine::is_online();
-    let was_playing = {
+    let released = {
         let mut hub = HUB.lock();
         let current = hub.link.as_ref().is_some_and(|l| l.generation == generation);
-        let was_playing = current && release_link(&hub);
+        let released = current && release_link(&hub);
         detach_state(&mut hub, generation, online);
-        was_playing
+        released
     };
-    pause_released(was_playing);
+    pause_released(released);
     changed();
     publish();
     publish_devices();
@@ -252,16 +256,16 @@ pub(crate) fn drop_stale_cluster() {
 
 /// Forgets any attached Spirc (forced cleanup after an aborted supervisor).
 pub(crate) fn detach_all() {
-    let was_playing = {
+    let released = {
         let mut hub = HUB.lock();
-        let was_playing = release_link(&hub);
+        let released = release_link(&hub);
         hub.link = None;
         hub.snapshot = None;
         hub.cluster = None;
         hub.activation = None;
-        was_playing
+        released
     };
-    pause_released(was_playing);
+    pause_released(released);
     changed();
     publish();
     publish_devices();
@@ -367,7 +371,13 @@ pub(crate) fn apply_snapshot(hub: &mut HubState, snap: ConnectSnapshot, session_
     }
     if snap.is_active && snap.track.is_some() {
         hub.last_active = Some(LastActive { snap: snap.clone(), ended_at_ms: None });
+        // A restore being applied took.
+        hub.restoring = None;
     } else if !snap.is_active {
+        if was_active && !session_invalid {
+            // Deliberately inactive (taken over, user stop) before a restore being applied took.
+            hub.restoring = None;
+        }
         if hub.reconnect.is_none() && !session_invalid {
             // Deliberately inactive (another device took over, user stop): nothing to restore.
             hub.last_active = None;
@@ -425,7 +435,9 @@ pub(crate) fn compose() -> PlaybackSnapshot {
         let hub = HUB.lock();
         let local = hub.snapshot.clone().filter(|s| s.is_active);
         let (now, now_ms) = (Instant::now(), super::now_ms());
-        let placeholder = hub.reconnect.as_ref().filter(|f| f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned();
+        // Also while the restore is applied, until the Spirc is active with its track.
+        let frozen = hub.reconnect.as_ref().or(hub.restoring.as_ref().map(|r| &r.frozen));
+        let placeholder = frozen.filter(|f| f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned();
         (local, hub.cluster.clone(), placeholder, hub.refused_error.clone())
     };
     // None once a paused or finished offline queue gave way to a device that took over.
@@ -582,6 +594,15 @@ mod hub_tests {
 
     fn cluster(active: &str) -> Arc<Cluster> {
         Arc::new(Cluster { active_device_id: active.into(), ..Default::default() })
+    }
+
+    #[test]
+    fn a_released_spirc_is_paused_whatever_it_published() {
+        // its last snapshot may say paused or stopped while a resume is stuck in its state put
+        assert!(pauses_released(true, false));
+        // the offline queue owns the Player: left alone
+        assert!(!pauses_released(true, true));
+        assert!(!pauses_released(false, false));
     }
 
     #[test]

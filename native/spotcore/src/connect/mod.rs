@@ -269,6 +269,11 @@ async fn control(mut cmd: Ctl) -> AppResult<Value> {
             }
         }
     }
+    // While the restore is applied, a play / pause is recorded on its restore point too (and a
+    // toggle on the paused placeholder means play).
+    if let Some(play) = restore::while_restoring(&cmd) {
+        cmd = if play { Ctl::Play } else { Ctl::Pause };
+    }
     await_ready(cmd.kind(), true).await;
     match decide(cmd.kind(), false)? {
         Target::Local { activate } => local_control(&cmd, activate)?,

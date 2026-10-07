@@ -550,6 +550,12 @@ impl OfflineQueue {
         Some(self.play_context_pos(p, play, now_ms))
     }
 
+    /// A load returned by the queue never reached the Player (no Player): no request id comes
+    /// for it.
+    pub fn load_not_sent(&mut self) {
+        self.pending_loads = self.pending_loads.saturating_sub(1);
+    }
+
     /// Stops and forgets everything (another controller took over, or a user stop).
     pub fn reset(&mut self) {
         let next_queue_id = self.next_queue_id;
@@ -670,23 +676,26 @@ impl OfflineQueue {
             Some(Current::Context(i)) => Some(i),
             _ => None,
         };
-        let mut p = if self.order.is_empty() { None } else { Some(self.pos) };
-        // Walk forward (wrapping with repeat context) until MAX_NEXT or a full cycle.
-        let mut steps = 0usize;
-        while next.len() < MAX_NEXT && steps < self.order.len() {
-            let Some(np) = self.next_context_pos(p) else { break };
-            if Some(np) <= p && !self.repeat_context {
+        // One pass over the positions after the current one (wrapping with repeat context, to the
+        // current one: after a queued track that is the context track played before it, like
+        // Spirc), so that every playable item is listed once. Counting only the playable items
+        // visited listed some twice when items were skipped or unavailable.
+        let len = self.order.len();
+        for off in 1..=len {
+            if next.len() >= MAX_NEXT {
                 break;
             }
-            let idx = self.order[np];
-            if Some(idx) == current_idx && steps > 0 {
+            let p = if self.repeat_context {
+                (self.pos + off) % len
+            } else if self.pos + off < len {
+                self.pos + off
+            } else {
                 break;
-            }
-            if Some(idx) != current_idx {
+            };
+            let idx = self.order[p];
+            if self.playable(idx) && Some(idx) != current_idx {
                 next.push(Self::track(&self.items[idx], TrackProvider::Context));
             }
-            p = Some(np);
-            steps += 1;
         }
         next
     }
@@ -1177,6 +1186,53 @@ mod tests {
         // a foreign load supersedes
         q.on_event(Event::RequestId(5), 0);
         assert!(!q.active);
+    }
+
+    #[test]
+    fn a_load_that_never_reached_the_player_owns_no_id() {
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 0, false, RepeatMode::Off), 0);
+        q.load_not_sent();
+        q.load(spec(3, 1, false, RepeatMode::Off), 0);
+        q.on_event(Event::RequestId(1), 0);
+        assert!(q.active);
+        // Spirc's load afterwards isn't taken as ours
+        q.on_event(Event::RequestId(2), 0);
+        assert!(!q.active);
+    }
+
+    #[test]
+    fn up_next_lists_every_item_once_after_a_queued_track() {
+        let uids = |q: &OfflineQueue| q.snapshot(dev(), 0).next_tracks.iter().map(|t| t.uid.clone()).collect::<Vec<_>>();
+        for repeat_one in [false, true] {
+            let mut q = OfflineQueue::default();
+            q.load(spec(4, 0, false, RepeatMode::Context), 0);
+            started(&mut q, 1);
+            assert!(q.remove("o2"));
+            assert!(q.add_to_queue("spotify:track:x".into()));
+            q.next(0);
+            started(&mut q, 2);
+            if repeat_one {
+                // repeat-one on the queued track, entered from repeat-all (wraps too)
+                q.set_repeat(RepeatMode::Track);
+            }
+            assert_eq!(uids(&q), ["o1", "o3", "o0"], "repeat one: {repeat_one}");
+            let h = q.handover(0, 50);
+            let unique: HashSet<&String> = h.uris.iter().collect();
+            assert_eq!(unique.len(), h.uris.len(), "{:?}", h.uris);
+        }
+        // on a context track the cycle ends before it
+        let mut q = OfflineQueue::default();
+        q.load(spec(4, 1, false, RepeatMode::Context), 0);
+        started(&mut q, 1);
+        assert!(q.remove("o3"));
+        assert_eq!(uids(&q), ["o2", "o0"]);
+        // without repeat the list ends with the context
+        let mut q = OfflineQueue::default();
+        q.load(spec(4, 1, false, RepeatMode::Off), 0);
+        started(&mut q, 1);
+        assert!(q.remove("o2"));
+        assert_eq!(uids(&q), ["o3"]);
     }
 
     #[test]

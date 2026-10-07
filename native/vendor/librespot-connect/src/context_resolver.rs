@@ -34,6 +34,8 @@ pub(super) struct ResolveContext {
     fallback: Option<String>,
     update: ContextType,
     action: ContextAction,
+    // SPOTIFYGOOD: a further page (`page_url`) of a resolved context, see fetch_as
+    page: bool,
 }
 
 impl ResolveContext {
@@ -45,6 +47,7 @@ impl ResolveContext {
             fallback: None,
             update,
             action: ContextAction::Append,
+            page: true,
         }
     }
 
@@ -60,6 +63,7 @@ impl ResolveContext {
             fallback: (!fallback_uri.is_empty()).then_some(fallback_uri),
             update,
             action,
+            page: false,
         }
     }
 
@@ -69,6 +73,7 @@ impl ResolveContext {
             fallback: None,
             update,
             action,
+            page: false,
         }
     }
 
@@ -86,12 +91,14 @@ impl ResolveContext {
     }
 
     // SPOTIFYGOOD: a further page is resolved like a context, also one of an autoplay context
-    // (it is appended to that one)
+    // (it is appended to that one). Every other resolve goes by its type: the autoplay
+    // continuation (an Append of the playing context) asks the autoplay endpoint for new tracks.
     /// how the resolve is requested
     fn fetch_as(&self) -> ContextType {
-        match self.action {
-            ContextAction::Append => ContextType::Default,
-            ContextAction::Replace => self.update,
+        if self.page {
+            ContextType::Default
+        } else {
+            self.update
         }
     }
 
@@ -444,6 +451,29 @@ mod tests {
             .get_context(ty)
             .map(|c| c.tracks.iter().map(|t| t.uid.clone()).collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn each_resolve_asks_the_right_endpoint() {
+        use ContextAction::*;
+        use ContextType::*;
+        let fetch = |update, action| ResolveContext::from_uri(PLAYLIST, "", update, action).fetch_as();
+        // the autoplay continuation (spirc's Append of the playing context) asks for new radio
+        // tracks, not for the playlist again
+        assert_eq!(fetch(Autoplay, Append), Autoplay);
+        assert_eq!(fetch(Autoplay, Replace), Autoplay);
+        assert_eq!(fetch(Default, Append), Default);
+        assert_eq!(fetch(Default, Replace), Default);
+        let ctx = Context { uri: Some(PLAYLIST.into()), ..Context::default() };
+        assert_eq!(ResolveContext::from_context(ctx, Autoplay, Replace).fetch_as(), Autoplay);
+        // only a further page of a context is fetched as a page, also one of an autoplay context
+        assert_eq!(ResolveContext::append_context("spotify:album:a", Autoplay).fetch_as(), Default);
+        assert_eq!(ResolveContext::append_context("spotify:album:a", Default).fetch_as(), Default);
+        // a page and the continuation of the same uri are different resolves
+        assert_ne!(
+            ResolveContext::append_context(PLAYLIST, Autoplay),
+            ResolveContext::from_uri(PLAYLIST, "", Autoplay, Append)
+        );
     }
 
     #[test]
