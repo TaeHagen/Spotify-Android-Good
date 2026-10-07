@@ -410,7 +410,10 @@ private fun PlaylistHeader(
                             )
                         },
                         trailing = {
-                            SmartShuffleButton(active = isContext && state.playback.smartShuffle, onClick = actions.onSmartShuffle)
+                            // The engine rejects smart shuffle offline (it needs recommendations); plain shuffle works.
+                            if (!state.offline) {
+                                SmartShuffleButton(active = isContext && state.playback.smartShuffle, onClick = actions.onSmartShuffle)
+                            }
                             ShuffleButton(
                                 active = isContext && state.playback.shuffle && !state.playback.smartShuffle,
                                 onClick = actions.onShuffle,
