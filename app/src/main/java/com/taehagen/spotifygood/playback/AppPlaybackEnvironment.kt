@@ -60,7 +60,6 @@ internal class AppPlaybackEnvironment(private val graph: AppGraph) : PlaybackEnv
     }
 
     override suspend fun downloadedMembers(contextUri: String, startUri: String?): OfflineMembers? {
-        if (OfflineLoads.kindOf(contextUri) == null) return null
         return try {
             withTimeoutOrNull(LOOKUP_TIMEOUT_MS) {
                 val downloads = graph.downloads
