@@ -656,7 +656,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   stop on `expired_token`/`access_denied`) only while the login screen is visible: polling
   pauses when the app goes to the background or the screen leaves composition (e.g. while the
   code is approved in the Custom Tab) and resumes when it is shown again, and stops when the
-  screen is left for good (activity finished) before a token arrived. The device code is
+  screen is left for good (activity finished) before a token arrived. The same applies when a
+  silent refresh-token login fails and the flow falls back to a code: hidden or closed meanwhile,
+  it pauses or stops instead of polling without a screen. The device code is
   persisted (≤ expiry) so polling resumes after process death. No local server.
 * **Fallback:** OAuth Authorization Code + PKCE with the desktop client id
   `65b708073fc0480ea92a077233ca87bd`, redirect `http://127.0.0.1:5588/login` (fallback
