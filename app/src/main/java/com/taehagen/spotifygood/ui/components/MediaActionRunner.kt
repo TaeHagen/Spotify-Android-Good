@@ -11,7 +11,15 @@ import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.Resource
 import com.taehagen.spotifygood.data.dataOrNull
+import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.playback.EngineReach
+import com.taehagen.spotifygood.playback.OfflineMembers
+import com.taehagen.spotifygood.ui.screens.album.engineReach
+import com.taehagen.spotifygood.ui.screens.album.isNetworkClassError
+import com.taehagen.spotifygood.ui.screens.library.DownloadMetadata
+import com.taehagen.spotifygood.ui.screens.library.decodeDownloadMetadata
+import com.taehagen.spotifygood.ui.screens.library.explicitFilterFlow
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.SpotifyLinks
 import kotlinx.coroutines.CancellationException
@@ -55,6 +63,39 @@ internal class MediaActionRunner(
                 navigator?.showMessage(friendlyErrorMessage(appContext, t))
             }
         }
+
+    /**
+     * "Add to queue" of the collection [uri] (playlist or album). While the session is ONLINE (by
+     * the engine's reach) the server's list ([online]); otherwise, or when fetching it fails for
+     * lack of connection, the collection's downloaded members in order (offline nothing else can be
+     * queued), without explicit ones while Hide explicit content is on.
+     */
+    fun addCollectionToQueue(uri: String, online: suspend () -> List<String>) {
+        launch {
+            val fromServer = if (graph.engineReach() == EngineReach.ONLINE) {
+                try {
+                    online()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (!isNetworkClassError(e)) throw e
+                    null
+                }
+            } else {
+                null
+            }
+            if (fromServer != null) {
+                addToQueue(fromServer)
+                return@launch
+            }
+            val downloaded = graph.downloadedQueueUris(uri)
+            if (downloaded.isEmpty()) {
+                withContext(Dispatchers.Main) { message(R.string.shell_msg_queue_nothing_downloaded) }
+            } else {
+                addToQueue(downloaded)
+            }
+        }
+    }
 
     /**
      * Adds [uris] in order, one player command each, and reports what really happened in one
@@ -117,4 +158,32 @@ fun shareSpotifyLink(context: Context, uri: String, title: String?): Boolean {
         if (context !is Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     return runCatching { context.startActivity(chooser) }.isSuccess
+}
+
+/**
+ * The downloaded members of the collection [contextUri] to queue (see [offlineQueueUris]), as
+ * playback's offline loads find them (playlist / album / show membership, or an album's
+ * individually downloaded tracks).
+ */
+internal suspend fun AppGraph.downloadedQueueUris(contextUri: String): List<String> {
+    val members = player.environment?.downloadedMembers(contextUri, startUri = null)
+        ?: downloads.collections.first().firstOrNull { it.ref.uri == contextUri }?.let { collection ->
+            OfflineMembers(collection.itemUris, downloads.downloadedUris.value)
+        }
+        ?: return emptyList()
+    val skipped = if (explicitFilterFlow().first()) {
+        downloads.items.first()
+            .filter { it.state == DownloadState.COMPLETED && it.uri in members.downloaded }
+            .filter { item ->
+                when (val meta = decodeDownloadMetadata(json, item.uri, item.metadataJson)) {
+                    is DownloadMetadata.OfTrack -> meta.track.explicit
+                    is DownloadMetadata.OfEpisode -> meta.episode.explicit
+                    null -> false
+                }
+            }
+            .mapTo(HashSet()) { it.uri }
+    } else {
+        emptySet()
+    }
+    return offlineQueueUris(members, skipped)
 }

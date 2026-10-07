@@ -330,9 +330,8 @@ private fun AlbumActions(t: MediaActionTarget.AlbumTarget, s: ActionScope) {
     }
     SheetAction(Icons.AutoMirrored.Rounded.QueueMusic, stringResource(R.string.shell_action_add_to_queue)) {
         s.dismiss()
-        s.runner.launch {
-            val tracks = s.graph.catalog.album(album.uri).awaitData()?.tracks.orEmpty()
-            s.runner.addToQueue(tracks.filter { it.playable }.map { it.uri })
+        s.runner.addCollectionToQueue(album.uri) {
+            s.graph.catalog.album(album.uri).awaitData()?.tracks.orEmpty().filter { it.playable }.map { it.uri }
         }
     }
     SheetAction(
@@ -397,7 +396,7 @@ private fun PlaylistActions(t: MediaActionTarget.PlaylistTarget, s: ActionScope)
     }
     SheetAction(Icons.AutoMirrored.Rounded.QueueMusic, stringResource(R.string.shell_action_add_to_queue)) {
         s.dismiss()
-        s.runner.launch { s.runner.addToQueue(s.graph.catalog.playlistItemUris(playlist.uri)) }
+        s.runner.addCollectionToQueue(playlist.uri) { s.graph.catalog.playlistItemUris(playlist.uri) }
     }
     if (t.isOwned) {
         SheetAction(Icons.Rounded.Edit, stringResource(R.string.shell_action_rename)) { s.setPage(SheetPage.Rename) }

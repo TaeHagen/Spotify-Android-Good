@@ -448,7 +448,7 @@ internal class SpotifyPlayer(
     }
 
     /**
-     * [track] for a load: completes once the loaded item (or remote playback) shows, or the start
+     * [track] for a load: completes once the loaded item shows on this phone, or the start
      * failed ([LoadSettle]), so Media3's placeholder and foreground last over a cold session's
      * activation; bounded by [LOAD_SETTLE_MS] after the command went through.
      */

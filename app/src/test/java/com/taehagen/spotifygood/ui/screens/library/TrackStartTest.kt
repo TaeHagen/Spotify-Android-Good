@@ -2,10 +2,6 @@ package com.taehagen.spotifygood.ui.screens.library
 
 import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.DownloadState
-import com.taehagen.spotifygood.model.PlaybackContext
-import com.taehagen.spotifygood.model.PlaybackSnapshot
-import com.taehagen.spotifygood.model.PlaybackStatus
-import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.ui.screens.album.canStartNow
@@ -111,20 +107,33 @@ class TrackStartTest {
     }
 
     @Test
-    fun supersededMeansAnotherStartOrAPauseNotTheSongEnding() {
-        fun t(uri: String) = PlaybackTrack(uri = uri, name = uri)
-        val start = PlaybackSnapshot(
-            status = PlaybackStatus.PLAYING,
-            context = PlaybackContext(uri = "spotify:album:x"),
-            track = t("a"),
-            nextTracks = listOf(t("b")),
+    fun anyUserCommandAfterTheTapSupersedes() = runTest {
+        // A pause during the wait, or a play started from an empty snapshot, bumps the counter.
+        assertTrue(startSuperseded(at = 4, now = 5))
+        assertFalse(startSuperseded(at = 4, now = 4))
+
+        // The wait itself: the counter is read after each wait, so a command meanwhile drops it.
+        var commands = 4L
+        val waited = planTrackStart(
+            trackUri = track.uri,
+            known = null,
+            downloaded = false,
+            reach = EngineReach.CONNECTING,
+            awaitOnline = { commands++; true }, // e.g. the user paused while the session connected
+            lookup = { inAlbum },
+            superseded = { startSuperseded(4, commands) },
         )
-        assertTrue(!startSuperseded(start, start))
-        assertTrue("the song ended, the next one plays", !startSuperseded(start, start.copy(track = t("b"))))
-        assertTrue(startSuperseded(start, start.copy(track = t("z"))))
-        assertTrue(startSuperseded(start, start.copy(context = PlaybackContext(uri = "spotify:playlist:y"))))
-        assertTrue("paused", startSuperseded(start, start.copy(status = PlaybackStatus.PAUSED)))
-        val idle = PlaybackSnapshot()
-        assertTrue("something started", startSuperseded(idle, start))
+        assertEquals(TrackStartPlan.Superseded, waited)
+        // Nothing issued meanwhile (snapshots of the session coming online don't count): it plays.
+        val quiet = planTrackStart(
+            trackUri = track.uri,
+            known = null,
+            downloaded = false,
+            reach = EngineReach.CONNECTING,
+            awaitOnline = { true },
+            lookup = { inAlbum },
+            superseded = { startSuperseded(7, 7) },
+        )
+        assertEquals(TrackStartPlan.Play(track.uri, album.uri), quiet)
     }
 }

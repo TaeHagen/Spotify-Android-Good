@@ -4,7 +4,6 @@ import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
-import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.ui.components.SessionMessenger
@@ -120,7 +119,7 @@ internal sealed interface TrackStartPlan {
     data class Play(val trackUri: String, val albumUri: String?) : TrackStartPlan
     data class Blocked(val reason: TrackStartBlock) : TrackStartPlan
 
-    /** Something else was started (or playback paused) while this one waited: it is dropped. */
+    /** The user did something else (play, pause, skip, ...) while this one waited: it is dropped. */
     data object Superseded : TrackStartPlan
 }
 
@@ -154,17 +153,14 @@ internal suspend fun planTrackStart(
 }
 
 /**
- * Whether playback changed since [start] in a way that means the user started (or paused)
- * something else: another context, playing ↔ not playing, or another track that isn't simply the
- * next one of [start] (the current song ending).
+ * Whether the user issued a playback command since the start was tapped ([at]: the value of
+ * `PlayerController.userCommands` then, [now]: its current value). That covers a play or load
+ * from the app or the media session (also from an empty snapshot), a pause, a skip or a seek,
+ * and nothing the session does by itself while coming online (the first cluster, a restored
+ * reconnect placeholder, a hand-back to Spirc), which a comparison of snapshots could not tell
+ * apart.
  */
-internal fun startSuperseded(start: PlaybackSnapshot, now: PlaybackSnapshot): Boolean {
-    if (start.context?.uri != now.context?.uri) return true
-    if (start.isPlaying != now.isPlaying) return true
-    val before = start.track?.uri
-    val after = now.track?.uri
-    return before != after && after != start.nextTracks.firstOrNull()?.uri
-}
+internal fun startSuperseded(at: Long, now: Long): Boolean = now != at
 
 /** The single-track start in flight: a newer one replaces it (it would otherwise land later). */
 private object TrackStarts {
@@ -182,17 +178,19 @@ private object TrackStarts {
 /**
  * Starts [trackUri] within its album (so playback continues naturally), else on its own, unless
  * [planTrackStart] says it can't: then shows why instead of letting a different track play. Runs
- * in the app scope; a newer single-track start cancels this one, and a play started elsewhere
- * meanwhile wins.
+ * in the app scope; a newer single-track start cancels this one, and any playback command the
+ * user issues meanwhile (in the app or through the media session: play, pause, skip, ...) wins
+ * ([startSuperseded]).
  */
 internal fun AppGraph.launchTrackStart(trackUri: String, track: Track?) {
-    TrackStarts.launch(appScope) { startTrack(trackUri, track) }
+    // Read at the tap, before the start runs: any command the user issues after it drops it.
+    val commands = player.userCommands.value
+    TrackStarts.launch(appScope) { startTrack(trackUri, track, commands) }
 }
 
-private suspend fun AppGraph.startTrack(trackUri: String, track: Track?) {
+private suspend fun AppGraph.startTrack(trackUri: String, track: Track?, commandsAtTap: Long) {
     val downloaded = trackUri in downloads.downloadedUris.value
     val reach = engineReach()
-    val start = playback.snapshot.value
     val messenger = SessionMessenger(app)
     if (reach == EngineReach.CONNECTING && !downloaded && !track.isUnplayable) {
         // The tap registered: the song starts once the session is back.
@@ -215,7 +213,7 @@ private suspend fun AppGraph.startTrack(trackUri: String, track: Track?) {
                 }
             }
         },
-        superseded = { startSuperseded(start, playback.snapshot.value) },
+        superseded = { startSuperseded(commandsAtTap, player.userCommands.value) },
     )
     when (plan) {
         is TrackStartPlan.Blocked -> messenger.post(
@@ -224,10 +222,12 @@ private suspend fun AppGraph.startTrack(trackUri: String, track: Track?) {
                 TrackStartBlock.NOT_DOWNLOADED -> R.string.playback_error_not_available_offline
             },
         )
-        is TrackStartPlan.Play -> if (plan.albumUri != null) {
-            player.playContext(plan.albumUri, startUri = plan.trackUri)
-        } else {
-            player.playTracks(listOf(plan.trackUri))
+        is TrackStartPlan.Play -> {
+            if (plan.albumUri != null) {
+                player.playContext(plan.albumUri, startUri = plan.trackUri)
+            } else {
+                player.playTracks(listOf(plan.trackUri))
+            }
         }
         TrackStartPlan.Superseded -> Unit
     }
