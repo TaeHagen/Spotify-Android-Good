@@ -92,7 +92,7 @@ class AppGraph(val app: Application) {
     val search: SearchRepository by lazy { SearchRepository(rpc, database.recentSearches()) }
     val home: HomeRepository by lazy { HomeRepository(rpc, responseCache) }
     val lyrics: LyricsRepository by lazy { LyricsRepository(rpc) }
-    val playlists: PlaylistEditor by lazy { PlaylistEditor(rpc, library, catalog) }
+    val playlists: PlaylistEditor by lazy { PlaylistEditor(appScope, rpc, library, catalog) }
 
     val downloads: DownloadManager by lazy {
         DownloadManager(app, appScope, database, rpc, events, engine, settings, credentialStore)
