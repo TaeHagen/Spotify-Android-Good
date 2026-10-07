@@ -589,24 +589,24 @@ impl ConnectState {
         session.spclient().put_connect_state_request(&request).await
     }
 
+    // SPOTIFYGOOD: for the state puts of Spirc, which run next to its loop (owning a copy)
+    /// A copy of the state request, with the given reason instead of the default one
+    pub fn put_state_request(&self, reason: Option<PutStateReason>) -> PutStateRequest {
+        let mut request = self.request.clone();
+        if let Some(reason) = reason {
+            request.put_state_reason = EnumOrUnknown::new(reason);
+        }
+        request
+    }
+
     /// Notifies the remote server about a new device
     pub async fn notify_new_device_appeared(&mut self, session: &Session) -> SpClientResult {
         self.send_with_reason(session, PutStateReason::NEW_DEVICE)
             .await
     }
 
-    /// Notifies the remote server about a new volume
-    pub async fn notify_volume_changed(&mut self, session: &Session) -> SpClientResult {
-        self.send_with_reason(session, PutStateReason::VOLUME_CHANGED)
-            .await
-    }
-
-    // SPOTIFYGOOD: see [ConnectState::set_audio_output]
-    /// Notifies the remote server about a new audio output
-    pub async fn notify_audio_output_changed(&mut self, session: &Session) -> SpClientResult {
-        self.send_with_reason(session, PutStateReason::AUDIO_DRIVER_INFO_CHANGED)
-            .await
-    }
+    // SPOTIFYGOOD: notify_volume_changed (and the added notify_audio_output_changed) are gone,
+    // Spirc sends those puts next to its loop with put_state_request
 
     /// Sends the connect state for the connect session to the remote server
     pub async fn send_state(&self, session: &Session) -> SpClientResult {

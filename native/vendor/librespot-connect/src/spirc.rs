@@ -11,7 +11,8 @@ use crate::{
             protocol::{Command, FallbackWrapper, Message, Request},
         },
         session::UserAttributes,
-        spclient::TransferRequest,
+        // SPOTIFYGOOD: + SpClientResult (state puts next to the loop)
+        spclient::{SpClientResult, TransferRequest},
     },
     model::{AudioOutputKind, LoadRequest, PlayingTrack, SpircPlayStatus},
     playback::{
@@ -21,7 +22,8 @@ use crate::{
     },
     protocol::{
         autoplay_context_request::AutoplayContextRequest,
-        connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
+        // SPOTIFYGOOD: + PutStateReason
+        connect::{Cluster, ClusterUpdate, LogoutCommand, PutStateReason, SetVolumeCommand},
         context::Context,
         explicit_content_pubsub::UserAttributesUpdate,
         playlist4_external::PlaylistModificationInfo,
@@ -38,7 +40,11 @@ use crate::{
         SPOTIFY_MAX_NEXT_TRACKS_SIZE, StateError,
     },
 };
-use futures_util::StreamExt;
+// SPOTIFYGOOD: + BoxFuture, FutureExt (the state put in flight)
+use futures_util::{
+    StreamExt,
+    future::{BoxFuture, FutureExt},
+};
 use librespot_protocol::context_page::ContextPage;
 use protobuf::MessageField;
 // SPOTIFYGOOD: + VecDeque (commands received before the connection was established)
@@ -54,7 +60,7 @@ use thiserror::Error;
 // smart shuffle backoff
 use tokio::{
     sync::{broadcast, mpsc, watch},
-    time::{Instant, sleep, timeout},
+    time::{Instant, error::Elapsed, sleep, timeout},
 };
 
 #[derive(Debug, Error)]
@@ -157,6 +163,8 @@ struct SpircTask {
     pause_on_drop: bool,
     /// set by Spirc::release_player
     player_released: Arc<AtomicBool>,
+    /// the state puts, see [StatePuts]
+    state_puts: StatePuts,
 }
 
 // SPOTIFYGOOD: lets Spirc::add_to_queue reject an add right away when the queue is full, the
@@ -175,6 +183,69 @@ impl QueueGauge {
         let _ = self
             .pending
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
+}
+
+// SPOTIFYGOOD: the state puts run next to the loop. The handlers awaited them, unbounded: on a
+// stalled or rate limited connection (spclient sleeps out every Retry-After) no other command and
+// no player event was handled meanwhile, so e.g. a pause (headphones unplugged) waited behind the
+// put of the previous command, for up to a minute.
+/// What a state put announces
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatePut {
+    /// the player state (the request's own reason)
+    State,
+    Volume,
+    AudioOutput,
+}
+
+impl StatePut {
+    fn reason(self) -> Option<PutStateReason> {
+        match self {
+            StatePut::State => None,
+            StatePut::Volume => Some(PutStateReason::VOLUME_CHANGED),
+            StatePut::AudioOutput => Some(PutStateReason::AUDIO_DRIVER_INFO_CHANGED),
+        }
+    }
+}
+
+type StatePutResult = Result<SpClientResult, Elapsed>;
+
+/// The state puts: at most one is in flight (polled by the loop, bounded by [STATE_PUT_TIMEOUT]),
+/// the ones requested meanwhile wait, at most one of each kind in the order they were first
+/// requested. A put is built when it is sent, so it carries the state of then.
+#[derive(Default)]
+struct StatePuts {
+    in_flight: Option<(StatePut, BoxFuture<'static, StatePutResult>)>,
+    waiting: VecDeque<StatePut>,
+}
+
+impl StatePuts {
+    /// Requests a put, returns whether it is to be sent right away (none is in flight)
+    fn request(&mut self, put: StatePut) -> bool {
+        if self.in_flight.is_none() {
+            return true;
+        }
+        if !self.waiting.contains(&put) {
+            self.waiting.push_back(put)
+        }
+        false
+    }
+
+    fn start(&mut self, put: StatePut, request: BoxFuture<'static, StatePutResult>) {
+        self.in_flight = Some((put, request));
+    }
+
+    /// The put in flight is done, returns the next one to send
+    fn done(&mut self) -> Option<StatePut> {
+        self.in_flight = None;
+        self.waiting.pop_front()
+    }
+
+    /// Drops the put in flight (its request is cancelled) and the waiting ones
+    fn cancel(&mut self) {
+        self.in_flight = None;
+        self.waiting.clear();
     }
 }
 
@@ -294,8 +365,10 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 // SPOTIFYGOOD: upper bound for starting the dealer, the task ends after it
 const DEALER_START_TIMEOUT: Duration = Duration::from_secs(30);
-// SPOTIFYGOOD: upper bound for the delayed (background) state and volume puts of the loop
+// SPOTIFYGOOD: upper bound for every state put (see StatePuts)
 const STATE_PUT_TIMEOUT: Duration = Duration::from_secs(5);
+// SPOTIFYGOOD: upper bound for a request a command waits for (the transfer to this device)
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 // SPOTIFYGOOD: capacity of the command error broadcast, slow receivers lag (skip) old errors
 const ERROR_CHANNEL_CAPACITY: usize = 16;
 // SPOTIFYGOOD: smart shuffle fetch pacing
@@ -466,6 +539,7 @@ impl Spirc {
             autoplay_override: None,
             pause_on_drop: false,
             player_released: player_released.clone(),
+            state_puts: StatePuts::default(),
         };
 
         let spirc = Spirc {
@@ -868,6 +942,8 @@ impl SpircTask {
 
             let commands = self.commands.as_mut();
             let player_events = self.player_events.as_mut();
+            // SPOTIFYGOOD: see StatePuts
+            let state_put = self.state_puts.in_flight.as_mut();
 
             // when state and volume update have a higher priority than context resolving
             // because of that the context resolving has to wait, so that the other tasks can finish
@@ -958,36 +1034,30 @@ impl SpircTask {
                 suggestions = self.suggestions_rx.recv() => if let Some(suggestions) = suggestions {
                     self.handle_suggestions(suggestions)
                 },
+                // SPOTIFYGOOD: the state put in flight, see StatePuts
+                done = async {
+                    let (put, sending) = state_put?;
+                    Some((*put, sending.await))
+                }, if state_put.is_some() => if let Some((put, result)) = done {
+                    self.handle_state_put_done(put, result)
+                },
                 _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
                     self.update_state = false;
 
-                    // SPOTIFYGOOD: bounded, so that a stalled put can't keep a shutdown waiting
-                    match timeout(STATE_PUT_TIMEOUT, self.notify()).await {
-                        Ok(Ok(())) => (),
-                        Ok(Err(why)) => error!("state update: {why}"),
-                        Err(_) => error!("state update timed out"),
-                    }
+                    // SPOTIFYGOOD: next to the loop, see StatePuts
+                    self.put_state(StatePut::State);
                 },
                 _ = async { sleep(VOLUME_UPDATE_DELAY).await }, if self.update_volume => {
                     self.update_volume = false;
 
                     info!("delayed volume update for all devices: volume is now {}", self.connect_state.device_info().volume);
-                    // SPOTIFYGOOD: both puts are bounded, see above
-                    match timeout(STATE_PUT_TIMEOUT, self.connect_state.notify_volume_changed(&self.session)).await {
-                        // SPOTIFYGOOD: the response may contain the cluster
-                        Ok(Ok(response)) => self.publish_cluster_from_response(&response),
-                        Ok(Err(why)) => error!("error updating connect state for volume update: {why}"),
-                        Err(_) => error!("volume update timed out"),
-                    }
+                    // SPOTIFYGOOD: next to the loop, see StatePuts
+                    self.put_state(StatePut::Volume);
 
                     // for some reason the web-player does need two separate updates, so that the
                     // position of the current track is retained, other clients also send a state
                     // update before they send the volume update
-                    match timeout(STATE_PUT_TIMEOUT, self.notify()).await {
-                        Ok(Ok(())) => (),
-                        Ok(Err(why)) => error!("error updating connect state for volume update: {why}"),
-                        Err(_) => error!("state update after the volume update timed out"),
-                    }
+                    self.put_state(StatePut::State);
                 },
                 // context resolver handling, the idea/reason behind it the following:
                 //
@@ -1010,9 +1080,8 @@ impl SpircTask {
                 }, if allow_context_resolving && self.context_resolver.has_next() => {
                     let update_state = self.handle_next_context(next_context);
                     if update_state {
-                        if let Err(why) = self.notify().await {
-                            error!("update after context resolving failed: {why}")
-                        }
+                        // SPOTIFYGOOD: next to the loop, see StatePuts
+                        self.put_state(StatePut::State);
                     }
                 },
                 else => break
@@ -1225,29 +1294,37 @@ impl SpircTask {
             }
             SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
                 let device_id = self.session.device_id();
-                self.session
-                    .spclient()
-                    .transfer(device_id, device_id, request.as_ref())
-                    .await?;
+                // SPOTIFYGOOD: bounded, the loop handles nothing else meanwhile (spclient retries
+                // without a timeout and sleeps out a 429's Retry-After)
+                let transfer =
+                    self.session
+                        .spclient()
+                        .transfer(device_id, device_id, request.as_ref());
+                timeout(REQUEST_TIMEOUT, transfer)
+                    .await
+                    .map_err(|_| Error::deadline_exceeded("the transfer request timed out"))??;
                 return Ok(());
             }
             SpircCommand::Activate if !self.connect_state.is_active() => {
                 trace!("Received SpircCommand::{cmd:?}");
                 self.handle_activate();
-                return self.notify().await;
+                // SPOTIFYGOOD: next to the loop, see StatePuts
+                self.put_state(StatePut::State);
+                return Ok(());
             }
             // SPOTIFYGOOD: allowed while not active
             SpircCommand::SetAudioOutput(kind, name) => {
-                return self.handle_set_audio_output(kind, name).await;
+                self.handle_set_audio_output(kind, name);
+                return Ok(());
             }
             // SPOTIFYGOOD: allowed while not active
             SpircCommand::SetAutoplay(autoplay) => self.handle_set_autoplay(autoplay)?,
             // SPOTIFYGOOD: allowed while not active, the response of the state put contains the
             // cluster. A failure isn't reported, the refresh is a background request.
             SpircCommand::RefreshCluster => {
-                if let Err(why) = self.notify().await {
-                    debug!("cluster refresh failed: {why}")
-                }
+                // SPOTIFYGOOD: next to the loop (see StatePuts), its response publishes the
+                // cluster
+                self.put_state(StatePut::State);
                 return Ok(());
             }
             SpircCommand::Transfer(..) | SpircCommand::Activate => {
@@ -1255,11 +1332,9 @@ impl SpircTask {
             }
             _ if !self.connect_state.is_active() => {
                 warn!("SpircCommand::{cmd:?} will be ignored while Not Active");
-                // SPOTIFYGOOD: still put the state like before (bounded, so that a backlog of
-                // rejected commands can't stall the loop), but report the command as failed
-                if let Err(why) = bounded_put("state", timeout(STATE_PUT_TIMEOUT, self.notify()).await) {
-                    warn!("state update failed: {why}")
-                }
+                // SPOTIFYGOOD: still put the state like before (next to the loop, see
+                // StatePuts), but report the command as failed
+                self.put_state(StatePut::State);
                 return Err(SpircError::NotActive(cmd.name()).into());
             }
             SpircCommand::Disconnect { pause } => {
@@ -1307,9 +1382,11 @@ impl SpircTask {
         };
 
         // SPOTIFYGOOD: the snapshot shows the command's effect (e.g. playing again) before the
-        // put, which can take long on a bad network (it was only published after it)
+        // put, which can take long on a bad network (it was only published after it). The put
+        // runs next to the loop (see StatePuts): the next command doesn't wait for it.
         self.publish_snapshot();
-        self.notify().await
+        self.put_state(StatePut::State);
+        Ok(())
     }
 
     fn handle_player_event(&mut self, event: PlayerEvent) -> Result<(), Error> {
@@ -1476,6 +1553,9 @@ impl SpircTask {
     async fn handle_connection_id_update(&mut self, connection_id: String) -> Result<(), Error> {
         trace!("Received connection ID update: {connection_id:?}");
         self.session.set_connection_id(&connection_id);
+        // SPOTIFYGOOD: the announce below carries the whole state, a put of before (in flight or
+        // waiting, see StatePuts) must not land after it
+        self.state_puts.cancel();
 
         // SPOTIFYGOOD: bounded, see NEW_DEVICE_PUT_TIMEOUT (unbounded, a live task never
         // delivered its first cluster: the app never knew which device was active)
@@ -1636,6 +1716,8 @@ impl SpircTask {
             self.player.stop();
             self.publish_inactive_snapshot();
             self.play_request_id = None;
+            // SPOTIFYGOOD: see handle_disconnect
+            self.state_puts.cancel();
             // SPOTIFYGOOD: bounded, see handle_disconnect
             let res = bounded_put(
                 "inactive state",
@@ -1714,7 +1796,8 @@ impl SpircTask {
                 self.handle_transfer(transfer.data.expect("by condition checked"), false)?;
                 // SPOTIFYGOOD: see handle_command
                 self.publish_snapshot();
-                return self.notify().await;
+                self.put_state(StatePut::State);
+                return Ok(());
             }
             Play(mut play) => {
                 if !self.connect_state.is_active() {
@@ -1941,6 +2024,9 @@ impl SpircTask {
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
         self.context_resolver.clear();
+        // SPOTIFYGOOD: a put still in flight (or waiting) would announce the active state again
+        // after the inactive one below
+        self.state_puts.cancel();
 
         self.play_status = SpircPlayStatus::Stopped {};
         self.connect_state
@@ -2373,21 +2459,12 @@ impl SpircTask {
     }
 
     // SPOTIFYGOOD: see Spirc::set_audio_output
-    async fn handle_set_audio_output(
-        &mut self,
-        kind: AudioOutputKind,
-        name: Option<String>,
-    ) -> Result<(), Error> {
-        if !self.connect_state.set_audio_output(kind, name) {
-            return Ok(());
+    // SPOTIFYGOOD: the put runs next to the loop (see StatePuts), a failure is only logged; the
+    // state holds the new output, so every later put carries it
+    fn handle_set_audio_output(&mut self, kind: AudioOutputKind, name: Option<String>) {
+        if self.connect_state.set_audio_output(kind, name) {
+            self.put_state(StatePut::AudioOutput);
         }
-
-        let response = self
-            .connect_state
-            .notify_audio_output_changed(&self.session)
-            .await?;
-        self.publish_cluster_from_response(&response);
-        Ok(())
     }
 
     // SPOTIFYGOOD: see Spirc::set_autoplay, the local value also survives a replacement of all
@@ -2900,6 +2977,47 @@ impl SpircTask {
         Ok(())
     }
 
+    // SPOTIFYGOOD: see StatePuts, the handlers request puts instead of awaiting notify
+    /// Requests a state put, it is sent right away or after the one in flight
+    fn put_state(&mut self, put: StatePut) {
+        if self.state_puts.request(put) {
+            self.send_state_put(put)
+        }
+    }
+
+    fn send_state_put(&mut self, put: StatePut) {
+        // like notify
+        self.connect_state.set_status(&self.play_status);
+        if self.connect_state.is_playing() {
+            self.connect_state
+                .update_position_in_relation(self.now_ms());
+        }
+        self.connect_state.set_now(self.now_ms() as u64);
+
+        let request = self.connect_state.put_state_request(put.reason());
+        let session = self.session.clone();
+        let sending = async move {
+            timeout(
+                STATE_PUT_TIMEOUT,
+                session.spclient().put_connect_state_request(&request),
+            )
+            .await
+        };
+        self.state_puts.start(put, sending.boxed());
+    }
+
+    fn handle_state_put_done(&mut self, put: StatePut, result: StatePutResult) {
+        match result {
+            // the response may contain the cluster
+            Ok(Ok(response)) => self.publish_cluster_from_response(&response),
+            Ok(Err(why)) => error!("{put:?} put failed: {why}"),
+            Err(_) => error!("{put:?} put timed out"),
+        }
+        if let Some(next) = self.state_puts.done() {
+            self.send_state_put(next)
+        }
+    }
+
     async fn notify(&mut self) -> Result<(), Error> {
         self.connect_state.set_status(&self.play_status);
 
@@ -3002,7 +3120,75 @@ impl Drop for SpircTask {
 // SPOTIFYGOOD
 #[cfg(test)]
 mod tests {
-    use super::{PlayAction, SpircPlayStatus, SuggestionFetch, play_action, pauses_on_drop};
+    use super::{
+        PlayAction, SpircPlayStatus, StatePut, StatePutResult, StatePuts, SuggestionFetch,
+        pauses_on_drop, play_action,
+    };
+    use futures_util::FutureExt;
+    use std::time::Duration;
+
+    #[test]
+    fn state_puts_wait_once_per_kind_in_order() {
+        let mut puts = StatePuts::default();
+        assert!(
+            puts.request(StatePut::State),
+            "nothing in flight, sent right away"
+        );
+        puts.start(StatePut::State, std::future::pending().boxed());
+
+        assert!(!puts.request(StatePut::Volume));
+        assert!(!puts.request(StatePut::State));
+        assert!(!puts.request(StatePut::Volume));
+        assert!(!puts.request(StatePut::AudioOutput));
+        assert!(!puts.request(StatePut::State));
+        assert_eq!(
+            puts.waiting,
+            [StatePut::Volume, StatePut::State, StatePut::AudioOutput]
+        );
+
+        assert_eq!(puts.done(), Some(StatePut::Volume));
+        assert!(puts.in_flight.is_none());
+        puts.start(StatePut::Volume, std::future::pending().boxed());
+        assert_eq!(puts.done(), Some(StatePut::State));
+        puts.start(StatePut::State, std::future::pending().boxed());
+
+        // a disconnect drops them all
+        puts.cancel();
+        assert!(puts.in_flight.is_none() && puts.waiting.is_empty());
+        assert!(puts.request(StatePut::State));
+    }
+
+    #[test]
+    fn a_stalled_state_put_doesnt_hold_back_a_command() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut puts = StatePuts::default();
+            // a put that never gets an answer (stalled connection, Retry-After), bounded
+            let stalled = async {
+                tokio::time::timeout(Duration::from_millis(50), std::future::pending()).await
+            };
+            puts.start(StatePut::State, stalled.boxed());
+            assert!(!puts.request(StatePut::State));
+
+            // the loop handles the command (e.g. a pause) while the put is in flight
+            let (commands, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            commands.send("pause").unwrap();
+            let state_put = puts.in_flight.as_mut();
+            tokio::select! {
+                _ = async { (&mut state_put.unwrap().1).await } => panic!("the put was answered"),
+                cmd = rx.recv() => assert_eq!(cmd, Some("pause")),
+            }
+
+            // and the put gives up, the waiting one follows
+            let (_, sending) = puts.in_flight.as_mut().unwrap();
+            let result: StatePutResult = sending.await;
+            assert!(result.is_err(), "timed out");
+            assert_eq!(puts.done(), Some(StatePut::State));
+        });
+    }
 
     #[test]
     fn play_while_stopped_restarts_the_current_track() {
