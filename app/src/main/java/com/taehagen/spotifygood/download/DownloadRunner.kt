@@ -86,6 +86,13 @@ internal class KeyCache {
     operator fun set(uri: String, hex: String) {
         keys[uri] = hex
     }
+
+    /**
+     * Caches a key decrypted outside the mutation lock, unless one is cached already: that one came
+     * from a newer commit of [uri] (removed and downloaded again while this one was decrypted).
+     * Returns the cached key.
+     */
+    fun remember(uri: String, hex: String): String = keys.putIfAbsent(uri, hex) ?: hex
     fun remove(uris: Collection<String>) = uris.forEach { keys.remove(it) }
     fun clear() = keys.clear()
 }

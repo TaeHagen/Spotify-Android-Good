@@ -470,7 +470,9 @@ class DownloadManager(
         val path = row.path ?: record.path
         if (!File(path).isFile) return RecordResult.Missing
         val keyHex = keys[row.uri] ?: if (skipKeystore) return RecordResult.KeystoreBusy else when (val key = decryptKey(row)) {
-            is KeyResult.Key -> key.hex.also { keys[row.uri] = it }
+            // Not overwriting a key a newer commit of this URI cached meanwhile; this row's record
+            // still gets this row's key.
+            is KeyResult.Key -> key.hex.also { keys.remember(row.uri, it) }
             KeyResult.Unreadable -> return RecordResult.Unreadable
             KeyResult.KeystoreBusy -> return RecordResult.KeystoreBusy
         }
