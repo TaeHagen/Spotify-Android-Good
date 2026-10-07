@@ -198,13 +198,45 @@ pub(crate) fn detach_state(hub: &mut HubState, generation: u64, online: bool) {
     }
 }
 
+/// The engine is done with the attached Spirc: it no longer touches the shared Player, not even
+/// while it shuts down (the offline queue may take the Player over right away, see
+/// `Spirc::release_player`). Returns whether it was the active device playing: then the Player
+/// is to be paused instead (unless the offline queue owns it).
+fn release_link(hub: &HubState) -> bool {
+    let Some(link) = hub.link.as_ref() else { return false };
+    link.spirc.release_player();
+    hub.snapshot.as_ref().is_some_and(|s| {
+        s.is_active
+            && matches!(
+                s.status,
+                librespot_connect::SnapshotPlayStatus::Playing | librespot_connect::SnapshotPlayStatus::LoadingPlay
+            )
+    })
+}
+
+fn pause_released(was_playing: bool) {
+    if was_playing && !offline::is_active() {
+        if let Some(player) = engine::player_host::player() {
+            log::info!("the detached spirc was playing, pausing its player");
+            player.pause();
+        }
+    }
+}
+
 /// Called by the engine when a Spirc goes away (teardown or death, or hiding from Spotify
 /// Connect while the session stays online).
 pub(crate) fn detach(generation: u64) {
     // Hidden (the session stays online): keep the last cluster for the remote player state. A
     // later teardown of the hidden session (offline, stopped) drops it, there is no link then.
     let online = engine::is_online();
-    detach_state(&mut HUB.lock(), generation, online);
+    let was_playing = {
+        let mut hub = HUB.lock();
+        let current = hub.link.as_ref().is_some_and(|l| l.generation == generation);
+        let was_playing = current && release_link(&hub);
+        detach_state(&mut hub, generation, online);
+        was_playing
+    };
+    pause_released(was_playing);
     changed();
     publish();
     publish_devices();
@@ -220,13 +252,16 @@ pub(crate) fn drop_stale_cluster() {
 
 /// Forgets any attached Spirc (forced cleanup after an aborted supervisor).
 pub(crate) fn detach_all() {
-    {
+    let was_playing = {
         let mut hub = HUB.lock();
+        let was_playing = release_link(&hub);
         hub.link = None;
         hub.snapshot = None;
         hub.cluster = None;
         hub.activation = None;
-    }
+        was_playing
+    };
+    pause_released(was_playing);
     changed();
     publish();
     publish_devices();
@@ -277,9 +312,9 @@ async fn observe(
 }
 
 /// The Spirc task is gone (its state channel closed): if it was the active device playing, the
-/// Player is released (Spirc pauses it itself when it ends; this also covers a task whose
-/// future was dropped before its last snapshot). Not if a newer Spirc or the offline queue
-/// owns the Player by now.
+/// Player is released (Spirc pauses it itself when it ends, unless it was detached, then
+/// `detach` did; this also covers a task whose future was dropped before its last snapshot).
+/// Not if a newer Spirc or the offline queue owns the Player by now.
 fn on_spirc_ended(generation: u64, last: &ConnectSnapshot) {
     let playing = last.is_active
         && matches!(

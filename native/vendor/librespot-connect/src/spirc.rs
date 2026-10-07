@@ -46,7 +46,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     sync::Arc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -152,6 +152,8 @@ struct SpircTask {
     autoplay_override: Option<bool>,
     /// the loop ended while the player played (or was paused), pause it when the task ends
     pause_on_drop: bool,
+    /// set by Spirc::release_player
+    player_released: Arc<AtomicBool>,
 }
 
 // SPOTIFYGOOD: lets Spirc::add_to_queue reject an add right away when the queue is full, the
@@ -300,6 +302,15 @@ const SUGGESTION_ERROR_BACKOFF: Duration = Duration::from_secs(30);
 const SUGGESTION_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 const SUGGESTION_TIMEOUT: Duration = Duration::from_secs(20);
 
+// SPOTIFYGOOD: upper bound for the put that announces the device (its response is the first
+// cluster); the task ends after it (failed dealer setup), the app connects again
+const NEW_DEVICE_PUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+// SPOTIFYGOOD: the result of a put bounded by a timeout
+fn bounded_put<T>(what: &str, result: Result<Result<T, Error>, tokio::time::error::Elapsed>) -> Result<T, Error> {
+    result.unwrap_or_else(|_| Err(Error::deadline_exceeded(format!("{what} put timed out"))))
+}
+
 // delay to update volume after a certain amount of time, instead on each update request
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
 // to reduce updates to remote, we group some request by waiting for a set amount of time
@@ -313,6 +324,7 @@ pub struct Spirc {
     cluster_rx: watch::Receiver<Option<Arc<Cluster>>>,
     errors_rx: broadcast::Receiver<SpircCommandError>,
     queue_gauge: Arc<QueueGauge>,
+    player_released: Arc<AtomicBool>,
 }
 
 impl Spirc {
@@ -401,6 +413,7 @@ impl Spirc {
         let player_events = player.get_player_event_channel();
         // SPOTIFYGOOD
         let queue_gauge = Arc::new(QueueGauge::default());
+        let player_released = Arc::new(AtomicBool::new(false));
 
         let mut task = SpircTask {
             player,
@@ -449,6 +462,7 @@ impl Spirc {
             queue_gauge: queue_gauge.clone(),
             autoplay_override: None,
             pause_on_drop: false,
+            player_released: player_released.clone(),
         };
 
         let spirc = Spirc {
@@ -458,6 +472,7 @@ impl Spirc {
             cluster_rx,
             errors_rx,
             queue_gauge,
+            player_released,
         };
 
         let initial_volume = task.connect_state.device_info().volume;
@@ -624,6 +639,14 @@ impl Spirc {
     /// while the task still disconnects. Commands then fail to send.
     pub fn is_running(&self) -> bool {
         !self.commands.is_closed()
+    }
+
+    // SPOTIFYGOOD
+    /// Hands the player back to the app (the app detached this spirc, which is about to shut
+    /// down, and may drive the same player on its own): the task no longer touches it, not even
+    /// to pause or stop it when it ends, and stops handling events (it shuts down at once).
+    pub fn release_player(&self) {
+        self.player_released.store(true, Ordering::Release);
     }
 
     /// Subscribes to snapshots of the local connect state
@@ -824,6 +847,14 @@ impl SpircTask {
         }
 
         while !self.session.is_invalid() && !self.shutdown {
+            // SPOTIFYGOOD: the app took the player back (see Spirc::release_player): no more
+            // events are handled (a remote command would load into the app's playback), the
+            // shutdown that follows is handled right away
+            if !self.owns_player() {
+                info!("the player was released, shutting down");
+                self.handle_shutdown().await;
+                break;
+            }
             // SPOTIFYGOOD: handle the commands that arrived before the connection was established
             while self.connect_established && !self.shutdown {
                 match self.pending_commands.pop_front() {
@@ -1010,6 +1041,9 @@ impl SpircTask {
         // SPOTIFYGOOD: the player of a task that ended by itself is still playing, it is paused
         // when the task is dropped (after the epilogue), see Drop
         self.pause_on_drop = !matches!(self.play_status, SpircPlayStatus::Stopped);
+        if !self.owns_player() {
+            debug!("the player was released, it is left alone");
+        }
 
         // SPOTIFYGOOD: the final snapshot is the state when the loop ended (see
         // ConnectSnapshot::ending), the disconnect below only describes the teardown (stopped,
@@ -1058,7 +1092,12 @@ impl SpircTask {
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
         let next_context = match next_context {
             Err(why) => {
-                self.context_resolver.mark_next_unavailable();
+                // SPOTIFYGOOD: only a context that can't be resolved is skipped for a while, a
+                // transient failure (network, rate limit, server error) is retried by the next
+                // request for it
+                if ContextResolver::is_unavailable(&why) {
+                    self.context_resolver.mark_next_unavailable();
+                }
                 self.context_resolver.remove_used_and_invalid();
                 error!("{why}");
                 return false;
@@ -1213,8 +1252,9 @@ impl SpircTask {
             }
             _ if !self.connect_state.is_active() => {
                 warn!("SpircCommand::{cmd:?} will be ignored while Not Active");
-                // SPOTIFYGOOD: still put the state like before, but report the command as failed
-                if let Err(why) = self.notify().await {
+                // SPOTIFYGOOD: still put the state like before (bounded, so that a backlog of
+                // rejected commands can't stall the loop), but report the command as failed
+                if let Err(why) = bounded_put("state", timeout(STATE_PUT_TIMEOUT, self.notify()).await) {
                     warn!("state update failed: {why}")
                 }
                 return Err(SpircError::NotActive(cmd.name()).into());
@@ -1430,11 +1470,14 @@ impl SpircTask {
         trace!("Received connection ID update: {connection_id:?}");
         self.session.set_connection_id(&connection_id);
 
-        let cluster = match self
-            .connect_state
-            .notify_new_device_appeared(&self.session)
-            .await
-        {
+        // SPOTIFYGOOD: bounded, see NEW_DEVICE_PUT_TIMEOUT (unbounded, a live task never
+        // delivered its first cluster: the app never knew which device was active)
+        let announced = timeout(
+            NEW_DEVICE_PUT_TIMEOUT,
+            self.connect_state.notify_new_device_appeared(&self.session),
+        )
+        .await;
+        let cluster = match bounded_put("new device", announced) {
             Ok(res) => Cluster::parse_from_bytes(&res).ok(),
             Err(why) => {
                 error!("{why:?}");
@@ -1566,7 +1609,10 @@ impl SpircTask {
                 // and show it; the state is cleaned up after the requests, like below
                 self.play_status = SpircPlayStatus::Stopped;
                 self.player.stop();
-                self.publish_snapshot();
+                // SPOTIFYGOOD: shown inactive before the (bounded) requests, so that commands
+                // follow the device that took over meanwhile (they would go to this loop, stuck
+                // in the requests, and be dropped as not active afterwards)
+                self.publish_inactive_snapshot();
                 let res = self.handle_disconnect().await;
                 self.handle_stop();
                 res?;
@@ -1581,9 +1627,13 @@ impl SpircTask {
             // fails), it used to keep playing while the device reported itself as inactive
             self.play_status = SpircPlayStatus::Stopped;
             self.player.stop();
-            self.publish_snapshot();
+            self.publish_inactive_snapshot();
             self.play_request_id = None;
-            let res = self.connect_state.became_inactive(&self.session).await;
+            // SPOTIFYGOOD: bounded, see handle_disconnect
+            let res = bounded_put(
+                "inactive state",
+                timeout(STATE_PUT_TIMEOUT, self.connect_state.became_inactive(&self.session)).await,
+            );
             self.handle_stop();
             res?;
         }
@@ -1889,12 +1939,17 @@ impl SpircTask {
         self.connect_state
             .update_position_in_relation(self.now_ms());
         // SPOTIFYGOOD: become inactive (locally) even if the state update fails, it used to
-        // return early and the device kept reporting itself as active
-        let notified = self.notify().await;
+        // return early and the device kept reporting itself as active. Each request is bounded
+        // on its own (spclient retries without a timeout and waits out a 429's Retry-After);
+        // became_inactive resets the local state before its request.
+        let notified = bounded_put("state", timeout(STATE_PUT_TIMEOUT, self.notify()).await);
         // SPOTIFYGOOD: the player isn't ours anymore, a stale id must never match its events
         self.play_request_id = None;
 
-        let inactive = self.connect_state.became_inactive(&self.session).await;
+        let inactive = bounded_put(
+            "inactive state",
+            timeout(STATE_PUT_TIMEOUT, self.connect_state.became_inactive(&self.session)).await,
+        );
 
         self.player
             .emit_session_disconnected_event(self.session.connection_id(), self.session.username());
@@ -1905,7 +1960,10 @@ impl SpircTask {
     }
 
     fn handle_stop(&mut self) {
-        self.player.stop();
+        // SPOTIFYGOOD: see Spirc::release_player (a transfer away that ended after the release)
+        if self.owns_player() {
+            self.player.stop();
+        }
         self.connect_state.update_position(0, self.now_ms());
         self.connect_state.clear_next_tracks();
 
@@ -2100,12 +2158,12 @@ impl SpircTask {
         } else {
             debug!("resolving context for load command");
             self.context_resolver.clear();
-            self.context_resolver.add(ResolveContext::from_uri(
-                &context_uri,
-                fallback,
-                update_context,
-                ContextAction::Replace,
-            ));
+            let resolve =
+                ResolveContext::from_uri(&context_uri, fallback, update_context, ContextAction::Replace);
+            // SPOTIFYGOOD: an explicit load always asks again, a failure of the same context a
+            // moment ago (e.g. a network hiccup) refused it without any request for a minute
+            self.context_resolver.forget_unavailable(&resolve);
+            self.context_resolver.add(resolve);
             let context = self.context_resolver.get_next_context(Vec::new).await;
             self.handle_next_context(context);
         }
@@ -2136,7 +2194,11 @@ impl SpircTask {
                 position_ms,
                 preloading_of_next_track_triggered,
             } => {
-                self.player.play();
+                // SPOTIFYGOOD: see Spirc::release_player (a handler that resumes after the
+                // release must not drive the app's playback)
+                if self.owns_player() {
+                    self.player.play();
+                }
                 self.connect_state
                     .update_position(position_ms, self.now_ms());
                 self.play_status = SpircPlayStatus::Playing {
@@ -2145,7 +2207,9 @@ impl SpircTask {
                 };
             }
             SpircPlayStatus::LoadingPause { position_ms } => {
-                self.player.play();
+                if self.owns_player() {
+                    self.player.play();
+                }
                 self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
             }
             _ => return,
@@ -2175,7 +2239,10 @@ impl SpircTask {
                 nominal_start_time,
                 preloading_of_next_track_triggered,
             } => {
-                self.player.pause();
+                // SPOTIFYGOOD: see Spirc::release_player
+                if self.owns_player() {
+                    self.player.pause();
+                }
                 let position_ms = (self.now_ms() - nominal_start_time) as u32;
                 self.connect_state
                     .update_position(position_ms, self.now_ms());
@@ -2185,7 +2252,9 @@ impl SpircTask {
                 };
             }
             SpircPlayStatus::LoadingPlay { position_ms } => {
-                self.player.pause();
+                if self.owns_player() {
+                    self.player.pause();
+                }
                 self.play_status = SpircPlayStatus::LoadingPause { position_ms };
             }
             _ => (),
@@ -2201,7 +2270,10 @@ impl SpircTask {
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
-        self.player.seek(position_ms);
+        // SPOTIFYGOOD: see Spirc::release_player
+        if self.owns_player() {
+            self.player.seek(position_ms);
+        }
         let now = self.now_ms();
         match self.play_status {
             SpircPlayStatus::Stopped => (),
@@ -2466,6 +2538,27 @@ impl SpircTask {
         }
     }
 
+    // SPOTIFYGOOD: see the transfer away in handle_cluster_update: the snapshot of a device that
+    // is becoming inactive (stopped), ahead of its state. The next publish_snapshot compares
+    // against it afresh.
+    fn publish_inactive_snapshot(&mut self) {
+        let mut snapshot = self.connect_state.snapshot(
+            SnapshotPlayStatus::Stopped,
+            1000 * self.session.time_delta(),
+            self.last_error.clone(),
+        );
+        snapshot.is_active = false;
+        self.snapshot_fingerprint = None;
+        self.snapshot_tx.send_if_modified(|current| {
+            if *current != snapshot {
+                *current = snapshot;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     // SPOTIFYGOOD: publishes the state, skipped cheaply if nothing visible changed
     fn publish_snapshot(&mut self) {
         let status = self.snapshot_status();
@@ -2538,7 +2631,10 @@ impl SpircTask {
         }
 
         if let Some(track_id) = self.connect_state.preview_next_track() {
-            self.player.preload(track_id);
+            // SPOTIFYGOOD: see Spirc::release_player
+            if self.owns_player() {
+                self.player.preload(track_id);
+            }
         }
     }
 
@@ -2766,7 +2862,11 @@ impl SpircTask {
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
-        self.player.load(id, start_playing, position_ms);
+        // SPOTIFYGOOD: see Spirc::release_player (e.g. a load whose context resolved only after
+        // the release)
+        if self.owns_player() {
+            self.player.load(id, start_playing, position_ms);
+        }
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
@@ -2816,6 +2916,18 @@ impl SpircTask {
     }
 }
 
+impl SpircTask {
+    // SPOTIFYGOOD: see Spirc::release_player
+    fn owns_player(&self) -> bool {
+        !self.player_released.load(Ordering::Acquire)
+    }
+}
+
+// SPOTIFYGOOD: see Drop for SpircTask
+fn pauses_on_drop(owns_player: bool, pause_on_drop: bool, stopped: bool) -> bool {
+    owns_player && (pause_on_drop || !stopped)
+}
+
 impl Drop for SpircTask {
     fn drop(&mut self) {
         debug!("drop Spirc[{}]", self.spirc_id);
@@ -2823,8 +2935,14 @@ impl Drop for SpircTask {
         self.suggestion_fetch.cancel();
         // SPOTIFYGOOD: nothing controls the player after this. A task that ended by itself, or
         // was aborted in the middle of a handler (handle_shutdown never ran), left it playing.
-        // An inactive spirc doesn't touch it (the app may drive it, see handle_player_event).
-        if self.pause_on_drop || !matches!(self.play_status, SpircPlayStatus::Stopped) {
+        // An inactive spirc doesn't touch it (the app may drive it, see handle_player_event),
+        // neither does one whose player the app took back (its offline playback may already
+        // run on it, see Spirc::release_player).
+        if pauses_on_drop(
+            self.owns_player(),
+            self.pause_on_drop,
+            matches!(self.play_status, SpircPlayStatus::Stopped),
+        ) {
             self.player.pause();
         }
     }
@@ -2833,7 +2951,18 @@ impl Drop for SpircTask {
 // SPOTIFYGOOD
 #[cfg(test)]
 mod tests {
-    use super::SuggestionFetch;
+    use super::{SuggestionFetch, pauses_on_drop};
+
+    #[test]
+    fn a_released_player_is_left_alone_when_the_task_ends() {
+        // ended by itself while playing, or aborted in a handler: paused
+        assert!(pauses_on_drop(true, true, true));
+        assert!(pauses_on_drop(true, false, false));
+        assert!(!pauses_on_drop(true, false, true));
+        // the app took the player back (its offline playback may run on it): untouched
+        assert!(!pauses_on_drop(false, true, false));
+        assert!(!pauses_on_drop(false, false, false));
+    }
 
     #[test]
     fn restart_aborts_the_suggestion_fetch_in_flight() {
