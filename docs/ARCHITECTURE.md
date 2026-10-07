@@ -1017,6 +1017,10 @@ Native catalog strategy (Rust `catalog/`):
   read for and never served to another account (a load that finishes after a logout included).
   `session.logout` drops them (`catalog::clear_user_state`, next to `metadata::clear_cache`),
   and a login as another account without a logout drops them on first use.
+* **Country of the metadata cache**: entity metadata (`playable`, market-specific data) uses the
+  access point's country, or the account's `country` attribute until that arrives. Entities
+  fetched with no country at all are cached for 60 s instead of 12 h, and the whole metadata
+  cache is dropped when a country arrives (or changes) after entries were computed without it.
 * The public Web API is never used by default.
 
 
