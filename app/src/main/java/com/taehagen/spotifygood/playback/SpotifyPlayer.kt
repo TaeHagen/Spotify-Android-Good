@@ -10,6 +10,7 @@ import androidx.media3.common.C
 import androidx.media3.common.DeviceInfo
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.SimpleBasePlayer
@@ -40,7 +41,9 @@ import kotlinx.coroutines.withTimeoutOrNull
  * [PlaybackRepository.snapshot] (docs/ARCHITECTURE.md §9.4; research §1):
  * * playlist = [QueueWindow] (10 previous + current + 50 next, unique uids, play order);
  * * state: IDLE without a track, BUFFERING while loading, READY otherwise; `playWhenReady` while
- *   playing/loading; position extrapolated from the snapshot;
+ *   playing/loading; position extrapolated from the snapshot; while nothing plays, IDLE with a
+ *   player error when there is one to show (logged out, Premium required, a failed start), so Auto
+ *   and other controllers tell the user (the playlist is kept);
  * * commands gated by Spotify restrictions; remote devices expose `DeviceInfo(REMOTE, 0..100)` and
  *   device-volume commands (hardware volume keys control the remote device); local playback is
  *   `DeviceInfo(LOCAL)` without volume commands (the system stream volume is synced natively).
@@ -59,6 +62,10 @@ internal class SpotifyPlayer(
     private val downloadedUris: () -> List<String>,
     /** Absolute path of the downloaded cover of a track / episode uri (offline artwork), if any. */
     private val downloadedImage: (String) -> String? = { null },
+    /** The error to publish while nothing plays (logged out, Premium, failed start), see [PlayerErrors]. */
+    private val playerError: () -> PlaybackException? = { null },
+    /** A controller retries (`prepare()`, e.g. Android Auto's retry): drop sticky errors. */
+    private val onRetry: () -> Unit = {},
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
 
     private val context = context.applicationContext
@@ -181,6 +188,13 @@ internal class SpotifyPlayer(
             builder.setPlaybackState(STATE_IDLE)
                 .setPlayWhenReady(false, PLAY_WHEN_READY_CHANGE_REASON_REMOTE)
         }
+        playerError()?.let { error ->
+            // Media3 allows a player error only in STATE_IDLE.
+            builder.setPlaybackState(STATE_IDLE)
+                .setIsLoading(false)
+                .setPlayWhenReady(false, PLAY_WHEN_READY_CHANGE_REASON_REMOTE)
+                .setPlayerError(error)
+        }
         return builder.build()
     }
 
@@ -252,7 +266,12 @@ internal class SpotifyPlayer(
     override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> =
         track(if (playWhenReady) controller.resumeAsync() else controller.pauseAsync())
 
-    override fun handlePrepare(): ListenableFuture<*> = Futures.immediateVoidFuture()
+    override fun handlePrepare(): ListenableFuture<*> {
+        // Auto's "retry" (and Media3's play button in STATE_IDLE) prepare first.
+        controller.clearFailure()
+        onRetry()
+        return Futures.immediateVoidFuture()
+    }
 
     override fun handleStop(): ListenableFuture<*> = track(controller.pauseAsync())
 

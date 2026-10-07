@@ -19,11 +19,13 @@ import androidx.media3.common.C
 import androidx.media3.common.HeartRating
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Rating
 import androidx.media3.session.CacheBitmapLoader
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaConstants
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaNotification
 import androidx.media3.session.MediaSession
@@ -45,6 +47,7 @@ import com.taehagen.spotifygood.engine.EngineHolder
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.PlaybackSource
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -105,6 +108,10 @@ class PlaybackService : MediaLibraryService() {
     private val searchCache = ConcurrentHashMap<String, List<MediaItem>>()
     /** uri → downloaded cover path of completed downloads (offline artwork). */
     @Volatile private var downloadedImages: Map<String, String> = emptyMap()
+    /** The stored credentials were read: "logged out" is real from then on. */
+    @Volatile private var engineReady = false
+    /** Last published player error (the same instance while unchanged, so controllers see it once). */
+    private var publishedError: Pair<PlayerErrorInfo, PlaybackException>? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -124,6 +131,8 @@ class PlaybackService : MediaLibraryService() {
             audioSessionId = graph.audioSink.audioSessionId,
             downloadedUris = { graph.downloads.downloadedUris.value.toList() },
             downloadedImage = { uri -> downloadedImages[uri] },
+            playerError = ::currentPlayerError,
+            onRetry = ::retryAfterError,
         )
 
         val provider = PlaybackNotificationProvider(this).apply { setSmallIcon(R.drawable.ic_notification) }
@@ -243,7 +252,22 @@ class PlaybackService : MediaLibraryService() {
                 playback.snapshot.map { },
                 graph.devices.devices.map { },
                 coordinator.volumeSync.streamIndex.map { },
+                // Inputs of the player error.
+                graph.engine.state.map { },
+                graph.player.failure.map { },
             ).collect { player.refresh() }
+        }
+        lifecycleScope.launch {
+            graph.engine.awaitReady()
+            engineReady = true
+            player.refresh()
+        }
+        lifecycleScope.launch {
+            // Asynchronous playback failures (e.g. nothing in the context could be played) reach
+            // the session as well, not only the in-app snackbar.
+            graph.events.errors
+                .filter { it.context == "playback" && it.code != NativeErrorCode.CANCELLED && it.code != NativeErrorCode.PLAYBACK_REFUSED }
+                .collect { e -> PlaybackErrorKind.fromCode(e.code)?.let { graph.player.noteFailure(it, e.message) } }
         }
         lifecycleScope.launch {
             playback.isPlaying.filter { it }.collect { if (ResumeAlert.isPosted) ResumeAlert.cancel(this@PlaybackService) }
@@ -331,6 +355,66 @@ class PlaybackService : MediaLibraryService() {
                     }
                 }
         }
+    }
+
+    // ---- player error ---------------------------------------------------------------------------
+
+    /** What controllers should be told while nothing plays (see [PlayerErrors]). Main thread. */
+    private fun currentPlayerError(): PlaybackException? {
+        val info = PlayerErrors.select(
+            ready = engineReady,
+            loggedIn = graph.engine.isLoggedIn.value,
+            accountErrorCode = graph.engine.state.value.error?.code,
+            snapshot = graph.playback.snapshot.value,
+            failure = graph.player.failure.value,
+            messages = graph.player.errorMessages,
+        )
+        if (info == null) {
+            publishedError = null
+            return null
+        }
+        publishedError?.takeIf { it.first == info }?.let { return it.second }
+        val error = PlaybackException(info.message, null, info.code, if (info.signIn) signInExtras() else Bundle.EMPTY)
+        publishedError = info to error
+        return error
+    }
+
+    /** A controller retried (`prepare()`): give account errors a fresh chance, like the app's "Try again". */
+    private fun retryAfterError() {
+        val code = graph.engine.state.value.error?.code
+        if (code == NativeErrorCode.PLAYBACK_REFUSED || code == NativeErrorCode.PREMIUM_REQUIRED) {
+            graph.engine.clearError()
+            graph.engine.retry()
+        }
+    }
+
+    /** "Sign in" resolution (Android Auto shows it with the error): opens the app's login. */
+    private fun signInExtras(): Bundle {
+        val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return Bundle.EMPTY
+        val intent = PendingIntent.getActivity(this, REQUEST_SIGN_IN, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        return Bundle().apply {
+            putString(MediaConstants.EXTRAS_KEY_ERROR_RESOLUTION_ACTION_LABEL_COMPAT, getString(R.string.playback_error_action_sign_in))
+            putParcelable(MediaConstants.EXTRAS_KEY_ERROR_RESOLUTION_ACTION_INTENT_COMPAT, intent)
+        }
+    }
+
+    /**
+     * Browsing while logged out or without Premium: an error (with "Sign in") instead of empty
+     * tabs; Media3 replicates these codes to the platform session for Auto.
+     */
+    private suspend fun accountLibraryError(): SessionError? {
+        if (!graph.engine.isLoggedIn.value) {
+            if (withTimeoutOrNull(LOGIN_WAIT_MS) { graph.engine.awaitReady() } == null) return null
+            if (!graph.engine.isLoggedIn.value) {
+                val message = graph.player.errorMessages.message(PlaybackErrorKind.NOT_LOGGED_IN, null)
+                return SessionError(SessionError.ERROR_SESSION_AUTHENTICATION_EXPIRED, message, withContext(Dispatchers.Main) { signInExtras() })
+            }
+        }
+        if (graph.engine.state.value.error?.code == NativeErrorCode.PREMIUM_REQUIRED) {
+            val message = graph.player.errorMessages.message(PlaybackErrorKind.PREMIUM_REQUIRED, null)
+            return SessionError(SessionError.ERROR_SESSION_PREMIUM_ACCOUNT_REQUIRED, message)
+        }
+        return null
     }
 
     /** Liked state of the current track (null while unknown). */
@@ -556,6 +640,7 @@ class PlaybackService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = lifecycleScope.future(Dispatchers.Default) {
+            accountLibraryError()?.let { return@future LibraryResult.ofError(it) }
             // Auto browses right after connecting, often on a cold engine: let the session come up
             // first instead of answering from an empty cache.
             if (LibraryTree.needsSession(parentId)) coordinator.environment.awaitSessionStart()
@@ -692,6 +777,7 @@ class PlaybackService : MediaLibraryService() {
         const val EXTRA_OPEN_PLAYER = "com.taehagen.spotifygood.extra.OPEN_PLAYER"
 
         private const val REQUEST_SESSION = 1
+        private const val REQUEST_SIGN_IN = 3
         /** Well inside the system's startForeground deadline (5–10 s). */
         private const val FOREGROUND_DEADLINE_MS = 3_000L
         private const val RESUME_SAVE_INTERVAL_MS = 15_000L

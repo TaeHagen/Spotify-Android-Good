@@ -42,6 +42,8 @@
     <string name="playback_error_not_logged_in">You\'re not logged in.</string>
     <string name="playback_error_timeout">The device didn\'t respond. Try again.</string>
     <string name="playback_error_generic">Something went wrong. Try again.</string>
+    <!-- Resolution action shown with the "not logged in" error (Android Auto). -->
+    <string name="playback_error_action_sign_in">Sign in</string>
 
     <!-- Android Auto browse tree -->
     <string name="playback_tab_home">Home</string>
