@@ -29,7 +29,7 @@ impl ConnectState {
     pub fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {
         if shuffle {
             // SPOTIFYGOOD: checked first, a refused shuffle left the option set
-            self.validate_shuffle_allowed()?;
+            self.validate_shuffle_toggle()?;
             self.set_shuffle(true);
             return self.shuffle_new();
         }

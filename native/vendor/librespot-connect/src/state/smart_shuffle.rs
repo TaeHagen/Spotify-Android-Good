@@ -76,7 +76,8 @@ impl ConnectState {
             return Ok(());
         }
 
-        self.validate_shuffle_allowed()?;
+        // not while autoplay plays, there is nothing left to interleave
+        self.validate_shuffle_toggle()?;
         if !self.shuffling_context() {
             self.set_shuffle(true);
             self.shuffle_new()?;

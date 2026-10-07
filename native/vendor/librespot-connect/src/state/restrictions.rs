@@ -63,8 +63,10 @@ impl ConnectState {
                     .clear();
                 restrictions.disallow_toggling_repeat_track_reasons.clear();
                 // SPOTIFYGOOD: also while a queued track plays after the default context ended,
-                // ConnectState::handle_set_repeat_context refuses it then
+                // ConnectState::handle_set_repeat_context and turning shuffle on
+                // (validate_shuffle_toggle) refuse it then
                 if autoplay_active {
+                    restrictions.disallow_toggling_shuffle_reasons = vec![AUTOPLAY.to_string()];
                     restrictions.disallow_toggling_repeat_context_reasons =
                         vec![AUTOPLAY.to_string()];
                 }
