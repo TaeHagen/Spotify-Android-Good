@@ -478,42 +478,53 @@ impl ConnectState {
             0
         };
 
-        let new_index = new_index.unwrap_or(0);
-        self.update_current_index(|i| i.track = new_index as u32);
-        self.update_context_index(self.active_context, new_index + 1)?;
+        // SPOTIFYGOOD: a track that isn't part of the context (a queued track, a playing smart
+        // shuffle suggestion, or a track an update removed from the context) stays the current
+        // track, and `new_index` is the context track it follows: the fill up continues after
+        // it, and it is the last prev track. Without `new_index` the context starts over at its
+        // first track (upstream skipped that one, as if it was the current track).
+        let follows = self.current_track(|t| {
+            t.is_queue()
+                || t.is_suggestion()
+                || (t.is_some()
+                    && self
+                        .get_context(self.active_context)
+                        .is_ok_and(|ctx| Self::position_in_context(ctx, t).is_none()))
+        });
+        let (current_index, fill_up_index, prev_end) = match new_index {
+            Some(i) if follows => (i, i + 1, i + 1),
+            Some(i) => (i, i + 1, i),
+            None if follows => (0, 0, 0),
+            None => (0, 1, 0),
+        };
+
+        self.update_current_index(|i| i.track = current_index as u32);
+        self.update_context_index(self.active_context, fill_up_index)?;
         // SPOTIFYGOOD: see above
         self.get_context_mut(self.active_context)?.index.page = pass;
         self.fill_up_context = self.active_context;
 
-        // SPOTIFYGOOD: a playing smart shuffle suggestion is not part of the context, keep it
-        // (like a queued track) instead of replacing it with the track it follows
-        if !self.current_track(|t| t.is_queue() || t.is_suggestion() || self.is_skip_track(t, None))
-        {
-            self.set_current_track(new_index)?;
+        if !follows && !self.current_track(|t| self.is_skip_track(t, None)) {
+            self.set_current_track(current_index)?;
         }
 
         self.clear_prev_track();
 
-        if new_index > 0 {
+        if prev_end > 0 {
             let context = self.get_context(self.active_context)?;
 
-            let before_new_track = context.tracks.len() - new_index;
-            self.player_mut().prev_tracks = context
-                .tracks
-                .iter()
-                .rev()
-                .skip(before_new_track)
-                .take(SPOTIFY_MAX_PREV_TRACKS_SIZE)
-                .rev()
-                .cloned()
-                .collect();
+            // SPOTIFYGOOD: clamped, a kept track may follow the last context track
+            let prev_end = prev_end.min(context.tracks.len());
+            self.player_mut().prev_tracks = context.tracks
+                [prev_end.saturating_sub(SPOTIFY_MAX_PREV_TRACKS_SIZE)..prev_end]
+                .to_vec();
             debug!("has {} prev tracks", self.prev_tracks().len())
         }
 
         self.clear_next_tracks();
         // SPOTIFYGOOD: smart shuffle, see above
         if default_ctx {
-            if let Some(suggestion) = self.continue_suggestions_at(pass, new_index + 1) {
+            if let Some(suggestion) = self.continue_suggestions_at(pass, fill_up_index) {
                 self.next_tracks_mut().push(suggestion)
             }
         }

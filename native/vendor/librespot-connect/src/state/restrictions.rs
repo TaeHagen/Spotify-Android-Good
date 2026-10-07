@@ -1,4 +1,6 @@
 use crate::state::ConnectState;
+// SPOTIFYGOOD: ContextType
+use crate::state::context::ContextType;
 use crate::state::provider::IsProvider;
 use librespot_protocol::player::Restrictions;
 use protobuf::MessageField;
@@ -16,6 +18,8 @@ impl ConnectState {
         const AUTOPLAY: &str = "autoplay";
 
         let prev_tracks_is_empty = self.prev_tracks().is_empty();
+        // SPOTIFYGOOD: see below
+        let autoplay_active = matches!(self.active_context, ContextType::Autoplay);
 
         let is_paused = self.is_pause();
         let is_playing = self.is_playing();
@@ -56,6 +60,12 @@ impl ConnectState {
                     .disallow_toggling_repeat_context_reasons
                     .clear();
                 restrictions.disallow_toggling_repeat_track_reasons.clear();
+                // SPOTIFYGOOD: also while a queued track plays after the default context ended,
+                // ConnectState::handle_set_repeat_context refuses it then
+                if autoplay_active {
+                    restrictions.disallow_toggling_repeat_context_reasons =
+                        vec![AUTOPLAY.to_string()];
+                }
             }
         }
     }

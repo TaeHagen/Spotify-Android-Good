@@ -775,6 +775,114 @@ fn smart_shuffle_suggestions_stay_in_their_pass_when_repeat_is_toggled() {
     assert_unique_uids(&state);
 }
 
+/// `uid{n}` -> n
+fn uid_index(uid: &str) -> usize {
+    uid.strip_prefix("uid").unwrap().parse().unwrap()
+}
+
+#[test]
+fn unshuffle_while_a_queued_track_plays_continues_after_the_last_context_track() {
+    // a uri that isn't in the context, and one that is (the track at position 30)
+    for queued_uri in [track_uri(1, 9), track_uri(30, 0)] {
+        let (_rt, mut state) = state(40);
+        state.handle_smart_shuffle(true).unwrap();
+        state.add_suggestions(suggestions(10)).unwrap();
+        let played = play_through(&mut state, 5);
+        let last_played = played
+            .iter()
+            .rev()
+            .find(|uid| uid.starts_with("uid"))
+            .unwrap()
+            .clone();
+        state.queue_add_uri(&queued_uri).unwrap();
+        state.queue_add_uri(&track_uri(2, 9)).unwrap();
+        state.next_track().unwrap();
+        assert!(state.current_track(|t| t.is_queue()));
+
+        state.handle_shuffle(false).unwrap();
+        assert!(!state.shuffling_context());
+        assert!(!state.smart_shuffle());
+        assert_eq!(state.current_track(|t| t.uri.clone()), queued_uri);
+        // the rest of the queue, then the context in its order after the last played track
+        let next = next_uids(&state);
+        assert_eq!(next[0], "q1");
+        assert_eq!(next[1..], uids(uid_index(&last_played) + 1..40));
+        assert!(state.next_tracks().iter().all(|t| !t.is_suggestion()));
+        assert_eq!(state.prev_tracks().last().unwrap().uid, last_played);
+    }
+}
+
+#[test]
+fn repeat_toggle_while_a_queued_track_plays() {
+    let (_rt, mut state) = state(5);
+    state.set_repeat_context(true);
+    state.reset_playback_to_position(Some(0)).unwrap();
+    play_through(&mut state, 2);
+    state.queue_add_uri(&track_uri(1, 9)).unwrap();
+    state.next_track().unwrap();
+    assert_eq!(state.current_track(|t| t.uid.clone()), "q0");
+
+    // the wraps of the context are gone
+    state.handle_set_repeat_context(false).unwrap();
+    assert!(!state.repeat_context());
+    assert_eq!(state.current_track(|t| t.uid.clone()), "q0");
+    assert_eq!(next_uids(&state), ["uid3", "uid4"]);
+
+    // and back after the last track
+    state.handle_set_repeat_context(true).unwrap();
+    let next = next_uids(&state);
+    assert_eq!(next[..2], ["uid3", "uid4"]);
+    assert!(next[2].starts_with(IDENTIFIER_DELIMITER));
+    assert_eq!(next[3], "uid0");
+    assert_unique_uids(&state);
+}
+
+#[test]
+fn shuffle_and_repeat_toggles_while_autoplay_plays() {
+    let (_rt, mut state) = state(3);
+    state
+        .update_context(
+            Context {
+                uri: Some(CONTEXT_URI.to_string()),
+                ..context(20, 5)
+            },
+            ContextType::Autoplay,
+        )
+        .unwrap();
+    state.handle_shuffle(true).unwrap();
+    // the other two context tracks, then autoplay
+    play_through(&mut state, 3);
+    assert!(state.current_track(|t| t.is_autoplay()));
+    let next = next_uids(&state);
+
+    // refused without changing anything
+    assert!(state.handle_set_repeat_context(true).is_err());
+    assert!(!state.repeat_context());
+    assert_eq!(next_uids(&state), next);
+
+    // the played default context is unshuffled, autoplay goes on
+    state.handle_shuffle(false).unwrap();
+    assert!(!state.shuffling_context());
+    assert!(state.current_track(|t| t.is_autoplay()));
+    assert_eq!(next_uids(&state), next);
+    let default_uids = state
+        .get_context(ContextType::Default)
+        .unwrap()
+        .tracks
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(default_uids, uids(0..3));
+
+    // a queued track that plays during autoplay can't toggle repeat either
+    state.queue_add_uri(&track_uri(1, 9)).unwrap();
+    state.next_track().unwrap();
+    assert!(state.current_track(|t| t.is_queue()));
+    let snapshot = state.snapshot(SnapshotPlayStatus::Playing, 0, None);
+    assert!(!snapshot.can_toggle_repeat);
+    assert!(state.handle_set_repeat_context(true).is_err());
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(

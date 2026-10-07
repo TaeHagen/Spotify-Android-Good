@@ -75,6 +75,16 @@ impl ConnectState {
             .ok_or(StateError::CanNotFindTrackInContext(None, ctx.tracks.len()))
     }
 
+    // SPOTIFYGOOD: the uid tells apart a track that is twice in the context, the uri is the
+    // fallback for contexts without stable uids (they are generated on every resolve)
+    /// The position of the given track in the context, by uid, else by uri
+    pub(super) fn position_in_context(ctx: &StateContext, track: &ProvidedTrack) -> Option<usize> {
+        ctx.tracks
+            .iter()
+            .position(|t| !track.uid.is_empty() && t.uid == track.uid)
+            .or_else(|| ctx.tracks.iter().position(|t| t.uri == track.uri))
+    }
+
     pub fn get_context(&self, ty: ContextType) -> Result<&StateContext, StateError> {
         match ty {
             ContextType::Default => self.context.as_ref(),
