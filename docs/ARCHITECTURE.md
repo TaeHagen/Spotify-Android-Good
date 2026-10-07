@@ -208,9 +208,11 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   every 5 s instead, for at most 60 s after the loss (a suspended mobile network keeps the AP
   socket open, so librespot alone would notice only after its 80 s keep-alive). A load of
   downloads without a network ends that wait at once (the session goes offline without a
-  restore point, see §4.6). When the session is lost (no network, or it died) while this
-  device plays or paused a downloaded track, that playback is not frozen for the reconnect
-  but handed to the OfflineController (§4.6). Backoff
+  restore point, see §4.6). When the session goes away without a network, or Offline mode is
+  turned on, while this device plays or paused a downloaded track, that playback is not frozen
+  for the reconnect but handed to the OfflineController (§4.6); a session that dies while the
+  network is up is frozen and restored through Spirc. A dead Player while visible always
+  rebuilds Player and Spirc. Backoff
   1→60 s, reset once a connection stayed up 60 s (or when the network comes back), so a
   connection that drops right after connecting keeps backing off; at most one attempt in
   flight; no attempts while the network is known to be down. At most 10 attempts per
@@ -294,13 +296,15 @@ Online and visible, `queue.add` may also queue a track that isn't downloaded (it
 Without a network a `player.load` of downloads plays offline also while the session still reads
 Online (its network-loss wait): Spirc lets go of the Player and the session goes offline; one
 of anything else fails with `UNAVAILABLE` "Not available offline".
-**Handoff**: when the session is lost (no network, or it died) while this device plays (or
-paused) a downloaded track through Spirc, the OfflineController takes that playback over as it
-is, before anything pauses the Player: the track keeps playing without a reload, with the
+**Handoff**: when the session goes away without a network, or Offline mode is turned on, while
+this device plays (or paused) a downloaded track through Spirc, the OfflineController takes that
+playback over as it is, before anything pauses the Player (a track that ended meanwhile moves
+on to the next one): the track keeps playing without a reload, with the
 visible tracks around it in play order (user queue included) up to the first one on either side
 that isn't downloaded (the queue ends there), the position, repeat mode, shuffle flag and play
 state. No restore point is kept for that session; when it is back, the queue plays on as above.
-A streamed current track is frozen for the reconnect as before (§8).
+A streamed current track is frozen for the reconnect as before (§8), and so is any playback
+when the session dies while the network is up (the reconnect follows within seconds).
 The OfflineController notices a Player whose thread died: the queue stops where it was (so its
 snapshot no longer shows playing), and the next control starts a new Player (a play loads the
 track there again at that position). A paused or finished
@@ -394,8 +398,10 @@ becoming visible isn't routed offline or as "nothing is active". Right after a l
 restore activated this device, commands go to it although its state doesn't say active yet.
 A pending reconnect restore (§8) is this device's session: a play / pause decides whether it
 comes back playing, other controls wait for it and then act on the restored session, a load
-replaces it only once the load goes through, a transfer to another device hands it over. A play
-without a session (no network, backoff) isn't answered by the restore: it fails or falls back as
+replaces it only once the load goes through, a transfer to another device hands it over (and
+drops it here only once the target accepted it). A play without a session (no network, also
+while the session still reads online in its network-loss grace; backoff) isn't answered by the
+restore: it fails or falls back as
 usual and leaves no intent behind; a play reported as handled counts for that connection's
 restore decision. Once the new Spirc's first cluster is overdue (60 s), commands no longer wait
 for the restore and a play restores right away (one already answered restores then).
@@ -631,8 +637,9 @@ For a remote active device, smart shuffle is not supported (the command reports
   Gaps count the time the phone slept (wall clock, never less than the monotonic clock; a clock
   set back counts as a long gap). Without a first cluster after 60 s a play restores right away
   (the user asked for it here). Until the restored session is active with its track, the
-  restore point stays (shown as the paused placeholder): a connection lost meanwhile freezes it
-  again, and a play / pause meanwhile is recorded on it too. A queued or suggested current
+  restore point stays (shown as the paused placeholder, also over the Spirc's empty activation
+  snapshot; commands queue behind the restore): a connection lost meanwhile freezes it again, a
+  play / pause meanwhile is recorded on it too, and a failed restore load drops it. A queued or suggested current
   track keeps its context (the track is requeued, restarts, and gets repeat-one back; a full
   queue loses its tail, not the track); handed to another device it goes as the visible track
   window in play order instead. An explicit `player.load` (local, remote or offline) or running

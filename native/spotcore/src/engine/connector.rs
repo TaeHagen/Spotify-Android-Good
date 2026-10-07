@@ -207,18 +207,22 @@ async fn stop_spirc(session: &Session, spirc: &Arc<Spirc>, mut task: JoinHandle<
     }
 }
 
-/// The session is lost for now (no network, or it died): this device's downloaded playback goes
-/// on in the OfflineController instead of being frozen for the reconnect (decided before
-/// anything pauses the Player). An intentional reconnect of a working session restores.
+/// Whether a teardown hands downloaded playback to the OfflineController (see
+/// [`keep_playing_offline`]): only without a network. A session that dies while the network is up
+/// reconnects within seconds and is restored through Spirc (full context, Connect state).
+fn hands_off(restore: bool, network_available: bool) -> bool {
+    restore && !network_available
+}
+
+/// No network: this device's downloaded playback goes on in the OfflineController instead of
+/// being frozen for the reconnect (decided before anything pauses the Player).
 fn keep_playing_offline(live: &Live, restore: bool) -> bool {
-    restore
-        && (!state::network_available() || live.session.is_invalid())
-        && connect::hand_off_to_offline(live.generation)
+    hands_off(restore, state::network_available()) && connect::hand_off_to_offline(live.generation)
 }
 
 /// Shuts a live connection down. `restore`: remember the local playback for after the
 /// reconnect (otherwise any pending restore is dropped); downloaded playback continues offline
-/// when the session is lost (see [`keep_playing_offline`]).
+/// when there is no network (see [`keep_playing_offline`]).
 pub(crate) async fn teardown(live: Live, restore: bool) {
     if keep_playing_offline(&live, restore) {
         log::info!("the session is lost, the downloads keep playing offline");
@@ -273,6 +277,15 @@ pub(crate) fn session_credentials(session: &Session) -> Option<StoredCredentials
 mod tests {
     use super::*;
     use librespot_core::{Error, SessionConfig};
+
+    #[test]
+    fn downloads_are_handed_offline_only_without_a_network() {
+        assert!(hands_off(true, false));
+        // the session died with the network up: frozen and restored through Spirc
+        assert!(!hands_off(true, true));
+        // no restore (stop, logout): nothing is kept (offline mode hands off on its own)
+        assert!(!hands_off(false, false));
+    }
 
     #[tokio::test]
     async fn only_ap_refusals_are_terminal() {

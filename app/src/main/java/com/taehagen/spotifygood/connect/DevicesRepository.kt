@@ -28,7 +28,7 @@ class DevicesRepository(
 ) {
     private val _devices = MutableStateFlow(events.devices.value)
 
-    /** Latest device list: `devices` events, or the result of [refresh] if newer. */
+    /** Latest device list: the latest `devices` event. */
     val devices: StateFlow<DeviceList> = _devices.asStateFlow()
 
     /**
@@ -57,11 +57,12 @@ class DevicesRepository(
     /**
      * Fetches the device list from Spotify again (e.g. when the device picker opens or refresh is
      * tapped). The engine sends at most one request every 2.5 s and waits up to 3 s for it; when
-     * debounced, offline or timed out it returns the cached list. The list is also emitted as a
-     * `devices` event.
+     * debounced, offline or timed out it keeps the cached list. The refreshed list arrives as a
+     * `devices` event, which the engine posts before the call returns: the result itself isn't
+     * assigned, so it can't overwrite a newer event (cluster updates come in bursts).
      */
     suspend fun refresh() {
-        _devices.value = rpc.call<DeviceList>("connect.refreshDevices")
+        rpc.callUnit("connect.refreshDevices")
     }
 
     internal companion object {

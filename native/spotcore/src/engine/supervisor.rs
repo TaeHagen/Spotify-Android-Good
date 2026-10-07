@@ -628,6 +628,10 @@ impl Supervisor {
                     Some(Msg::Settings { old }) => {
                         let new = super::settings();
                         if new.offline {
+                            // Downloaded playback of this device keeps playing in offline mode.
+                            if live.device.is_some() && connect::hand_off_to_offline(live.generation) {
+                                log::info!("offline mode: the downloads keep playing offline");
+                            }
                             connector::teardown(live, false).await;
                             return Phase::Gate;
                         }
@@ -646,7 +650,11 @@ impl Supervisor {
                         }
                     }
                     Some(Msg::PlayerDead(generation)) => {
-                        if live.device.is_some() && player_host::dead_generation() == Some(generation) {
+                        // This Spirc plays on that Player (or on an older one the offline path
+                        // replaced meanwhile): rebuild it, also when the thread hasn't finished
+                        // yet or the Player was already replaced.
+                        if live.device.is_some() {
+                            log::warn!("player {generation} died, rebuilding the Spirc");
                             return self.reconnect(live).await;
                         }
                     }

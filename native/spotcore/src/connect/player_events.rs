@@ -214,7 +214,8 @@ pub(crate) fn on_player_event(event: PlayerEvent) {
 /// Spirc ran out of playable tracks after unavailable ones: tell the user once (unless the load
 /// brake already did).
 pub(crate) fn check_exhausted(snap: &ConnectSnapshot) {
-    if !snap.is_active || snap.status != SnapshotPlayStatus::Stopped {
+    // Without a track it is an activation (a load or the restore follows), not an exhausted queue.
+    if !snap.is_active || snap.status != SnapshotPlayStatus::Stopped || snap.track.is_none() {
         return;
     }
     if !snapshot::visible_next_indices(&snap.next_tracks).is_empty() {
