@@ -18,6 +18,7 @@ import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.BackgroundMessages
+import com.taehagen.spotifygood.ui.components.SessionMessenger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -161,14 +162,14 @@ internal abstract class DetailViewModel(
     }
 
     /**
-     * The signed-in session this page belongs to (it lives in that session's ViewModel store): a
-     * write that finishes after the session ended (logout, app closed) reports nothing.
+     * Bound to the signed-in session this page belongs to: a write that finishes after the session
+     * ended (logout, app closed) reports nothing.
      */
-    private val messageGeneration = BackgroundMessages.currentGeneration()
+    private val messenger = SessionMessenger(graph.app)
 
     /** A snackbar message, shown by the main scaffold (also once the page is gone). */
     protected fun message(@StringRes res: Int, vararg args: Any) {
-        BackgroundMessages.post(graph.app.getString(res, *args), messageGeneration)
+        messenger.post(res, *args)
     }
 
     /**

@@ -208,13 +208,6 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
     }
 }
 
-internal fun LibraryMessage.messageRes(): Int = when (this) {
-    LibraryMessage.DOWNLOAD_FAILED -> R.string.browse_download_failed
-    LibraryMessage.DOWNLOAD_STARTED -> R.string.browse_download_started
-    LibraryMessage.DOWNLOAD_REMOVED -> R.string.browse_download_removed
-    LibraryMessage.NOTHING_TO_PLAY -> R.string.browse_nothing_to_play
-}
-
 @Composable
 private fun LikedHeader(total: Int?) {
     Box(

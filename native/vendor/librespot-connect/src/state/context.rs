@@ -310,7 +310,8 @@ impl ConnectState {
             .into_iter()
             .flat_map(|page| {
                 if !page.tracks.is_empty() {
-                    self.fill_context_from_page(page).ok()?;
+                    // SPOTIFYGOOD: into the context that is updated
+                    self.fill_context_from_page(page, ty).ok()?;
                     None
                 } else if matches!(page.page_url, Some(ref url) if !url.is_empty()) {
                     Some(page_url_to_uri(
@@ -545,17 +546,65 @@ impl ConnectState {
         Ok(track)
     }
 
-    pub fn fill_context_from_page(&mut self, page: ContextPage) -> Result<(), Error> {
-        let ctx_len = self.context.as_ref().map(|c| c.tracks.len());
-        let context = self.state_context_from_page(page, HashMap::new(), None, None, ctx_len, None);
+    // SPOTIFYGOOD: appends to the context of the given type. Upstream always appended to the
+    // default context, also the further pages of an autoplay resolve: the autoplay context never
+    // grew, so autoplay stopped after its first batch, and the playlist got the autoplay tracks
+    // as its own tracks.
+    /// Appends the tracks of a further page to the context of the given type
+    pub fn fill_context_from_page(
+        &mut self,
+        page: ContextPage,
+        ty: ContextType,
+    ) -> Result<(), Error> {
+        match ty {
+            ContextType::Default => {
+                let ctx_len = self.context.as_ref().map(|c| c.tracks.len());
+                if self
+                    .context
+                    .as_ref()
+                    .is_some_and(|c| c.get_shuffle_seed().is_some())
+                {
+                    warn!("appending to the shuffled default context, it can't be unshuffled");
+                }
+                let context =
+                    self.state_context_from_page(page, HashMap::new(), None, None, ctx_len, None);
 
-        let ctx = self
-            .context
-            .as_mut()
-            .ok_or(StateError::NoContext(ContextType::Default))?;
+                let ctx = self
+                    .context
+                    .as_mut()
+                    .ok_or(StateError::NoContext(ContextType::Default))?;
 
-        for t in context.tracks {
-            ctx.tracks.push(t)
+                for t in context.tracks {
+                    ctx.tracks.push(t)
+                }
+            }
+            ContextType::Autoplay => {
+                // the tracks of the autoplay context share its uri (not the default one)
+                let context_uri = self
+                    .get_context(ContextType::Autoplay)?
+                    .tracks
+                    .first()
+                    .and_then(|t| t.get_context_uri())
+                    .cloned();
+                let context = self.state_context_from_page(
+                    page,
+                    HashMap::new(),
+                    None,
+                    context_uri.as_deref(),
+                    None,
+                    Some(Provider::Autoplay),
+                );
+
+                let ctx = self.get_context_mut(ContextType::Autoplay)?;
+                for t in context.tracks {
+                    // the endpoint may send tracks again that it already sent
+                    if ctx.tracks.iter().any(|c| c.uri == t.uri) {
+                        debug!("ignoring autoplay track <{}>, it is already there", t.uri);
+                    } else {
+                        ctx.tracks.push(t)
+                    }
+                }
+            }
         }
 
         Ok(())

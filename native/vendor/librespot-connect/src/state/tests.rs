@@ -900,13 +900,44 @@ fn shuffle_and_repeat_toggles_while_autoplay_plays() {
         .collect::<Vec<_>>();
     assert_eq!(default_uids, uids(0..3));
 
-    // a queued track that plays during autoplay can't toggle repeat either
+    // a queued track that plays during autoplay can't toggle repeat or shuffle either
     state.queue_add_uri(&track_uri(1, 9)).unwrap();
     state.next_track().unwrap();
     assert!(state.current_track(|t| t.is_queue()));
     let snapshot = state.snapshot(SnapshotPlayStatus::Playing, 0, None);
     assert!(!snapshot.can_toggle_repeat);
+    assert!(!snapshot.can_toggle_shuffle);
     assert!(state.handle_set_repeat_context(true).is_err());
+
+    // shuffling would start the played default context over, and autoplay after it
+    let next = next_uids(&state);
+    let prev = state
+        .prev_tracks()
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    let autoplay_index = |state: &ConnectState| {
+        state
+            .get_context(ContextType::Autoplay)
+            .unwrap()
+            .index
+            .track
+    };
+    let index = autoplay_index(&state);
+    assert!(index > 0);
+    assert!(state.handle_shuffle(true).is_err());
+    assert!(state.handle_smart_shuffle(true).is_err());
+    assert!(!state.shuffling_context());
+    assert!(!state.smart_shuffle());
+    assert_eq!(next_uids(&state), next);
+    let prev_now = state
+        .prev_tracks()
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(prev_now, prev);
+    assert_eq!(autoplay_index(&state), index);
+    assert!(matches!(state.active_context, ContextType::Autoplay));
 }
 
 /// a playlist modification: the same context is resolved again, then the state is set up like
@@ -1075,6 +1106,135 @@ fn previous_is_available_whenever_a_track_plays() {
     // nothing to restart without a track
     state.player_mut().track = MessageField::none();
     assert!(!can_skip_prev(&state));
+}
+
+/// an autoplay page with the uids `a{n}`, the uris of the autoplay context (salt 5)
+fn autoplay_page(range: std::ops::Range<usize>) -> ContextPage {
+    ContextPage {
+        tracks: range
+            .map(|i| ContextTrack {
+                uri: Some(track_uri(i, 5)),
+                uid: Some(format!("a{i}")),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn default_uids(state: &ConnectState) -> Vec<String> {
+    state
+        .get_context(ContextType::Default)
+        .unwrap()
+        .tracks
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect()
+}
+
+fn autoplay_uids(state: &ConnectState) -> Vec<String> {
+    state
+        .get_context(ContextType::Autoplay)
+        .unwrap()
+        .tracks
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect()
+}
+
+#[test]
+fn autoplay_continues_with_appended_pages() {
+    let (_rt, mut state) = state(3);
+    state
+        .update_context(autoplay_context(3), ContextType::Autoplay)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    // to the last autoplay track
+    assert_eq!(
+        play_through(&mut state, 10),
+        ["uid1", "uid2", "a0", "a1", "a2"]
+    );
+
+    // the next batch (one track it already sent) goes into the autoplay context
+    let mut page = autoplay_page(3..6);
+    page.tracks.push(autoplay_page(1..2).tracks.remove(0));
+    state
+        .fill_context_from_page(page, ContextType::Autoplay)
+        .unwrap();
+    assert_eq!(default_uids(&state), uids(0..3));
+    assert_eq!(autoplay_uids(&state), ["a0", "a1", "a2", "a3", "a4", "a5"]);
+
+    state.fill_up_next_tracks().unwrap();
+    assert_eq!(next_uids(&state), ["a3", "a4", "a5"]);
+    assert!(state.next_tracks().iter().all(|t| t.is_autoplay()));
+    assert_eq!(play_through(&mut state, 10), ["a3", "a4", "a5"]);
+
+    // further pages of an autoplay response as well
+    let (_rt, mut state) = self::state(3);
+    let mut ctx = autoplay_context(3);
+    ctx.pages.push(autoplay_page(3..5));
+    state.update_context(ctx, ContextType::Autoplay).unwrap();
+    assert_eq!(default_uids(&state), uids(0..3));
+    assert_eq!(autoplay_uids(&state), ["a0", "a1", "a2", "a3", "a4"]);
+    state.fill_up_next_tracks().unwrap();
+    assert_eq!(
+        play_through(&mut state, 10),
+        ["uid1", "uid2", "a0", "a1", "a2", "a3", "a4"]
+    );
+
+    // and further pages of the default context still go into it
+    let (_rt, mut state) = self::state(1);
+    let mut ctx = context(3, 0);
+    ctx.pages.push(ContextPage {
+        tracks: vec![ContextTrack {
+            uri: Some(track_uri(3, 0)),
+            uid: Some("uid3".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    state.update_context(ctx, ContextType::Default).unwrap();
+    let default = state.get_context(ContextType::Default).unwrap();
+    assert_eq!(default.tracks.len(), 4);
+    assert_eq!(default.tracks[3].get_context_index(), Some(3));
+}
+
+#[test]
+fn autoplay_append_resolve_fills_the_autoplay_context() {
+    use crate::context_resolver::{ContextAction, ContextResolver, ResolveContext};
+
+    let (rt, mut state) = state(3);
+    let session = {
+        let _guard = rt.enter();
+        Session::new(SessionConfig::default(), None)
+    };
+    state
+        .update_context(autoplay_context(3), ContextType::Autoplay)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    play_through(&mut state, 5);
+    assert!(state.next_tracks().is_empty());
+
+    // what spirc queues when the autoplay context already has tracks, and its response
+    let mut resolver = ContextResolver::new(session);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Autoplay,
+        ContextAction::Append,
+    ));
+    let response = Context {
+        uri: Some(CONTEXT_URI.to_string()),
+        pages: vec![autoplay_page(3..6)],
+        ..Default::default()
+    };
+    let remaining = resolver.apply_next_context(&mut state, response).unwrap();
+    assert!(remaining.is_none());
+    assert_eq!(default_uids(&state), uids(0..3));
+    assert_eq!(autoplay_uids(&state), ["a0", "a1", "a2", "a3", "a4", "a5"]);
+
+    assert!(resolver.try_finish(&mut state, &mut None));
+    assert_eq!(next_uids(&state), ["a3", "a4", "a5"]);
 }
 
 /// compile time check: the engine spawns the task and shares the handle between threads

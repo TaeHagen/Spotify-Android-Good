@@ -34,4 +34,5 @@
     <string name="data_dl_error_unplayable">No longer available on Spotify.</string>
     <string name="data_dl_error_key">Re-download required: this download can no longer be decrypted.</string>
     <string name="data_dl_error_missing_file">The downloaded file is missing. Download it again.</string>
+    <string name="data_dl_error_keystore">The device\'s key storage is busy. Will retry.</string>
 </resources>

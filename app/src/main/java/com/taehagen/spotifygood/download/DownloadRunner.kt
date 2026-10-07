@@ -10,6 +10,7 @@ import android.util.Log
 import androidx.room.withTransaction
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.auth.CredentialStore
+import com.taehagen.spotifygood.auth.KeystoreUnavailableException
 import com.taehagen.spotifygood.data.callWith
 import com.taehagen.spotifygood.data.db.AppDatabase
 import com.taehagen.spotifygood.data.db.DownloadEntity
@@ -220,6 +221,8 @@ internal class DownloadRunner(
 
     private suspend fun sessionBody(host: DownloadHost): RunOutcome {
         dao.resetInterrupted()
+        // Started for a queue that was emptied meanwhile (removals): no session, no notification.
+        if (dao.pendingCount() == 0) return RunOutcome.FINISHED
         // Everything pending is held back (backoff, queue pause) for longer than a run waits: do not
         // bring the engine up only to find that out.
         val paused = pausedForMs(System.currentTimeMillis())
@@ -378,6 +381,14 @@ internal class DownloadRunner(
                 withTimeoutOrNull(FILE_ID_CANCEL_TIMEOUT_MS) { recordFileId(item.uri) }
             }
             throw e
+        } catch (e: KeystoreUnavailableException) {
+            // Downloaded and verified, but the Keystore could not seal its key even after waiting
+            // (sealKey): not the item's fault and nothing is lost. The file stays (its fileId is
+            // recorded, download.track reuses it), the item is requeued without an attempt and the
+            // whole queue waits for the device's Keystore.
+            progress.cancelAndJoin()
+            recordFileId(item.uri)
+            onKeystoreBusy(item)
         } catch (e: Exception) {
             progress.cancelAndJoin()
             val error = e as? NativeException
@@ -386,6 +397,34 @@ internal class DownloadRunner(
             recordFileId(item.uri)
             handleFailure(item, error, stats)
         }
+    }
+
+    private suspend fun onKeystoreBusy(item: DownloadEntity): ItemResult {
+        val pause = breaker.onKeystoreBusy()
+        val until = System.currentTimeMillis() + pause
+        Log.w(TAG, "Keystore unavailable while storing ${item.uri}; pausing the queue for $pause ms")
+        dao.scheduleRetry(item.uri, item.attempts, until, context.getString(R.string.data_dl_error_keystore))
+        dao.deferPending(until)
+        return if (pause > MAX_INLINE_WAIT_MS) ItemResult.Reschedule else ItemResult.Done
+    }
+
+    /**
+     * Encrypts an audio key with the Keystore, waiting out a short outage (1, 2, 4, 8 s between
+     * tries) so that a finished download is stored without a new `download.track`. Throws
+     * [KeystoreUnavailableException] when the Keystore stays unavailable.
+     */
+    private suspend fun sealKey(plain: ByteArray): ByteArray {
+        var delayMs = SEAL_RETRY_MS
+        repeat(SEAL_ATTEMPTS - 1) {
+            try {
+                return withContext(Dispatchers.IO) { credentialStore.encrypt(plain) }
+            } catch (e: KeystoreUnavailableException) {
+                Log.w(TAG, "Keystore unavailable while sealing a key, retrying in $delayMs ms")
+                delay(delayMs)
+                delayMs *= 2
+            }
+        }
+        return withContext(Dispatchers.IO) { credentialStore.encrypt(plain) }
     }
 
     /**
@@ -459,7 +498,7 @@ internal class DownloadRunner(
      */
     private suspend fun commit(item: DownloadEntity, record: OfflineTrackRecord, quality: Int): Boolean {
         val keyHex = record.keyHex.lowercase()
-        val encryptedKey = withContext(Dispatchers.IO) { credentialStore.encrypt(Hex.decode(keyHex)) }
+        val encryptedKey = sealKey(Hex.decode(keyHex))
         val recordJson = json.encodeToString(OfflineTrackRecord.serializer(), record.copy(keyHex = ""))
         val metadataJson = record.track?.let { json.encodeToString(Track.serializer(), it) }
             ?: record.episode?.let { json.encodeToString(Episode.serializer(), it) }
@@ -597,6 +636,8 @@ internal class DownloadRunner(
         const val UI_THROTTLE_MS = 1_000L
         const val NATIVE_CALL_TIMEOUT_MS = 10_000L
         const val FILE_ID_CANCEL_TIMEOUT_MS = 2_000L
+        const val SEAL_RETRY_MS = 1_000L
+        const val SEAL_ATTEMPTS = 5
         const val STOP_TIMEOUT_MS = 5_000L
         const val MAX_NETWORK_WAITS = 5
     }
