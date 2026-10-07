@@ -18,10 +18,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoMode
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Smartphone
+import androidx.compose.material.icons.rounded.Speaker
 import androidx.compose.material.icons.rounded.SpeakerGroup
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -47,9 +49,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,6 +63,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.connect.DevicesRepository
 import com.taehagen.spotifygood.model.ConnectDevice
 import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.PlaybackSnapshot
@@ -76,6 +81,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
@@ -89,6 +95,8 @@ internal data class DevicesUiState(
     val snapshot: PlaybackSnapshot = PlaybackSnapshot.EMPTY,
     val transferringId: String? = null,
     val refreshing: Boolean = false,
+    /** The device the next play goes to (picked while nothing played anywhere), if any. */
+    val pendingTargetId: String? = null,
 ) {
     val thisDevice: ConnectDevice? get() = devices.devices.firstOrNull { it.isThisDevice }
     val thisDeviceId: String? get() = devices.thisDeviceId ?: thisDevice?.id
@@ -124,17 +132,37 @@ internal sealed interface DevicesEvent {
 
     /**
      * Nothing is playing anywhere and there is no saved session to start (NOT_ACTIVE_DEVICE): the
-     * device is fine, there is just nothing to move to it yet.
+     * device is fine, there is just nothing to move to it yet. [selected]: it became the pending
+     * target, so the next play goes there.
      */
-    data class NothingToPlay(override val sheet: String, val deviceName: String, val isThisDevice: Boolean) : DevicesEvent
+    data class NothingToPlay(
+        override val sheet: String,
+        val deviceName: String,
+        val isThisDevice: Boolean,
+        val selected: Boolean = false,
+    ) : DevicesEvent
 }
 
-/** The result of a transfer to [deviceName] that failed with [error]. */
-internal fun transferFailureEvent(sheet: String, deviceName: String, isThisDevice: Boolean, error: Exception): DevicesEvent = when {
-    error is NativeException && error.code == NativeErrorCode.NOT_ACTIVE_DEVICE -> DevicesEvent.NothingToPlay(sheet, deviceName, isThisDevice)
+/**
+ * The result of a transfer to [deviceName] that failed with [error]; [selected]: the device is now
+ * the pending target (`DevicesRepository.pendingTarget`).
+ */
+internal fun transferFailureEvent(
+    sheet: String,
+    deviceName: String,
+    isThisDevice: Boolean,
+    error: Exception,
+    selected: Boolean = false,
+): DevicesEvent = when {
+    error is NativeException && error.code == NativeErrorCode.NOT_ACTIVE_DEVICE ->
+        DevicesEvent.NothingToPlay(sheet, deviceName, isThisDevice, selected = selected && !isThisDevice)
     error is NativeException -> DevicesEvent.TransferFailed(sheet, deviceName, error.isNetwork)
     else -> DevicesEvent.TransferFailed(sheet, deviceName, network = false)
 }
+
+/** Name of the pending target [id] in [devices] (null without one, or when it isn't listed). */
+internal fun pendingTargetName(id: String?, devices: DeviceList): String? =
+    id?.let { pending -> devices.devices.firstOrNull { it.id == pending }?.name?.takeIf { it.isNotBlank() } }
 
 internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
     private val devicesRepository = graph.devices
@@ -147,17 +175,22 @@ internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
     val events: Flow<DevicesEvent> = eventChannel.receiveAsFlow()
 
     val state: StateFlow<DevicesUiState> = combine(
-        devicesRepository.devices,
+        combine(devicesRepository.devices, devicesRepository.pendingTarget, ::Pair),
         outputs.outputs,
         graph.playback.snapshot,
         transferring,
         refreshing,
-    ) { devices, outputList, snapshot, transferringId, isRefreshing ->
-        DevicesUiState(devices, outputList, snapshot, transferringId, isRefreshing)
+    ) { (devices, pendingTarget), outputList, snapshot, transferringId, isRefreshing ->
+        DevicesUiState(devices, outputList, snapshot, transferringId, isRefreshing, pendingTarget)
     }.stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(5_000),
-        DevicesUiState(devicesRepository.devices.value, outputs.outputs.value, graph.playback.snapshot.value),
+        DevicesUiState(
+            devicesRepository.devices.value,
+            outputs.outputs.value,
+            graph.playback.snapshot.value,
+            pendingTargetId = devicesRepository.pendingTarget.value,
+        ),
     )
 
     /**
@@ -192,7 +225,9 @@ internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
                 throw e
             } catch (e: Exception) {
                 val isThisDevice = deviceId == state.value.thisDeviceId
-                eventChannel.trySend(transferFailureEvent(sheet, deviceName, isThisDevice, e))
+                // The repository keeps a device picked with nothing to play as the next play's target.
+                val selected = devicesRepository.pendingTarget.value == deviceId
+                eventChannel.trySend(transferFailureEvent(sheet, deviceName, isThisDevice, e, selected))
             } finally {
                 transferring.value = null
             }
@@ -236,10 +271,10 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
                 is DevicesEvent.NothingToPlay -> {
                     // A transfer only moves what is playing; with nothing playing (and no saved
                     // session) a play would start on this phone, so say what does work.
-                    val message = if (event.isThisDevice) {
-                        context.getString(R.string.player_devices_nothing_to_play_here)
-                    } else {
-                        context.getString(R.string.player_devices_nothing_to_play, event.deviceName)
+                    val message = when {
+                        event.selected -> context.getString(R.string.player_devices_selected, event.deviceName)
+                        event.isThisDevice -> context.getString(R.string.player_devices_nothing_to_play_here)
+                        else -> context.getString(R.string.player_devices_nothing_to_play, event.deviceName)
                     }
                     scope.launch { snackbar.showSnackbar(message) }
                 }
@@ -317,7 +352,8 @@ private fun DevicesList(
             CurrentDeviceCard(state = state, remote = remote, onVolumeChange = onVolumeChange)
         }
         item(key = "header:phone") { SheetSectionLabel(thisPhone) }
-        if (remote != null) {
+        // Also with a device picked for the next play: picking the phone takes the next play back.
+        if (remote != null || state.pendingTargetId != null) {
             item(key = "phone") {
                 val id = state.thisDeviceId
                 DeviceListItem(
@@ -386,18 +422,21 @@ private fun DevicesList(
             items(others, key = { "device:${it.id}" }) { device ->
                 val active = device.id == remote?.id
                 val busy = state.transferringId == device.id
+                val pending = !active && device.id == state.pendingTargetId
                 DeviceListItem(
                     title = device.name,
                     subtitle = when {
                         busy -> stringResource(R.string.player_devices_connecting)
                         active -> stringResource(R.string.player_devices_playing)
+                        pending -> stringResource(R.string.player_devices_selected_subtitle)
                         !device.canPlay -> stringResource(R.string.player_devices_cannot_play)
                         device.isGroup -> stringResource(R.string.player_devices_group)
                         else -> listOfNotNull(device.brand, device.model).joinToString(" ").ifBlank { null }
                     },
                     icon = device.type.icon(device.isGroup),
-                    highlighted = active,
+                    highlighted = active || pending,
                     busy = busy,
+                    pending = pending,
                     enabled = device.canPlay && !active && state.transferringId == null,
                     onClick = { onTransfer(device.id, device.name) },
                 )
@@ -509,6 +548,8 @@ private fun DeviceListItem(
     busy: Boolean,
     enabled: Boolean,
     onClick: () -> Unit,
+    /** Picked for the next play: a check instead of the playing indicator. */
+    pending: Boolean = false,
 ) {
     val accent = MaterialTheme.colorScheme.primary
     ListItem(
@@ -534,6 +575,9 @@ private fun DeviceListItem(
         trailingContent = when {
             busy -> {
                 { CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp) }
+            }
+            pending -> {
+                { Icon(Icons.Rounded.Check, contentDescription = null, tint = accent) }
             }
             highlighted -> {
                 { Icon(Icons.Rounded.GraphicEq, contentDescription = null, tint = accent) }
@@ -581,3 +625,51 @@ private fun OutputListItem(
 @Composable
 private fun outputName(output: AudioOutput): String =
     if (output.kind == OutputKind.SPEAKER || output.name.isBlank()) stringResource(R.string.player_output_speaker) else output.name
+
+/** Name of the device the next play goes to (see [pendingTargetName]), null without one. */
+internal fun DevicesRepository.pendingTargetNameFlow(): Flow<String?> =
+    combine(pendingTarget, devices, ::pendingTargetName).distinctUntilChanged()
+
+/**
+ * Small bar in the docked bottom stack while a device is picked for the next play (nothing plays
+ * anywhere yet, so there is no mini player to show it): tapping opens the devices sheet, the close
+ * button keeps the next play on this phone.
+ */
+@Composable
+internal fun PendingDeviceBanner(deviceName: String, onClick: () -> Unit, onCancel: () -> Unit, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable(role = Role.Button, onClick = onClick)
+            .semantics { liveRegion = LiveRegionMode.Polite },
+        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 16.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Rounded.Speaker,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = stringResource(R.string.player_pending_device, deviceName),
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(onClick = onCancel) {
+                Icon(
+                    Icons.Rounded.Close,
+                    contentDescription = stringResource(R.string.player_pending_device_cancel),
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+    }
+}

@@ -1,11 +1,14 @@
 package com.taehagen.spotifygood.ui.screens.player
 
+import com.taehagen.spotifygood.model.ConnectDevice
+import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -24,7 +27,24 @@ class ConnectLocalDeviceTest {
     @Test
     fun nothingToPlayIsNotAFailure() = runTest {
         val event = connectLocalDevice("s", "Kitchen", login = { "dev-1" }, transfer = { throw native(NativeErrorCode.NOT_ACTIVE_DEVICE) })
-        assertEquals(LocalConnectEvent.Ready("s", "Kitchen"), event)
+        assertEquals(LocalConnectEvent.Ready("s", "Kitchen", selected = false), event)
+    }
+
+    @Test
+    fun aDevicePickedForTheNextPlayIsReadyAndSelected() = runTest {
+        // The repository keeps the device as the pending target after NOT_ACTIVE_DEVICE.
+        var pending: String? = null
+        val event = connectLocalDevice(
+            "s",
+            "Kitchen",
+            login = { "dev-1" },
+            transfer = { id ->
+                pending = id
+                throw native(NativeErrorCode.NOT_ACTIVE_DEVICE)
+            },
+            isSelected = { it == pending },
+        )
+        assertEquals(LocalConnectEvent.Ready("s", "Kitchen", selected = true), event)
     }
 
     @Test
@@ -58,6 +78,35 @@ class ConnectLocalDeviceTest {
 
 class TransferFailureEventTest {
     private fun native(code: String) = NativeException(NativeErrorInfo(code, "x"))
+
+    @Test
+    fun aDevicePickedWithNothingToPlayIsSelectedForTheNextPlay() {
+        assertEquals(
+            DevicesEvent.NothingToPlay("s", "Living Room", isThisDevice = false, selected = true),
+            transferFailureEvent("s", "Living Room", isThisDevice = false, error = native(NativeErrorCode.NOT_ACTIVE_DEVICE), selected = true),
+        )
+        // This phone is never a pending target (picking it clears one).
+        assertEquals(
+            DevicesEvent.NothingToPlay("s", "This phone", isThisDevice = true, selected = false),
+            transferFailureEvent("s", "This phone", isThisDevice = true, error = native(NativeErrorCode.NOT_ACTIVE_DEVICE), selected = true),
+        )
+        // A real failure is reported as one, whatever is pending.
+        assertEquals(
+            DevicesEvent.TransferFailed("s", "Living Room", network = true),
+            transferFailureEvent("s", "Living Room", isThisDevice = false, error = native(NativeErrorCode.NETWORK), selected = true),
+        )
+    }
+
+    @Test
+    fun pendingTargetNameComesFromTheDeviceList() {
+        val list = DeviceList(
+            devices = listOf(ConnectDevice(id = "a", name = "Living Room"), ConnectDevice(id = "b", name = " ")),
+        )
+        assertEquals("Living Room", pendingTargetName("a", list))
+        assertNull("no pending target", pendingTargetName(null, list))
+        assertNull("not listed", pendingTargetName("gone", list))
+        assertNull("no name to show", pendingTargetName("b", list))
+    }
 
     @Test
     fun nothingToMoveIsNotADeviceFailure() {

@@ -121,6 +121,10 @@
     <string name="player_devices_refresh_failed">Couldn\'t refresh devices</string>
     <string name="player_devices_nothing_to_play">Nothing is playing yet. Start something, then pick %1$s here to play it there.</string>
     <string name="player_devices_nothing_to_play_here">Nothing is playing yet. Pick something to play.</string>
+    <string name="player_devices_selected">%1$s is selected. Start something to play it there.</string>
+    <string name="player_devices_selected_subtitle">Selected · plays what you start next</string>
+    <string name="player_pending_device">Next play goes to %1$s</string>
+    <string name="player_pending_device_cancel">Play on this phone instead</string>
     <string name="player_devices_switcher_unavailable">The system output picker isn\'t available on this phone</string>
     <string name="player_output_speaker">Phone speaker</string>
     <string name="player_output_selected">Selected</string>
