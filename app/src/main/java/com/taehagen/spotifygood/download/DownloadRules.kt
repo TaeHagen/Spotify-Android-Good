@@ -331,7 +331,31 @@ internal object DownloadRules {
     fun keyFailure(e: Throwable): KeyFailure =
         if (e is KeystoreUnavailableException) KeyFailure.RETRY_LATER else KeyFailure.UNREADABLE
 
+    /**
+     * [items] with the live byte progress of the item being downloaded ([currentUri]): the database
+     * only gets it every few seconds (each write wakes every observer of the table).
+     */
+    fun withLiveProgress(items: List<DownloadItem>, currentUri: String?, bytes: Long, totalBytes: Long): List<DownloadItem> {
+        if (currentUri == null || totalBytes <= 0) return items
+        return items.map { if (it.uri == currentUri) it.copy(bytes = bytes, totalBytes = totalBytes) else it }
+    }
+
     // ---- scheduling ----------------------------------------------------------------------------------
+
+    /** The notice a run leaves when it ends. */
+    enum class RunNotice { NONE, COMPLETE, PAUSED }
+
+    /**
+     * "N downloads complete" only when the queue is really empty; a run that ended with items still
+     * queued (network lost, rescheduled) after doing some work says it paused; a user cancel or a run
+     * that stopped with its own message (storage, account) leaves nothing more.
+     */
+    fun runNotice(stoppedWithMessage: Boolean, cancelledByUser: Boolean, pending: Int, processed: Int): RunNotice = when {
+        stoppedWithMessage || cancelledByUser -> RunNotice.NONE
+        pending == 0 -> if (processed > 0) RunNotice.COMPLETE else RunNotice.NONE
+        processed > 0 -> RunNotice.PAUSED
+        else -> RunNotice.NONE
+    }
 
     /** A change of the download settings that matters for scheduling. */
     data class PolicyChange(val offline: Boolean, val cellularChanged: Boolean)
