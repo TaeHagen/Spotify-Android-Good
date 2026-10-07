@@ -37,6 +37,7 @@ import androidx.compose.material.icons.rounded.Album
 import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Person
@@ -116,7 +117,12 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
     val snapshot by viewModel.snapshot.collectAsStateWithLifecycle()
     val liked by viewModel.isLiked.collectAsStateWithLifecycle()
     val indicator by viewModel.indicator.collectAsStateWithLifecycle()
+    // The downloaded cover while offline, so there is artwork without a network.
+    val artwork by viewModel.artwork.collectAsStateWithLifecycle()
+    val remoteVolumeSupported by viewModel.remoteVolumeSupported.collectAsStateWithLifecycle()
     val lyricsPreview by viewModel.lyricsPreview.collectAsStateWithLifecycle()
+    // Ungated by the preview setting: decides whether the lyrics button can open anything.
+    val lyricsState by viewModel.lyrics.collectAsStateWithLifecycle()
     val sleepTimer by viewModel.sleepTimerState.collectAsStateWithLifecycle()
     val navigator = LocalAppNavigator.current
     val context = LocalContext.current
@@ -169,7 +175,7 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
 
     val track = snapshot.track
     // Read only in the draw phase / leaf composables: the colour animates on every track change.
-    val artworkColor = rememberArtworkColor(track?.imageUrl)
+    val artworkColor = rememberArtworkColor(artwork)
 
     PlayerSurfaceTheme {
         Box(
@@ -197,9 +203,12 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
                 NowPlayingBody(
                     snapshot = snapshot,
                     track = track,
+                    artwork = artwork,
                     liked = liked,
                     indicator = indicator,
+                    remoteVolumeSupported = remoteVolumeSupported,
                     lyrics = (lyricsPreview as? LyricsState.Loaded)?.lyrics,
+                    lyricsUnavailable = lyricsState == LyricsState.Unavailable,
                     lyricsFallbackColor = artworkColor,
                     sleepTimer = sleepTimer,
                     viewModel = viewModel,
@@ -234,9 +243,12 @@ private fun NothingPlaying(onCollapse: () -> Unit) {
 private fun NowPlayingBody(
     snapshot: PlaybackSnapshot,
     track: PlaybackTrack,
+    artwork: String?,
     liked: Boolean,
     indicator: DeviceIndicator,
+    remoteVolumeSupported: Boolean,
     lyrics: Lyrics?,
+    lyricsUnavailable: Boolean,
     lyricsFallbackColor: State<Color>,
     sleepTimer: SleepTimerState,
     viewModel: PlayerViewModel,
@@ -281,6 +293,7 @@ private fun NowPlayingBody(
     val artwork: @Composable (Modifier) -> Unit = { artworkModifier ->
         NowPlayingArtwork(
             track = track,
+            artwork = artwork,
             canNext = restrictions.canSkipNext,
             canPrevious = restrictions.canSkipPrev,
             onNext = viewModel::next,
@@ -311,8 +324,10 @@ private fun NowPlayingBody(
             onPlayPause = viewModel::togglePlayPause,
             onNext = viewModel::next,
             onRepeat = viewModel::cycleRepeat,
+            onSeekBy = viewModel::seekBy,
         )
-        if (isRemote) {
+        // Fixed-volume receivers and some groups ignore volume changes (the thumb would snap back).
+        if (isRemote && remoteVolumeSupported) {
             VolumeSlider(
                 volume = snapshot.volume,
                 onVolumeChange = viewModel::setVolume,
@@ -323,6 +338,10 @@ private fun NowPlayingBody(
             indicator = indicator,
             showDeviceName = !isRemote,
             onDevices = navigator::openDevices,
+            // Always reachable (the preview card can be turned off or missing after a failed
+            // load; the full screen offers Retry). Disabled once Spotify has none for the track.
+            lyricsButton = if (track.isEpisode) null else !lyricsUnavailable,
+            onLyrics = navigator::openLyrics,
             onShare = onShare,
             onQueue = navigator::openQueue,
         )
@@ -533,7 +552,7 @@ private fun NowPlayingMenu(
         }
         DropdownMenu(expanded = expanded, onDismissRequest = dismiss) {
             if (pickArtist) {
-                track.artists.forEach { artist ->
+                track.artists.filter { it.uri.isNotBlank() }.forEach { artist ->
                     DropdownMenuItem(
                         text = { Text(artist.name) },
                         leadingIcon = { Icon(Icons.Rounded.Person, contentDescription = null) },
@@ -583,7 +602,8 @@ private fun MainMenuItems(
             onAddToPlaylist()
         },
     )
-    val album = track.album
+    // Refs may carry only a name (the last-session placeholder): nothing to go to then.
+    val album = track.album?.takeIf { it.uri.isNotBlank() }
     if (!track.isEpisode && album != null) {
         DropdownMenuItem(
             text = { Text(stringResource(R.string.player_go_to_album)) },
@@ -594,21 +614,22 @@ private fun MainMenuItems(
             },
         )
     }
-    if (!track.isEpisode && track.artists.isNotEmpty()) {
+    val artistPages = track.artists.filter { it.uri.isNotBlank() }
+    if (!track.isEpisode && artistPages.isNotEmpty()) {
         DropdownMenuItem(
             text = { Text(stringResource(R.string.player_go_to_artist)) },
             leadingIcon = { Icon(Icons.Rounded.Person, contentDescription = null) },
             onClick = {
-                if (track.artists.size == 1) {
+                if (artistPages.size == 1) {
                     dismiss()
-                    onOpenUri(track.artists.first().uri)
+                    onOpenUri(artistPages.first().uri)
                 } else {
                     onPickArtist()
                 }
             },
         )
     }
-    val show = track.show
+    val show = track.show?.takeIf { it.uri.isNotBlank() }
     if (track.isEpisode && show != null) {
         DropdownMenuItem(
             text = { Text(stringResource(R.string.player_go_to_podcast)) },
@@ -675,6 +696,7 @@ private fun MainMenuItems(
 @Composable
 private fun NowPlayingArtwork(
     track: PlaybackTrack,
+    artwork: String?,
     canNext: Boolean,
     canPrevious: Boolean,
     onNext: () -> Unit,
@@ -697,7 +719,7 @@ private fun NowPlayingArtwork(
             }
         },
     ) {
-        Crossfade(targetState = track.imageUrl, animationSpec = tween(durationMillis = 450), label = "nowPlayingArtwork") { url ->
+        Crossfade(targetState = artwork, animationSpec = tween(durationMillis = 450), label = "nowPlayingArtwork") { url ->
             Artwork(
                 url = url,
                 contentDescription = artworkDescription,
@@ -717,7 +739,8 @@ private fun TitleRow(
     onToggleLike: () -> Unit,
     onOpenUri: (String) -> Unit,
 ) {
-    val titleTarget = if (track.isEpisode) track.show?.uri else track.album?.uri
+    // Refs may carry only a name (the last-session placeholder): no link then.
+    val titleTarget = (if (track.isEpisode) track.show?.uri else track.album?.uri)?.takeIf { it.isNotBlank() }
     val openAlbumLabel = stringResource(if (track.isEpisode) R.string.player_go_to_podcast else R.string.player_open_album)
     val currentOpen by rememberUpdatedState(onOpenUri)
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -743,15 +766,19 @@ private fun TitleRow(
             )
             val subtitle = remember(track.uri, track.artists, track.show, track.isEpisode) {
                 buildAnnotatedString {
-                    if (track.isEpisode) {
-                        val show = track.show
-                        if (show != null) {
-                            withLink(LinkAnnotation.Clickable(show.uri, linkStyle) { currentOpen(show.uri) }) { append(show.name) }
+                    fun appendLinked(uri: String, name: String) {
+                        if (uri.isBlank()) {
+                            append(name)
+                        } else {
+                            withLink(LinkAnnotation.Clickable(uri, linkStyle) { currentOpen(uri) }) { append(name) }
                         }
+                    }
+                    if (track.isEpisode) {
+                        track.show?.let { show -> appendLinked(show.uri, show.name) }
                     } else {
                         track.artists.forEachIndexed { index, artist ->
                             if (index > 0) append(", ")
-                            withLink(LinkAnnotation.Clickable(artist.uri, linkStyle) { currentOpen(artist.uri) }) { append(artist.name) }
+                            appendLinked(artist.uri, artist.name)
                         }
                     }
                 }
@@ -807,28 +834,36 @@ private fun TransportControls(
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
     onRepeat: () -> Unit,
+    onSeekBy: (deltaMs: Long) -> Unit,
 ) {
     val restrictions = snapshot.restrictions
+    // Podcasts: skip back / forward 15 s next to play/pause instead of shuffle and repeat.
+    val episode = snapshot.track?.isEpisode == true
+    val skipSize = if (episode) 32.dp else 40.dp
     Row(
         Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        ShuffleButton(
-            shuffle = snapshot.shuffle,
-            smart = snapshot.smartShuffle,
-            enabled = restrictions.canToggleShuffle,
-            onClick = onShuffle,
-        )
-        SkipButton(next = false, enabled = restrictions.canSkipPrev, onClick = onPrevious, iconSize = 40.dp)
+        if (!episode) {
+            ShuffleButton(
+                shuffle = snapshot.shuffle,
+                smart = snapshot.smartShuffle,
+                enabled = restrictions.canToggleShuffle,
+                onClick = onShuffle,
+            )
+        }
+        SkipButton(next = false, enabled = restrictions.canSkipPrev, onClick = onPrevious, iconSize = skipSize)
+        if (episode) SeekStepButton(forward = false, enabled = restrictions.canSeek, onClick = { onSeekBy(-SEEK_STEP_MS) })
         PlayPauseButton(
             status = snapshot.status,
             onClick = onPlayPause,
             enabled = !(snapshot.status == PlaybackStatus.PLAYING && !restrictions.canPause),
             size = 68.dp,
         )
-        SkipButton(next = true, enabled = restrictions.canSkipNext, onClick = onNext, iconSize = 40.dp)
-        RepeatButton(mode = snapshot.repeat, enabled = restrictions.canToggleRepeat, onClick = onRepeat)
+        if (episode) SeekStepButton(forward = true, enabled = restrictions.canSeek, onClick = { onSeekBy(SEEK_STEP_MS) })
+        SkipButton(next = true, enabled = restrictions.canSkipNext, onClick = onNext, iconSize = skipSize)
+        if (!episode) RepeatButton(mode = snapshot.repeat, enabled = restrictions.canToggleRepeat, onClick = onRepeat)
     }
 }
 
@@ -837,6 +872,9 @@ private fun BottomActions(
     indicator: DeviceIndicator,
     showDeviceName: Boolean,
     onDevices: () -> Unit,
+    /** null: no lyrics button (podcast episodes); otherwise whether it is enabled. */
+    lyricsButton: Boolean?,
+    onLyrics: () -> Unit,
     onShare: () -> Unit,
     onQueue: () -> Unit,
 ) {
@@ -876,6 +914,11 @@ private fun BottomActions(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
+            }
+        }
+        if (lyricsButton != null) {
+            IconButton(onClick = onLyrics, enabled = lyricsButton) {
+                Icon(Icons.Rounded.Lyrics, contentDescription = stringResource(R.string.player_open_lyrics))
             }
         }
         IconButton(onClick = onShare) {

@@ -1,13 +1,16 @@
 package com.taehagen.spotifygood.playback
 
 import android.content.Context
+import android.os.Build
 import android.os.Bundle
 import android.os.Looper
+import android.os.SystemClock
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.DeviceInfo
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.SimpleBasePlayer
@@ -24,10 +27,13 @@ import com.taehagen.spotifygood.model.RepeatMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.guava.future
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -35,7 +41,9 @@ import kotlinx.coroutines.withTimeoutOrNull
  * [PlaybackRepository.snapshot] (docs/ARCHITECTURE.md §9.4; research §1):
  * * playlist = [QueueWindow] (10 previous + current + 50 next, unique uids, play order);
  * * state: IDLE without a track, BUFFERING while loading, READY otherwise; `playWhenReady` while
- *   playing/loading; position extrapolated from the snapshot;
+ *   playing/loading; position extrapolated from the snapshot; while nothing plays, IDLE with a
+ *   player error when there is one to show (logged out, Premium required, a failed start), so Auto
+ *   and other controllers tell the user (the playlist is kept);
  * * commands gated by Spotify restrictions; remote devices expose `DeviceInfo(REMOTE, 0..100)` and
  *   device-volume commands (hardware volume keys control the remote device); local playback is
  *   `DeviceInfo(LOCAL)` without volume commands (the system stream volume is synced natively).
@@ -52,6 +60,12 @@ internal class SpotifyPlayer(
     private val volume: VolumeSync,
     private val audioSessionId: Int,
     private val downloadedUris: () -> List<String>,
+    /** Absolute path of the downloaded cover of a track / episode uri (offline artwork), if any. */
+    private val downloadedImage: (String) -> String? = { null },
+    /** The error to publish while nothing plays (logged out, Premium, failed start), see [PlayerErrors]. */
+    private val playerError: () -> PlaybackException? = { null },
+    /** A controller retries (`prepare()`, e.g. Android Auto's retry): drop sticky errors. */
+    private val onRetry: () -> Unit = {},
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
 
     private val context = context.applicationContext
@@ -62,6 +76,9 @@ internal class SpotifyPlayer(
     private var itemCache: Map<String, CachedItem> = emptyMap()
     private var unmutePercent = DEFAULT_UNMUTE_PERCENT
     private var mutedByUs = false
+    /** Last remote volume we sent, so quick volume-key steps accumulate before the snapshot catches up. */
+    private val remoteVolume = RemoteVolumeTarget(SystemClock::elapsedRealtime)
+    private var remoteVolumeExpiry: Job? = null
 
     private data class ItemKey(
         val track: PlaybackTrack,
@@ -69,6 +86,8 @@ internal class SpotifyPlayer(
         val remoteDevice: String?,
         val durationMs: Long,
         val seekable: Boolean,
+        /** Downloaded cover, preferred over the CDN url (part of the key: downloads come and go). */
+        val imagePath: String?,
     )
 
     private class CachedItem(val key: ItemKey, val data: MediaItemData)
@@ -81,6 +100,8 @@ internal class SpotifyPlayer(
         val w = QueueWindow.build(s)
         queueWindow = w
         val hasItem = !w.isEmpty
+        // Podcasts skip back / forward 15 s (notification, Auto, Wear), like Now Playing.
+        val episodeSkips = hasItem && w.current?.track?.isEpisode == true && s.restrictions.canSeek
         val remote = s.source == PlaybackSource.REMOTE
         val remoteName = if (remote) s.activeDevice?.name else null
         val remoteVolumeSupported = remote && s.activeDevice?.let { active ->
@@ -105,6 +126,8 @@ internal class SpotifyPlayer(
             .addIf(COMMAND_SEEK_TO_MEDIA_ITEM, hasItem)
             .addIf(COMMAND_SEEK_TO_DEFAULT_POSITION, hasItem)
             .addIf(COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM, hasItem && r.canSeek)
+            .addIf(COMMAND_SEEK_BACK, episodeSkips)
+            .addIf(COMMAND_SEEK_FORWARD, episodeSkips)
             .addIf(COMMAND_SEEK_TO_NEXT, hasItem && r.canSkipNext)
             .addIf(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM, hasItem && r.canSkipNext)
             .addIf(COMMAND_SEEK_TO_PREVIOUS, hasItem && r.canSkipPrev)
@@ -121,6 +144,8 @@ internal class SpotifyPlayer(
             .setPlaylist(buildItems(w, s, remoteName))
             .setAudioAttributes(AUDIO_ATTRIBUTES)
             .setAudioSessionId(audioSessionId)
+            .setSeekBackIncrementMs(EPISODE_SKIP_MS)
+            .setSeekForwardIncrementMs(EPISODE_SKIP_MS)
             .setShuffleModeEnabled(s.shuffle || s.smartShuffle)
             .setRepeatMode(
                 when (s.repeat) {
@@ -131,12 +156,15 @@ internal class SpotifyPlayer(
             )
 
         if (remote) {
-            val percent = VolumeMath.connectToPercent(s.volume)
+            // While a target we sent is in flight, report it instead of the stale snapshot value
+            // (the system volume UI would otherwise bounce between old and new).
+            val percent = remoteVolume.reported(s.activeDevice?.id, VolumeMath.connectToPercent(s.volume))
             if (percent > 0) mutedByUs = false
             builder.setDeviceInfo(REMOTE_DEVICE_INFO)
                 .setDeviceVolume(percent)
                 .setIsDeviceMuted(mutedByUs && percent == 0)
         } else {
+            remoteVolume.clear()
             val min = volume.minIndex
             val max = volume.maxIndex.coerceAtLeast(min)
             builder.setDeviceInfo(DeviceInfo.Builder(DeviceInfo.PLAYBACK_TYPE_LOCAL).setMinVolume(min).setMaxVolume(max).build())
@@ -160,6 +188,13 @@ internal class SpotifyPlayer(
             builder.setPlaybackState(STATE_IDLE)
                 .setPlayWhenReady(false, PLAY_WHEN_READY_CHANGE_REASON_REMOTE)
         }
+        playerError()?.let { error ->
+            // Media3 allows a player error only in STATE_IDLE.
+            builder.setPlaybackState(STATE_IDLE)
+                .setIsLoading(false)
+                .setPlayWhenReady(false, PLAY_WHEN_READY_CHANGE_REASON_REMOTE)
+                .setPlayerError(error)
+        }
         return builder.build()
     }
 
@@ -179,6 +214,7 @@ internal class SpotifyPlayer(
                 remoteDevice = remoteName.takeIf { isCurrent },
                 durationMs = durationMs,
                 seekable = s.restrictions.canSeek,
+                imagePath = downloadedImage(entry.track.uri),
             )
             val cached = itemCache[entry.uid]?.takeIf { it.key == key } ?: CachedItem(key, itemData(entry.uid, key))
             cache[entry.uid] = cached
@@ -195,12 +231,20 @@ internal class SpotifyPlayer(
         } else {
             null
         }
+        val artist = t.artistLine.ifBlank { null }
+        val deviceLine = key.remoteDevice?.let { context.getString(R.string.playback_playing_on, it) }
         val metadata = MediaMetadata.Builder()
             .setTitle(t.name)
-            .setArtist(t.artistLine.ifBlank { null })
+            // SysUI media controls (API 30+: QS / lock screen player) and Wear show only title and
+            // artist, so the "Playing on <device>" line goes into the artist there (docs §8). Older
+            // releases render our notification, whose content text adds the subtitle instead
+            // (the notification provider of PlaybackService), keeping the artist clean.
+            .setArtist(if (Build.VERSION.SDK_INT >= DeviceLine.IN_ARTIST_SDK) DeviceLine.join(context, artist, deviceLine) else artist)
             .setAlbumTitle(t.album?.name ?: t.show?.name)
-            .setArtworkUri(artworkUri(context, t.imageUrl))
-            .setSubtitle(key.remoteDevice?.let { context.getString(R.string.playback_playing_on, it) })
+            // The downloaded cover works offline (notification, lock screen, Auto) and is the one
+            // the download stored; the CDN url (best(300)) usually names a different image file.
+            .setArtworkUri(artworkUri(context, key.imagePath) ?: artworkUri(context, t.imageUrl))
+            .setSubtitle(deviceLine)
             .setDurationMs(key.durationMs.takeIf { it > 0 })
             .setIsBrowsable(false)
             .setIsPlayable(true)
@@ -222,7 +266,12 @@ internal class SpotifyPlayer(
     override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> =
         track(if (playWhenReady) controller.resumeAsync() else controller.pauseAsync())
 
-    override fun handlePrepare(): ListenableFuture<*> = Futures.immediateVoidFuture()
+    override fun handlePrepare(): ListenableFuture<*> {
+        // Auto's "retry" (and Media3's play button in STATE_IDLE) prepare first.
+        controller.clearFailure()
+        onRetry()
+        return Futures.immediateVoidFuture()
+    }
 
     override fun handleStop(): ListenableFuture<*> = track(controller.pauseAsync())
 
@@ -321,7 +370,7 @@ internal class SpotifyPlayer(
 
     override fun handleSetDeviceVolume(deviceVolume: Int, flags: Int): ListenableFuture<*> {
         mutedByUs = false
-        return track(controller.setVolumeAsync(VolumeMath.percentToConnect(deviceVolume)))
+        return sendRemoteVolume(deviceVolume)
     }
 
     override fun handleIncreaseDeviceVolume(flags: Int): ListenableFuture<*> =
@@ -333,15 +382,31 @@ internal class SpotifyPlayer(
     override fun handleSetDeviceMuted(muted: Boolean, flags: Int): ListenableFuture<*> {
         return if (muted) {
             currentRemotePercent().takeIf { it > 0 }?.let { unmutePercent = it }
-            val op = controller.setVolumeAsync(0)
             mutedByUs = true
-            track(op)
+            sendRemoteVolume(0)
         } else {
             handleSetDeviceVolume(unmutePercent, flags)
         }
     }
 
-    private fun currentRemotePercent(): Int = VolumeMath.connectToPercent(playback.snapshot.value.volume)
+    /** Sends [percent] to the active (remote) device and remembers it as the base of the next step. */
+    private fun sendRemoteVolume(percent: Int): ListenableFuture<*> {
+        val target = percent.coerceIn(0, 100)
+        remoteVolume.set(target, playback.snapshot.value.activeDevice?.id)
+        // Re-publish from the snapshot once the target expires unconfirmed (e.g. a failed PUT).
+        remoteVolumeExpiry?.cancel()
+        remoteVolumeExpiry = scope.launch {
+            delay((remoteVolume.remainingMs() ?: 0) + 1)
+            invalidateState()
+        }
+        return track(controller.setVolumeAsync(VolumeMath.percentToConnect(target)))
+    }
+
+    /** The remote volume a relative step starts from: our in-flight target, else the device's. */
+    private fun currentRemotePercent(): Int {
+        val s = playback.snapshot.value
+        return remoteVolume.base(s.activeDevice?.id, VolumeMath.connectToPercent(s.volume))
+    }
 
     /**
      * Future completing when all [ops] finished and the engine published a new snapshot (or after
@@ -357,19 +422,21 @@ internal class SpotifyPlayer(
         }
     }
 
-    private companion object {
-        const val SETTLE_MS = 2_000L
-        const val LOAD_SETTLE_MS = 8_000L
-        const val RESTART_THRESHOLD_MS = 3_000L
-        const val VOLUME_STEP_PERCENT = 5
-        const val DEFAULT_UNMUTE_PERCENT = 50
+    internal companion object {
+        /** Skip back / forward of podcast episodes (the Now Playing ±15 s buttons). */
+        const val EPISODE_SKIP_MS = 15_000L
+        private const val SETTLE_MS = 2_000L
+        private const val LOAD_SETTLE_MS = 8_000L
+        private const val RESTART_THRESHOLD_MS = 3_000L
+        private const val VOLUME_STEP_PERCENT = 5
+        private const val DEFAULT_UNMUTE_PERCENT = 50
 
-        val AUDIO_ATTRIBUTES: AudioAttributes = AudioAttributes.Builder()
+        private val AUDIO_ATTRIBUTES: AudioAttributes = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
 
-        val REMOTE_DEVICE_INFO: DeviceInfo = DeviceInfo.Builder(DeviceInfo.PLAYBACK_TYPE_REMOTE)
+        private val REMOTE_DEVICE_INFO: DeviceInfo = DeviceInfo.Builder(DeviceInfo.PLAYBACK_TYPE_REMOTE)
             .setMinVolume(0)
             .setMaxVolume(100)
             .build()

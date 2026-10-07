@@ -8,8 +8,9 @@ import java.io.File
 /**
  * On-disk layout of downloads (docs/ARCHITECTURE.md §9.7): encrypted audio in
  * `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part` while incomplete, resumed natively) and
- * cover art in `noBackupFilesDir/offline/images/<imageHex>`. Both directories belong to downloads
- * only. All methods do blocking file I/O: call them off the main thread.
+ * cover art in `noBackupFilesDir/offline/images/<imageHex>.jpg`. Both directories belong to downloads
+ * only. Files can be shared by several downloads (see [DownloadRules.audioToDelete]). All methods do
+ * blocking file I/O: call them off the main thread.
  */
 internal class DownloadStorage(context: Context) {
     private val root = File(context.noBackupFilesDir, "offline")
@@ -29,11 +30,13 @@ internal class DownloadStorage(context: Context) {
         Long.MAX_VALUE
     }
 
-    /** Deletes a downloaded file and its partial download. */
+    /**
+     * Deletes a completed audio file; the caller checked that no remaining download uses it. A
+     * `.part` of the same file belongs to whichever download is (or was) writing it and is left to
+     * [collectGarbage].
+     */
     fun deleteAudio(path: String?) {
-        if (path.isNullOrEmpty()) return
-        delete(File(path))
-        delete(File("$path.part"))
+        if (!path.isNullOrEmpty()) delete(File(path))
     }
 
     fun deleteImage(path: String?) {
@@ -45,17 +48,25 @@ internal class DownloadStorage(context: Context) {
     }
 
     /**
-     * Removes files no download row refers to: unreferenced audio and images, plus every `.part`
-     * file. Only call this while no download can be in flight and none is pending (nothing could
-     * resume the partial files). Matching is by file name, so path aliases (`/data/user/0` vs
-     * `/data/data`) do not matter. Returns the number of bytes freed.
+     * Removes files no download row refers to: audio no row has as its path or file ([paths],
+     * [fileIds]), `.part` files no unfinished row is writing ([unfinishedFileIds]: failed and
+     * cancelled rows resume theirs when retried) and unreferenced images
+     * ([DownloadRules.audioGarbage]). Only call this while no download can be in flight (a file being
+     * written or just reused is not referenced yet). Matching is by file name, so path aliases
+     * (`/data/user/0` vs `/data/data`) do not matter. Returns the number of bytes freed.
      */
-    fun collectGarbage(referencedAudio: Collection<String>, referencedImages: Collection<String>): Long {
-        val audioNames = referencedAudio.mapTo(HashSet()) { File(it).name }
+    fun collectGarbage(
+        paths: Collection<String>,
+        fileIds: Collection<String>,
+        unfinishedFileIds: Collection<String>,
+        referencedImages: Collection<String>,
+    ): Long {
         val imageNames = referencedImages.mapTo(HashSet()) { File(it).name }
         var freed = 0L
-        audioDir.listFiles()?.forEach { file ->
-            if (file.isFile && (file.name.endsWith(PART_SUFFIX) || file.name !in audioNames)) freed += sizeAndDelete(file)
+        val audio = audioDir.listFiles()?.filter { it.isFile }.orEmpty()
+        val garbage = DownloadRules.audioGarbage(audio.map { it.name }, paths, fileIds, unfinishedFileIds).toHashSet()
+        audio.forEach { file ->
+            if (file.name in garbage) freed += sizeAndDelete(file)
         }
         imageDir.listFiles()?.forEach { file ->
             if (file.isFile && file.name !in imageNames) freed += sizeAndDelete(file)
@@ -75,6 +86,5 @@ internal class DownloadStorage(context: Context) {
 
     private companion object {
         const val TAG = "DownloadStorage"
-        const val PART_SUFFIX = ".part"
     }
 }

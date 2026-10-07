@@ -274,6 +274,13 @@ prev/next semantics identical to Spirc (prev restarts if position > 3 s). It dri
 same Player and emits the same `playback` snapshots with `source:"local"`,
 `isActiveDevice:true`, `offline:true`. When the session comes back Online, the offline
 queue keeps playing; the next `player.load` goes through Spirc again.
+The engine cannot know which downloads belong to a playlist or Liked Songs, so while the
+session is not Online Kotlin's `PlayerController` sends context loads of a playlist / Liked
+Songs / album / show with `trackUris` = that context's downloads in context order (Room
+collection membership; albums/shows not downloaded as a whole by metadata), keeping
+`contextUri`/`startUri`/`startUid` for Spirc. Nothing downloaded while offline → "not
+available offline" without a native call. Smart shuffle is not offered for `offline:true`
+snapshots.
 
 ## 5. Events (Rust → Kotlin `onEvent(type, json)`)
 
@@ -373,6 +380,14 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.skipTo` | `{"uid":"…"}` |
 | `connect.transfer` | `{"deviceId":"…","play":true?}` (self = pull, other = push) |
 | `connect.refreshDevices` | `{}` → `DeviceList` |
+| `connect.localInfo` | `{"url":"http://host:port/<CPath>"}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
+| `connect.localLogin` | `{"url":"…","deviceId"?:"…"}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
+
+`LocalDeviceInfo`: `{"deviceId","remoteName","deviceType":<DeviceList type>,"activeUser"?,"tokenTypes":[…],"supportsAccessToken":bool,"version","brand"?,"model"?,"isGroup":bool,"availability"?}`.
+Key material (the device's DH public key, client id) never crosses the JNI boundary; Rust keeps it
+for the `addUser` call. `connect.localInfo`/`connect.localLogin` are routed by `rpc.rs` to the
+`zeroconf_client` module (a `connect.local` prefix match ahead of the generic `connect.` route),
+not to the `connect` playback module. `connect.localLogin` requires an online session.
 
 ### 6.3 Catalog (Spotify internal APIs, JSON shaped for the UI)
 
@@ -408,9 +423,19 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 
 | method | args | result |
 |---|---|---|
-| `download.track` | `{"uri","bitrate":160,"dir":"…/offline/audio","imageDir":"…/offline/images"}` | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`) |
-| `offline.setIndex` | `{"tracks":[OfflineTrackRecord]}` | `{}` or `{"rejected":["uri",…]}` (replaces the in-memory resolver index; malformed records are skipped) |
-| `offline.add` / `offline.remove` | `{"tracks":[…]}` / `{"uris":[…]}` | `{}` (`add` may also return `"rejected"`; `remove` never deletes files — Kotlin owns deletion) |
+| `download.track` | `{"uri","bitrate":160,"dir":"…/offline/audio","imageDir":"…/offline/images"}` | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`; waits ≤ 10 s for the session country, else `NOT_CONNECTED`; a CDN `429` asking for more than 30 s, or a second `429`, fails at once with `RATE_LIMITED` and the server's `retryAfterMs`) |
+| `download.fileId` | `{"uri"}` | `{"fileId"}` (omitted when unknown): the file the last `download.track` of `uri` in this process chose, also after it failed or was cancelled |
+| `offline.setIndex` | `{"tracks":[OfflineTrackRecord],"seq"?}` | `{}` or `{"rejected":["uri",…]}` (replaces the in-memory resolver index, except URIs changed after `seq`; malformed records are skipped) |
+| `offline.add` / `offline.remove` | `{"tracks":[…],"seq"?}` / `{"uris":[…],"seq"?}` | `{}` (`add` may also return `"rejected"`; `remove` matches a record's `uri` only, never its `playedUri`, and never deletes files — Kotlin owns deletion) |
+| `offline.beginIndex` | `{"seq"}` | `{}` (the next `setIndex` without `seq` is a snapshot containing the changes up to `seq`) |
+
+Ordering: the index RPCs run as independent native tasks and may take effect out of order.
+Kotlin numbers every change of its completed downloads (`seq`, increasing within the process,
+taken under the `DownloadManager` lock together with the database write) and every snapshot
+(the last change it contains; `DownloadManager.offlineRecords()` announces it with
+`offline.beginIndex` before the engine sends `offline.setIndex`). The index applies each URI's
+newest change, ignores older ones, and a snapshot only sets URIs that did not change after it.
+Calls without `seq` apply unconditionally.
 
 `OfflineTrackRecord`:
 `{"uri","playedUri","fileId","format","keyHex","path","sizeBytes","normalisation":{"trackGainDb","trackPeak","albumGainDb","albumPeak"},"track":Track|"episode":Episode,"imagePath":"…"}`.
@@ -477,6 +502,32 @@ For a remote active device, smart shuffle is not supported (the command reports
   control the remote device; the notification says "Playing on <device>".
 * **Audio output reporting**: Kotlin reports the current local output (speaker /
   Bluetooth "<name>" / wired / USB / car) with `player.setAudioOutput`.
+* **Local-network discovery (the "send" side)**: speakers and receivers on the LAN that are not
+  yet in the account's cluster (a librespot/spotifyd box, an idle speaker) advertise a ZeroConf
+  HTTP service `_spotify-connect._tcp`. The app lists them and logs the tapped one into this
+  account, so it joins the cluster and playback can be transferred to it.
+  * **Kotlin (`connect/LocalDeviceDiscovery.kt`)** browses mDNS with `NsdManager`
+    (`registerServiceInfoCallback` on API 34+, `resolveService` below, one resolve at a time),
+    reads the `CPath` TXT record (default `/`), and holds a Wi-Fi `MulticastLock` **only while the
+    devices sheet is visible**. Discovery runs only while the sheet is open and stops on dispose,
+    background or logout (battery). Each resolved service is probed with `connect.localInfo`, then
+    deduped by `deviceId` and dropped if it is already in the cluster `DeviceList`.
+  * **Rust (`zeroconf_client/`)** is the exact inverse of `librespot-discovery` 0.8.0's device
+    side. `connect.localInfo` GETs `?action=getInfo`. `connect.localLogin` POSTs `?action=addUser`
+    with the credentials blob: Diffie-Hellman with the device's `publicKey` (librespot's DH group),
+    `baseKey = SHA1(shared)[..16]`, `encryptionKey = HMAC-SHA1(baseKey,"encryption")[..16]`,
+    `checksumKey = HMAC-SHA1(baseKey,"checksum")`; AES-128-CTR with a random IV and an HMAC-SHA1
+    checksum over the ciphertext, sent as `base64(iv‖ciphertext‖mac)` with our DH public key as
+    `clientKey`. The inner blob is the inverse of `Credentials::with_blob`
+    (`0x49,bytes(user),0x50,int(authType),0x51,bytes(authData)`, block-padded, the XOR-with-prior-
+    block step, AES-192-ECB under a PBKDF2 key from `SHA1(deviceId)` and the username, then base64).
+    When `getInfo` advertises `tokenType` `accesstoken`, a fresh login5 access token (keymaster,
+    `streaming` scope) is sent as the blob with the device's client id as `clientKey`; otherwise the
+    stored reusable credentials blob is used. After a successful `addUser` the engine waits up to
+    10 s for the device to appear in the cluster and returns its Connect device id for
+    `connect.transfer`. Only local-network hosts (loopback / private / link-local / `.local`) over
+    plain HTTP are accepted; all timeouts are bounded. mDNS browsing is Kotlin's `NsdManager`, so
+    Rust only ever sees the URL.
 
 ## 9. Android app
 
@@ -542,16 +593,34 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   snapshot (extrapolating). Media items carry title/artist/album/artworkUri
   (`content://<app>.artwork/<urlhash>` served by `ArtworkProvider` from the Coil disk cache).
 * Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
-  set-media-items (Auto/Assistant/resumption), device volume only when remote.
-  Media button preferences: like/unlike, shuffle (3-state), repeat (3-state). `onSetRating`
-  (HeartRating) toggles like.
+  set-media-items (Auto/Assistant/resumption), device volume only when remote (relative
+  steps accumulate from the last sent target for 2 s), seek back/forward 15 s for episodes.
+  Media button preferences: like/unlike, shuffle (3-state), repeat (3-state); for episodes
+  −15 s / +15 s next to play/pause instead of shuffle/repeat. `onSetRating` (HeartRating)
+  toggles like. Remote playback: the current item's artist reads "<artists> • Playing on
+  <device>" on API 30+ (SysUI shows only title/artist), the notification text adds it below
+  API 30; the subtitle carries the device line. Downloaded tracks use their downloaded cover.
+* Player error (only while nothing plays; STATE_IDLE, playlist kept): logged out →
+  `AUTHENTICATION_EXPIRED` + "Sign in" action; `PREMIUM_REQUIRED`; `PLAYBACK_REFUSED`; else
+  the last failed attempt to start playback (`PlayerController.failure`, also native
+  `playback` error events). `prepare()` clears it. Browsing logged out / without Premium
+  returns the matching `SessionError`.
+* Cold start: commands that start playback wait (≤ 15 s, outside their timeout; a pause cancels
+  the wait) while the session is starting with a network; play/resume fall back to the
+  `ResumeStore` session on NOT_ACTIVE_DEVICE, NOT_CONNECTED (not while mirroring a remote
+  device) and UNAVAILABLE while connecting. Auto browse/search/voice wait the same way.
 * `onConnectAsync` grants commands to the notification, SysUI, Auto/AAOS, Wear and the
   app's own controller; others get read-only.
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata) persisted on pause and every 15 s while playing.
 * Foreground: Media3 default (10 min after pause, then notification becomes dismissable).
-  `onForegroundServiceStartNotAllowedException` → post a "Tap to resume" notification.
+  Local audio never plays without it: local audio starting in the background with no service
+  (remote "play on this phone" during the idle grace or a download) starts the service with
+  `startForegroundService` (focus waits for the foreground); refused, or not foreground within
+  5 s → pause + "Tap to resume" (`ResumeAlert`). `onForegroundServiceStartNotAllowedException`
+  → for local playback pause + "Tap to resume"; while mirroring a remote device the notification
+  is posted without the foreground (the remote device is never paused).
   `onTaskRemoved` default behaviour. Engine holder released when the service is destroyed.
 * **Opt-in Connect presence** (setting "Stay available for Spotify Connect", default off):
   when enabled and the app goes to background while idle, the service keeps itself in the
@@ -562,7 +631,7 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Audio focus (`AudioFocusController`, AudioManagerCompat): requested when local playback
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
-  0.2 → restore. Request failure → pause.
+  0.2 → restore (a duck keeps focus; a granted request clears the duck). Request failure → pause.
 * `BecomingNoisyReceiver`: registered only while playing locally → `player.pause`.
 * Wake locks: Media3 `WakeLockManager` + `WifiLockManager` `setStayAwake(true)` only while
   local status is playing/loading; false otherwise.
@@ -577,8 +646,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * User selection → `AudioSinkBridge.setPreferredDevice(AudioDeviceInfo?)` (`null` =
   system default; best effort — verify with `routedDevice()`). "More devices…" opens the
   system output switcher via `androidx.mediarouter.app.SystemOutputSwitcherDialogController
-  .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — includes Cast and
-  BT devices not yet connected. Never use `setCommunicationDevice` for media.
+  .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — lists Bluetooth and
+  other system audio outputs not yet connected (the app does not cast). Never use `setCommunicationDevice` for media.
 * Device sheet (one UI for everything, like Spotify's): **This phone** (with current output
   name + icon and local output choices), then **Spotify Connect devices**, then
   "More devices…". Selecting a Connect device → `connect.transfer`.
@@ -610,13 +679,40 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   queued items one at a time with `download.track` (cancellation propagates to
   `nativeCancel`), stores records (encrypted key), updates `offline.add`, retries failures
   with backoff (max 3), stops gracefully on `onStopped`/timeout (Android 15 6 h limit),
-  re-enqueues itself if work remains.
+  re-enqueues itself if work remains. "Not enough storage" reschedules (the hosts require
+  storage not low) instead of stopping for good.
+* Scheduling: turning "Download using mobile data" off or on stops a running run (its item
+  resumes from the `.part`) and re-creates the job / worker with the new network constraint;
+  pending work whose constraint does not match the setting is re-created too, and the runner
+  never downloads on a metered network while mobile data is off. User actions, app start,
+  coming online and returning to the app re-create work that waits out a retry backoff (never
+  an executing job or running worker).
+* Queue-wide pauses (`QueueBreaker`): `RATE_LIMITED` requeues the item without counting an
+  attempt and pauses the whole queue for the server's `retryAfterMs` (else 1 min, doubling);
+  three consecutive connectivity failures while the session is online (CDN unreachable) pause
+  it for 1, 4, 16 min …; at most 30 min. Every pending row is held back (`retryAt`), so the run
+  waits inline (≤ 2 min) or reschedules; a completed download resets the breaker.
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
-  of another downloaded collection).
+  of another downloaded collection). Liked Songs are listed with `library.tracks
+  {urisOnly:true}`; new rows get metadata from `catalog.tracks`. Only a *complete* resolution
+  removes items (item count matches the source's total, not empty): an empty or short one only
+  adds, and is retried. A collection whose sync fails or is incomplete is retried after 1 h,
+  doubling up to 24 h (`lastAttemptAt`, `syncFailures`), instead of at every reconnect.
+  Members the catalog resolves as not playable here (`playable:false` with a name) stay members
+  but are not queued and do not count in the collection status (`unavailableUrisJson`); they
+  are queued once they become playable.
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
   `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks start at 2 MiB and adapt between 1 and
-  4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all".
+  4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all";
+  usage counts every row that still owns a finished file (also ones marked failed later), each
+  shared file once.
+* Files are shared: the downloader reuses a verified `<fileId>`, so several rows (relinking, the
+  same recording in two releases) can use one file. Removal deletes a completed file only when no
+  remaining row has it as its `path` or `fileId`. Unfinished rows record the file their download
+  writes (`download.fileId`, stored in `fileId`); garbage collection (when the queue is idle)
+  keeps a `.part` while an unfinished row (pending, failed, cancelled) names it, so "Retry
+  failed" resumes it, and deletes files and `.part`s no row names.
 * Downloads require Premium (they are always Premium here) and are wiped on logout.
 
 ### 9.8 Data layer

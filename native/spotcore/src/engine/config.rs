@@ -92,7 +92,7 @@ pub(crate) fn connect_config(settings: &EngineSettings, initial_volume: u16) -> 
 
 /// Streaming cache only (downloads live elsewhere). No credentials location: librespot would
 /// write the reusable credentials there in plaintext on every login; they are taken from the
-/// Session instead (`connector::harvest_credentials`) and Kotlin stores them encrypted.
+/// Session instead (`connector::session_credentials`) and Kotlin stores them encrypted.
 /// Blocking (directory scan) → `spawn_blocking`.
 pub(crate) async fn build_cache(settings: &EngineSettings) -> AppResult<Cache> {
     let limit_mb = settings.streaming_cache_mb;

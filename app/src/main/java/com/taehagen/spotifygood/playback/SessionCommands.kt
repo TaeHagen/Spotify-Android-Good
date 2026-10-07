@@ -11,7 +11,9 @@ import com.taehagen.spotifygood.model.RepeatMode
 /**
  * Custom session commands and the media button preferences of the notification, SysUI media
  * controls, Android Auto and Wear (docs/ARCHITECTURE.md §9.4): like/unlike, tri-state shuffle
- * (off → shuffle → smart shuffle, `ICON_SHUFFLE_STAR`) and tri-state repeat.
+ * (off → shuffle → smart shuffle, `ICON_SHUFFLE_STAR`) and tri-state repeat for music; for podcast
+ * episodes −15 s / +15 s next to play/pause instead of shuffle and repeat (like Spotify's own
+ * notification and the Now Playing screen).
  *
  * Shuffle uses a custom command because Media3 has no third shuffle state; repeat uses a
  * parameterised player command (`COMMAND_SET_REPEAT_MODE`), which Media3 maps for legacy
@@ -38,6 +40,9 @@ internal object PlaybackSessionCommands {
         val smartShuffleAvailable: Boolean,
         val canShuffle: Boolean,
         val repeat: RepeatMode,
+        /** The current item is a podcast episode: skip buttons instead of shuffle / repeat. */
+        val isEpisode: Boolean = false,
+        val canSeek: Boolean = true,
     )
 
     /** Ordered like, shuffle, repeat: SysUI shows the first overflow buttons. */
@@ -52,6 +57,26 @@ internal object PlaybackSessionCommands {
                         .setSlots(CommandButton.SLOT_OVERFLOW)
                         .build(),
                 )
+            }
+
+            if (state.isEpisode) {
+                add(
+                    CommandButton.Builder(CommandButton.ICON_SKIP_BACK_15)
+                        .setDisplayName(context.getString(R.string.playback_action_seek_back))
+                        .setPlayerCommand(Player.COMMAND_SEEK_BACK)
+                        .setEnabled(state.canSeek)
+                        .setSlots(CommandButton.SLOT_BACK, CommandButton.SLOT_OVERFLOW)
+                        .build(),
+                )
+                add(
+                    CommandButton.Builder(CommandButton.ICON_SKIP_FORWARD_15)
+                        .setDisplayName(context.getString(R.string.playback_action_seek_forward))
+                        .setPlayerCommand(Player.COMMAND_SEEK_FORWARD)
+                        .setEnabled(state.canSeek)
+                        .setSlots(CommandButton.SLOT_FORWARD, CommandButton.SLOT_OVERFLOW)
+                        .build(),
+                )
+                return@buildList
             }
 
             val (shuffleIcon, shuffleLabel) = when (state.shuffle) {

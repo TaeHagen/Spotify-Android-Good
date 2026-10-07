@@ -1,7 +1,11 @@
 package com.taehagen.spotifygood.playback
 
 import android.content.Context
+import androidx.media3.common.PlaybackException
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.model.PlaybackSnapshot
+import com.taehagen.spotifygood.model.PlaybackSource
+import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 
 /** User-facing categories of playback command failures. */
@@ -11,6 +15,8 @@ enum class PlaybackErrorKind {
     PREMIUM_REQUIRED,
     PLAYBACK_REFUSED,
     UNAVAILABLE,
+    /** Offline and the requested context / track is not downloaded. */
+    NOT_AVAILABLE_OFFLINE,
     NOT_FOUND,
     RATE_LIMITED,
     NOT_LOGGED_IN,
@@ -54,6 +60,7 @@ fun interface PlaybackErrorMessages {
                         PlaybackErrorKind.PREMIUM_REQUIRED -> R.string.playback_error_premium_required
                         PlaybackErrorKind.PLAYBACK_REFUSED -> R.string.playback_error_refused
                         PlaybackErrorKind.UNAVAILABLE -> R.string.playback_error_unavailable
+                        PlaybackErrorKind.NOT_AVAILABLE_OFFLINE -> R.string.playback_error_not_available_offline
                         PlaybackErrorKind.NOT_FOUND -> R.string.playback_error_not_found
                         PlaybackErrorKind.RATE_LIMITED -> R.string.playback_error_rate_limited
                         PlaybackErrorKind.NOT_LOGGED_IN -> R.string.playback_error_not_logged_in
@@ -63,5 +70,57 @@ fun interface PlaybackErrorMessages {
                 )
             }
         }
+    }
+}
+
+/**
+ * The error a media controller (Android Auto, lock screen, Wear) should see while nothing plays,
+ * as Media3 `PlaybackException` data. [code] is a `PlaybackException.ERROR_CODE_*`; [signIn] asks
+ * for a "Sign in" resolution action.
+ */
+internal data class PlayerErrorInfo(val code: Int, val kind: PlaybackErrorKind, val message: String, val signIn: Boolean = false)
+
+/** Which error the session player publishes (docs/ARCHITECTURE.md §9.4). Pure. */
+internal object PlayerErrors {
+    /**
+     * Nothing while something plays or loads. Otherwise, in this order: logged out (once the stored
+     * credentials were read: [ready]), the sticky account errors (Premium required; playback
+     * refused while the local snapshot still reports it), then the last failure to start playback.
+     */
+    fun select(
+        ready: Boolean,
+        loggedIn: Boolean,
+        accountErrorCode: String?,
+        snapshot: PlaybackSnapshot,
+        failure: PlaybackFailure?,
+        messages: PlaybackErrorMessages,
+    ): PlayerErrorInfo? {
+        val active = snapshot.status == PlaybackStatus.PLAYING ||
+            snapshot.status == PlaybackStatus.LOADING
+        if (active) return null
+        fun of(kind: PlaybackErrorKind, message: String = messages.message(kind, null)) =
+            PlayerErrorInfo(codeOf(kind), kind, message, signIn = kind == PlaybackErrorKind.NOT_LOGGED_IN)
+        return when {
+            ready && !loggedIn -> of(PlaybackErrorKind.NOT_LOGGED_IN)
+            accountErrorCode == NativeErrorCode.PREMIUM_REQUIRED -> of(PlaybackErrorKind.PREMIUM_REQUIRED)
+            accountErrorCode == NativeErrorCode.PLAYBACK_REFUSED &&
+                snapshot.source == PlaybackSource.LOCAL && snapshot.lastError != null ->
+                of(PlaybackErrorKind.PLAYBACK_REFUSED)
+            failure != null -> of(failure.kind, failure.message)
+            else -> null
+        }
+    }
+
+    /** `PlaybackException` error code of [kind] (Media3 maps these to the legacy error codes Auto reads). */
+    fun codeOf(kind: PlaybackErrorKind): Int = when (kind) {
+        PlaybackErrorKind.NOT_LOGGED_IN -> PlaybackException.ERROR_CODE_AUTHENTICATION_EXPIRED
+        PlaybackErrorKind.PREMIUM_REQUIRED -> PlaybackException.ERROR_CODE_PREMIUM_ACCOUNT_REQUIRED
+        PlaybackErrorKind.PLAYBACK_REFUSED -> PlaybackException.ERROR_CODE_PERMISSION_DENIED
+        PlaybackErrorKind.NETWORK, PlaybackErrorKind.NOT_AVAILABLE_OFFLINE ->
+            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED
+        PlaybackErrorKind.TIMEOUT -> PlaybackException.ERROR_CODE_TIMEOUT
+        PlaybackErrorKind.NOT_ACTIVE_DEVICE, PlaybackErrorKind.UNAVAILABLE, PlaybackErrorKind.NOT_FOUND,
+        PlaybackErrorKind.RATE_LIMITED, PlaybackErrorKind.GENERIC,
+        -> PlaybackException.ERROR_CODE_UNSPECIFIED
     }
 }

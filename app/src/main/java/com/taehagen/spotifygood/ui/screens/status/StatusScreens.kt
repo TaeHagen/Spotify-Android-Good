@@ -24,6 +24,7 @@ import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.MusicOff
 import androidx.compose.material.icons.rounded.WarningAmber
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -33,6 +34,10 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -44,12 +49,16 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.ui.theme.AppColors
 
-/** Shown when the account cannot stream (Spotify Free): explanation, retry (after upgrading) and log out. */
+/**
+ * Shown when the account cannot stream (Spotify Free): explanation, retry (after upgrading) and log
+ * out. [onLogout] runs only after the user confirmed (logging out deletes all downloads).
+ */
 @Composable
 fun PremiumRequiredScreen(
     onLogout: () -> Unit,
@@ -58,6 +67,7 @@ fun PremiumRequiredScreen(
     onRetry: (() -> Unit)? = null,
 ) {
     val uriHandler = LocalUriHandler.current
+    var confirmLogout by rememberSaveable { mutableStateOf(false) }
     StatusLayout(
         icon = Icons.Rounded.Lock,
         title = stringResource(R.string.shell_premium_title),
@@ -69,7 +79,7 @@ fun PremiumRequiredScreen(
         modifier = modifier,
     ) {
         Button(
-            onClick = onLogout,
+            onClick = { confirmLogout = true },
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = 52.dp),
@@ -90,11 +100,21 @@ fun PremiumRequiredScreen(
                 .heightIn(min = 48.dp),
         ) { Text(stringResource(R.string.shell_premium_learn_more)) }
     }
+    if (confirmLogout) {
+        LogoutConfirmDialog(
+            onConfirm = {
+                confirmLogout = false
+                onLogout()
+            },
+            onDismiss = { confirmLogout = false },
+        )
+    }
 }
 
 /**
  * Spotify refused audio keys for this account (librespot limitation, docs §3.3): playback on this
  * phone is not possible, but browsing and controlling other Connect devices still work.
+ * [onLogout] runs only after the user confirmed (logging out deletes all downloads).
  */
 @Composable
 fun PlaybackRefusedScreen(
@@ -103,6 +123,7 @@ fun PlaybackRefusedScreen(
     onContinue: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var confirmLogout by rememberSaveable { mutableStateOf(false) }
     StatusLayout(
         icon = Icons.Rounded.MusicOff,
         title = stringResource(R.string.shell_refused_title),
@@ -124,12 +145,41 @@ fun PlaybackRefusedScreen(
                 .heightIn(min = 52.dp),
         ) { Text(stringResource(R.string.shell_try_again)) }
         TextButton(
-            onClick = onLogout,
+            onClick = { confirmLogout = true },
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = 48.dp),
         ) { Text(stringResource(R.string.shell_logout)) }
     }
+    if (confirmLogout) {
+        LogoutConfirmDialog(
+            onConfirm = {
+                confirmLogout = false
+                onLogout()
+            },
+            onDismiss = { confirmLogout = false },
+        )
+    }
+}
+
+/** Logging out wipes downloads, caches and the database (docs §9.3): always confirmed first. */
+@Composable
+private fun LogoutConfirmDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.shell_logout_confirm_title)) },
+        text = { Text(stringResource(R.string.shell_logout_confirm_message)) },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(
+                    text = stringResource(R.string.shell_logout),
+                    color = MaterialTheme.colorScheme.error,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.shell_cancel)) } },
+    )
 }
 
 /** Slim strip above the mini player while playback is refused (tap → details). */

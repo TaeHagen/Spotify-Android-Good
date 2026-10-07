@@ -63,6 +63,7 @@ import com.taehagen.spotifygood.ui.components.PlayFab
 import com.taehagen.spotifygood.ui.components.TrackRow
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
+import com.taehagen.spotifygood.ui.navigation.MainNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
 import com.taehagen.spotifygood.ui.screens.album.AddedButton
@@ -74,7 +75,6 @@ import com.taehagen.spotifygood.ui.screens.album.HeaderMetaText
 import com.taehagen.spotifygood.ui.screens.album.LoadMoreEffect
 import com.taehagen.spotifygood.ui.screens.album.LoadState
 import com.taehagen.spotifygood.ui.screens.album.LoadStateContent
-import com.taehagen.spotifygood.ui.screens.album.MessageEffect
 import com.taehagen.spotifygood.ui.screens.album.MoreButton
 import com.taehagen.spotifygood.ui.screens.album.PagingFooter
 import com.taehagen.spotifygood.ui.screens.album.ShuffleButton
@@ -96,19 +96,15 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
     var showAddSongs by rememberSaveable { mutableStateOf(false) }
     var showEditDetails by rememberSaveable { mutableStateOf(false) }
     var confirmDelete by rememberSaveable { mutableStateOf(false) }
-    val deletedMessage = stringResource(R.string.detail_playlist_deleted)
     val data = state.load.dataOrNull()
 
-    MessageEffect(viewModel.messages)
     // The query survives process death (saveable) but a recreated ViewModel starts unfiltered.
     LaunchedEffect(viewModel) { if (query.isNotEmpty()) viewModel.setFilter(query) }
     LaunchedEffect(viewModel, navigator) {
         viewModel.events.collect { event ->
             when (event) {
-                PlaylistEvent.Deleted -> {
-                    navigator.showMessage(deletedMessage)
-                    navigator.back()
-                }
+                // The "deleted" message comes from the ViewModel (also when the page is gone).
+                PlaylistEvent.Deleted -> if (navigator is MainNavigator) navigator.leavePlaylist(uri) else navigator.back()
             }
         }
     }
@@ -414,7 +410,10 @@ private fun PlaylistHeader(
                             )
                         },
                         trailing = {
-                            SmartShuffleButton(active = isContext && state.playback.smartShuffle, onClick = actions.onSmartShuffle)
+                            // The engine rejects smart shuffle offline (it needs recommendations); plain shuffle works.
+                            if (!state.offline) {
+                                SmartShuffleButton(active = isContext && state.playback.smartShuffle, onClick = actions.onSmartShuffle)
+                            }
                             ShuffleButton(
                                 active = isContext && state.playback.shuffle && !state.playback.smartShuffle,
                                 onClick = actions.onShuffle,

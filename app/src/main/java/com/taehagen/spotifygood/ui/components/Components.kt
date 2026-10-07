@@ -124,6 +124,7 @@ import com.taehagen.spotifygood.ui.navigation.LocalOptionalAppNavigator
 import com.taehagen.spotifygood.ui.theme.AppColors
 import com.taehagen.spotifygood.ui.theme.LocalIsDarkTheme
 import kotlinx.coroutines.delay
+import java.io.File
 
 // Shared UI building blocks. Signatures are a contract used by every screen; implementations are
 // owned by the UI shell (see docs/ARCHITECTURE.md §9.9). Keep parameters stable.
@@ -133,7 +134,13 @@ private const val DISABLED_ALPHA = 0.38f
 /** Space below the status bar kept free for the transparent back-button bar of detail pages. */
 private val OVERLAID_TOP_BAR_SPACE = 56.dp
 
-/** Cover art / artist image with placeholder, crossfade and Coil caching. */
+/**
+ * Coil data for an image "url": an absolute path (a downloaded cover, used offline) is loaded as
+ * a local [File], anything else as the URL it is.
+ */
+internal fun imageData(url: String): Any = if (url.startsWith('/')) File(url) else url
+
+/** Cover art / artist image with placeholder, crossfade and Coil caching. [url] may be a local path. */
 @Composable
 fun Artwork(
     url: String?,
@@ -144,7 +151,7 @@ fun Artwork(
 ) {
     val context = LocalPlatformContext.current
     val request = remember(url, context) {
-        url?.takeIf { it.isNotBlank() }?.let { ImageRequest.Builder(context).data(it).crossfade(true).build() }
+        url?.takeIf { it.isNotBlank() }?.let { ImageRequest.Builder(context).data(imageData(it)).crossfade(true).build() }
     }
     var loaded by remember(url) { mutableStateOf(false) }
     Box(

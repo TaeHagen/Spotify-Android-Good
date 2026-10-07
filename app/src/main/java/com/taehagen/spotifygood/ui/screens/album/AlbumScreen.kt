@@ -42,7 +42,6 @@ fun AlbumScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier =
     val navigator = LocalAppNavigator.current
     val listState = rememberLazyListState()
     val showTitle by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 } }
-    MessageEffect(viewModel.messages)
 
     DetailScaffold(
         title = state.load.dataOrNull()?.album?.name.orEmpty(),

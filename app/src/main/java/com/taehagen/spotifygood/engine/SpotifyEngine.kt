@@ -34,6 +34,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
@@ -575,7 +576,7 @@ class SpotifyEngine(
                 offlineMode || session == SessionState.ONLINE || session == SessionState.OFFLINE
             }
                 .distinctUntilChanged()
-                .collect { due -> if (due && !offlineIndexPushed) pushOfflineIndex() }
+                .collectLatest { due -> if (due && !offlineIndexPushed) pushOfflineIndex() }
         }
     }
 
@@ -593,11 +594,24 @@ class SpotifyEngine(
         }
     }
 
+    /**
+     * Pushes the offline index, retrying with backoff while it is due (the collector cancels the
+     * retries when it no longer is): a failed push would leave the index empty for the engine run.
+     */
     private suspend fun pushOfflineIndex() {
+        var retryMs = OFFLINE_INDEX_RETRY_MS
+        while (!tryPushOfflineIndex()) {
+            delay(retryMs)
+            retryMs = (retryMs * 2).coerceAtMost(OFFLINE_INDEX_RETRY_MAX_MS)
+        }
+    }
+
+    /** One push of the offline index; true when done (or there is nothing to push). */
+    private suspend fun tryPushOfflineIndex(): Boolean {
         val provider = offlineIndexProvider
         if (provider == null) {
             offlineIndexPushed = true
-            return
+            return true
         }
         val tracks = try {
             withContext(Dispatchers.IO) { provider() }
@@ -605,12 +619,14 @@ class SpotifyEngine(
             throw e
         } catch (t: Throwable) {
             Log.w(TAG, "Loading offline records failed", t)
-            return
+            return false
         }
         if (callQuietly("offline.setIndex", rpc.args(OfflineIndexArgs(tracks)), OFFLINE_INDEX_TIMEOUT_MS)) {
             offlineIndexPushed = true
             Log.d(TAG, "Offline index pushed (${tracks.size} tracks)")
+            return true
         }
+        return false
     }
 
     // ---- native events ------------------------------------------------------------------------
@@ -822,6 +838,8 @@ class SpotifyEngine(
         private const val OFFLINE_INDEX_TIMEOUT_MS = 30_000L
         private const val CREDENTIALS_LOAD_ATTEMPTS = 4
         private const val CREDENTIALS_RETRY_DELAY_MS = 200L
+        private const val OFFLINE_INDEX_RETRY_MS = 2_000L
+        private const val OFFLINE_INDEX_RETRY_MAX_MS = 60_000L
         private val FATAL_CODES = setOf(NativeErrorCode.BAD_CREDENTIALS, NativeErrorCode.PREMIUM_REQUIRED)
 
         private fun nativeUnavailableInfo() =

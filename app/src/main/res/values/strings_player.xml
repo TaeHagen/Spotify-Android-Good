@@ -56,6 +56,8 @@
     <string name="player_seek">Playback position</string>
     <string name="player_seek_state">%1$s of %2$s</string>
     <string name="player_volume">Volume</string>
+    <string name="player_seek_back_step">Back %1$d seconds</string>
+    <string name="player_seek_forward_step">Forward %1$d seconds</string>
     <string name="player_volume_state">%1$d percent</string>
     <string name="player_open_now_playing">Open now playing</string>
     <string name="player_open_queue">Queue</string>
@@ -103,7 +105,7 @@
     <string name="player_devices_automatic_description">Let Android choose the audio output</string>
     <string name="player_devices_routed">Playing through this output</string>
     <string name="player_devices_more">More devices…</string>
-    <string name="player_devices_more_description">Cast, Bluetooth and other outputs</string>
+    <string name="player_devices_more_description">Bluetooth, wired and other outputs of this phone</string>
     <string name="player_devices_connect">Spotify Connect</string>
     <string name="player_devices_playing">Playing</string>
     <string name="player_devices_group">Group</string>
@@ -112,8 +114,7 @@
     <string name="player_devices_refresh">Refresh devices</string>
     <string name="player_devices_none">No other devices found</string>
     <string name="player_devices_tip_account">Make sure your other devices are signed in to the same Spotify account.</string>
-    <string name="player_devices_tip_network">Some speakers and TVs only show up on the same Wi-Fi network.</string>
-    <string name="player_devices_hint">Devices appear here while their Spotify app is open.</string>
+    <string name="player_devices_hint">Don\'t see your device? Open Spotify on it, signed in to the same account, then tap refresh.</string>
     <string name="player_devices_transfer_failed">Couldn\'t play on %1$s</string>
     <string name="player_devices_transfer_failed_network">Couldn\'t reach %1$s. Check your connection.</string>
     <string name="player_devices_refresh_failed">Couldn\'t refresh devices</string>

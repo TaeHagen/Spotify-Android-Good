@@ -473,7 +473,8 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
                     title = stringResource(R.string.shell_settings_remove_downloads),
                     summary = stringResource(R.string.shell_settings_remove_downloads_summary),
                     icon = Icons.Rounded.DeleteSweep,
-                    enabled = downloadedCount > 0 || usedBytes > 0,
+                    // Failed rows can still own (partial) files, so they count too.
+                    enabled = downloadedCount > 0 || usedBytes > 0 || failedCount > 0,
                     onClick = { dialog = SettingsDialog.RemoveDownloads },
                     destructive = true,
                 )

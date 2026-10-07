@@ -6,6 +6,7 @@ import coil3.SingletonImageLoader
 import com.taehagen.spotifygood.auth.AuthRepository
 import com.taehagen.spotifygood.auth.CredentialStore
 import com.taehagen.spotifygood.connect.DevicesRepository
+import com.taehagen.spotifygood.connect.LocalDeviceDiscovery
 import com.taehagen.spotifygood.data.CatalogRepository
 import com.taehagen.spotifygood.data.HomeRepository
 import com.taehagen.spotifygood.data.LibraryRepository
@@ -78,6 +79,12 @@ class AppGraph(val app: Application) {
     val resumeStore: ResumeStore by lazy { ResumeStore(app) }
     val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore) }
     val devices: DevicesRepository by lazy { DevicesRepository(appScope, rpc, events) }
+    private val localDiscoveryLazy = lazy {
+        LocalDeviceDiscovery(app, rpc) { devices.devices.value.devices.map { it.id }.toSet() }
+    }
+
+    /** Spotify Connect local-network discovery (the "send" side); runs only while the sheet is up. */
+    val localDiscovery: LocalDeviceDiscovery by localDiscoveryLazy
     val outputs: OutputRouteManager by lazy {
         OutputRouteManager(app, appScope, audioSink, rpc).also { manager ->
             appScope.launch(Dispatchers.Main) {
@@ -122,6 +129,8 @@ class AppGraph(val app: Application) {
                     if (failure == null) failure = t
                 }
             }
+            // Browsing the LAN for the old account's Connect targets ends with it.
+            step("local discovery") { if (localDiscoveryLazy.isInitialized()) localDiscovery.stop() }
             step("engine") { engine.logout() }
             step("downloads") { downloads.removeAll() }
             // The playback service clears it too, but only while it runs.

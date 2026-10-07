@@ -91,6 +91,31 @@ pub fn oauth_token() -> Option<(String, i64)> {
     shared().oauth.lock().clone().filter(|(_, expires)| *expires > now_ms() + TOKEN_EXPIRY_MARGIN_MS)
 }
 
+/// The reusable credentials the engine holds for the logged-in user: the stored ones Kotlin
+/// passed, or, failing that, the ones harvested from the live session. Used by the ZeroConf
+/// client to build the stored-credentials login blob (docs/ARCHITECTURE.md §8).
+pub fn reusable_credentials() -> Option<StoredCredentials> {
+    {
+        let login = shared().login.lock();
+        if let Some(c) = login.credentials.clone() {
+            return Some(c);
+        }
+        // No token either: logged out, or a logout is tearing the session down.
+        login.access_token.as_ref()?;
+    }
+    // A fresh token login whose credentials weren't harvested yet.
+    let session = try_session()?;
+    config::from_session(session.username(), session.auth_data())
+}
+
+/// Mints a fresh login5 access token (keymaster client, `streaming` scope) for the logged-in
+/// user, bounded by [`TOKEN_TIMEOUT`]. Used for the ZeroConf `accesstoken` login path.
+pub async fn access_token() -> AppResult<String> {
+    let session = session()?;
+    let token = tokio::time::timeout(TOKEN_TIMEOUT, session.login5().auth_token()).await??;
+    Ok(token.access_token)
+}
+
 pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
     match method {
         "session.start" => start(parse_args(args)?).await,
