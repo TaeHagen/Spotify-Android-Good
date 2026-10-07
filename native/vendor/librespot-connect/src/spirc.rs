@@ -1475,8 +1475,11 @@ impl SpircTask {
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
                 info!("device became inactive");
-                self.handle_disconnect().await?;
+                // SPOTIFYGOOD: always stop the local player, even if the requests fail (it kept
+                // playing next to the device that took over), like below
+                let res = self.handle_disconnect().await;
                 self.handle_stop();
+                res?;
             } else if self.connect_state.is_active() {
                 // fixme: workaround fix, because of missing information why it behaves like it does
                 //  background: when another device sends a connect-state update, some player's position de-syncs
@@ -1792,13 +1795,17 @@ impl SpircTask {
         self.play_status = SpircPlayStatus::Stopped {};
         self.connect_state
             .update_position_in_relation(self.now_ms());
-        self.notify().await?;
+        // SPOTIFYGOOD: become inactive (locally) even if the state update fails, it used to
+        // return early and the device kept reporting itself as active
+        let notified = self.notify().await;
 
-        self.connect_state.became_inactive(&self.session).await?;
+        let inactive = self.connect_state.became_inactive(&self.session).await;
 
         self.player
             .emit_session_disconnected_event(self.session.connection_id(), self.session.username());
 
+        notified?;
+        inactive?;
         Ok(())
     }
 
