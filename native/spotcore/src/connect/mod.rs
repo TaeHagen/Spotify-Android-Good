@@ -33,7 +33,11 @@ use librespot_core::spclient::TransferRequest;
 use librespot_playback::mixer::Mixer;
 use route::{CommandKind, RouteInput, Target};
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// How long a playback command waits for a connect attempt in flight (below Kotlin's 15 s
+/// command timeout).
+const CONNECTING_WAIT: Duration = Duration::from_secs(10);
 
 pub(crate) use hub::Attachment;
 pub(crate) use player_events::on_player_event;
@@ -115,12 +119,38 @@ fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     route::route(&input, kind, downloaded)
 }
 
+/// Whether a command waits for the session: a connect attempt is in flight (cold start,
+/// reconnect) and the command would otherwise be routed offline. A running offline queue answers
+/// controls right away; a load replaces it, so it waits too.
+fn should_wait(kind: CommandKind, online: bool, connecting: bool, offline_active: bool) -> bool {
+    !online && connecting && (kind == CommandKind::Load || !offline_active)
+}
+
+/// Holds a command for at most [`CONNECTING_WAIT`] while the session is connecting; stops early
+/// once it is online or the attempt ended (error, offline, stop, backoff).
+async fn await_online_if_connecting(kind: CommandKind) {
+    let mut status = engine::status_watch();
+    let mut online = engine::online_watch();
+    let wait = async {
+        while should_wait(kind, engine::is_online(), engine::is_connecting(), offline::is_active()) {
+            tokio::select! {
+                r = online.changed() => if r.is_err() { break },
+                r = status.changed() => if r.is_err() { break },
+            }
+        }
+    };
+    if tokio::time::timeout(CONNECTING_WAIT, wait).await.is_err() {
+        log::info!("the session is still connecting, routing the command anyway");
+    }
+}
+
 fn spirc() -> AppResult<std::sync::Arc<librespot_connect::Spirc>> {
     hub::spirc().ok_or_else(AppError::not_connected)
 }
 
 async fn load(args: LoadArgs) -> AppResult<Value> {
     player_events::on_user_load();
+    await_online_if_connecting(CommandKind::Load).await;
     let downloaded = !engine::is_online() && offline::has_downloaded(&args);
     let target = decide(CommandKind::Load, downloaded)?;
     // An explicit load replaces whatever a reconnect would have restored.
@@ -145,6 +175,12 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
 }
 
 async fn control(cmd: Ctl) -> AppResult<Value> {
+    await_online_if_connecting(cmd.kind()).await;
+    if engine::is_online() {
+        // The user took over before a pending reconnect restore ran (it waits for the first
+        // cluster); while offline the restore point stays for when the session is back.
+        restore::cancel();
+    }
     match decide(cmd.kind(), false)? {
         Target::Local { activate } => local_control(&cmd, activate)?,
         Target::Remote(device) => remote_control(&cmd, &device).await.map_err(remote::remote_error)?,
@@ -420,4 +456,24 @@ pub(crate) fn reset() {
         hub.audio_output = None;
     }
     on_engine_state_changed();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_wait_only_for_an_attempt_in_flight() {
+        use CommandKind::*;
+        assert!(should_wait(Load, false, true, false));
+        assert!(should_wait(Control, false, true, false));
+        assert!(should_wait(Queue, false, true, false));
+        // a running offline queue answers controls, a load replaces it
+        assert!(!should_wait(Control, false, true, true));
+        assert!(should_wait(Load, false, true, true));
+        // online, or no attempt in flight (offline mode, no network, backoff, error)
+        assert!(!should_wait(Load, true, true, false));
+        assert!(!should_wait(Load, false, false, false));
+        assert!(!should_wait(Control, false, false, false));
+    }
 }

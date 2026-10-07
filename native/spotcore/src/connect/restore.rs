@@ -143,9 +143,24 @@ pub(crate) fn prepare_reconnect() {
 /// that ended by itself) has no owner anymore and is stopped, unless the offline queue or an
 /// active Spirc owns the Player.
 pub(crate) fn clear() {
+    drop_restore(true);
+}
+
+/// A user command while a restore is pending: the user took over, the restore is dropped (like
+/// `clear`, but the restore point of the attached Spirc for a later reconnect is kept).
+pub(crate) fn cancel() {
+    if HUB.lock().reconnect.is_some() {
+        log::info!("user command while a restore is pending, not restoring");
+        drop_restore(false);
+    }
+}
+
+fn drop_restore(forget_last_active: bool) {
     let (dropped, orphaned) = {
         let mut hub = HUB.lock();
-        hub.last_active = None;
+        if forget_last_active {
+            hub.last_active = None;
+        }
         let dropped = hub.reconnect.take().is_some();
         let running = spirc_running(&hub);
         let owned = running && hub.snapshot.as_ref().is_some_and(|s| s.is_active);

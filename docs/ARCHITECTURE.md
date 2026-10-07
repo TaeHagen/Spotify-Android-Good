@@ -308,7 +308,12 @@ snapshots.
 All results are JSON objects (`{}` when nothing to return). Commands that act on
 playback are routed by the engine: **if this device is active (or nothing is active)**
 → local Spirc (activating first when needed) / OfflineController; **if another device is
-active** → connect-state command to that device.
+active** → connect-state command to that device. While a connect attempt is in flight
+(`connecting`, or `reconnecting` outside a backoff wait, with the network up and offline mode
+off) `player.load` and the control / queue commands first wait up to 10 s for `online`
+(controls don't wait while offline playback runs), so a command right after a cold start or
+during a reconnect isn't routed offline. A control after `online` drops a pending reconnect
+restore (§8).
 
 ### 6.1 Session
 
