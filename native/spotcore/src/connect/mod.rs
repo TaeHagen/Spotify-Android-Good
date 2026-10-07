@@ -263,8 +263,10 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
             let spirc = spirc()?;
             let request = local::load_request(&args)?;
             restore::clear();
-            // The offline queue hands the Player over to Spirc.
+            // The offline queue hands the Player over to Spirc (and a hand-back on its way is
+            // replaced: its failure must not make this phone inactive).
             offline::stop();
+            hub::forget_hand_back();
             if activate {
                 local::sent(spirc.activate())?;
                 // Commands that arrive before the Spirc reports itself active go to it.
@@ -507,18 +509,34 @@ fn set_audio_output(args: AudioOutputArgs) -> AppResult<Value> {
     ok()
 }
 
-/// The `play` of an offline queue handed over to another device: its items in play order (so no
-/// shuffle on the target), its repeat mode, paused unless it played.
-fn handover_load(h: offline_queue::Handover, play: bool) -> LoadArgs {
-    LoadArgs {
-        track_uris: Some(h.uris),
-        start_index: Some(0),
-        position_ms: h.position_ms,
-        shuffle: Some(false),
-        repeat: Some(h.repeat),
-        play,
-        ..Default::default()
+/// The commands handing an offline queue over to another device: its context at its current
+/// track when that is a track of one that can be loaded again (the whole context plays there, the
+/// user queue is added after it), else its items in play order (so no shuffle on the target);
+/// its repeat mode and position, paused unless it played (Spirc-based targets start playing
+/// whatever `initially_paused` says).
+fn handover_bodies(h: offline_queue::Handover, play: bool) -> Vec<Value> {
+    let base = LoadArgs { position_ms: h.position_ms, repeat: Some(h.repeat), play, ..Default::default() };
+    let (load, queued) = match h.context {
+        Some(c) => (
+            LoadArgs { context_uri: Some(c.context_uri), start_uri: Some(c.track_uri), shuffle: Some(h.shuffle), ..base },
+            h.queued,
+        ),
+        None => (LoadArgs { track_uris: Some(h.uris), start_index: Some(0), shuffle: Some(false), ..base }, Vec::new()),
+    };
+    let mut bodies = vec![remote::play(&load, &uri::random_command_id())];
+    bodies.extend(queued.iter().map(|u| remote::add_to_queue(u, &uri::random_command_id())));
+    if !play {
+        bodies.push(remote::simple("pause", &uri::random_command_id()));
     }
+    bodies
+}
+
+/// Whether a push to another device starts a session there (a connect-state `play` of the
+/// frozen or the given session) instead of transferring this phone's: a restore is still being
+/// applied here, or there is no session to transfer (nothing active, or this phone active with
+/// nothing loaded and nothing on its way).
+fn push_starts_session(applying: bool, local_session: bool, other_active: bool) -> bool {
+    applying || (!local_session && !other_active)
 }
 
 fn nothing_active() -> AppError {
@@ -604,23 +622,18 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
 /// The push of `transfer` to another device.
 async fn push(args: &TransferArgs, other_active: bool, offline_owns: bool, frozen: Option<&restore::Taken>) -> AppResult<()> {
     if offline_owns {
-        // The offline queue has no Connect state to transfer: hand its tracks over as a play
-        // command, then stop locally.
+        // The offline queue has no Connect state to transfer: hand it over as a play command,
+        // then stop locally.
         if let Some(handover) = offline::handover(50).filter(|h| !h.uris.is_empty()) {
             let playing = args.play && handover.playing;
-            let load = handover_load(handover, playing);
-            let mut bodies = vec![remote::play(&load, &uri::random_command_id())];
-            if !playing {
-                // Spirc-based targets start playing whatever `initially_paused` says.
-                bodies.push(remote::simple("pause", &uri::random_command_id()));
-            }
-            remote::send_all(&args.device_id, bodies).await.map_err(remote::remote_error)?;
+            remote::send_all(&args.device_id, handover_bodies(handover, playing)).await.map_err(remote::remote_error)?;
             offline::stop();
             return Ok(());
         }
     }
     let applying = frozen.is_some_and(|t| t.applying);
-    if applying || (!hub::local_active_or_activating() && !other_active) {
+    let local_session = hub::local_active_or_activating() && !hub::local_active_empty();
+    if push_starts_session(applying, local_session, other_active) {
         // Nothing to transfer (or a restore still being applied here): start the frozen (or the
         // given) session on the target.
         let resume = frozen
@@ -845,13 +858,54 @@ mod tests {
             position_ms: 42_000,
             repeat: RepeatMode::Track,
             playing: false,
+            context: None,
+            shuffle: true,
+            queued: vec!["spotify:track:b".into()],
         };
-        let load = handover_load(h, false);
-        let body = remote::play(&load, "id").to_string();
+        let bodies = handover_bodies(h, false);
+        assert_eq!(bodies.len(), 2, "play, pause (the queue is in the list)");
+        let body = bodies[0].to_string();
         assert!(body.contains("\"shuffling_context\":false"), "{body}");
         assert!(body.contains("\"repeating_track\":true"), "{body}");
         assert!(body.contains("\"initially_paused\":true"), "{body}");
         assert!(body.contains("42000"), "{body}");
+        assert!(bodies[1].to_string().contains("pause"));
+    }
+
+    #[test]
+    fn an_offline_queue_of_a_context_is_handed_over_as_that_context() {
+        let h = offline_queue::Handover {
+            uris: vec!["spotify:track:a".into(), "spotify:track:q".into()],
+            position_ms: 42_000,
+            repeat: RepeatMode::Context,
+            playing: true,
+            context: Some(offline_queue::ContextStart {
+                context_uri: "spotify:playlist:p".into(),
+                track_uri: "spotify:track:a".into(),
+            }),
+            shuffle: true,
+            queued: vec!["spotify:track:q".into()],
+        };
+        let bodies = handover_bodies(h, true);
+        let body = bodies[0].to_string();
+        assert!(body.contains("spotify:playlist:p") && body.contains("spotify:track:a"), "{body}");
+        assert!(!body.contains("spotify:track:q"), "{body}");
+        assert!(body.contains("\"shuffling_context\":true") && body.contains("\"repeating_context\":true"), "{body}");
+        assert!(body.contains("42000"), "{body}");
+        // the user queue after it, playing
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].to_string().contains("add_to_queue") && bodies[1].to_string().contains("spotify:track:q"));
+    }
+
+    #[test]
+    fn a_push_from_a_phone_with_nothing_loaded_starts_the_session_there() {
+        // active with nothing loaded (a failed load) or nothing active: the given session
+        assert!(push_starts_session(false, false, false));
+        // a session here, or another device's: transferred
+        assert!(!push_starts_session(false, true, false));
+        assert!(!push_starts_session(false, false, true));
+        // a restore still being applied here: started there
+        assert!(push_starts_session(true, true, false));
     }
 
     #[test]

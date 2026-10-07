@@ -307,12 +307,17 @@ this device plays (or paused) a downloaded track through Spirc, the OfflineContr
 playback over as it is, before anything pauses the Player (a track that ended meanwhile moves
 on to the next one): the track keeps playing without a reload, with the
 visible tracks around it in play order (user queue included, one pass of the context with
-repeat-all: the queue's own repeat wraps it) up to the first one on either side that isn't
-downloaded (the queue ends there), the position, repeat mode, shuffle flag and play state. No
-restore point is kept for that session; when it is back, the queue plays on as above, and when
-it reaches the end of the handed-over window (stops or would wrap) with a visible session up, it
-hands back to Spirc: the context loads at the first track after the window (its options as
-now), unless the user changed the window meanwhile (a load, a shuffle toggle).
+repeat-all, its start that Spirc no longer lists as previous tracks in front: the queue's own
+repeat wraps it) up to the first one on either side that isn't downloaded (the queue ends
+there), the position, repeat mode, shuffle flag and play state. No restore point is kept for
+that session; when it is back, the queue plays on as above, and when it reaches the end of the
+handed-over window (stops or would wrap) with a visible session up and no other device active,
+it hands back to Spirc: the queue's track stops, and the context loads at its first track after
+the window (suggestions skipped, smart shuffle adds new ones; the user queue's tracks there are
+queued again and play after that first track), with its options as now, unless the user changed
+the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
+stays shown (loading), so the notification and the media session stay; a failed load makes
+this phone inactive (nothing plays, the app's own resume is the fallback).
 A streamed current track is frozen for the reconnect as before (§8), and so is any playback
 when the session dies while the network is up (the reconnect follows within seconds).
 The OfflineController notices a Player whose thread died: the queue stops where it was (so its
@@ -409,7 +414,8 @@ off), and once online until the new Spirc's first cluster says which device is a
 `player.load`, `connect.transfer` and the control / queue commands first wait (≤ 10 s; controls
 don't wait while offline playback runs), so a command right after a cold start, a reconnect or
 becoming visible isn't routed offline or as "nothing is active". Right after a local load or
-restore activated this device, commands go to it although its state doesn't say active yet, and
+restore activated this device, commands go to it although its state doesn't say active yet (and
+the `playback` snapshot doesn't show another device's playback meanwhile), and
 right after a play was sent to another device (a load for the pending target, a transfer that
 started a session there) they follow it there until a cluster names the active device (≤ 10 s).
 A play / toggle on this device while it is active with nothing loaded (a load failed after its
@@ -462,7 +468,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
-| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs","shuffle"?,"smartShuffle"?,"repeat"?,"trackUris"?:["…"]}?}` (`trackUris`: the session as a track list, when its current track wasn't a context track; played from `trackUri` on instead of the context) (self = pull, other = push). When no device is active, `resume` (the app's last session, with its modes; smart shuffle becomes a plain shuffle on another device) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE` (Kotlin then keeps the device as the pending target for the next play, see §8). Pushing offline playback hands over its tracks (in play order), current position and repeat mode, and keeps it paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as the visible track window in play order) |
+| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs","shuffle"?,"smartShuffle"?,"repeat"?,"trackUris"?:["…"]}?}` (`trackUris`: the session as a track list, when its current track wasn't a context track; played from `trackUri` on instead of the context) (self = pull, other = push). When no device is active, or this phone is active with nothing loaded (a failed load) and nothing on its way, `resume` (the app's last session, with its modes; smart shuffle becomes a plain shuffle on another device) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE` (Kotlin then keeps the device as the pending target for the next play, see §8). Pushing offline playback whose current track is a track of a context that can be loaded again hands over that context at the track (position, shuffle, repeat; its user queue added after it), other offline playback its tracks (in play order), current position and repeat mode; either is kept paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as one pass of the visible tracks in play order) |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
@@ -670,12 +676,15 @@ For a remote active device, smart shuffle is not supported (the command reports
   (the user asked for it here). Until the restored session is active with its track, the
   restore point stays (shown as the paused placeholder, also over the Spirc's empty activation
   snapshot; commands queue behind the restore): a connection lost meanwhile freezes it again, a
-  play / pause meanwhile is recorded on it too, and a failed restore load puts it back as pending
-  (a play restores right away; once more at most, then it goes) and makes the empty Spirc
-  inactive. A queued or suggested current
+  play / pause meanwhile is recorded on it too, and a failed restore load drops it and makes
+  this phone inactive right away (shown and routed so before the Spirc's own inactive state
+  arrives): a play then gets `NOT_ACTIVE_DEVICE` and the app's own resume loads its stored
+  session (`"local": true`, activating this phone again). A queued or suggested current
   track keeps its context (the track is requeued, restarts, and gets repeat-one back; a full
-  queue loses its tail, not the track); handed to another device it goes as the visible track
-  window in play order instead. An explicit `player.load` (local, remote or offline) or running
+  queue loses its tail, not the track; with no context track before it, the context loads with
+  the track played in front of it); handed to another device it goes as one pass of the visible
+  tracks in play order instead. A context that can't be loaded again (a plain track list) is
+  restored as one pass of its visible tracks (with repeat-all Spirc lists the next passes too). An explicit `player.load` (local, remote or offline) or running
   offline playback replaces the restore point; a dropped restore point stops the paused track
   nobody owns anymore.
 * **Local-network discovery (the "send" side)**: speakers and receivers on the LAN that are not
