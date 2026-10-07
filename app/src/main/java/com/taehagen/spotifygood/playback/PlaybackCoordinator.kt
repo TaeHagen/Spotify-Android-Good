@@ -129,6 +129,7 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
         graph.player.onPlaybackRequested = ::ensureServiceStarted
         graph.player.errorMessages = PlaybackErrorMessages.fromResources(app)
         graph.sleepTimer.fader = { graph.audioSink.setFadeVolume(it) }
+        graph.sleepTimer.wakeups = AndroidSleepWakeups(app)
         graph.devices.onTransferToThisDevice = ::ensureServiceStarted
         // Starts/stops with the engine (AppGraph wires it) and reports the output to Connect.
         graph.outputs
