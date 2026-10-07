@@ -93,6 +93,14 @@ class SearchLogicTest {
     }
 
     @Test
+    fun onlyResultsWithSomethingToShowCount() {
+        assertTrue(SearchResults(tracks = listOf(track)).hasAnyResult())
+        assertTrue(SearchResults(topResult = MediaRef(MediaType.ARTIST, "spotify:artist:a", "A")).hasAnyResult())
+        assertTrue("an empty answer is not cached", !SearchResults().hasAnyResult())
+        assertTrue(!SearchResults(totals = mapOf("track" to 0)).hasAnyResult())
+    }
+
+    @Test
     fun topResultFallsBackToArtistThenTrack() {
         val server = MediaRef(MediaType.PLAYLIST, "spotify:playlist:p", "P")
         assertEquals(server, SearchResults(topResult = server, tracks = listOf(track)).topResultOrBest())

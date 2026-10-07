@@ -51,6 +51,9 @@ internal object DownloadRules {
     /** Completed downloads are re-validated against the catalog after this long. */
     const val REVALIDATE_AFTER_MS = 30L * 24 * 60 * 60 * 1000
 
+    /** Members a collection records as not playable here are looked up again after this long. */
+    const val UNAVAILABLE_RECHECK_MS = 24L * 60 * 60 * 1000
+
     /** A downloaded collection is synced again (when the session comes online) after this long. */
     const val SYNC_STALE_MS = 12L * 60 * 60 * 1000
 
@@ -364,6 +367,24 @@ internal object DownloadRules {
      */
     fun replaceWork(replace: Boolean, kick: Boolean, enqueued: Boolean, stale: Boolean, runAttempts: Int): Boolean =
         replace || (enqueued && (stale || (kick && runAttempts > 0)))
+
+    /** A downloaded collection's recorded unavailable members and when they were last looked up. */
+    data class UnavailableMembers(val collection: String, val members: Set<String>, val checkedAt: Long?)
+
+    /** What [unavailableToRecheck] looks up: the [members] and the [collections] they cover. */
+    data class Recheck(val members: Set<String>, val collections: Set<String>)
+
+    /**
+     * Unavailable members to look up again ([UNAVAILABLE_RECHECK_MS] after a collection's last check):
+     * listings that skip them (URI-only Liked Songs, an unchanged playlist revision) would otherwise
+     * never notice that they became playable. Members with a row other than FAILED are left out (they
+     * are being or were downloaded).
+     */
+    fun unavailableToRecheck(sets: List<UnavailableMembers>, states: Map<String, DownloadState>, now: Long): Recheck {
+        val due = sets.filter { it.members.isNotEmpty() && (it.checkedAt == null || now - it.checkedAt >= UNAVAILABLE_RECHECK_MS) }
+        val members = due.flatMapTo(HashSet()) { set -> set.members.filter { states[it] == null || states[it] == DownloadState.FAILED } }
+        return Recheck(members, due.mapTo(HashSet()) { it.collection })
+    }
 
     /** Rough size of [count] items at [kbps] (≈ 4 min each) for the job's network estimate. */
     fun estimateBytes(count: Int, kbps: Int): Long = count.toLong() * kbps * 1000 / 8 * AVERAGE_DURATION_S

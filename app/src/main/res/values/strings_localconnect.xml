@@ -5,6 +5,7 @@
     <string name="local_connect_searching">Looking for devices…</string>
     <string name="local_connect_connecting">Connecting…</string>
     <string name="local_connect_subtitle">Tap to connect</string>
+    <string name="local_connect_ready">Connected to %1$s. Pick something to play there.</string>
     <string name="local_connect_login_failed">Couldn\'t connect to %1$s</string>
     <string name="local_connect_login_failed_network">Couldn\'t reach %1$s. Check your Wi‑Fi.</string>
     <string name="local_connect_hint">Speakers and receivers signed out of your account appear here while they’re on this Wi‑Fi network.</string>

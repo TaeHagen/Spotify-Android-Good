@@ -173,8 +173,8 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
  Stopped ───────────────▶ Connecting ─────────▶ Online ───────────────────────────────┐
     ▲   ◀── session.stop ──┤  ▲  failed (retryable)  │                                │
     │                      │  └──────────── Reconnecting(backoff 1s,2s,4s…60s) ◀──────┘
-    │                      │                         │ network lost ≥ 12 s (deferred while
-    │                      │                         ▼ this device plays from its buffer)
+    │                      │                         │ network lost ≥ 12 s (deferred ≤ 60 s while
+    │                      │                         ▼ this device streams from its buffer)
     │                      │                      Offline ── network back ──▶ Connecting
     │                      └─ BAD_CREDENTIALS / PREMIUM_REQUIRED ─▶ Error (no retry)
     └── session.stop (from any state; graceful, bounded to 10 s)
@@ -204,9 +204,13 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   while Online (cheap, no network), reacts to `session.setNetworkAvailable`. A network loss
   reported while Online tears the session down after 12 s (restoring local playback once it
   is back) and goes Offline, unless the network came back first; while this device is the
-  active one playing from its buffer, that is re-checked every 5 s instead (a suspended mobile
-  network keeps the AP socket open, so librespot alone would notice only after its 80 s
-  keep-alive). Backoff
+  active one streaming from its buffer (a track that isn't downloaded), that is re-checked
+  every 5 s instead, for at most 60 s after the loss (a suspended mobile network keeps the AP
+  socket open, so librespot alone would notice only after its 80 s keep-alive). A load of
+  downloads without a network ends that wait at once (the session goes offline without a
+  restore point, see §4.6). When the session is lost (no network, or it died) while this
+  device plays or paused a downloaded track, that playback is not frozen for the reconnect
+  but handed to the OfflineController (§4.6). Backoff
   1→60 s, reset once a connection stayed up 60 s (or when the network comes back), so a
   connection that drops right after connecting keeps backing off; at most one attempt in
   flight; no attempts while the network is known to be down. At most 10 attempts per
@@ -279,13 +283,27 @@ decode failure of an offline file is reported (`playback` error event) and the f
 ### 4.6 Offline mode controller
 
 When `settings.offline == true` or the network is down and no session is Online (the session
-leaves Online at most ~12 s after the network is reported lost, see §4.2), playback
-commands are handled by `OfflineController`: a local queue of downloaded tracks with
+leaves Online 12 s after the network is reported lost, up to 60 s while this device streams
+from its buffer, see §4.2), playback commands are handled by `OfflineController`: a local queue of downloaded tracks with
 shuffle (seeded), repeat context/track, user queue (add/remove/move/clear/skipTo),
 prev/next semantics identical to Spirc (prev restarts if position > 3 s). It drives the
 same Player and emits the same `playback` snapshots with `source:"local"`,
 `isActiveDevice:true`, `offline:true`. When the session comes back Online, the offline
-queue keeps playing; the next `player.load` goes through Spirc again. A paused or finished
+queue keeps playing; the next `player.load` goes through Spirc again, and while the session is
+Online and visible, `queue.add` may also queue a track that isn't downloaded (it streams).
+Without a network a `player.load` of downloads plays offline also while the session still reads
+Online (its network-loss wait): Spirc lets go of the Player and the session goes offline; one
+of anything else fails with `UNAVAILABLE` "Not available offline".
+**Handoff**: when the session is lost (no network, or it died) while this device plays (or
+paused) a downloaded track through Spirc, the OfflineController takes that playback over as it
+is, before anything pauses the Player: the track keeps playing without a reload, with the
+visible tracks around it in play order (user queue included) up to the first one on either side
+that isn't downloaded (the queue ends there), the position, repeat mode, shuffle flag and play
+state. No restore point is kept for that session; when it is back, the queue plays on as above.
+A streamed current track is frozen for the reconnect as before (§8).
+The OfflineController notices a Player whose thread died: the queue stops where it was (so its
+snapshot no longer shows playing), and the next control starts a new Player (a play loads the
+track there again at that position). A paused or finished
 offline queue gives way only to a device that took over after it paused here (or after it first
 saw a cluster): one that became the active device, or the active one starting to play (the
 queue is stopped, commands and the snapshot follow that device). A device that only sits paused
@@ -294,14 +312,16 @@ phone (user, call, headphones unplugged) never hands the session away. The user 
 most 80 tracks like Spirc's (`UNAVAILABLE` "The queue is full"); a manual next / skip leaves
 repeat-track like Spirc; repeat-one entered from repeat-all keeps wrapping (next / prev /
 upcoming tracks); a shuffle load without a start begins anywhere; a paused load stays paused
-through next / unavailable items.
+through next / unavailable items; a load keeps the user queue (like Spirc), `queue.clear`
+clears it.
 Native resolution of an offline `player.load`: `trackUris` queues the downloaded ones among
 them; a bare album / artist / show `contextUri` queues its downloads in context order (disc
 and track number; newest episode first); a playlist / Liked Songs / other `contextUri`
 without `trackUris` fails with `UNAVAILABLE` "Not available offline" (never "all downloads").
 `positionMs` applies only when the requested start item itself is downloaded.
-The engine cannot know which downloads belong to a playlist or Liked Songs, so while the
-session is not Online Kotlin's `PlayerController` sends context loads of a playlist / Liked
+The engine cannot know which downloads belong to a playlist or Liked Songs, so whenever it
+cannot stream (offline mode, an offline session, or no network — also while the session still
+reads Online) Kotlin's `PlayerController` sends context loads of a playlist / Liked
 Songs / album / show with `trackUris` = that context's downloads in context order (Room
 collection membership; albums/shows not downloaded as a whole by metadata), keeping
 `contextUri`/`startUri`/`startUid` for Spirc. Nothing downloaded while offline → "not
@@ -445,7 +465,7 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.artist` | `{"uri"}` | `Artist` |
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
-| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
+| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. A pathfinder answer whose `searchV2` failed (`null` with a GraphQL field error, or every requested section failed) counts as a failed source: searchview and context-resolve are asked, and if they fail too the call fails instead of returning "no results". "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
 | `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
 | `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
@@ -756,6 +776,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   start-self intent) that is not in the foreground 3 s later enters and leaves the foreground
   (own notification id), so the system never kills the app; an unknown start then stops again.
   Bulk queue adds send one `queue.add` command per item (≤ 80), interleaved with other commands.
+  A queue clear stops bulk adds queued before it (silently: the user cleared); a load does not
+  (Spirc and remote devices keep the user queue across loads).
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata) persisted on pause and every 15 s while playing.
@@ -784,15 +806,16 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   local status is playing/loading; false otherwise.
 * Sleep timer (`SleepTimer`): coroutine delays stop while the CPU sleeps (remote playback holds
   no wake lock), so an `ELAPSED_REALTIME_WAKEUP` allow-while-idle alarm (also delivered, with
-  network, in Doze) reaches the non-exported `SleepTimerAlarmReceiver`, which pokes the timer and
-  holds a timed partial wake lock until the end + 30 s (≤ 10 min). Exact at the end where no
+  network, in Doze) reaches the non-exported `SleepTimerAlarmReceiver`, which pokes the timer. It
+  holds a timed partial wake lock until the end + 30 s only while a remote device plays and the end
+  is within 10 min, or at the final stage; early stages hold 2 s (re-check, re-arm). Exact at the end where no
   runtime grant is needed (API < 31, or SCHEDULE_EXACT_ALARM already allowed; never requested;
   not USE_EXACT_ALARM). Otherwise inexact and staged: its heuristic window
   [t, t + 0.75 × (t − now)] (≤ 1 h) is placed to end at the timer's end
   (t = now + (end − now) / 1.75), Android 12+ delivers at the window end unless woken earlier, and
   an early delivery arms the next stage until < 10 s remain (a handful of stages, within the
-  allow-while-idle quota). A remote timer ending within 10 min also holds the wake lock from the
-  start (honoured outside Doze). "End of track" arms the snapshot's track end and re-arms on every
+  allow-while-idle quota). A timer ending within 10 min while a remote device plays also holds the
+  wake lock from the start (honoured outside Doze). "End of track" arms the snapshot's track end and re-arms on every
   snapshot. Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
@@ -860,7 +883,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   {urisOnly:true}`; members without a row and members whose row failed get metadata and their
   playability from `catalog.tracks` (batched, ≤ 60 s; completed and pending rows are not looked up
   again; placeholders are stored without metadata). Re-validation adds a member found not playable
-  to the unavailable set of every collection containing it (and removes it when playable again). Only a *complete* resolution removes items (not `partial`, not empty, and for
+  to the unavailable set of every collection containing it (and removes it when playable again).
+  Members in a collection's unavailable set are looked up again once a day during sync
+  (`unavailableCheckedAt`), so an unchanged playlist revision or a URI-only listing cannot keep them
+  out: playable ones leave the set and are queued. Removing a member removes it from the set. Only a *complete* resolution removes items (not `partial`, not empty, and for
   playlists / Liked Songs every slot listed): an empty, short or partial one only adds, and is
   retried. A collection whose sync fails or is incomplete is retried after 1 h,
   doubling up to 24 h (`lastAttemptAt`, `syncFailures`), instead of at every reconnect.

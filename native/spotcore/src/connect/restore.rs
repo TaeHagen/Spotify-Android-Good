@@ -53,7 +53,7 @@ const PLAY_INTENT_MAX: Duration = Duration::from_secs(30);
 /// a phone asleep in between still doesn't play hours later).
 const ANSWERED_PLAY_MAX: Duration = FIRST_CLUSTER_MAX.saturating_add(super::CONNECTING_WAIT);
 /// A restore being applied is kept this long at most (see [`Restoring`]).
-const RESTORING_MAX: Duration = Duration::from_secs(60);
+pub(crate) const RESTORING_MAX: Duration = Duration::from_secs(60);
 /// Spirc's queue holds at most this many entries (its next tracks).
 const QUEUE_MAX: usize = super::snapshot::MAX_NEXT;
 /// A frozen session handed to another device as a track list carries at most this many next
@@ -325,14 +325,27 @@ pub(crate) fn clear() {
     drop_restore();
 }
 
+/// A restore point taken out for a transfer (see [`take`]).
+pub(crate) struct Taken {
+    pub frozen: Frozen,
+    /// Its restore was being applied to the attached Spirc (see [`Restoring`]).
+    pub applying: bool,
+}
+
 /// Takes the pending restore point out (it won't run here): a transfer of this session to
-/// another device. The paused track is stopped like by [`clear`].
-pub(crate) fn take() -> Option<Frozen> {
-    let frozen = HUB.lock().reconnect.clone();
-    if frozen.is_some() {
+/// another device. The paused track is stopped like by [`clear`]. Also a restore being applied.
+pub(crate) fn take() -> Option<Taken> {
+    let taken = {
+        let hub = HUB.lock();
+        hub.reconnect
+            .clone()
+            .map(|frozen| Taken { frozen, applying: false })
+            .or_else(|| hub.restoring.as_ref().map(|r| Taken { frozen: r.frozen.clone(), applying: true }))
+    };
+    if taken.is_some() {
         drop_restore();
     }
-    frozen
+    taken
 }
 
 fn drop_restore() {

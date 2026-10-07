@@ -1,0 +1,12 @@
+{
+  "errors": [
+    {
+      "message": "Exception while fetching data (/searchV2) : Request to search backend timed out",
+      "locations": [{"line": 1, "column": 105}],
+      "path": ["searchV2"],
+      "extensions": {"classification": "DataFetchingException"}
+    }
+  ],
+  "data": {"searchV2": null},
+  "extensions": {}
+}

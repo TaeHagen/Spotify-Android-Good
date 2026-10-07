@@ -21,14 +21,19 @@ internal data class DownloadedEntry(
 )
 
 /**
- * Offline context loads (docs/ARCHITECTURE.md §4.6). The native offline queue cannot know which
- * downloads belong to a playlist or Liked Songs (it would queue every download), so while the
- * session is not Online a `player.load` of a playlist / Liked Songs / album / show context without
- * `trackUris` becomes a `trackUris` load of that context's downloads, in context order.
+ * Offline context loads (docs/ARCHITECTURE.md §4.6). The engine plays a load through its offline
+ * queue whenever it cannot stream: offline mode, an offline session, and any time Android reports
+ * no network — also while the session still reads Online (its network-loss grace). It then plays
+ * the request's `trackUris`, but it cannot know which downloads belong to a playlist or Liked
+ * Songs. So whenever [EngineReach] is not [EngineReach.ONLINE], a `player.load` of a playlist /
+ * Liked Songs / album / show context without `trackUris` becomes a `trackUris` load of that
+ * context's downloads, in context order. Offline with nothing of it downloaded, it fails here
+ * ([Plan.NotDownloaded]) as the engine would (UNAVAILABLE "Not available offline").
  *
- * The context uri stays in the request: should the session be Online by the time the engine
- * routes it, Spirc loads the context itself (it ignores `trackUris` for a resolvable context) and
- * starts at `startUid` / `startUri`, which are kept for that reason.
+ * The context uri stays in the request: should the session be Online with a network by the time
+ * the engine routes it (the [EngineReach.CONNECTING] case), Spirc loads the context itself (it
+ * ignores `trackUris` for a resolvable context) and starts at `startUid` / `startUri`, which are
+ * kept for that reason.
  */
 internal object OfflineLoads {
     enum class ContextKind { PLAYLIST, LIKED_SONGS, ALBUM, SHOW }
@@ -96,7 +101,7 @@ internal object OfflineLoads {
     }
 
     /**
-     * Rewrites [request] for the offline queue when [reach] is not Online. The start is the
+     * Rewrites [request] for the offline queue when [reach] is not [EngineReach.ONLINE]. The start is the
      * requested item, or the first download after it when it is not downloaded (like the engine's
      * own selection), else the first download; the position is kept only for the requested item.
      */

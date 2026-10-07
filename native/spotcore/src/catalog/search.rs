@@ -1,7 +1,8 @@
 //! `catalog.search`: pathfinder `searchDesktop` → spclient `searchview/km/v4` → context-resolve
 //! `spotify:search:<q>` (tracks only). A source that answers (even with no hits) wins; only
 //! errors fall through to the next one, and a transport error (offline, rate limited) of
-//! searchview ends the chain: context-resolve would hit the same spclient.
+//! searchview ends the chain: context-resolve would hit the same spclient. A pathfinder answer
+//! whose `searchV2` field failed (`null` plus a GraphQL error) is an error, not "no results".
 
 use super::context;
 use super::http::{self, JSON};
@@ -121,6 +122,50 @@ pub(crate) fn hide_explicit(r: &mut SearchResults, top_explicit: bool) {
     if drop_top {
         r.top_result = None;
     }
+}
+
+/// List key ("tracks", …) of a `searchV2` section, for the sections results are read from.
+fn list_of_section(section: &str) -> Option<&'static str> {
+    Some(match section {
+        "tracksV2" | "tracks" => "tracks",
+        "artists" => "artists",
+        "albumsV2" | "albums" => "albums",
+        "playlists" => "playlists",
+        "podcasts" => "shows",
+        "episodes" => "episodes",
+        _ => return None,
+    })
+}
+
+/// Why a pathfinder answer cannot stand as the search result, if it cannot: `searchV2` missing
+/// or `null` (graphql-java nulls a field whose resolver failed, e.g. a backend timeout), or every
+/// requested section failed. An answer that is merely empty (no hits) stands. Then the next
+/// source is asked instead of returning "no results".
+pub(crate) fn pathfinder_failure(answer: &pathfinder::Answer, types: &Types) -> Option<String> {
+    let reason = |fallback: &str| -> String {
+        answer.errors.first().map(|e| e.message.clone()).filter(|m| !m.is_empty()).unwrap_or_else(|| fallback.to_string())
+    };
+    if !answer.data.get("searchV2").is_some_and(Value::is_object) {
+        return Some(reason("searchV2 missing"));
+    }
+    let mut failed: HashSet<&str> = HashSet::new();
+    for e in &answer.errors {
+        match e.path.as_slice() {
+            [root] if root == "searchV2" => return Some(reason("searchV2 failed")),
+            [root, section, ..] if root == "searchV2" => failed.extend(list_of_section(section)),
+            _ => {}
+        }
+    }
+    let requested = [
+        ("tracks", types.tracks),
+        ("artists", types.artists),
+        ("albums", types.albums),
+        ("playlists", types.playlists),
+        ("shows", types.shows),
+        ("episodes", types.episodes),
+    ];
+    let all_failed = requested.iter().filter(|(_, on)| *on).all(|(name, _)| failed.contains(name));
+    all_failed.then(|| reason("every requested section failed"))
 }
 
 /// Requested from the server per page: more than `limit`, so that entities the parsers drop
@@ -406,7 +451,15 @@ pub(crate) async fn rpc(args: Value) -> AppResult<Value> {
     let session = engine::session()?;
     let filter_explicit = session.filter_explicit_content();
     let first = match pathfinder::query(&session, "searchDesktop", variables(query, a.offset, fetch_limit(limit))).await {
-        Ok(data) => return to_value(&types.apply(parse_pathfinder(&data, limit as usize, filter_explicit))),
+        Ok(answer) => match pathfinder_failure(&answer, &types) {
+            None => return to_value(&types.apply(parse_pathfinder(&answer.data, limit as usize, filter_explicit))),
+            Some(why) => {
+                // Not "no results": the search backend failed behind pathfinder.
+                let e = AppError::unavailable(format!("pathfinder search: {why}"));
+                log::info!("{e}");
+                e
+            }
+        },
         Err(e) => {
             let e: AppError = e.into();
             log::info!("pathfinder search failed: {e}");
@@ -485,6 +538,34 @@ mod tests {
         assert!(json["artists"].as_array().unwrap().is_empty());
         assert!(json.get("topResult").is_none());
         assert_eq!(json["totals"], serde_json::json!({"tracks": 800}), "totals of the requested types only");
+    }
+
+    #[test]
+    fn a_failed_search_field_is_not_no_results() {
+        let all = Types::from_list(&[]);
+        let tracks_only = Types::from_list(&["track".into()]);
+        // graphql-java's answer when the search resolver failed: searchV2 is null.
+        let answer = pathfinder::interpret(include_bytes!("testdata/pathfinder_search_field_error.json")).unwrap();
+        let why = pathfinder_failure(&answer, &all).expect("must fall back, not report no results");
+        assert!(why.contains("timed out"), "{why}");
+        // searchV2 absent altogether.
+        let absent = pathfinder::Answer { data: serde_json::json!({}), errors: vec![] };
+        assert!(pathfinder_failure(&absent, &all).is_some());
+        // A real answer, even an empty one, stands.
+        let real: Value = serde_json::from_str(PATHFINDER).unwrap();
+        let ok = pathfinder::Answer { data: real["data"].clone(), errors: vec![] };
+        assert!(pathfinder_failure(&ok, &all).is_none());
+        let empty = pathfinder::Answer { data: serde_json::json!({"searchV2": {"tracksV2": {"items": []}}}), errors: vec![] };
+        assert!(pathfinder_failure(&empty, &tracks_only).is_none());
+        // A failed section only fails the search when it is all that was asked for.
+        let section_error = |section: &str| pathfinder::FieldError {
+            message: format!("Exception while fetching data (/searchV2/{section})"),
+            path: vec!["searchV2".into(), section.into()],
+        };
+        let partial = pathfinder::Answer { data: real["data"].clone(), errors: vec![section_error("tracksV2")] };
+        assert!(pathfinder_failure(&partial, &tracks_only).is_some(), "the Songs tab falls back");
+        assert!(pathfinder_failure(&partial, &all).is_none(), "the other sections still answer");
+        assert!(pathfinder_failure(&partial, &Types::from_list(&["album".into()])).is_none());
     }
 
     #[test]

@@ -207,10 +207,22 @@ async fn stop_spirc(session: &Session, spirc: &Arc<Spirc>, mut task: JoinHandle<
     }
 }
 
+/// The session is lost for now (no network, or it died): this device's downloaded playback goes
+/// on in the OfflineController instead of being frozen for the reconnect (decided before
+/// anything pauses the Player). An intentional reconnect of a working session restores.
+fn keep_playing_offline(live: &Live, restore: bool) -> bool {
+    restore
+        && (!state::network_available() || live.session.is_invalid())
+        && connect::hand_off_to_offline(live.generation)
+}
+
 /// Shuts a live connection down. `restore`: remember the local playback for after the
-/// reconnect (otherwise any pending restore is dropped).
+/// reconnect (otherwise any pending restore is dropped); downloaded playback continues offline
+/// when the session is lost (see [`keep_playing_offline`]).
 pub(crate) async fn teardown(live: Live, restore: bool) {
-    if restore {
+    if keep_playing_offline(&live, restore) {
+        log::info!("the session is lost, the downloads keep playing offline");
+    } else if restore {
         connect::prepare_reconnect();
     } else {
         connect::clear_restore();
@@ -230,7 +242,9 @@ pub(crate) async fn teardown(live: Live, restore: bool) {
 
 /// Cleans up after the Spirc task ended by itself (lost connection, invalid session).
 pub(crate) async fn teardown_finished(live: Live, restore: bool) {
-    if restore {
+    if keep_playing_offline(&live, restore) {
+        log::info!("the session is lost, the downloads keep playing offline");
+    } else if restore {
         connect::prepare_reconnect();
     } else {
         connect::clear_restore();

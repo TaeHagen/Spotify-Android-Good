@@ -239,15 +239,16 @@ internal fun <T> LoadStateContent(
 
 /**
  * Quiet notice on a page built from its download (offline, no cached copy): what is shown is what
- * was downloaded, which may differ from the current version online.
+ * was downloaded, which may differ from the current version online. [onRetry] (when the server may
+ * be reachable) fetches the page again; the server's version replaces the copy.
  */
 @Composable
-internal fun DownloadedCopyNotice(text: String, modifier: Modifier = Modifier) {
+internal fun DownloadedCopyNotice(text: String, modifier: Modifier = Modifier, onRetry: (() -> Unit)? = null) {
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .heightIn(min = 40.dp)
-            .padding(horizontal = 16.dp, vertical = 4.dp),
+            .heightIn(min = if (onRetry != null) 48.dp else 40.dp)
+            .padding(start = 16.dp, end = if (onRetry != null) 8.dp else 16.dp, top = 4.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
@@ -257,7 +258,15 @@ internal fun DownloadedCopyNotice(text: String, modifier: Modifier = Modifier) {
             modifier = Modifier.size(18.dp),
         )
         Spacer(Modifier.width(8.dp))
-        Text(text = text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        if (onRetry != null) {
+            TextButton(onClick = onRetry) { Text(stringResource(R.string.shell_retry)) }
+        }
     }
 }
 

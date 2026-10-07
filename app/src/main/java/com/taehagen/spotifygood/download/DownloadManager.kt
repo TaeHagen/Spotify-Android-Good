@@ -321,6 +321,7 @@ class DownloadManager(
                 lastAttemptAt = existing?.lastAttemptAt,
                 syncFailures = existing?.syncFailures ?: 0,
                 unavailableUrisJson = existing?.unavailableUrisJson ?: EMPTY_ITEMS,
+                unavailableCheckedAt = existing?.unavailableCheckedAt,
             )
             applyMembershipLocked(entity, resolved, userInitiated = true).removal
         }
@@ -393,6 +394,8 @@ class DownloadManager(
             val files = fileRows(targets)
             database.withTransaction { deleteRows(targets) }
             deleteFiles(files)
+            // Removed by the user: not looked up (and downloaded) again as an unavailable member.
+            adjustUnavailableLocked(gone = emptySet(), playableAgain = targets.toHashSet())
             cancelWorkIfIdleLocked()
             Removal(files.map { it.uri }, index.next())
         }
@@ -775,7 +778,7 @@ class DownloadManager(
      * reuses the file. Returns how many were queued.
      */
     private suspend fun revalidate(): Int {
-        val requeued = requeuePlayableAgain()
+        val requeued = requeuePlayableAgain() + queueUnavailableAgain()
         val now = System.currentTimeMillis()
         val stale = dao.completedUrisNotValidatedSince(now - DownloadRules.REVALIDATE_AFTER_MS)
         if (stale.isEmpty()) return requeued
@@ -804,6 +807,46 @@ class DownloadManager(
             index.remove(gone, seq)
         }
         return requeued
+    }
+
+    /**
+     * Looks up the members collections record as unavailable once a day
+     * ([DownloadRules.unavailableToRecheck]; batched and bounded like new members), and queues the ones
+     * that are playable again: they leave every collection's unavailable set, get a row (with
+     * metadata) or their FAILED row is requeued. Returns how many were queued.
+     */
+    private suspend fun queueUnavailableAgain(): Int {
+        val now = System.currentTimeMillis()
+        val sets = collectionDao.getAll().map {
+            DownloadRules.UnavailableMembers(it.uri, decodeItems(it.unavailableUrisJson).toHashSet(), it.unavailableCheckedAt)
+        }
+        val all = sets.flatMapTo(HashSet()) { it.members }.toList()
+        if (all.isEmpty()) return 0
+        val states = all.chunked(SQL_CHUNK).flatMap { dao.statesOf(it) }.associate { it.uri to it.state }
+        val recheck = DownloadRules.unavailableToRecheck(sets, states, now)
+        if (recheck.collections.isEmpty()) return 0
+        val fetched = if (recheck.members.isEmpty()) {
+            emptyMap()
+        } else {
+            resolver.itemsBestEffort(recheck.members.toList(), COLLECTION_METADATA_TIMEOUT_MS)
+        }
+        // Lookups that failed stay unknown: those collections are checked again at the next sync.
+        val checked = sets.filter { it.collection in recheck.collections && (it.members intersect recheck.members).all { m -> m in fetched } }
+        val again = fetched.values.filter { it.metadataJson != null && !it.unavailable }
+        return mutex.withLock {
+            if (checked.isNotEmpty()) collectionDao.markUnavailableChecked(checked.map { it.collection }, now)
+            if (again.isEmpty()) return@withLock 0
+            adjustUnavailableLocked(gone = emptySet(), playableAgain = again.mapTo(HashSet()) { it.uri })
+            val current = again.map { it.uri }.chunked(SQL_CHUNK).flatMap { dao.statesOf(it) }.associate { it.uri to it.state }
+            val fresh = again.filter { current[it.uri] == null }
+            val quality = settings.awaitLoaded().downloadQuality.kbps
+            database.withTransaction {
+                insertRows(fresh, quality, individual = false, now = now)
+                again.filter { current[it.uri] == DownloadState.FAILED }.map { it.uri }.chunked(SQL_CHUNK).forEach { dao.requeueFailedOnly(it) }
+            }
+            Log.i(TAG, "${again.size} members recorded as unavailable are playable again: queued")
+            again.size
+        }
     }
 
     /** See [revalidate]. Independent of collection syncs (an unchanged playlist revision skips those). */

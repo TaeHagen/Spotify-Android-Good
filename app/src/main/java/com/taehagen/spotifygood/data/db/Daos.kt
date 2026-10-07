@@ -273,6 +273,9 @@ interface DownloadCollectionDao {
     @Query("SELECT COUNT(*) FROM download_collections")
     suspend fun count(): Int
 
+    @Query("UPDATE download_collections SET unavailableCheckedAt = :at WHERE uri IN (:uris)")
+    suspend fun markUnavailableChecked(uris: List<String>, at: Long)
+
     /** JSON arrays of the members each downloaded collection records as not playable here. */
     @Query("SELECT unavailableUrisJson FROM download_collections")
     suspend fun unavailableUrisJsons(): List<String>

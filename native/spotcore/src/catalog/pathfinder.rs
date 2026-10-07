@@ -500,31 +500,52 @@ impl From<PfError> for AppError {
     }
 }
 
-/// Interprets a pathfinder response body: `data` (partial errors tolerated), a stale-hash
-/// error, or a GraphQL error.
-pub(crate) fn interpret(body: &[u8]) -> Result<Value, PfError> {
-    let v: Value = serde_json::from_slice(body).map_err(|e| PfError::GraphQl(format!("bad response: {e}")))?;
-    let errors: Vec<String> = v
-        .get("errors")
-        .and_then(Value::as_array)
-        .map(|errs| {
-            errs.iter()
-                .map(|e| {
-                    let msg = e.get("message").and_then(Value::as_str).unwrap_or_default();
-                    let code = e.pointer("/extensions/code").and_then(Value::as_str).unwrap_or_default();
-                    format!("{msg} {code}")
-                })
-                .collect()
+/// An entry of a GraphQL response's `errors`: graphql-java reports a failed field (e.g. a
+/// backend timeout) here and sets that field to `null` in `data`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct FieldError {
+    pub message: String,
+    /// Path of the failed field (`["searchV2"]`, `["searchV2","episodes"]`; indexes as text).
+    pub path: Vec<String>,
+}
+
+/// A pathfinder answer: `data` plus the field errors that came with it (callers decide whether
+/// what they need survived).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Answer {
+    pub data: Value,
+    pub errors: Vec<FieldError>,
+}
+
+fn field_errors(v: &Value) -> Vec<FieldError> {
+    let Some(errs) = v.get("errors").and_then(Value::as_array) else { return Vec::new() };
+    errs.iter()
+        .map(|e| {
+            let msg = e.get("message").and_then(Value::as_str).unwrap_or_default();
+            let code = e.pointer("/extensions/code").and_then(Value::as_str).unwrap_or_default();
+            let path = e
+                .get("path")
+                .and_then(Value::as_array)
+                .map(|p| p.iter().map(|s| s.as_str().map(str::to_string).unwrap_or_else(|| s.to_string())).collect())
+                .unwrap_or_default();
+            FieldError { message: format!("{msg} {code}").trim().to_string(), path }
         })
-        .unwrap_or_default();
+        .collect()
+}
+
+/// Interprets a pathfinder response body: `data` with its field errors, a stale-hash error, or
+/// a GraphQL error (no `data`).
+pub(crate) fn interpret(body: &[u8]) -> Result<Answer, PfError> {
+    let v: Value = serde_json::from_slice(body).map_err(|e| PfError::GraphQl(format!("bad response: {e}")))?;
+    let errors = field_errors(&v);
     let stale = errors.iter().any(|e| {
-        let l = e.to_ascii_lowercase();
+        let l = e.message.to_ascii_lowercase();
         l.contains("persistedquerynotfound") || l.contains("persisted_query_not_found")
     });
     match v.get("data") {
-        Some(d) if !d.is_null() && !stale => Ok(d.clone()),
+        Some(d) if !d.is_null() && !stale => Ok(Answer { data: d.clone(), errors }),
         _ if stale => Err(PfError::StaleHash),
-        _ => Err(PfError::GraphQl(errors.first().cloned().unwrap_or_else(|| "no data".into()))),
+        _ => Err(PfError::GraphQl(errors.first().map(|e| e.message.clone()).unwrap_or_else(|| "no data".into()))),
     }
 }
 
@@ -574,7 +595,7 @@ async fn client_token(session: &Session) -> Option<String> {
     }
 }
 
-async fn post(session: &Session, op: &str, hash: &str, variables: &Value, client_token: Option<&str>) -> Result<Value, PfError> {
+async fn post(session: &Session, op: &str, hash: &str, variables: &Value, client_token: Option<&str>) -> Result<Answer, PfError> {
     let body = request_body(op, hash, variables).to_string();
     let version = app_version();
     let candidates = tokens(session).await;
@@ -617,9 +638,10 @@ async fn post(session: &Session, op: &str, hash: &str, variables: &Value, client
     Err(last)
 }
 
-/// Runs a persisted query and returns its `data` object. Retries once with freshly discovered
+/// Runs a persisted query and returns its `data` object with any field errors (a failed field
+/// is `null` in `data`; callers check what they need). Retries once with freshly discovered
 /// hashes when the server reports an unknown hash (waiting at most [`REFRESH_WAIT`] for them).
-pub(crate) async fn query(session: &Session, op: &str, variables: Value) -> Result<Value, PfError> {
+pub(crate) async fn query(session: &Session, op: &str, variables: Value) -> Result<Answer, PfError> {
     ensure_loaded().await;
     maybe_refresh_in_background(session);
     let hash = match hash_for(op) {
@@ -813,7 +835,14 @@ mod tests {
             interpret(br#"{"errors":[{"message":"PersistedQueryNotFound","extensions":{"code":"PERSISTED_QUERY_NOT_FOUND"}}]}"#),
             Err(PfError::StaleHash)
         ));
-        assert!(interpret(br#"{"data":{"x":1},"errors":[{"message":"partial"}]}"#).is_ok());
+        let partial = interpret(br#"{"data":{"x":1},"errors":[{"message":"partial","path":["x",0,"y"]}]}"#).unwrap();
+        assert_eq!(partial.data["x"], 1);
+        assert_eq!(partial.errors, [FieldError { message: "partial".into(), path: vec!["x".into(), "0".into(), "y".into()] }]);
+        // A field error next to an unknown hash is still a stale hash (refresh, then retry).
+        assert!(matches!(
+            interpret(br#"{"data":{"searchV2":null},"errors":[{"message":"PersistedQueryNotFound","path":["searchV2"]}]}"#),
+            Err(PfError::StaleHash)
+        ));
         assert!(matches!(interpret(br#"{"data":null,"errors":[{"message":"boom"}]}"#), Err(PfError::GraphQl(m)) if m.contains("boom")));
         assert!(matches!(interpret(b"<html>"), Err(PfError::GraphQl(_))));
         let body = request_body("home", "abc", &json!({"timeZone":"UTC"}));

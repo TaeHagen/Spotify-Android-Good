@@ -367,8 +367,19 @@ class LocalDeviceDiscovery(
             if (!isCurrent(s) || s.infoCallbacks.containsKey(name)) return
             s.infoCallbacks[name] = callback
         }
-        runCatching { nsdManager?.registerServiceInfoCallback(serviceInfo, Executor { it.run() }, callback) }
+        val manager = nsdManager ?: return
+        val registered = runCatching { manager.registerServiceInfoCallback(serviceInfo, Executor { it.run() }, callback) }
             .onFailure { Log.w(TAG, "registerServiceInfoCallback failed", it) }
+            .isSuccess
+        // pause() may have run between recording the callback and the platform registering it:
+        // its unregister then failed ("not registered") and nobody else would ever unregister.
+        // Re-check after our own register, and undo it if this session or entry is gone.
+        val stale = synchronized(lock) {
+            val current = session === s && s.infoCallbacks[name] === callback
+            if (!registered && s.infoCallbacks[name] === callback) s.infoCallbacks.remove(name) // allow a retry
+            registered && !current
+        }
+        if (stale) runCatching { manager.unregisterServiceInfoCallback(callback) }
     }
 
     // --- API < 34: one resolve at a time, across sessions -----------------------------------------

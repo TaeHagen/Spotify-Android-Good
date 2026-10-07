@@ -3,11 +3,14 @@
 //! them through the vendored offline hook without any network access.
 
 use super::args::LoadArgs;
-use super::offline_queue::{select_downloaded, Action, Elsewhere, Event, Handover, LoadSpec, OfflineQueue};
+use super::offline_queue::{
+    select_downloaded, Action, Adoption, Elsewhere, Event, Handover, LoadSpec, OfflineQueue, MAX_NEXT,
+};
 use super::{hub, now_ms, player_events, uri, Ctl};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{ActiveDeviceRef, OfflineTrackRecord, PlaybackSnapshot, RepeatMode};
 use crate::{engine, events, offline as downloads};
+use librespot_connect::{ConnectSnapshot, SnapshotPlayStatus, SnapshotTrack};
 use librespot_core::SpotifyUri;
 use librespot_playback::player::PlayerEvent;
 use librespot_protocol::connect::Cluster;
@@ -69,6 +72,92 @@ pub(crate) fn snapshot(device: ActiveDeviceRef, volume: u16) -> Option<PlaybackS
 pub(crate) fn handover(max_next: usize) -> Option<Handover> {
     let q = QUEUE.lock();
     q.active.then(|| q.handover(now_ms(), max_next))
+}
+
+/// What the queue takes over from this device's Spirc playback when the session goes away (see
+/// [`take_over`]): the current track and the visible tracks around it in play order (user queue
+/// and suggestions included), up to the first one that isn't downloaded on either side (the
+/// queue ends there; nothing is kept for the reconnect), the position at `now_ms`, the repeat
+/// mode and whether it plays. `None` unless this device is active with a downloaded current
+/// track that isn't stopped.
+pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, now_ms: i64) -> Option<Adoption> {
+    if !s.is_active {
+        return None;
+    }
+    let (playing, loading) = match s.status {
+        SnapshotPlayStatus::Playing => (true, false),
+        SnapshotPlayStatus::Paused => (false, false),
+        SnapshotPlayStatus::LoadingPlay => (true, true),
+        SnapshotPlayStatus::LoadingPause => (false, true),
+        SnapshotPlayStatus::Stopped => return None,
+    };
+    let current = s.track.as_ref().filter(|t| !t.hidden && downloaded(&t.uri))?;
+    let visible = |t: &&SnapshotTrack| !t.hidden && t.uri != uri::DELIMITER_URI;
+    let mut uris: Vec<String> =
+        s.prev_tracks.iter().rev().filter(visible).take_while(|t| downloaded(&t.uri)).map(|t| t.uri.clone()).collect();
+    uris.reverse();
+    let start = uris.len();
+    uris.push(current.uri.clone());
+    uris.extend(s.next_tracks.iter().filter(visible).take_while(|t| downloaded(&t.uri)).take(MAX_NEXT).map(|t| t.uri.clone()));
+    let repeat = if s.repeat_track {
+        RepeatMode::Track
+    } else if s.repeat_context {
+        RepeatMode::Context
+    } else {
+        RepeatMode::Off
+    };
+    Some(Adoption {
+        context_uri: Some(s.context_uri.clone()).filter(|c| !c.is_empty()),
+        uris,
+        start,
+        position_ms: super::restore::position_now(s, now_ms).max(0) as u64,
+        duration_ms: s.duration_ms.max(0) as u64,
+        playing,
+        loading,
+        repeat,
+        repeat_context: s.repeat_context,
+        shuffle: s.shuffle || s.smart_shuffle,
+    })
+}
+
+/// The session of the Spirc `generation` goes away (no network, or it died) while this device
+/// plays (or paused) a downloaded track: the queue takes the Player over as it is, without a
+/// gap (see [`handoff`]), before anything pauses it. The Spirc lets go of the Player first, no
+/// restore point is kept. Returns whether it did.
+pub(crate) fn take_over(generation: u64) -> bool {
+    let Some((spirc, snap)) = hub::link_snapshot(generation) else { return false };
+    let now = now_ms();
+    let Some(adoption) = handoff(&snap, downloads::is_downloaded, now) else { return false };
+    if engine::player_host::player().is_none() {
+        return false;
+    }
+    // From now on the dying Spirc doesn't pause or stop the Player.
+    spirc.release_player();
+    log::info!("the downloads play on offline ({} tracks)", adoption.uris.len());
+    let action = QUEUE.lock().adopt(adoption, now);
+    if let Some(action) = action {
+        // Resumes a Player that the Spirc paused when its task ended.
+        if let Err(e) = apply(action) {
+            log::warn!("offline playback: {e}");
+        }
+    }
+    // Stops nothing: the queue owns the Player.
+    super::restore::clear();
+    hub::publish();
+    true
+}
+
+/// The Player's thread died: the queue stops where it was (a play starts it again on a new
+/// Player), and its request ids are forgotten. Also when the Player is released.
+pub(crate) fn player_lost() {
+    let active = {
+        let mut q = QUEUE.lock();
+        q.player_lost(now_ms());
+        q.active
+    };
+    if active {
+        hub::publish();
+    }
 }
 
 /// Another controller (Spirc) took the Player over: forget the queue without touching the Player.
@@ -248,8 +337,17 @@ fn not_found(what: &str) -> AppError {
     AppError::not_found(format!("{what} is not in the queue"))
 }
 
-/// Handles a playback / queue command while the offline queue owns the Player.
-pub(crate) fn control(cmd: &Ctl) -> AppResult<()> {
+/// Handles a playback / queue command while the offline queue owns the Player. A Player whose
+/// thread died is replaced first (the queue stopped where it was, a play loads it again).
+pub(crate) async fn control(cmd: &Ctl) -> AppResult<()> {
+    if !is_active() {
+        return Err(AppError::not_connected());
+    }
+    if engine::player_host::player().is_none() {
+        engine::player_host::ensure_player_for_offline().await?;
+    }
+    // Online and visible, the Player is bound to the session: a queued track may stream.
+    let can_stream = engine::is_online() && engine::network_available() && hub::spirc().is_some();
     let now = now_ms();
     let action = {
         let mut q = QUEUE.lock();
@@ -274,7 +372,7 @@ pub(crate) fn control(cmd: &Ctl) -> AppResult<()> {
                 None
             }
             Ctl::QueueAdd(u) => {
-                if !downloads::is_downloaded(u) {
+                if !can_stream && !downloads::is_downloaded(u) {
                     return Err(AppError::unavailable("Not available offline"));
                 }
                 if !q.add_to_queue(u.clone()) {
@@ -301,12 +399,11 @@ pub(crate) fn control(cmd: &Ctl) -> AppResult<()> {
             Ctl::SkipTo(uid) => Some(q.skip_to(uid, now).ok_or_else(|| not_found(uid))?),
         }
     };
-    if let Some(action) = action {
-        apply(action)?;
-    }
-    // No yield here: a pause on this device never hands the session away.
+    let result = action.map_or(Ok(()), apply);
+    // No yield here: a pause on this device never hands the session away. Published also when
+    // the Player refused it: the snapshot must not keep a state the queue left.
     hub::publish();
-    Ok(())
+    result
 }
 
 fn convert(event: &PlayerEvent) -> Option<Event> {
@@ -408,6 +505,51 @@ mod tests {
             }),
             ..record(uri, "", "")
         }
+    }
+
+    fn st(uri: &str, provider: librespot_connect::TrackProvider) -> SnapshotTrack {
+        SnapshotTrack { uri: uri.into(), uid: uri.into(), provider, context_index: None, hidden: false, metadata: Default::default() }
+    }
+
+    fn playing(prev: &[&str], current: &str, next: &[&str]) -> ConnectSnapshot {
+        use librespot_connect::TrackProvider::*;
+        ConnectSnapshot {
+            is_active: true,
+            status: SnapshotPlayStatus::Playing,
+            position_ms: 10_000,
+            position_timestamp_ms: 1_000_000,
+            playback_speed: 1.0,
+            duration_ms: 180_000,
+            context_uri: "spotify:playlist:p".into(),
+            track: Some(st(current, Context)),
+            prev_tracks: prev.iter().map(|u| st(u, Context)).collect(),
+            next_tracks: next.iter().map(|u| st(u, if u.contains('q') { Queue } else { Context })).collect(),
+            repeat_context: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn downloaded_playback_is_handed_over_up_to_the_first_gap() {
+        let downloaded = |u: &str| !u.ends_with('x');
+        let mut s = playing(&["t:x", "t:1", "t:2"], "t:3", &["t:q1", "t:4", "t:5x", "t:6"]);
+        s.next_tracks.insert(1, SnapshotTrack { hidden: true, ..st("t:hidden-x", librespot_connect::TrackProvider::Context) });
+        s.next_tracks.insert(2, st(uri::DELIMITER_URI, librespot_connect::TrackProvider::Context));
+        let a = handoff(&s, downloaded, 1_005_000).expect("handed over");
+        assert_eq!(a.uris, ["t:1", "t:2", "t:3", "t:q1", "t:4"]);
+        assert_eq!(a.start, 2);
+        assert_eq!(a.position_ms, 15_000, "where it is now");
+        assert_eq!(a.duration_ms, 180_000);
+        assert!(a.playing && !a.loading);
+        assert_eq!(a.repeat, RepeatMode::Context);
+        assert_eq!(a.context_uri.as_deref(), Some("spotify:playlist:p"));
+        // paused stays paused
+        let paused = ConnectSnapshot { status: SnapshotPlayStatus::Paused, ..s.clone() };
+        assert!(handoff(&paused, downloaded, 1_005_000).is_some_and(|a| !a.playing && a.position_ms == 10_000));
+        // a streamed current track, a stopped or another device's playback: frozen as before
+        assert!(handoff(&playing(&[], "t:3x", &["t:4"]), downloaded, 0).is_none());
+        assert!(handoff(&ConnectSnapshot { status: SnapshotPlayStatus::Stopped, ..s.clone() }, downloaded, 0).is_none());
+        assert!(handoff(&ConnectSnapshot { is_active: false, ..s }, downloaded, 0).is_none());
     }
 
     #[test]
