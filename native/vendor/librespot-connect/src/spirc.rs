@@ -1302,6 +1302,9 @@ impl SpircTask {
             }
         };
 
+        // SPOTIFYGOOD: the snapshot shows the command's effect (e.g. playing again) before the
+        // put, which can take long on a bad network (it was only published after it)
+        self.publish_snapshot();
         self.notify().await
     }
 
@@ -1705,6 +1708,8 @@ impl SpircTask {
             Transfer(transfer) => {
                 // SPOTIFYGOOD: added the start_paused argument, a remote transfer is unchanged
                 self.handle_transfer(transfer.data.expect("by condition checked"), false)?;
+                // SPOTIFYGOOD: see handle_command
+                self.publish_snapshot();
                 return self.notify().await;
             }
             Play(mut play) => {
