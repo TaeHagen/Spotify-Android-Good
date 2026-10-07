@@ -51,6 +51,8 @@ internal data class AlbumUiState(
     val offline: Boolean = false,
     /** Other albums of the primary artist. */
     val moreBy: List<AlbumRef> = emptyList(),
+    /** The session is ONLINE: rows that aren't downloaded can start ([canStartNow]). */
+    val online: Boolean = true,
 )
 
 internal class AlbumViewModel(graph: AppGraph, private val uri: String) : DetailViewModel(graph, uri) {
@@ -116,9 +118,9 @@ internal class AlbumViewModel(graph: AppGraph, private val uri: String) : Detail
         playbackInfo,
         graph.savedFlow(uri),
         graph.downloads.collectionUi(uri),
-        combine(graph.downloads.statesFor(trackUris), offline, moreBy, ::Triple),
-    ) { load, playback, saved, download, (rows, offline, moreBy) ->
-        AlbumUiState(load, playback, saved, download, rows, offline, moreBy)
+        combine(graph.downloads.statesFor(trackUris), connectivity, moreBy, ::Triple),
+    ) { load, playback, saved, download, (rows, connectivity, moreBy) ->
+        AlbumUiState(load, playback, saved, download, rows, connectivity.offline, moreBy, connectivity.online)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), AlbumUiState())
 
     /** Plays the album starting at [track]. */

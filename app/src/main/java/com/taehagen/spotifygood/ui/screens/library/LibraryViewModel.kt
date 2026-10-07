@@ -19,6 +19,9 @@ import com.taehagen.spotifygood.model.SavedAlbum
 import com.taehagen.spotifygood.model.SavedArtist
 import com.taehagen.spotifygood.model.SavedShow
 import com.taehagen.spotifygood.model.User
+import com.taehagen.spotifygood.playback.EngineReach
+import com.taehagen.spotifygood.ui.screens.album.engineReach
+import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.Flow
@@ -29,7 +32,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.launchIn
@@ -233,7 +236,12 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LibraryUiState())
 
     init {
-        viewModelScope.launch { loadExtras() }
+        // Liked Songs count and recents ranking: once the session is ONLINE (a request made while
+        // it connects fails NOT_CONNECTED), and again after reconnecting if they are still missing.
+        graph.engineReachFlow()
+            .filter { it == EngineReach.ONLINE }
+            .onEach { if (likedCount.value == null || recentRank.value.isEmpty()) loadExtras() }
+            .launchIn(viewModelScope)
         // Liked Songs and saved episodes are paged and not cached: refetch after library edits.
         graph.library.changes.debounce(CHANGE_DEBOUNCE_MS)
             .onEach {
@@ -245,7 +253,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
     }
 
     private suspend fun loadExtras() {
-        if (offline.first()) return
+        if (graph.engineReach() != EngineReach.ONLINE) return
         attempt { graph.library.likedTracks(0, 1) }.onSuccess { likedCount.value = it.total }
         attempt { graph.catalog.recentlyPlayed(RECENTS_LIMIT) }.onSuccess { recentRank.value = recentRanks(it) }
     }
@@ -322,7 +330,8 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
         refreshing.value = true
         viewModelScope.launch {
             try {
-                if (!offline.first()) attempt { graph.library.refresh() }
+                // The refresh drops the cached lists first: only when the server can answer.
+                if (graph.engineReach() == EngineReach.ONLINE) attempt { graph.library.refresh() }
                 reload.update { it + 1 }
                 loadExtras()
                 if (showEpisodes.value) episodesLoader.reload()
