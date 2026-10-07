@@ -264,6 +264,19 @@ pub(crate) fn forget_account() {
     *LIKED_FALLBACK.lock() = None;
 }
 
+/// `library.invalidate` (pull-to-refresh): forgets the cached library lists (set snapshots,
+/// the Liked Songs fallback, the rootlist), so the next `library.*` read goes to the server.
+/// Reads after it load each list once, as usual (no per-page bypass).
+pub(crate) async fn invalidate_rpc(_args: Value) -> AppResult<Value> {
+    invalidate_lists();
+    Ok(json!({}))
+}
+
+fn invalidate_lists() {
+    forget_account();
+    playlist::invalidate_rootlist();
+}
+
 /// Sorted (newest first) contents of `set`, at most `max_age` old.
 pub(crate) async fn snapshot(session: &Session, set: Set, max_age: Duration) -> AppResult<Arc<Vec<CollItem>>> {
     let user = username(session)?;
@@ -848,8 +861,7 @@ mod tests {
         assert_eq!(v["items"][0]["album"]["uri"], album);
     }
 
-    /// Serialises the tests that use the process-wide snapshot caches.
-    static CACHES: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    use crate::catalog::TEST_CACHES as CACHES;
 
     fn snap(owner: &str, uris: &[&str]) -> Snapshot {
         let items = uris.iter().map(|u| CollItem { uri: u.to_string(), added_at: 1 }).collect();
@@ -858,7 +870,7 @@ mod tests {
 
     #[test]
     fn liked_songs_fallback_is_cached_patched_and_skipped_on_transport_errors() {
-        let _caches = CACHES.lock();
+        let _caches = CACHES.blocking_lock();
         let item = |uri: &str, at: &str| context::ContextItem {
             uri: uri.into(),
             uid: None,
@@ -892,7 +904,7 @@ mod tests {
 
     #[test]
     fn patches_snapshots() {
-        let _caches = CACHES.lock();
+        let _caches = CACHES.blocking_lock();
         SNAPSHOTS.lock().insert(Set::Show, snap("alice", &["spotify:show:a"]));
         patch_snapshot("alice", Set::Show, &["spotify:show:b".into()], false);
         patch_snapshot("alice", Set::Show, &["spotify:show:a".into()], true);
@@ -904,7 +916,7 @@ mod tests {
 
     #[test]
     fn snapshots_belong_to_their_account() {
-        let _caches = CACHES.lock();
+        let _caches = CACHES.blocking_lock();
         SNAPSHOTS.lock().insert(Set::Artist, snap("alice", &["spotify:artist:0gxyHStUsqpMadRV0Di1Qt"]));
         *LIKED_FALLBACK.lock() = Some(snap("alice", &["spotify:track:4uLU6hMCjMI75M1A2tKUQC"]));
         // The next account never sees them (also covers a load for alice finishing late).
@@ -914,6 +926,17 @@ mod tests {
         // Logout drops them altogether.
         forget_account();
         assert!(cached("alice", Set::Artist, Duration::from_secs(60)).is_none());
+        assert!(cached_liked_fallback("alice").is_none());
+    }
+
+    #[test]
+    fn pull_to_refresh_forgets_the_cached_lists() {
+        let _caches = CACHES.blocking_lock();
+        SNAPSHOTS.lock().insert(Set::Collection, snap("alice", &["spotify:track:4uLU6hMCjMI75M1A2tKUQC"]));
+        *LIKED_FALLBACK.lock() = Some(snap("alice", &["spotify:track:4uLU6hMCjMI75M1A2tKUQC"]));
+        assert!(cached("alice", Set::Collection, LIST_MAX_AGE).is_some());
+        invalidate_lists();
+        assert!(cached("alice", Set::Collection, LIST_MAX_AGE).is_none(), "the next read goes to the server");
         assert!(cached_liked_fallback("alice").is_none());
     }
 }

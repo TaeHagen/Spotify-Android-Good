@@ -4,7 +4,7 @@
 //! call fails (an empty feed would pass for the user's home and be cached as such).
 
 use super::collection;
-use super::http::{self, JSON};
+use super::http::{self, HttpError, JSON};
 use super::metadata;
 use super::pathfinder;
 use super::pfparse;
@@ -87,26 +87,38 @@ fn section(id: &str, title: &str, items: Vec<MediaRef>) -> Option<HomeSection> {
     (!items.is_empty()).then(|| HomeSection { id: id.into(), title: title.into(), items })
 }
 
-/// The radio section and whether a seed lookup failed (then the feed is partial).
+/// Whether a failed radio seed lookup leaves the feed partial. A seed without a radio playlist
+/// (404, or another permanent 4xx) is an ordinary answer, as in `catalog.radio`; only transport
+/// errors, rate limits, timeouts and server errors are failures worth retrying.
+pub(crate) fn seed_failed(e: &HttpError) -> bool {
+    if e.is_not_found() {
+        return false;
+    }
+    e.is_transport() || e.status.is_none_or(|s| s >= 500)
+}
+
+/// The radio section and whether part of it failed to load (then the feed is partial).
 async fn radio_section(session: &Session, seeds: Vec<String>) -> (Option<HomeSection>, bool) {
     let lookups = seeds.into_iter().take(3).map(|seed| async move {
-        http::spc_get(session, &format!("/inspiredby-mix/v2/seed_to_playlist/{seed}?response-format=json"), Some(JSON))
+        let r = http::spc_get(session, &format!("/inspiredby-mix/v2/seed_to_playlist/{seed}?response-format=json"), Some(JSON))
             .await
-            .map(|body| radio::parse_inspiredby(&body))
+            .map(|body| radio::parse_inspiredby(&body));
+        (seed, r)
     });
     let mut failed = false;
     let mut uris: Vec<String> = Vec::new();
-    for r in join_all(lookups).await {
+    for (seed, r) in join_all(lookups).await {
         match r {
             Ok(uri) => uris.extend(uri),
-            Err(e) => {
-                log::info!("home: radio seed failed: {}", e.error);
+            Err(e) if seed_failed(&e) => {
+                log::info!("home: radio seed {seed} failed: {}", e.error);
                 failed = true;
             }
+            Err(e) => log::debug!("home: no radio for {seed} ({:?})", e.status),
         }
     }
-    let tiles = refs::resolve(session, &uris).await;
-    (section("local:radio", "Radio for you", tiles), failed)
+    let (tiles, incomplete) = refs::resolve_checked(session, &uris).await;
+    (section("local:radio", "Radio for you", tiles), failed || incomplete)
 }
 
 /// What the local feed's sources returned.
@@ -280,6 +292,18 @@ mod tests {
 
         assert_eq!(feed_value(vec![], true)["partial"], true);
         assert!(feed_value(vec![], false).get("partial").is_none());
+    }
+
+    #[test]
+    fn a_seed_without_radio_is_not_a_failure() {
+        let err = |status: Option<u16>, code: ErrorCode| HttpError { status, error: AppError::new(code, "x") };
+        assert!(!seed_failed(&err(Some(404), ErrorCode::NotFound)));
+        assert!(!seed_failed(&err(Some(410), ErrorCode::NotFound)));
+        assert!(!seed_failed(&err(Some(400), ErrorCode::InvalidArgument)));
+        assert!(!seed_failed(&err(Some(403), ErrorCode::Unavailable)));
+        assert!(seed_failed(&err(None, ErrorCode::Network)), "timeout / offline");
+        assert!(seed_failed(&err(Some(429), ErrorCode::RateLimited)));
+        assert!(seed_failed(&err(Some(503), ErrorCode::Unavailable)));
     }
 
     #[test]

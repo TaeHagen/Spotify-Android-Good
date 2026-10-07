@@ -293,14 +293,21 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
             MediaStore.Audio.Artists.ENTRY_CONTENT_TYPE -> r.artists.firstOrNull()?.let { artistItem(it) }
             MediaStore.Audio.Albums.ENTRY_CONTENT_TYPE -> r.albums.firstOrNull()?.let { albumItem(it) }
             PLAYLIST_FOCUS -> r.playlists.firstOrNull()?.let { playlistItem(it) }
-            MediaStore.Audio.Media.ENTRY_CONTENT_TYPE -> r.tracks.firstOrNull()?.let { trackItem(it, it.album?.uri) }
+            MediaStore.Audio.Media.ENTRY_CONTENT_TYPE -> r.tracks.firstOrNull { it.playable }?.let { trackItem(it, it.album?.uri) }
             else -> null
-        } ?: r.topResult?.let { mediaRefItem(it, null) }
-            ?: r.tracks.firstOrNull()?.let { trackItem(it, it.album?.uri) }
+        } ?: r.topResult?.takeIf { top -> isPlayableResult(r, top) }?.let { mediaRefItem(it, null) }
+            ?: r.tracks.firstOrNull { it.playable }?.let { trackItem(it, it.album?.uri) }
             ?: r.playlists.firstOrNull()?.let { playlistItem(it) }
             ?: r.albums.firstOrNull()?.let { albumItem(it) }
             ?: r.artists.firstOrNull()?.let { artistItem(it) }
-            ?: r.episodes.firstOrNull()?.let { episodeItem(it, null) }
+            ?: r.episodes.firstOrNull { it.playable }?.let { episodeItem(it, null) }
+    }
+
+    /** A top track/episode the results mark unplayable (e.g. explicit with the filter on) is skipped. */
+    private fun isPlayableResult(r: SearchResults, top: MediaRef): Boolean = when (top.type) {
+        MediaType.TRACK -> r.tracks.firstOrNull { it.uri == top.uri }?.playable != false
+        MediaType.EPISODE -> r.episodes.firstOrNull { it.uri == top.uri }?.playable != false
+        else -> true
     }
 
     // ---- builders -------------------------------------------------------------------------------

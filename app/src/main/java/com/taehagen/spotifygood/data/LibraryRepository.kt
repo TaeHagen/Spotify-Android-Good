@@ -133,8 +133,13 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
     /** Emits after any library mutation (lists can refresh). */
     val changes: SharedFlow<Unit> = _changes.asSharedFlow()
 
-    /** Invalidates every cached library list, re-checks recently used saved states and emits [changes]. */
+    /**
+     * Pull-to-refresh: invalidates every cached library list (the engine's own caches first, so the
+     * refetch reaches the server instead of the engine's 30–60 s copies), re-checks recently used
+     * saved states and emits [changes]. Liked Songs and the episode pager reload on [changes].
+     */
     suspend fun refresh() {
+        invalidateNativeLists()
         cache.invalidatePrefix(CacheKeys.LIBRARY_PREFIX)
         lookups.request(saved.recentKeys(MAX_REFRESH_LOOKUPS))
         _changes.emit(Unit)
@@ -163,6 +168,17 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
     }
 
     // ---- internals ----------------------------------------------------------------------------------
+
+    /** `library.invalidate` (docs §6.3); best effort: an error must not keep the app's own lists stale. */
+    private suspend fun invalidateNativeLists() {
+        try {
+            rpc.callUnitOffMain("library.invalidate")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Older engine or no session: the app-side invalidation still runs.
+        }
+    }
 
     private suspend fun mutate(uris: List<String>, value: Boolean) {
         val mutation = saved.mutate(uris, value)

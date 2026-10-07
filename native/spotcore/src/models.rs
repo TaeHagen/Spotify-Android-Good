@@ -321,6 +321,10 @@ pub struct SearchResults {
     pub episodes: Vec<Episode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_result: Option<MediaRef>,
+    /// Server-side result counts per list key ("tracks", "albums", …) when the source reports them
+    /// (docs §6.3): the lists may be shorter than `limit` while more results exist.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub totals: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.data.RecentSearch
 import com.taehagen.spotifygood.data.SearchType
+import com.taehagen.spotifygood.data.totalOf
 import com.taehagen.spotifygood.model.MediaRef
 import com.taehagen.spotifygood.model.MediaType
 import com.taehagen.spotifygood.model.SearchResults
@@ -157,7 +158,7 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
     private fun typedResults(query: String, type: SearchType): Flow<PagedState<SearchItem>> = channelFlow {
         // The loader lives in this producer scope: a newer query/filter cancels its requests.
         val loader = PagedLoader(this, TYPED_PAGE_SIZE, SearchItem::key) { offset, limit ->
-            PageResult(graph.search.search(query, setOf(type), offset, limit).itemsOf(type))
+            graph.search.search(query, setOf(type), offset, limit).let { PageResult(it.itemsOf(type), total = it.totalOf(type)) }
         }
         typedLoader = loader
         loader.loadMore()
@@ -255,7 +256,7 @@ class SearchResultsViewModel(private val graph: AppGraph, private val query: Str
     private val type: SearchType = searchTypeOf(typeWire) ?: SearchType.TRACK
 
     private val loader = PagedLoader(viewModelScope, PAGE_SIZE, SearchItem::key) { offset, limit ->
-        PageResult(graph.search.search(query, setOf(type), offset, limit).itemsOf(type))
+        graph.search.search(query, setOf(type), offset, limit).let { PageResult(it.itemsOf(type), total = it.totalOf(type)) }
     }
 
     private val offline = graph.offlineFlow()

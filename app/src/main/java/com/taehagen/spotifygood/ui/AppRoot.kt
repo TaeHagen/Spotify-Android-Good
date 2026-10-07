@@ -274,13 +274,24 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
             val album = track.album?.uri
             if (album != null) player.playContext(album, startUri = track.uri) else player.playTracks(listOf(track.uri))
         }
-        fun playRef(ref: MediaRef) {
+        /** False when the top result is a track/episode the results mark unplayable (e.g. explicit). */
+        fun playRef(ref: MediaRef): Boolean {
             when (ref.type) {
-                MediaType.TRACK -> results.tracks.firstOrNull { it.uri == ref.uri }?.let(::playTrack)
-                    ?: player.playTracks(listOf(ref.uri))
-                MediaType.EPISODE -> player.playTracks(listOf(ref.uri))
+                MediaType.TRACK -> {
+                    val track = results.tracks.firstOrNull { it.uri == ref.uri }
+                    when {
+                        track == null -> player.playTracks(listOf(ref.uri))
+                        track.playable -> playTrack(track)
+                        else -> return false
+                    }
+                }
+                MediaType.EPISODE -> {
+                    if (results.episodes.firstOrNull { it.uri == ref.uri }?.playable == false) return false
+                    player.playTracks(listOf(ref.uri))
+                }
                 else -> player.playContext(ref.uri)
             }
+            return true
         }
         when (type) {
             SearchType.ARTIST -> results.artists.firstOrNull()?.let { player.playContext(it.uri); return true }
@@ -288,7 +299,7 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
             SearchType.PLAYLIST -> results.playlists.firstOrNull()?.let { player.playContext(it.uri); return true }
             SearchType.TRACK -> results.tracks.firstOrNull { it.playable }?.let { playTrack(it); return true }
             else -> {
-                results.topResult?.let { playRef(it); return true }
+                results.topResult?.let { if (playRef(it)) return true }
                 results.tracks.firstOrNull { it.playable }?.let { playTrack(it); return true }
                 results.artists.firstOrNull()?.let { player.playContext(it.uri); return true }
                 results.albums.firstOrNull()?.let { player.playContext(it.uri); return true }

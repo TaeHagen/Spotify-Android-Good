@@ -102,6 +102,7 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
         "library.shows" => collection::shows(args).await,
         "library.episodes" => collection::episodes(args).await,
         "library.contains" => collection::contains_rpc(args).await,
+        "library.invalidate" => collection::invalidate_rpc(args).await,
         "library.save" => collection::save_rpc(args, false).await,
         "library.remove" => collection::save_rpc(args, true).await,
         "playlist.create" => playlist::create(args).await,
@@ -114,6 +115,10 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
         _ => Err(AppError::invalid(format!("unknown method {method}"))),
     }
 }
+
+/// Serialises the tests (of any catalog module) that use the process-wide library caches.
+#[cfg(test)]
+pub(crate) static TEST_CACHES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
