@@ -13,6 +13,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
@@ -57,6 +58,27 @@ class DevicesRepositoryTest {
         assertEquals(true, resume["shuffle"]?.jsonPrimitive?.boolean)
         assertEquals(true, resume["smartShuffle"]?.jsonPrimitive?.boolean)
         assertEquals("track", resume["repeat"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun transferCarriesTheTrackListForm() {
+        // a queued or autoplay track: its list, in play order, without the context or a shuffle
+        val session = state(null).copy(
+            shuffle = true,
+            repeat = RepeatMode.CONTEXT,
+            trackUris = listOf("spotify:track:t", "spotify:track:n"),
+        )
+        val resume = DevicesRepository.transferArgs("speaker", play = true, resume = session)["resume"]!!.jsonObject
+        assertEquals(listOf("spotify:track:t", "spotify:track:n"), resume["trackUris"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertFalse(resume.containsKey("contextUri"))
+        assertEquals(false, resume["shuffle"]?.jsonPrimitive?.boolean)
+        assertEquals("context", resume["repeat"]?.jsonPrimitive?.content)
+        // the context form sends none, nor does a list that doesn't start at the track
+        assertFalse(DevicesRepository.transferArgs("speaker", true, state("spotify:playlist:p"))["resume"]!!.jsonObject.containsKey("trackUris"))
+        val stale = state("spotify:playlist:p").copy(trackUris = listOf("spotify:track:x"))
+        val staleResume = DevicesRepository.transferArgs("speaker", true, stale)["resume"]!!.jsonObject
+        assertFalse(staleResume.containsKey("trackUris"))
+        assertEquals("spotify:playlist:p", staleResume["contextUri"]?.jsonPrimitive?.content)
     }
 
     @Test

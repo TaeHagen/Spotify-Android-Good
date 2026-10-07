@@ -18,7 +18,9 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 
 /**
@@ -163,15 +165,22 @@ class DevicesRepository(
             put("deviceId", deviceId)
             put("play", play)
             if (resume != null && resume.trackUri.isNotBlank()) {
+                // The same load as a local resume (ResumeState.toPlayRequest): the track-list form
+                // plays its list in the saved order, the context form its context.
+                val load = resume.resumeLoad
+                val list = load.trackUris?.filter { it.isNotBlank() }?.takeIf { it.isNotEmpty() }
                 putJsonObject("resume") {
-                    resume.contextUri?.takeIf { it.isNotBlank() && it != resume.trackUri }?.let { put("contextUri", it) }
+                    if (list == null) {
+                        resume.contextUri?.takeIf { it.isNotBlank() && it != resume.trackUri }?.let { put("contextUri", it) }
+                    }
                     put("trackUri", resume.trackUri)
                     put("positionMs", resume.positionMs.coerceAtLeast(0))
                     // The session's modes; the engine plays smart shuffle as a plain shuffle on
                     // another device.
-                    put("shuffle", resume.shuffle || resume.smartShuffle)
-                    put("smartShuffle", resume.smartShuffle)
-                    put("repeat", PlaybackModes.wire(resume.repeat))
+                    put("shuffle", load.shuffle || load.smartShuffle)
+                    put("smartShuffle", load.smartShuffle)
+                    put("repeat", PlaybackModes.wire(load.repeat))
+                    list?.let { uris -> putJsonArray("trackUris") { uris.forEach { add(it) } } }
                 }
             }
         }
