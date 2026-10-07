@@ -169,10 +169,13 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
 ### 4.2 Engine state machine
 
 ```
-          session.start            connected               network lost / session invalid
+          session.start            connected                         session invalid
  Stopped ───────────────▶ Connecting ─────────▶ Online ───────────────────────────────┐
-    ▲   ◀── session.stop ──┤  ▲  failed (retryable)                                   │
+    ▲   ◀── session.stop ──┤  ▲  failed (retryable)  │                                │
     │                      │  └──────────── Reconnecting(backoff 1s,2s,4s…60s) ◀──────┘
+    │                      │                         │ network lost ≥ 12 s (deferred while
+    │                      │                         ▼ this device plays from its buffer)
+    │                      │                      Offline ── network back ──▶ Connecting
     │                      └─ BAD_CREDENTIALS / PREMIUM_REQUIRED ─▶ Error (no retry)
     └── session.stop (from any state; graceful, bounded to 10 s)
  Offline mode (settings.offline or no network): Player runs without Spirc; only downloaded
@@ -198,7 +201,12 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   written to disk in plaintext, and a `credentials.json` left by an older build is deleted),
   Rust emits a `credentials` event; Kotlin stores them encrypted.
 * Reconnect supervisor: awaits the spirc task end / polls `session.is_invalid()` every 5 s
-  while Online (cheap, no network), reacts to `session.setNetworkAvailable`. Backoff
+  while Online (cheap, no network), reacts to `session.setNetworkAvailable`. A network loss
+  reported while Online tears the session down after 12 s (restoring local playback once it
+  is back) and goes Offline, unless the network came back first; while this device is the
+  active one playing from its buffer, that is re-checked every 5 s instead (a suspended mobile
+  network keeps the AP socket open, so librespot alone would notice only after its 80 s
+  keep-alive). Backoff
   1→60 s, reset once a connection stayed up 60 s (or when the network comes back), so a
   connection that drops right after connecting keeps backing off; at most one attempt in
   flight; no attempts while the network is known to be down. At most 10 attempts per
@@ -270,7 +278,8 @@ decode failure of an offline file is reported (`playback` error event) and the f
 
 ### 4.6 Offline mode controller
 
-When `settings.offline == true` or the network is down and no session is Online, playback
+When `settings.offline == true` or the network is down and no session is Online (the session
+leaves Online at most ~12 s after the network is reported lost, see §4.2), playback
 commands are handled by `OfflineController`: a local queue of downloaded tracks with
 shuffle (seeded), repeat context/track, user queue (add/remove/move/clear/skipTo),
 prev/next semantics identical to Spirc (prev restarts if position > 3 s). It drives the
