@@ -79,7 +79,11 @@ class OfflineLoadsTest {
         val members = OfflineLoads.members(playlist, t(2), emptyList(), setOf(t(2))) { error("not for playlists") }
         assertEquals(listOf(t(2)), members?.order)
         assertEquals(OfflineMembers(emptyList(), setOf(t(2))), OfflineLoads.members(playlist, null, emptyList(), setOf(t(2))) { emptyList() })
-        assertNull(OfflineLoads.members("spotify:artist:x", null, emptyList(), emptySet()) { emptyList() })
+        // Contexts the engine resolves: only which items are downloaded.
+        assertEquals(
+            OfflineMembers(emptyList(), setOf(t(1))),
+            OfflineLoads.members("spotify:artist:x", null, emptyList(), setOf(t(1))) { error("not for artists") },
+        )
     }
 
     @Test
@@ -163,5 +167,61 @@ class OfflineLoadsTest {
         assertEquals(OfflineLoads.Plan.NotDownloaded, OfflineLoads.plan(request, none, EngineReach.OFFLINE))
         // Still connecting: the engine may come online and play the context itself.
         assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(request, none, EngineReach.CONNECTING))
+    }
+
+    @Test
+    fun offlineSmartShuffleBecomesAPlainShuffle() {
+        val smart = PlayRequest(contextUri = playlist, smartShuffle = true)
+        assertEquals(smart.copy(shuffle = true, smartShuffle = null), OfflineLoads.withoutSmartShuffle(smart, EngineReach.OFFLINE))
+        assertEquals(smart, OfflineLoads.withoutSmartShuffle(smart, EngineReach.CONNECTING))
+        assertEquals(smart, OfflineLoads.withoutSmartShuffle(smart, EngineReach.ONLINE))
+        val off = PlayRequest(contextUri = playlist, shuffle = false, smartShuffle = false)
+        assertEquals(off, OfflineLoads.withoutSmartShuffle(off, EngineReach.OFFLINE))
+    }
+
+    @Test
+    fun connectingNeverSwapsInAnotherDownloadForTheRequestedItem() {
+        // Only track 2 of the album is downloaded; the user asked for track 5.
+        val members = OfflineMembers(listOf(t(2)), setOf(t(2)))
+        val request = PlayRequest(contextUri = album, startUri = t(5), startUid = "u5", positionMs = 3_000)
+        val connecting = load(OfflineLoads.plan(request, members, EngineReach.CONNECTING))
+        assertEquals(album, connecting.contextUri) // online, Spirc plays the album from track 5
+        assertEquals(listOf(t(5)), connecting.trackUris) // offline, "Not available offline"
+        assertEquals(t(5), connecting.startUri)
+        assertEquals("u5", connecting.startUid)
+        assertNull(connecting.startIndex)
+        assertEquals(3_000L, connecting.positionMs)
+        // Really offline the next download plays (resumptions and media-session loads rely on it).
+        assertEquals(listOf(t(2)), load(OfflineLoads.plan(request, members, EngineReach.OFFLINE)).trackUris)
+        // A downloaded start item still gets the context's downloads.
+        val downloaded = load(OfflineLoads.plan(request.copy(startUri = t(2)), members, EngineReach.CONNECTING))
+        assertEquals(listOf(t(2)), downloaded.trackUris)
+        assertEquals(3_000L, downloaded.positionMs)
+    }
+
+    @Test
+    fun connectingIndexOnlyStartThatIsNotDownloadedIsLoadedAlone() {
+        val members = OfflineMembers(listOf(t(1), t(2), t(3)), setOf(t(1), t(3)))
+        val converted = load(OfflineLoads.plan(PlayRequest(contextUri = playlist, startIndex = 1, startUid = "o1"), members, EngineReach.CONNECTING))
+        assertEquals(playlist, converted.contextUri)
+        assertEquals(listOf(t(2)), converted.trackUris)
+        assertEquals(t(2), converted.startUri)
+        assertEquals(0, converted.startIndex)
+        assertNull(converted.startUid) // an offline queue uid means nothing to Spirc
+    }
+
+    @Test
+    fun connectingArtistLoadsNameOnlyAStartItemThatIsNotDownloaded() {
+        val artist = "spotify:artist:x"
+        val members = checkNotNull(OfflineLoads.members(artist, t(9), emptyList(), setOf(t(1))) { emptyList() })
+        val notDownloaded = PlayRequest(contextUri = artist, startUri = t(9))
+        val converted = load(OfflineLoads.plan(notDownloaded, members, EngineReach.CONNECTING))
+        assertEquals(artist, converted.contextUri)
+        assertEquals(listOf(t(9)), converted.trackUris)
+        // A downloaded start, a load without a start, or offline: the engine resolves the artist.
+        assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(notDownloaded.copy(startUri = t(1)), members, EngineReach.CONNECTING))
+        assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(PlayRequest(contextUri = artist), members, EngineReach.CONNECTING))
+        assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(notDownloaded, members, EngineReach.OFFLINE))
+        assertEquals(OfflineLoads.Plan.Unchanged, OfflineLoads.plan(notDownloaded, members, EngineReach.ONLINE))
     }
 }

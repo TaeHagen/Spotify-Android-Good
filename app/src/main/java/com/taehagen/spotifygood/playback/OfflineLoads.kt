@@ -5,8 +5,9 @@ import com.taehagen.spotifygood.download.DownloadedCollection
 
 /**
  * The downloads of a context: [order] lists the context's items in context order (all of them
- * when the context was downloaded as a collection, otherwise only what is known), [downloaded]
- * says which items are complete downloads.
+ * when the context was downloaded as a collection, otherwise only what is known; empty for
+ * contexts the engine resolves itself, e.g. artists), [downloaded] says which items are complete
+ * downloads.
  */
 data class OfflineMembers(val order: List<String>, val downloaded: Set<String>)
 
@@ -33,7 +34,10 @@ internal data class DownloadedEntry(
  * The context uri stays in the request: should the session be Online with a network by the time
  * the engine routes it (the [EngineReach.CONNECTING] case), Spirc loads the context itself (it
  * ignores `trackUris` for a resolvable context) and starts at `startUid` / `startUri`, which are
- * kept for that reason.
+ * kept for that reason. While connecting, a requested start item that is not downloaded is the
+ * only item of `trackUris` (any context kind, artists too): online Spirc plays it in its context,
+ * otherwise the engine fails with "Not available offline" instead of playing another download
+ * (the next-download start is for [EngineReach.OFFLINE] only, which resumptions rely on).
  */
 internal object OfflineLoads {
     enum class ContextKind { PLAYLIST, LIKED_SONGS, ALBUM, SHOW }
@@ -48,6 +52,14 @@ internal object OfflineLoads {
         /** Offline and nothing of the context is downloaded. */
         data object NotDownloaded : Plan
     }
+
+    /**
+     * Offline ([EngineReach.OFFLINE]) there is no smart shuffle: the offline queue only shuffles
+     * and reports smart shuffle unavailable. A load asking for it asks for a plain shuffle instead.
+     */
+    fun withoutSmartShuffle(request: PlayRequest, reach: EngineReach): PlayRequest =
+        if (reach != EngineReach.OFFLINE || request.smartShuffle != true) request
+        else request.copy(shuffle = true, smartShuffle = null)
 
     /** Uids of the native offline queue ("o<n>"), which the engine reads as an index. */
     private val OFFLINE_UID = Regex("o\\d+")
@@ -72,7 +84,8 @@ internal object OfflineLoads {
      * The downloads of [contextUri]: the downloaded collection's membership when the context was
      * downloaded as a whole; otherwise albums and shows by the downloads' metadata ([entries], only
      * evaluated then), and playlists / Liked Songs only [startUri] itself (their membership is not
-     * known offline). Null for context kinds this does not handle.
+     * known offline). Other contexts (artists, …) have an empty order: the engine resolves them,
+     * only [completed] is used (is the start item downloaded).
      */
     fun members(
         contextUri: String,
@@ -81,7 +94,7 @@ internal object OfflineLoads {
         completed: Set<String>,
         entries: () -> List<DownloadedEntry>,
     ): OfflineMembers? {
-        val kind = kindOf(contextUri) ?: return null
+        val kind = kindOf(contextUri) ?: return OfflineMembers(emptyList(), completed)
         val collection = collections.firstOrNull { it.ref.uri == contextUri }
             ?: collections.firstOrNull { kind == ContextKind.LIKED_SONGS && it.ref.type == CollectionType.LIKED_SONGS }
         if (collection != null) return OfflineMembers(collection.itemUris, completed)
@@ -102,13 +115,31 @@ internal object OfflineLoads {
 
     /**
      * Rewrites [request] for the offline queue when [reach] is not [EngineReach.ONLINE]. The start is the
-     * requested item, or the first download after it when it is not downloaded (like the engine's
-     * own selection), else the first download; the position is kept only for the requested item.
+     * requested item, or (offline only) the first download after it when it is not downloaded
+     * (like the engine's own selection), else the first download; the position is kept only for
+     * the requested item. Connecting, a requested item that is not downloaded is loaded alone.
      */
     fun plan(request: PlayRequest, members: OfflineMembers?, reach: EngineReach): Plan {
         if (reach == EngineReach.ONLINE) return Plan.Unchanged
-        if (request.contextUri == null || !request.trackUris.isNullOrEmpty() || members == null) return Plan.Unchanged
+        val context = request.contextUri
+        if (context == null || !request.trackUris.isNullOrEmpty() || members == null) return Plan.Unchanged
         val order = members.order
+        if (reach == EngineReach.CONNECTING) {
+            // The session may still come online: never swap in another download for the item asked for.
+            val startItem = request.startUri ?: request.startIndex?.let(order::getOrNull)
+            if (startItem != null && startItem !in members.downloaded) {
+                return Plan.Load(
+                    request.copy(
+                        trackUris = listOf(startItem),
+                        startUri = startItem,
+                        startIndex = request.startIndex?.let { 0 },
+                        startUid = request.startUid?.takeUnless { OFFLINE_UID.matches(it) },
+                    ),
+                )
+            }
+        }
+        // Artists and other contexts: the engine resolves their downloads itself.
+        if (kindOf(context) == null) return Plan.Unchanged
         val wanted = request.startUri?.let { uri -> order.indexOf(uri).takeIf { it >= 0 } } ?: request.startIndex
         val selected = ArrayList<String>()
         val seen = HashSet<String>()

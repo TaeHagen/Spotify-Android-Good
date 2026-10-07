@@ -386,6 +386,18 @@ internal object DownloadRules {
         return Recheck(members, due.mapTo(HashSet()) { it.collection })
     }
 
+    /**
+     * Of the members a re-check found playable again ([found], looked up without the lock), those
+     * still recorded as unavailable by a downloaded collection now ([liveUnavailable], re-read under
+     * the lock). A member whose collection was removed meanwhile, or that the user removed (which
+     * takes it out of every set), is dropped: queueing it would bring back a download nothing owns.
+     */
+    fun confirmRecheck(found: Collection<String>, liveUnavailable: Collection<Collection<String>>): List<String> {
+        val still = HashSet<String>()
+        liveUnavailable.forEach { still.addAll(it) }
+        return found.filter { it in still }.distinct()
+    }
+
     /** Rough size of [count] items at [kbps] (≈ 4 min each) for the job's network estimate. */
     fun estimateBytes(count: Int, kbps: Int): Long = count.toLong() * kbps * 1000 / 8 * AVERAGE_DURATION_S
 

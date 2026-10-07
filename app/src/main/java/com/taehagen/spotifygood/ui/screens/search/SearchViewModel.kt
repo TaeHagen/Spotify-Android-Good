@@ -25,6 +25,7 @@ import com.taehagen.spotifygood.ui.screens.library.debouncedInput
 import com.taehagen.spotifygood.ui.screens.library.nowPlayingFlow
 import com.taehagen.spotifygood.ui.screens.library.offlineFlow
 import com.taehagen.spotifygood.ui.screens.library.playTrackInAlbum
+import com.taehagen.spotifygood.ui.screens.library.startTrack
 import com.taehagen.spotifygood.ui.screens.library.toBrowseError
 import com.taehagen.spotifygood.ui.screens.library.toMediaRef
 import kotlinx.coroutines.flow.Flow
@@ -65,6 +66,13 @@ data class SearchUiState(
 )
 
 private data class SearchInput(val query: String, val filter: SearchFilter, val retry: Int, val offline: Boolean)
+
+/**
+ * Whether Retry should load the failed page of a typed list again (results listed, a later page
+ * failed) rather than search again from the start.
+ */
+internal fun retriesFailedPage(filter: SearchFilter, paged: PagedState<*>?): Boolean =
+    filter.type != null && paged != null && paged.items.isNotEmpty() && paged.error != null
 
 /** Longest wait for the engine to apply a changed explicit filter (as Settings waits). */
 private const val EXPLICIT_APPLY_TIMEOUT_MS = 15_000L
@@ -225,7 +233,19 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         filter.value = if (filter.value == value && value != SearchFilter.TOP) SearchFilter.TOP else value
     }
 
-    fun retry() = retry.update { it + 1 }
+    /**
+     * Retry. A typed list whose later page failed loads that page again, keeping what is listed
+     * (and the scroll position); anything else (top results, a failed first page, no results)
+     * searches again.
+     */
+    fun retry() {
+        val loader = typedLoader
+        if (loader != null && retriesFailedPage(filter.value, loader.state.value)) {
+            loader.loadMore()
+        } else {
+            retry.update { it + 1 }
+        }
+    }
 
     fun loadMore() {
         typedLoader?.loadMore()
@@ -248,7 +268,7 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         onOpened(ref)
         when (ref.type) {
             MediaType.TRACK -> (sections.byUri[ref.uri] as? SearchItem.Song)?.let { graph.playTrackInAlbum(it.track) }
-                ?: graph.player.playTracks(listOf(ref.uri))
+                ?: graph.appScope.launch { graph.startTrack(ref.uri, track = null) }
             MediaType.EPISODE -> graph.player.playTracks(listOf(ref.uri))
             else -> graph.player.playContext(ref.uri)
         }

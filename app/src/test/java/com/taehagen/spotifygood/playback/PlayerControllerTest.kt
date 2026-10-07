@@ -5,6 +5,7 @@ import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.PlaybackTrack
+import com.taehagen.spotifygood.model.RepeatMode
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import kotlinx.coroutines.CompletableDeferred
@@ -370,5 +371,27 @@ class PlayerControllerTest {
         // While something plays, failures are not sticky (the playing state is what to show).
         h.controller.noteFailure(PlaybackErrorKind.UNAVAILABLE, "gone")
         assertNull(h.controller.failure.value)
+    }
+
+    @Test
+    fun offlineTheResumeShufflesInsteadOfSmartShuffling() = runTest {
+        val notConnected = NativeException(NativeErrorInfo(NativeErrorCode.NOT_CONNECTED, "offline"))
+        val smart = resumeState(playlist).copy(shuffle = true, smartShuffle = true, repeat = RepeatMode.CONTEXT)
+        val offline = Harness(this, Env(EngineReach.OFFLINE, OfflineMembers(listOf(t(1), t(2)), setOf(t(1), t(2)))), resume = smart)
+        offline.fail = { if (it == "player.play") notConnected else null }
+        assertTrue(offline.controller.resumeAsync().await())
+        val load = offline.calls[1].second
+        assertEquals("true", load["shuffle"]?.jsonPrimitive?.content)
+        assertNull(load["smartShuffle"])
+        assertEquals("context", load["repeat"]?.jsonPrimitive?.content)
+        assertEquals(listOf(t(1), t(2)), load["trackUris"]?.jsonArray?.map { it.jsonPrimitive.content })
+
+        // Connecting (Spirc may still take it) and online, smart shuffle stays.
+        for (reach in listOf(EngineReach.CONNECTING, EngineReach.ONLINE)) {
+            val h = Harness(this, Env(reach), resume = smart)
+            h.fail = { if (it == "player.play") notConnected else null }
+            assertTrue(h.controller.resumeAsync().await())
+            assertEquals("true", h.calls[1].second["smartShuffle"]?.jsonPrimitive?.content)
+        }
     }
 }

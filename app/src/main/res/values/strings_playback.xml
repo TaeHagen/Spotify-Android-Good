@@ -31,7 +31,7 @@
     <string name="playback_presence_stop">Stop</string>
 
     <!-- Errors shown in snackbars -->
-    <string name="playback_error_not_active_device">No device is playing. Choose a device to play on.</string>
+    <string name="playback_error_not_active_device">Nothing is playing. Pick something to play first.</string>
     <string name="playback_error_network">Can\'t reach Spotify. Check your connection.</string>
     <string name="playback_error_premium_required">Spotify Premium is required to play music.</string>
     <string name="playback_error_refused">Spotify refused playback for this account.</string>

@@ -90,4 +90,12 @@ class PlaybackModesTest {
         val gains = (fade downTo 0 step 500).map { SleepTimer.fadeGain(it, fade) }
         assertEquals(gains.sortedDescending(), gains)
     }
+
+    @Test
+    fun repeatWireValuesReadBack() {
+        for (mode in RepeatMode.entries) assertEquals(mode, PlaybackModes.parseRepeat(PlaybackModes.wire(mode)))
+        assertEquals(RepeatMode.OFF, PlaybackModes.parseRepeat(null))
+        assertEquals(RepeatMode.OFF, PlaybackModes.parseRepeat("TRACK"))
+        assertEquals(RepeatMode.OFF, PlaybackModes.parseRepeat(""))
+    }
 }

@@ -63,6 +63,7 @@ import com.taehagen.spotifygood.model.ConnectDevice
 import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.playback.AudioOutput
 import com.taehagen.spotifygood.playback.OutputKind
@@ -120,6 +121,19 @@ internal sealed interface DevicesEvent {
     data class TransferFailed(override val sheet: String, val deviceName: String, val network: Boolean) : DevicesEvent
     data class TransferSucceeded(override val sheet: String) : DevicesEvent
     data class RefreshFailed(override val sheet: String) : DevicesEvent
+
+    /**
+     * Nothing is playing anywhere and there is no saved session to start (NOT_ACTIVE_DEVICE): the
+     * device is fine, there is just nothing to move to it yet.
+     */
+    data class NothingToPlay(override val sheet: String, val deviceName: String, val isThisDevice: Boolean) : DevicesEvent
+}
+
+/** The result of a transfer to [deviceName] that failed with [error]. */
+internal fun transferFailureEvent(sheet: String, deviceName: String, isThisDevice: Boolean, error: Exception): DevicesEvent = when {
+    error is NativeException && error.code == NativeErrorCode.NOT_ACTIVE_DEVICE -> DevicesEvent.NothingToPlay(sheet, deviceName, isThisDevice)
+    error is NativeException -> DevicesEvent.TransferFailed(sheet, deviceName, error.isNetwork)
+    else -> DevicesEvent.TransferFailed(sheet, deviceName, network = false)
 }
 
 internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
@@ -176,10 +190,9 @@ internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
                 eventChannel.trySend(DevicesEvent.TransferSucceeded(sheet))
             } catch (e: CancellationException) {
                 throw e
-            } catch (e: NativeException) {
-                eventChannel.trySend(DevicesEvent.TransferFailed(sheet, deviceName, e.isNetwork))
             } catch (e: Exception) {
-                eventChannel.trySend(DevicesEvent.TransferFailed(sheet, deviceName, network = false))
+                val isThisDevice = deviceId == state.value.thisDeviceId
+                eventChannel.trySend(transferFailureEvent(sheet, deviceName, isThisDevice, e))
             } finally {
                 transferring.value = null
             }
@@ -220,6 +233,16 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
                     scope.launch { snackbar.showSnackbar(message) }
                 }
                 is DevicesEvent.RefreshFailed -> scope.launch { snackbar.showSnackbar(context.getString(R.string.player_devices_refresh_failed)) }
+                is DevicesEvent.NothingToPlay -> {
+                    // A transfer only moves what is playing; with nothing playing (and no saved
+                    // session) a play would start on this phone, so say what does work.
+                    val message = if (event.isThisDevice) {
+                        context.getString(R.string.player_devices_nothing_to_play_here)
+                    } else {
+                        context.getString(R.string.player_devices_nothing_to_play, event.deviceName)
+                    }
+                    scope.launch { snackbar.showSnackbar(message) }
+                }
             }
         }
     }

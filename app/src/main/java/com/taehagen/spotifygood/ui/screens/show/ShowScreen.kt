@@ -61,6 +61,7 @@ import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
+import com.taehagen.spotifygood.ui.screens.album.canStartNow
 import com.taehagen.spotifygood.ui.screens.album.AddedButton
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadButton
 import com.taehagen.spotifygood.ui.screens.album.DownloadedCopyNotice
@@ -213,7 +214,7 @@ private fun ShowList(
         }
         items(state.list.episodes, key = { it.uri }, contentType = { "episode" }) { episode ->
             val downloadState = state.rowDownloads[episode.uri]
-            val playable = episode.playable && (!state.offline || downloadState == DownloadState.COMPLETED)
+            val playable = canStartNow(episode.playable, state.online, downloadState)
             val showActions = { navigator.showActions(MediaActionTarget.EpisodeTarget(episode)) }
             EpisodeRow(
                 episode = episode,
@@ -222,7 +223,7 @@ private fun ShowList(
                 isPlaying = state.playback.isPlayingItem(episode.uri),
                 downloadState = downloadState,
                 onLongClick = showActions,
-                // Unplayable (or not downloaded while offline): dimmed, actions still in the overflow.
+                // Unplayable (or not downloaded while the session isn't online): dimmed, actions still in the overflow.
                 enabled = playable,
                 onMoreClick = showActions,
             )
