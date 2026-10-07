@@ -1631,6 +1631,135 @@ fn a_transient_resolve_failure_is_retried_a_few_times() {
     }
 }
 
+/// what handle_load does for a start uri that isn't in the context (yet): it plays outside the
+/// context, the fill up waits
+fn play_outside_the_context(state: &mut ConnectState, uri: String, shuffle: bool) {
+    let track = state
+        .context_to_provided_track(
+            &ContextTrack {
+                uri: Some(uri),
+                ..Default::default()
+            },
+            Some(CONTEXT_URI),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    state.clear_next_tracks();
+    state.set_track(track);
+    if shuffle {
+        state.set_shuffle(true);
+    } else {
+        state.reset_context(ResetContext::DefaultIndex);
+    }
+}
+
+#[test]
+fn a_start_track_on_a_further_page_is_placed_when_the_page_arrives() {
+    use crate::context_resolver::{ContextAction, ResolveContext};
+
+    let start = track_uri(15, 0);
+    for shuffle in [false, true] {
+        // an artist: the start track is on an album page, resolved after the load
+        let (rt, mut state) = state(10);
+        play_outside_the_context(&mut state, start.clone(), shuffle);
+        assert!(state.next_tracks().is_empty());
+
+        let mut resolver = resolver(&rt);
+        resolver.add(ResolveContext::from_uri(
+            "spotify:album:1",
+            "",
+            ContextType::Default,
+            ContextAction::Append,
+        ));
+        let page = Context {
+            uri: Some(CONTEXT_URI.to_string()),
+            pages: vec![default_page(10..20)],
+            ..Default::default()
+        };
+        resolver.apply_next_context(&mut state, page).unwrap();
+        assert!(resolver.try_finish(&mut state, &mut None));
+
+        assert_eq!(state.current_track(|t| t.uri.clone()), start);
+        let mut next = next_uids(&state);
+        if shuffle {
+            // first in the shuffle, every other track follows
+            next.sort();
+            let mut expected = uids(0..20);
+            expected.retain(|uid| uid != "uid15");
+            expected.sort();
+            assert_eq!(next, expected);
+        } else {
+            // the context goes on after it
+            assert_eq!(next, uids(16..20));
+            assert_eq!(state.prev_tracks().last().unwrap().uid, "uid14");
+        }
+    }
+
+    // the page fails for good: the track plays before the context
+    let (rt, mut state) = state(10);
+    play_outside_the_context(&mut state, start.clone(), false);
+    let mut resolver = resolver(&rt);
+    resolver.add(ResolveContext::from_uri(
+        "spotify:album:1",
+        "",
+        ContextType::Default,
+        ContextAction::Append,
+    ));
+    assert!(resolver.finish_after_failure(&mut state, &mut None));
+    assert_eq!(state.current_track(|t| t.uri.clone()), start);
+    assert_eq!(next_uids(&state), uids(0..10));
+}
+
+#[test]
+fn only_a_resolved_complete_context_is_the_current_one() {
+    use crate::protocol::{session::Session as PlayingSession, transfer_state::TransferState};
+
+    let (_rt, mut state) = state(3);
+    assert!(state.is_current_context(CONTEXT_URI));
+    assert!(!state.is_current_context("spotify:album:0"));
+
+    // a page of it failed for good: a load of it resolves it again
+    state.mark_default_context_incomplete();
+    assert!(!state.is_current_context(CONTEXT_URI));
+    assert!(state.reset_context(ResetContext::WhenDifferent(CONTEXT_URI)));
+
+    // a transfer of it, still resolving it: no context
+    let mut transfer = TransferState {
+        current_session: MessageField::some(PlayingSession {
+            context: MessageField::some(Context {
+                uri: Some(CONTEXT_URI.to_string()),
+                pages: vec![default_page(0..2)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    state.handle_initial_transfer(&mut transfer, Some(CONTEXT_URI.to_string()));
+    assert_eq!(state.context_uri(), CONTEXT_URI);
+    assert!(!state.is_current_context(CONTEXT_URI));
+
+    // the stand-in after the resolve failed
+    state.set_track(ProvidedTrack {
+        uri: track_uri(1, 0),
+        uid: "uid1".to_string(),
+        provider: "context".to_string(),
+        ..Default::default()
+    });
+    state.finish_transfer_without_context(transfer).unwrap();
+    assert!(state.get_context(ContextType::Default).is_ok());
+    assert!(!state.is_current_context(CONTEXT_URI));
+
+    // resolved for real
+    state
+        .update_context(context(3, 0), ContextType::Default)
+        .unwrap();
+    assert!(state.is_current_context(CONTEXT_URI));
+    assert!(!state.reset_context(ResetContext::WhenDifferent(CONTEXT_URI)));
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(
