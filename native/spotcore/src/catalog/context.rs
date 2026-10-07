@@ -55,24 +55,37 @@ fn endpoint_for_page_url(url: &str) -> String {
 #[derive(Debug, Default)]
 pub(crate) struct Resolved {
     pub items: Vec<ContextItem>,
-    /// Set when a page request failed: `items` is then only a prefix of the context. Stopping at
-    /// `max_items` / `max_pages` is not a failure.
+    /// Set when a page request failed: `items` is then only a prefix of the context.
     pub incomplete: Option<AppError>,
+    /// The `max_items` / `max_pages` budget stopped the walk while more items remained: `items`
+    /// is a prefix (not a failure; callers that need the whole context must check it).
+    pub truncated: bool,
 }
 
 /// Resolves `context_uri` and collects up to `max_items` items in document order, following
 /// page URLs (at most `max_pages` extra requests). Fails when a followed page fails, so a
-/// truncated list is never mistaken for the whole context (see [`resolve_prefix`]).
+/// truncated list is never mistaken for the whole context (see [`resolve_prefix`]); stopping at
+/// the budget is fine here (see [`resolve_within`]).
 pub(crate) async fn resolve(
     session: &Session,
     context_uri: &str,
     max_items: usize,
     max_pages: usize,
 ) -> AppResult<Vec<ContextItem>> {
-    let r = resolve_prefix(session, context_uri, max_items, max_pages).await?;
-    match r.incomplete {
+    Ok(resolve_within(session, context_uri, max_items, max_pages).await?.items)
+}
+
+/// Like [`resolve`], keeping [`Resolved::truncated`] for callers that need the whole context.
+pub(crate) async fn resolve_within(
+    session: &Session,
+    context_uri: &str,
+    max_items: usize,
+    max_pages: usize,
+) -> AppResult<Resolved> {
+    let mut r = resolve_prefix(session, context_uri, max_items, max_pages).await?;
+    match r.incomplete.take() {
         Some(e) => Err(e),
-        None => Ok(r.items),
+        None => Ok(r),
     }
 }
 
@@ -113,6 +126,7 @@ async fn collect<'a>(
     let mut requests = 0;
     'pages: for page in pages {
         if out.items.len() >= max_items {
+            out.truncated = !page.tracks.is_empty() || non_empty(page.page_url.as_deref()).is_some();
             break;
         }
         let mut next = if page.tracks.is_empty() {
@@ -123,6 +137,8 @@ async fn collect<'a>(
         };
         while let Some(url) = next.take() {
             if out.items.len() >= max_items || requests >= max_pages {
+                // A page is left unread.
+                out.truncated = true;
                 break 'pages;
             }
             requests += 1;
@@ -139,7 +155,10 @@ async fn collect<'a>(
             }
         }
     }
-    out.items.truncate(max_items);
+    if out.items.len() > max_items {
+        out.items.truncate(max_items);
+        out.truncated = true;
+    }
     out
 }
 
@@ -227,7 +246,7 @@ mod tests {
             async move { parse_page(&body.ok_or_else(|| AppError::not_found(url))?) }.boxed()
         };
         let r = collect(&ctx.pages, 100, 10, &fetch).await;
-        assert!(r.incomplete.is_none());
+        assert!(r.incomplete.is_none() && !r.truncated);
         assert_eq!(*log.lock(), ["N0", "N1", "P1", "P1b", "P2"]);
         assert_eq!(
             uris(&r),
@@ -239,10 +258,19 @@ mod tests {
         let r = collect(&ctx.pages, 3, 10, &fetch).await;
         assert_eq!(uris(&r), ["spotify:track:a", "spotify:track:n0", "spotify:track:n1"]);
         assert_eq!(*log.lock(), ["N0", "N1"]);
-        // So does the request budget; neither is a failure.
+        // So does the request budget; neither is a failure, but both are reported.
+        assert!(r.incomplete.is_none() && r.truncated, "pages P1, P2 left unread");
         let r = collect(&ctx.pages, 100, 1, &fetch).await;
-        assert!(r.incomplete.is_none());
+        assert!(r.incomplete.is_none() && r.truncated, "N1 left unread");
         assert_eq!(uris(&r), ["spotify:track:a", "spotify:track:n0"]);
+        // The budget filled up with the next page of a chain still unread.
+        let r = collect(&ctx.pages, 2, 10, &fetch).await;
+        assert!(r.truncated);
+        assert_eq!(r.items.len(), 2);
+        // A budget the context fits into exactly is not a truncation.
+        let r = collect(&ctx.pages, 6, 5, &fetch).await;
+        assert!(!r.truncated);
+        assert_eq!(r.items.len(), 6);
     }
 
     #[tokio::test]

@@ -23,6 +23,11 @@ type Cache = Mutex<LruCache<String, (Instant, Option<Lyrics>)>>;
 static CACHE: LazyLock<Cache> =
     LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap_or(NonZeroUsize::MIN))));
 
+/// Drops cached lyrics (logout / account switch; availability depends on the account's market).
+pub(crate) fn forget_account() {
+    CACHE.lock().clear();
+}
+
 fn lenient_u64<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     Ok(match Value::deserialize(d)? {
         Value::String(s) => s.trim().parse::<f64>().map(|f| f.max(0.0) as u64).unwrap_or(0),

@@ -419,7 +419,7 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.recentlyPlayed` | `{"limit":50}` | `{"items":[MediaRef]}` |
 | `catalog.user` | `{"username"?}` | `User` (me when omitted; other users include their `publicPlaylists`) |
 | `library.playlists` | `{}` | `{"items":[RootlistEntry],"partial"?:true}` (rootlist, folders preserved; entries without decorations are named through cached header lookups, ≤100 requests per call; deleted/inaccessible playlists are remembered for 30 min; `partial` when some names could not be looked up yet and those playlists are missing) |
-| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}],"partial"?}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` (no metadata involved: the membership source for downloads) |
+| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}],"partial"?}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` (no metadata involved: the membership source for downloads). Library sets are read whole or not at all; only the context-resolve fallback can stop at its budget (20 000 items / 200 pages): pages are then `partial`, and `urisOnly` fails with `UNAVAILABLE` instead of listing a prefix as the whole collection |
 | `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"≤500}` | paged `{"total","items":[…],"partial"?}` |
 | `library.contains` | `{"uris":[…]}` | `{"contains":[bool]}` |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
@@ -803,6 +803,11 @@ Native catalog strategy (Rust `catalog/`):
   rootlist playlists (incl. followed Made-For-You mixes), followed artists and radio
   stations seeded from recent tracks. Liked Songs → context-resolve when `collection/v2/paging`
   fails (not when offline or rate limited); the resolved list is reused for 60 s.
+* **Per-account caches** (library set snapshots, the Liked Songs fallback, the rootlist,
+  playlist headers, lyrics, the pathfinder token state) are tagged with the username they were
+  read for and never served to another account (a load that finishes after a logout included).
+  `session.logout` drops them (`catalog::clear_user_state`, next to `metadata::clear_cache`),
+  and a login as another account without a logout drops them on first use.
 * The public Web API is never used by default.
 
 
