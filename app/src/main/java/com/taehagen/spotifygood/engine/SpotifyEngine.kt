@@ -217,15 +217,32 @@ class SpotifyEngine(
         ready.await()
     }
 
-    /** Suspends until ONLINE (acquire a holder first) or the timeout/error; returns success. */
+    /**
+     * Suspends until ONLINE (acquire a holder first) and returns true. Returns false at the
+     * timeout, in offline mode, when logged out, and promptly once the session is OFFLINE,
+     * ERROR, or STOPPED with no start coming.
+     */
     suspend fun awaitOnline(timeoutMs: Long = 30_000): Boolean {
         val online = withTimeoutOrNull(timeoutMs) {
             ready.await()
             combine(state, settings.settings) { s, prefs -> s to prefs.offlineMode }
-                .first { (s, offlineMode) -> s.session == SessionState.ONLINE || offlineMode || cannotGoOnline(s) }
+                .first { (s, offlineMode) ->
+                    s.session == SessionState.ONLINE || offlineMode || cannotGoOnline(s) || notGoingOnlineNow(s)
+                }
                 .first.session == SessionState.ONLINE
         }
         return online == true
+    }
+
+    /**
+     * States in which waiting for ONLINE is pointless right now, so [awaitOnline] returns false
+     * at once: OFFLINE (the network is gone), ERROR (halted; a retry needs a new start), and
+     * STOPPED unless a `session.start` is under way or about to be issued.
+     */
+    private fun notGoingOnlineNow(s: EngineState): Boolean = when (s.session) {
+        SessionState.OFFLINE, SessionState.ERROR -> true
+        SessionState.STOPPED -> !(running || (holderCount > 0 && (credentials != null || loginPending)))
+        SessionState.CONNECTING, SessionState.RECONNECTING, SessionState.ONLINE -> false
     }
 
     /** First login: hands the OAuth access token to the engine; reusable credentials follow via events. */
