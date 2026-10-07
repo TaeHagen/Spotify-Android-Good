@@ -531,7 +531,10 @@ For a remote active device, smart shuffle is not supported (the command reports
   starts audio on its own at launch.
 * **Visibility**: the phone is listed only while it can play. Kotlin sets `connectVisible`
   while a UI (app in the foreground), PLAYBACK or PRESENCE holder is held; a DOWNLOAD holder
-  alone and the idle grace keep it hidden. Hidden, the supervisor connects the Session without
+  alone and the idle grace keep it hidden. Becoming visible applies at once; becoming hidden only
+  after 20 s without such a holder (`ConnectVisibility`), because becoming visible again costs a
+  re-login, so a quick switch to another app and back changes nothing. A fresh start uses the
+  holders as they are (a start for downloads alone is hidden from the beginning). Hidden, the supervisor connects the Session without
   Spirc (catalog, downloads and tokens keep working). `connect` then never starts offline
   playback: `player.load`, control, queue and `connect.transfer` fail with `NOT_CONNECTED`
   (controls still reach a running offline queue, volume the local mixer), except while
@@ -875,7 +878,7 @@ current track is cached in memory (LRU) and refreshed via `library.contains`.
 | App visible | Online | yes | none unless playing | none |
 | Playing locally | Online (or offline mode) | yes | mediaPlayback | wake + Wi-Fi |
 | Paused < 10 min | Online | yes | mediaPlayback (Media3 timeout) | none |
-| Paused ≥ 10 min, app background | hidden, stopped 60 s after release | no | none | none |
+| Paused ≥ 10 min, app background | hidden 20 s after release, stopped after 60 s | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
 | Presence opt-in, idle | Online | yes | connectedDevice (low-importance) | none |

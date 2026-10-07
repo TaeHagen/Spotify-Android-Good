@@ -222,16 +222,25 @@ class CredentialStore(context: Context) {
     }
 
     /**
-     * True only when the key definitely can't round-trip data (a silently broken Keystore). A
-     * transient failure of the probe says nothing about the key.
+     * True only when the key definitely can't round-trip data (a silently broken Keystore): a
+     * probe sealed with it right now does not authenticate, or it is permanently invalid. A probe
+     * that can't be sealed or fails for any other reason says nothing about the key.
      */
-    private fun keyIsBroken(): Boolean = try {
+    private fun keyIsBroken(): Boolean {
         val probe = byteArrayOf(0x53, 0x47)
-        !decrypt(encrypt(probe)).contentEquals(probe)
-    } catch (e: Exception) {
-        when (classifyKeystoreFailure(e)) {
-            KeystoreFailure.PERMANENT, KeystoreFailure.DATA -> true
-            KeystoreFailure.RETRYABLE, KeystoreFailure.OTHER -> false
+        val sealed = try {
+            encrypt(probe) // replaces a permanently invalid key by itself
+        } catch (e: Exception) {
+            Log.w(TAG, "Key probe could not encrypt (${e.javaClass.simpleName}); keeping the key")
+            return false
+        }
+        return try {
+            !decrypt(sealed).contentEquals(probe)
+        } catch (e: Exception) {
+            when (classifyKeystoreFailure(e)) {
+                KeystoreFailure.DATA, KeystoreFailure.PERMANENT -> true
+                KeystoreFailure.RETRYABLE -> false
+            }
         }
     }
 
@@ -251,7 +260,8 @@ class CredentialStore(context: Context) {
         } catch (e: Exception) {
             when (classifyKeystoreFailure(e)) {
                 KeystoreFailure.DATA -> {
-                    // The file does not match the key: corrupt, or sealed by a key that no longer exists.
+                    // The tag does not match: the file is corrupt, or sealed by a key that no
+                    // longer exists. Only then is the key itself probed.
                     Log.w(TAG, "$name does not authenticate, discarding")
                     deleteFile(name)
                     if (keyIsBroken()) discardKeyAndSecrets()
@@ -263,7 +273,7 @@ class CredentialStore(context: Context) {
                     discardKeyAndSecrets()
                     null
                 }
-                KeystoreFailure.RETRYABLE, KeystoreFailure.OTHER -> {
+                KeystoreFailure.RETRYABLE -> {
                     Log.w(TAG, "Reading $name failed for now (${e.javaClass.simpleName}); keeping it")
                     throw e
                 }

@@ -13,6 +13,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -386,8 +387,11 @@ class AuthRepository(
             completeLogin(id, token)
             true
         } catch (e: NativeException) {
-            // Account problems are final; anything else falls back to the interactive login.
-            if (e.code == NativeErrorCode.PREMIUM_REQUIRED || e.code == NativeErrorCode.PLAYBACK_REFUSED) throw e
+            // Logged in after all (the account's credentials exist): its account problem is final
+            // and shown by the account screens.
+            if (isAccountRejection(e.code) && engine.isLoggedIn.value) throw e
+            // Otherwise the interactive login follows, where another account can be chosen
+            // (completeLogin dropped the token of an account the engine refused).
             Log.i(TAG, "Login with refreshed token failed (${e.code}), falling back to device login")
             synchronized(lock) {
                 if (id == flowId) tokenObtained = false
@@ -448,7 +452,17 @@ class AuthRepository(
         token.refreshToken?.let { refreshToken ->
             withContext(Dispatchers.IO) { credentialStore.saveRefreshToken(refreshToken) }
         }
-        engine.loginWithAccessToken(token.accessToken, System.currentTimeMillis() + token.expiresIn * 1000)
+        try {
+            engine.loginWithAccessToken(token.accessToken, System.currentTimeMillis() + token.expiresIn * 1000)
+        } catch (e: NativeException) {
+            if (!keepsRefreshToken(e.code, engine.isLoggedIn.value)) {
+                // This account can't use the app (not Premium, refused, rejected): a later
+                // "Log in" must not silently log it in again instead of offering a new code.
+                Log.i(TAG, "Login refused (${e.code}); forgetting its refresh token")
+                withContext(NonCancellable + Dispatchers.IO) { credentialStore.saveRefreshToken(null) }
+            }
+            throw e
+        }
         setState(id, LoginState.Success)
     }
 
@@ -494,3 +508,14 @@ class AuthRepository(
         const val LOOPBACK_TIMEOUT_MS = 5 * 60_000L
     }
 }
+
+/** Engine refusals of the account itself (not of one attempt). */
+internal fun isAccountRejection(code: String?): Boolean =
+    code == NativeErrorCode.PREMIUM_REQUIRED || code == NativeErrorCode.PLAYBACK_REFUSED || code == NativeErrorCode.BAD_CREDENTIALS
+
+/**
+ * Whether the refresh token of a login that failed with [code] is kept: yes for transient
+ * failures (a retry needs no new approval) and while the engine stays logged in; no when the
+ * engine refused a logged-out account, or every later "Log in" would silently reuse it.
+ */
+internal fun keepsRefreshToken(code: String?, loggedIn: Boolean): Boolean = loggedIn || !isAccountRejection(code)

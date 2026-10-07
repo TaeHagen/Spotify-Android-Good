@@ -113,6 +113,7 @@ import coil3.SingletonImageLoader
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.BuildConfig
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.data.ResponseCache
 import com.taehagen.spotifygood.data.settings.LibrarySort
 import com.taehagen.spotifygood.data.settings.LibraryView
 import com.taehagen.spotifygood.data.settings.Settings
@@ -142,6 +143,17 @@ import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 /** Settings state and actions. Mutations run in the app scope so they finish after navigation. */
+/** Cache keys of catalog pages (album, artist, show, playlist pages, home) with track `playable` flags. */
+private const val PLAYABLE_CACHE_PREFIX = "catalog."
+private const val EXPLICIT_APPLY_TIMEOUT_MS = 15_000L
+
+/**
+ * The explicit filter changed: catalog pages (their track `playable` flags) are marked stale,
+ * kept for offline display and refetched when next shown online. Library lists, saved state and
+ * everything else are untouched (no [ResponseCache.clear]).
+ */
+internal suspend fun invalidatePlayableCatalog(cache: ResponseCache) = cache.invalidatePrefix(PLAYABLE_CACHE_PREFIX)
+
 class SettingsViewModel(private val graph: AppGraph) : ViewModel() {
     val settings: StateFlow<Settings> = graph.settings.settings
     val user: StateFlow<User?> = graph.engine.user
@@ -165,12 +177,15 @@ class SettingsViewModel(private val graph: AppGraph) : ViewModel() {
 
     /**
      * "Hide explicit content" (engine: `EngineSettings.filterExplicit`). Cached catalog pages
-     * carry the old `playable` flags, so they are dropped.
+     * carry the old track `playable` flags: once the engine filters with the new value, they are
+     * marked stale (kept for offline display, refetched when next shown online; shown ones reload
+     * at once). Library lists and everything else stay as they are.
      */
     fun setHideExplicit(hide: Boolean) {
         graph.appScope.launch {
             graph.settings.update { it.copy(hideExplicit = hide) }
-            graph.responseCache.clear()
+            graph.engine.awaitSettingsApplied(EXPLICIT_APPLY_TIMEOUT_MS) { it.filterExplicit == hide }
+            invalidatePlayableCatalog(graph.responseCache)
         }
     }
 
