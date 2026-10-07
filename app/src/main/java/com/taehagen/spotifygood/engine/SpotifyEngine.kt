@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioManager
 import android.util.Log
 import com.taehagen.spotifygood.auth.CredentialStore
+import com.taehagen.spotifygood.auth.KeystoreUnavailableException
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.data.settings.toEngineSettings
 import com.taehagen.spotifygood.model.EngineSettings
@@ -49,6 +50,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Who needs the native session to run (docs/ARCHITECTURE.md §9.2). */
@@ -120,6 +122,23 @@ class SpotifyEngine(
     private val holderCounts = IntArray(HolderType.entries.size)
     private var holderTotal = 0
 
+    /**
+     * Whether the phone may be a Spotify Connect target (`EngineSettings.connectVisible`): only
+     * while it can actually play, i.e. the app is in the foreground (UI) or a PLAYBACK / PRESENCE
+     * holder is held. A DOWNLOAD holder alone, or the idle grace, keeps the session without
+     * Spirc. Updated under [holderLock].
+     */
+    private val connectVisible = MutableStateFlow(false)
+
+    /** Caller holds [holderLock]. */
+    private fun updateConnectVisibleLocked() {
+        connectVisible.value = connectVisibleFor(
+            ui = holderCounts[HolderType.UI.ordinal],
+            playback = holderCounts[HolderType.PLAYBACK.ordinal],
+            presence = holderCounts[HolderType.PRESENCE.ordinal],
+        )
+    }
+
     /** Number of holders currently held. */
     val holderCount: Int get() = synchronized(holderLock) { holderTotal }
 
@@ -148,8 +167,11 @@ class SpotifyEngine(
         launchSafe("load-credentials") {
             try {
                 val stored = try {
-                    withContext(Dispatchers.IO) { credentialStore.loadCredentials() }
+                    loadStoredCredentials()
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
+                    // Nothing was deleted: the next process start reads them again.
                     Log.e(TAG, "Loading credentials failed", e)
                     null
                 }
@@ -172,6 +194,26 @@ class SpotifyEngine(
         launchSafe("error-events") { events.errors.collect { onErrorEvent(it) } }
     }
 
+    /**
+     * Reads the stored credentials. A Keystore that is briefly unavailable (keystore2 busy right
+     * after boot) is retried; CredentialStore never deletes anything for such a failure.
+     */
+    private suspend fun loadStoredCredentials(): StoredCredentials? {
+        var delayMs = CREDENTIALS_RETRY_DELAY_MS
+        repeat(CREDENTIALS_LOAD_ATTEMPTS - 1) { attempt ->
+            try {
+                return withContext(Dispatchers.IO) { credentialStore.loadCredentials() }
+            } catch (e: KeystoreUnavailableException) {
+                Log.w(TAG, "Credentials not readable yet (attempt ${attempt + 1}), retrying")
+            } catch (e: IOException) {
+                Log.w(TAG, "Credentials not readable yet (attempt ${attempt + 1}): ${e.javaClass.simpleName}, retrying")
+            }
+            delay(delayMs)
+            delayMs *= 3
+        }
+        return withContext(Dispatchers.IO) { credentialStore.loadCredentials() }
+    }
+
     /** Supplies decrypted download records pushed to `offline.setIndex` whenever the engine starts. */
     fun setOfflineIndexProvider(provider: suspend () -> List<OfflineTrackRecord>) {
         offlineIndexProvider = provider
@@ -181,6 +223,7 @@ class SpotifyEngine(
         synchronized(holderLock) {
             holderCounts[type.ordinal]++
             holderTotal++
+            updateConnectVisibleLocked()
         }
         Log.d(TAG, "acquire $type")
         requestReconcile(acquired = true)
@@ -192,15 +235,32 @@ class SpotifyEngine(
         ready.await()
     }
 
-    /** Suspends until ONLINE (acquire a holder first) or the timeout/error; returns success. */
+    /**
+     * Suspends until ONLINE (acquire a holder first) and returns true. Returns false at the
+     * timeout, in offline mode, when logged out, and promptly once the session is OFFLINE,
+     * ERROR, or STOPPED with no start coming.
+     */
     suspend fun awaitOnline(timeoutMs: Long = 30_000): Boolean {
         val online = withTimeoutOrNull(timeoutMs) {
             ready.await()
             combine(state, settings.settings) { s, prefs -> s to prefs.offlineMode }
-                .first { (s, offlineMode) -> s.session == SessionState.ONLINE || offlineMode || cannotGoOnline(s) }
+                .first { (s, offlineMode) ->
+                    s.session == SessionState.ONLINE || offlineMode || cannotGoOnline(s) || notGoingOnlineNow(s)
+                }
                 .first.session == SessionState.ONLINE
         }
         return online == true
+    }
+
+    /**
+     * States in which waiting for ONLINE is pointless right now, so [awaitOnline] returns false
+     * at once: OFFLINE (the network is gone), ERROR (halted; a retry needs a new start), and
+     * STOPPED unless a `session.start` is under way or about to be issued.
+     */
+    private fun notGoingOnlineNow(s: EngineState): Boolean = when (s.session) {
+        SessionState.OFFLINE, SessionState.ERROR -> true
+        SessionState.STOPPED -> !(running || (holderCount > 0 && (credentials != null || loginPending)))
+        SessionState.CONNECTING, SessionState.RECONNECTING, SessionState.ONLINE -> false
     }
 
     /** First login: hands the OAuth access token to the engine; reusable credentials follow via events. */
@@ -261,13 +321,26 @@ class SpotifyEngine(
         }
     }
 
+    /**
+     * The name zeroconf advertises (and the login screen tells the user to pick): the device-name
+     * setting, else the device model, the same rule as the Connect name.
+     */
+    fun zeroconfDeviceName(): String = settings.settings.value.deviceName.trim().ifBlank { deviceName }
+
     /** Login by letting another Spotify app on the LAN hand over credentials (Spotify Connect zeroconf). */
     suspend fun loginWithZeroconf(timeoutMs: Long = 180_000) {
         ready.await()
         ensureNativeAvailable()
+        val name = settings.awaitLoaded().deviceName.trim().ifBlank { deviceName }
         val result = try {
             withTimeout(timeoutMs + ZEROCONF_GRACE_MS) {
-                rpc.call<ZeroconfResult>("session.zeroconfLogin", buildJsonObject { put("timeoutMs", timeoutMs) })
+                rpc.call<ZeroconfResult>(
+                    "session.zeroconfLogin",
+                    buildJsonObject {
+                        put("timeoutMs", timeoutMs)
+                        put("deviceName", name)
+                    },
+                )
             }
         } catch (e: TimeoutCancellationException) {
             throw NativeException(NativeErrorInfo(NativeErrorCode.NETWORK, "No Spotify app handed over a login"))
@@ -316,8 +389,11 @@ class SpotifyEngine(
         }
     }
 
-    /** Logs out: stops the engine, wipes credentials and user data (downloads included). */
-    suspend fun logout() {
+    /**
+     * Logs out: stops the engine, wipes credentials and user data (downloads included).
+     * Not cancellable: a half-done logout would leave the account behind.
+     */
+    suspend fun logout(): Unit = withContext(NonCancellable) {
         lifecycle.withLock {
             loginPending = false
             stopTimer?.cancel()
@@ -325,8 +401,15 @@ class SpotifyEngine(
             runningJob?.cancel()
             runningJob = null
             generation++
-            // Stops the session natively and clears its caches/credentials file.
-            callQuietly("session.logout", timeoutMs = STOP_TIMEOUT_MS)
+            // Forget the stored credentials first, so a process death during the native
+            // teardown can't log the account back in on the next start.
+            withContext(Dispatchers.IO) { credentialStore.clear() }
+            credentials = null
+            credentialsLoaded = true
+            // Natively: forgets the account, stops the session, deletes its caches. It always
+            // runs to the end (a timeout here only stops the wait) and a later session.start
+            // waits for it.
+            callQuietly("session.logout", timeoutMs = LOGOUT_TIMEOUT_MS)
             startCall?.cancel()
             startCall = null
             networkMonitor.stop()
@@ -335,9 +418,6 @@ class SpotifyEngine(
             offlineIndexPushed = false
             lastSentNetwork = null
             lastSentSettings = null
-            withContext(Dispatchers.IO) { credentialStore.clear() }
-            credentials = null
-            credentialsLoaded = true
             accountError = null
             updateState { EngineState(networkAvailable = it.networkAvailable) }
             _running.value = false
@@ -374,6 +454,7 @@ class SpotifyEngine(
             synchronized(holderLock) {
                 holderCounts[type.ordinal]--
                 holderTotal--
+                updateConnectVisibleLocked()
             }
             Log.d(TAG, "release $type")
             requestReconcile(acquired = false)
@@ -435,6 +516,7 @@ class SpotifyEngine(
         }
         callQuietly("session.setNetworkAvailable", networkArgs(network))
         val engineSettings = settings.awaitLoaded().toEngineSettings(network.metered, deviceName)
+            .copy(connectVisible = connectVisible.value)
         lastSentSettings = engineSettings
         runningJob?.cancel()
         runningJob = launchRunningCollectors()
@@ -454,7 +536,8 @@ class SpotifyEngine(
         startCall?.cancel()
         val gen = ++generation
         val network = networkMonitor.status.value
-        val engineSettings = lastSentSettings ?: settings.awaitLoaded().toEngineSettings(network.metered, deviceName)
+        val engineSettings = (lastSentSettings ?: settings.awaitLoaded().toEngineSettings(network.metered, deviceName))
+            .copy(connectVisible = connectVisible.value)
         updateState { it.copy(session = SessionState.CONNECTING, error = accountError, nextRetryMs = null) }
         val args = SessionStartArgs(credentials = creds, settings = engineSettings, initialVolume = initialVolume())
         Log.i(TAG, "session.start (retry)")
@@ -517,7 +600,9 @@ class SpotifyEngine(
             networkMonitor.status.collect { onNetworkStatus(it) }
         }
         launchLogged("settings") {
-            combine(settings.persisted, networkMonitor.status) { prefs, network -> prefs.toEngineSettings(network.metered, deviceName) }
+            combine(settings.persisted, networkMonitor.status, connectVisible) { prefs, network, visible ->
+                prefs.toEngineSettings(network.metered, deviceName).copy(connectVisible = visible)
+            }
                 .distinctUntilChanged()
                 .collect { engineSettings ->
                     if (engineSettings == lastSentSettings) return@collect
@@ -782,8 +867,17 @@ class SpotifyEngine(
         private const val LOGIN_TIMEOUT_MS = 60_000L
         private const val ZEROCONF_GRACE_MS = 15_000L
         private const val RPC_TIMEOUT_MS = 10_000L
-        private const val STOP_TIMEOUT_MS = 10_000L
+        /**
+         * Above the native bound of `session.stop` (10 s, docs/ARCHITECTURE.md §4.2), so the
+         * result is normally the real one. A timeout is harmless: the native stop runs to the
+         * end and a following `session.start` waits for it.
+         */
+        private const val STOP_TIMEOUT_MS = 15_000L
+        /** `session.logout` = the stop plus deleting the streaming cache. */
+        private const val LOGOUT_TIMEOUT_MS = 30_000L
         private const val OFFLINE_INDEX_TIMEOUT_MS = 30_000L
+        private const val CREDENTIALS_LOAD_ATTEMPTS = 4
+        private const val CREDENTIALS_RETRY_DELAY_MS = 200L
         private const val OFFLINE_INDEX_RETRY_MS = 2_000L
         private const val OFFLINE_INDEX_RETRY_MAX_MS = 60_000L
         private val FATAL_CODES = setOf(NativeErrorCode.BAD_CREDENTIALS, NativeErrorCode.PREMIUM_REQUIRED)
@@ -792,6 +886,12 @@ class SpotifyEngine(
             NativeErrorInfo(NativeErrorCode.INTERNAL, "The playback engine could not be loaded", context = "session")
     }
 }
+
+/**
+ * Spotify Connect visibility for the held holders: listed as a target only while the phone can
+ * play (foreground UI, playback, or the opt-in presence), never for downloads alone.
+ */
+internal fun connectVisibleFor(ui: Int, playback: Int, presence: Int): Boolean = ui > 0 || playback > 0 || presence > 0
 
 /** Largest Spotify Connect / mixer volume. */
 internal const val CONNECT_VOLUME_MAX = 65_535

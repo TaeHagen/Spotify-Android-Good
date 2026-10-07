@@ -91,4 +91,10 @@ class SettingsCodecTest {
         assertEquals(false, e.gapless)
         assertEquals(false, e.normalize)
     }
+
+    @Test
+    fun hideExplicitReachesTheEngine() {
+        assertEquals(false, Settings().toEngineSettings(false, "P").filterExplicit)
+        assertEquals(true, Settings(hideExplicit = true).toEngineSettings(false, "P").filterExplicit)
+    }
 }

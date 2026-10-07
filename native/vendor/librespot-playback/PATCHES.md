@@ -21,8 +21,8 @@ below. `Cargo.lock`, `Cargo.toml.orig` and `.cargo_vcs_info.json` were removed, 
    Android that kills the app.
 3. **Audio-key refusals (librespot #1649 / PR #1763).** Transient key failures are retried. A
    permanent denial aborts the load, and the reason reaches the app.
-4. **Runtime settings.** Downloads, bitrate and normalisation can change without recreating the
-   Player (and with it the Sink / AudioTrack and the Spirc binding).
+4. **Runtime settings.** Downloads, bitrate, normalisation and gapless can change without
+   recreating the Player (and with it the Sink / AudioTrack and the Spirc binding).
 5. **Resources.** Named threads, a 1-worker player runtime instead of one worker per CPU core,
    and a fix for a leaked loader-thread handle.
 
@@ -65,6 +65,7 @@ impl Player {
     pub fn set_offline_source(&self, source: Option<OfflineSourceRef>);
     pub fn set_bitrate(&self, bitrate: Bitrate);
     pub fn set_normalisation(&self, settings: NormalisationSettings);
+    pub fn set_gapless(&self, gapless: bool);
 }
 pub enum PlayerEvent {
     // ...
@@ -96,11 +97,12 @@ arm), which needed no change.
 | `src/lib.rs` | `pub mod offline;` |
 | `src/config.rs` | `PlayerConfig::offline_source` (+ default `None`); `NormalisationSettings` + helpers. |
 | `player.rs` imports | `process::exit` removed; `FutureExt` instead of `TryFutureExt`; new imports. |
-| `player.rs` consts | `AUDIO_KEY_RETRIES = 3`, `AUDIO_KEY_RETRY_DELAY = 1 s`, `PLAYER_RUNTIME_WORKER_THREADS = 1`. |
+| `player.rs` consts | `AUDIO_KEY_RETRIES = 3`, `AUDIO_KEY_RETRY_DELAY = 1 s`, `PLAYER_RUNTIME_WORKER_THREADS = 1`, `LOADER_JOIN_TIMEOUT = 1 s`, `LOADER_JOIN_POLL = 10 ms`, `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT = 250 ms`. |
 | `UnavailableReason`, `KeyFailure`, `classify_audio_key_error` | New. Classification: `is_permanent_denial` → abort; session invalid / `SessionError::NotConnected` → no retry; everything else → retry. |
-| `PlayerCommand` | `SetOfflineSource`, `SetBitrate`, `SetNormalisation` (+ `Debug` arms). |
+| `PlayerCommand` | `SetOfflineSource`, `SetBitrate`, `SetNormalisation`, `SetGapless` (+ `Debug` arms). |
 | `PlayerEvent::Unavailable` | `reason` field. |
-| `Player::new` | `thread::Builder` named `lrs-player`; runtime `new_multi_thread().worker_threads(1).thread_name("lrs-player-rt")`. |
+| `Player::new` | `thread::Builder` named `lrs-player`; runtime `new_multi_thread().worker_threads(1).thread_name("lrs-player-rt")`, ended with `shutdown_timeout(PLAYER_RUNTIME_SHUTDOWN_TIMEOUT)` instead of a plain drop (which waits for every blocking task, e.g. a hanging getaddrinfo). |
+| `impl Drop for PlayerInternal` | Joins the loader threads for at most `LOADER_JOIN_TIMEOUT` in total, then detaches the rest (stock joined every one without a limit; loaders have no network timeout, so a stalled request blocked `Player::drop` for minutes). |
 | `Player::set_*` | New methods. |
 | `PlayerPreload::Loading`, `PlayerState::Loading` | loader output `Result<_, UnavailableReason>` instead of `Result<_, ()>`. |
 | `PlayerTrackLoader::load_track` / `load_remote_track` / `load_local_track` | Return `Result<PlayerLoadedTrackData, UnavailableReason>`. Offline hook. Key retry. No cache deletion after a key failure. Local files: `duration.as_secs().max(1)` (stock divides by zero for files < 1 s). |
@@ -109,7 +111,8 @@ arm), which needed no change.
 | `PlayerState::{is_playing, decoder, playing_to_end_of_track, paused_to_playing, playing_to_paused}`, start-playback check, `handle_player_stop`, `handle_packet` | `exit(1)` → `panic!`. A panic only ends the player thread: `Player::is_invalid()` becomes true and the engine can create a new Player. |
 | `ensure_sink_stopped` | `sink.stop()` error: log, mark the sink closed, call the sink callback (was `exit(1)`). |
 | `normalisation_factor_for`, `handle_set_normalisation` | New. `start_playback` uses the helper; same behaviour. |
-| `PlayerInternal::load_track` | Named thread `lrs-loader`. Sends the full `Result`. Holds `load_handles` while spawning and inserting (stock could leak a finished thread's handle until Player drop). A dropped result sender maps to `Other`. |
+| `PlayerInternal::load_track` | Named thread `lrs-loader`. Sends the full `Result`. Holds `load_handles` while spawning and inserting (stock could leak a finished thread's handle until Player drop). A failed spawn is logged instead of panicking while the guard is held (that poisoned the mutex, and the unwind's `Drop` panicked again, aborting the process); the load ends as `Unavailable(Other)`. A dropped result sender maps to `Other`. |
+| `lock_load_handles`, `LOAD_HANDLES_POISON_MSG` | Every `load_handles` lock (loader thread, `load_track`, `Drop`) ignores poisoning (`PoisonError::into_inner`) instead of `expect`, so no panic can become a double panic in `PlayerInternal::drop`. The constant is removed. |
 
 ## Behaviour notes for the engine
 
@@ -133,6 +136,9 @@ arm), which needed no change.
     keep what they were loaded with.
   * `set_bitrate` only affects streamed tracks. To switch the current track, `stop()` and
     `load(uri, playing, position)`.
+  * `set_gapless` updates `config.gapless`, which `handle_command_load` reads: it applies from
+    the next load (track change). Commands are processed in order, so a load sent after the
+    command sees the new value.
 * **`set_normalisation`** applies from the next packet: the config and knee factor are updated,
   and the current track's gain is recomputed from its normalisation data. `normalisation_type:
   Auto` still follows `set_auto_normalise_as_album`.
@@ -144,6 +150,10 @@ arm), which needed no change.
   * Transient exhaustion → the file is still tried without decryption (some files are not
     encrypted). If that fails → `Unavailable(KeyTemporarilyDenied)`. A cached file is never
     deleted after a key failure.
+* **Bounded drop.** `Player::drop` returns within about `LOADER_JOIN_TIMEOUT` +
+  `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT` plus the current packet. Loaders still running then are
+  detached; the runtime shutdown cancels their I/O, so they end soon after with their result
+  discarded. The engine still bounds its own wait (`player_host::PLAYER_DROP_TIMEOUT`).
 * **Process safety.** Sink `start()`/`stop()` errors no longer exit the process. A failed start
   produces `Playing` then `Paused`. Watch `Player::is_invalid()` for a dead player thread.
 * **Threads.** `lrs-player` (decoding and all Sink calls), `lrs-player-rt` (1 tokio worker:

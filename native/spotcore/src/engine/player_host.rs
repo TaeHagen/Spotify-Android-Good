@@ -3,24 +3,30 @@
 //! * The mixer is created once per process (first `session.start`, with the current Android
 //!   media volume) and never dropped, so the volume survives player re-creation.
 //! * The Player is created once and re-bound to every new Session (`Player::set_session`). It is
-//!   dropped (on a blocking thread: its `Drop` joins the player thread) only on
+//!   dropped (on a blocking thread, bounded: its `Drop` joins the player thread) only on
 //!   `session.stop {releasePlayer:true}`, or replaced when its thread died (`is_invalid`).
+//! * Only the online bind (`bind`) and `detach_session` change the session of an existing
+//!   Player; offline playback uses whatever Player exists.
 //! * Without an online session the Player is bound to a never-connected "offline" Session, so no
 //!   dead online session (and its sockets) is kept alive by the Player.
 //! * One task per Player forwards its events to `connect`; when the channel closes while the
 //!   Player is still current, its thread died and the supervisor rebuilds Player + Spirc.
 
-use super::{config, state, supervisor::Msg};
+use super::{config, explicit, state, supervisor::Msg};
 use crate::audio::{AndroidMixer, AndroidSink};
 use crate::connect;
 use crate::error::AppResult;
 use crate::models::EngineSettings;
 use librespot_core::Session;
 use librespot_playback::mixer::Mixer;
-use librespot_playback::player::{Player, PlayerEventChannel};
+use librespot_playback::player::{Player, PlayerEvent, PlayerEventChannel};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+/// Longest wait for a dropped Player (part of the `session.stop` / `logout` bound).
+pub(crate) const PLAYER_DROP_TIMEOUT: Duration = Duration::from_millis(1500);
 
 struct Host {
     player: Arc<Player>,
@@ -28,9 +34,13 @@ struct Host {
 }
 
 static HOST: Mutex<Option<Host>> = parking_lot::const_mutex(None);
+/// The offline Session last handed to the Player (it plays with it while not online); kept to
+/// apply the explicit filter to it.
+static OFFLINE: Mutex<Option<Session>> = parking_lot::const_mutex(None);
 static MIXER: OnceLock<Arc<AndroidMixer>> = OnceLock::new();
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-/// Serialises Player creation (online bind vs. offline playback).
+/// Serialises Player creation (online bind vs. offline playback). The offline path must never
+/// rebind an existing Player: a connect attempt may have just bound it to the online session.
 static CREATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The process mixer, if a session was ever started.
@@ -59,15 +69,39 @@ pub(crate) fn dead_generation() -> Option<u64> {
     HOST.lock().as_ref().filter(|h| h.player.is_invalid()).map(|h| h.generation)
 }
 
-/// A never-connected Session (offline playback needs no network). Needs the runtime context.
+/// A never-connected Session (offline playback needs no network), with the explicit filter
+/// applied (offline loads check it too). Needs the runtime context.
 pub(crate) fn offline_session() -> Session {
-    Session::new(config::session_config(), None)
+    let session = Session::new(config::session_config(), None);
+    explicit::apply(&session, super::settings().filter_explicit);
+    *OFFLINE.lock() = Some(session.clone());
+    session
 }
 
+/// Applies the explicit filter to the offline Session; `Some(effective)` if it changed.
+pub(crate) fn apply_explicit_filter_offline(filter: bool) -> Option<bool> {
+    let session = OFFLINE.lock().clone()?;
+    explicit::apply(&session, filter)
+}
+
+/// Tells the Player its explicit filter changed (when it turns on, a loaded explicit track is
+/// skipped).
+pub(crate) fn emit_explicit_filter(filter: bool) {
+    if let Some(p) = player() {
+        p.emit_filter_explicit_content_changed_event(filter);
+    }
+}
+
+/// Drops a Player that is no longer in `HOST`, waiting at most [`PLAYER_DROP_TIMEOUT`]: its
+/// `Drop` joins the player thread, which joins the loader threads (bounded in the vendored
+/// player, see PATCHES.md). A drop that takes longer finishes in the background; a new Player
+/// can be created meanwhile (the old one was stopped first, so it no longer writes audio).
 async fn drop_player(player: Arc<Player>) {
     player.stop();
-    if let Err(e) = tokio::task::spawn_blocking(move || drop(player)).await {
-        log::warn!("dropping the player failed: {e}");
+    match tokio::time::timeout(PLAYER_DROP_TIMEOUT, tokio::task::spawn_blocking(move || drop(player))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("dropping the player failed: {e}"),
+        Err(_) => log::warn!("the player is still shutting down, continuing without waiting"),
     }
 }
 
@@ -84,14 +118,18 @@ fn create(session: &Session, settings: &EngineSettings) -> Arc<Player> {
     player
 }
 
-/// Binds `session` to the Player, creating it first if there is none (or it died).
-pub(crate) async fn bind(session: &Session, settings: &EngineSettings) -> Arc<Player> {
+/// The healthy Player, created first if there is none (or it died), under `CREATE`.
+/// `rebind`: bind an existing Player to this session (the online bind); a new Player gets it, or
+/// an offline session when `None`. With `None` an existing Player keeps its session.
+async fn get_or_create(rebind: Option<&Session>, settings: &EngineSettings) -> Arc<Player> {
     let _creating = CREATE.lock().await;
     let dead = {
         let mut host = HOST.lock();
         match host.as_ref() {
             Some(h) if !h.player.is_invalid() => {
-                h.player.set_session(session.clone());
+                if let Some(session) = rebind {
+                    h.player.set_session(session.clone());
+                }
                 return h.player.clone();
             }
             _ => host.take(),
@@ -101,16 +139,24 @@ pub(crate) async fn bind(session: &Session, settings: &EngineSettings) -> Arc<Pl
         log::warn!("player {} died, creating a new one", dead.generation);
         drop_player(dead.player).await;
     }
-    create(session, settings)
+    match rebind {
+        Some(session) => create(session, settings),
+        None => create(&offline_session(), settings),
+    }
 }
 
-/// A Player for the OfflineController (bound to an offline session if it has to be created).
+/// Binds `session` to the Player, creating it first if there is none (or it died).
+pub(crate) async fn bind(session: &Session, settings: &EngineSettings) -> Arc<Player> {
+    get_or_create(Some(session), settings).await
+}
+
+/// A Player for the OfflineController. An existing Player is used as it is (it may be bound to
+/// the online session of a connect attempt that won `CREATE`); a new one gets an offline session.
 pub(crate) async fn ensure_player_for_offline() -> AppResult<Arc<Player>> {
     if let Some(p) = player() {
         return Ok(p);
     }
-    let session = offline_session();
-    Ok(bind(&session, &super::settings()).await)
+    Ok(get_or_create(None, &super::settings()).await)
 }
 
 /// Releases the online session held by the Player (rebinds it to an offline session).
@@ -129,7 +175,8 @@ pub(crate) async fn release() {
     }
 }
 
-/// Applies bitrate / normalisation to the running Player (no re-creation needed).
+/// Applies bitrate / normalisation / gapless to the running Player through its runtime setters
+/// (no re-creation needed). A Player created later is built from the new settings.
 pub(crate) fn apply_settings(old: &EngineSettings, new: &EngineSettings) {
     let Some(p) = player() else { return };
     if config::bitrate(old.bitrate) != config::bitrate(new.bitrate) {
@@ -139,13 +186,20 @@ pub(crate) fn apply_settings(old: &EngineSettings, new: &EngineSettings) {
         p.set_normalisation(config::normalisation(new));
     }
     if old.gapless != new.gapless {
-        log::info!("gapless change applies when the player is recreated");
+        p.set_gapless(new.gapless);
     }
 }
 
 async fn forward_events(generation: u64, mut events: PlayerEventChannel) {
     while let Some(event) = events.recv().await {
+        // Spirc turned the filter off (an attribute mutation or its own report at connect):
+        // re-assert "Hide explicit content" if it is on.
+        let reassert = matches!(event, PlayerEvent::FilterExplicitContentChanged { filter: false })
+            && super::settings().filter_explicit;
         connect::on_player_event(event);
+        if reassert {
+            super::sync_explicit_filter();
+        }
     }
     let current = HOST.lock().as_ref().map(|h| h.generation) == Some(generation);
     if current {

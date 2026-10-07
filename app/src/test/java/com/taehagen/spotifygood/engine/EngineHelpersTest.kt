@@ -22,6 +22,14 @@ class EngineHelpersTest {
     }
 
     @Test
+    fun connectVisibilityFollowsTheHolders() {
+        assertEquals(false, connectVisibleFor(ui = 0, playback = 0, presence = 0))
+        assertEquals(true, connectVisibleFor(ui = 1, playback = 0, presence = 0))
+        assertEquals(true, connectVisibleFor(ui = 0, playback = 1, presence = 0))
+        assertEquals(true, connectVisibleFor(ui = 0, playback = 0, presence = 1))
+    }
+
+    @Test
     fun deviceNames() {
         assertEquals("Pixel 9 Pro", deviceNameFrom("Google", "Pixel 9 Pro"))
         assertEquals("Samsung SM-S928B", deviceNameFrom("samsung", "SM-S928B"))

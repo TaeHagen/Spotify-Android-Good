@@ -54,6 +54,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -81,6 +82,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
@@ -88,7 +90,6 @@ import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.auth.LoginState
-import com.taehagen.spotifygood.engine.defaultDeviceName
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.ui.appViewModel
@@ -110,18 +111,12 @@ class LoginViewModel(private val graph: AppGraph) : ViewModel() {
         .map { it.error }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), graph.engine.state.value.error)
 
-    /** Name other Spotify apps see during zeroconf login. */
-    val deviceName: String
-        get() = graph.settings.settings.value.deviceName.ifBlank { defaultDeviceName() }
+    /** Whether the engine is logged in (a stale [LoginState.Success] then shows the options). */
+    val loggedIn: StateFlow<Boolean> = graph.engine.isLoggedIn
 
-    init {
-        // A device code persisted before process death: resume polling instead of showing options.
-        if (state.value == LoginState.Idle) {
-            viewModelScope.launch {
-                if (graph.auth.hasPendingDeviceLogin() && state.value == LoginState.Idle) graph.auth.startDeviceLogin()
-            }
-        }
-    }
+    /** Name other Spotify apps see during zeroconf login (the same rule the engine uses). */
+    val deviceName: String
+        get() = graph.engine.zeroconfDeviceName()
 
     fun startDeviceLogin() = graph.auth.startDeviceLogin()
     fun openApprovalPage(activity: Activity) = graph.auth.openApprovalPage(activity)
@@ -129,32 +124,52 @@ class LoginViewModel(private val graph: AppGraph) : ViewModel() {
     fun startZeroconfLogin(context: Context) = graph.auth.startZeroconfLogin(context)
     fun cancel() = graph.auth.cancel()
 
+    /** Visible (ON_START, first composition): resumes a paused or persisted device login. */
+    fun onScreenShown() = graph.auth.onLoginScreenShown()
+
+    /** Hidden (ON_STOP, left composition): stops zeroconf, pauses device-code polling. */
+    fun onScreenHidden() = graph.auth.onLoginScreenHidden()
+
     override fun onCleared() {
         // The login screen is left for good (activity finished, not a configuration change):
         // stop polling / LAN advertising. Process death keeps the persisted device code.
-        when (state.value) {
-            is LoginState.AwaitingApproval, LoginState.WaitingForBrowser, LoginState.WaitingForDevice -> graph.auth.cancel()
-            else -> Unit
-        }
+        graph.auth.onLoginScreenLeft()
     }
 }
 
-private enum class LoginStep { OPTIONS, DEVICE_CODE, BROWSER, ZEROCONF, CONNECTING }
+internal enum class LoginStep { OPTIONS, DEVICE_CODE, BROWSER, ZEROCONF, CONNECTING }
 
-private fun LoginState.step(): LoginStep = when (this) {
+/**
+ * The card for [state]. A [LoginState.Success] while logged out is stale (a logout or rejected
+ * credentials undid it): the options are shown, never an endless "Connecting".
+ */
+internal fun loginStep(state: LoginState, loggedIn: Boolean): LoginStep = when (state) {
     LoginState.Idle, is LoginState.Failed -> LoginStep.OPTIONS
     is LoginState.AwaitingApproval -> LoginStep.DEVICE_CODE
     LoginState.WaitingForBrowser -> LoginStep.BROWSER
     LoginState.WaitingForDevice -> LoginStep.ZEROCONF
-    LoginState.Connecting, LoginState.Success -> LoginStep.CONNECTING
+    LoginState.Connecting -> LoginStep.CONNECTING
+    LoginState.Success -> if (loggedIn) LoginStep.CONNECTING else LoginStep.OPTIONS
 }
 
 @Composable
 fun LoginScreen(modifier: Modifier = Modifier) {
     val vm = appViewModel { LoginViewModel(it) }
     val state by vm.state.collectAsStateWithLifecycle()
+    val loggedIn by vm.loggedIn.collectAsStateWithLifecycle()
     val engineError by vm.engineError.collectAsStateWithLifecycle()
     val activity = LocalActivity.current
+    // Polling and LAN advertising only while the screen is visible (docs/ARCHITECTURE.md §9.3).
+    // A configuration change is not "hidden": the flows survive it.
+    LifecycleEventEffect(Lifecycle.Event.ON_START) { vm.onScreenShown() }
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) {
+        if (activity?.isChangingConfigurations != true) vm.onScreenHidden()
+    }
+    DisposableEffect(vm) {
+        onDispose {
+            if (activity?.isChangingConfigurations != true) vm.onScreenHidden()
+        }
+    }
     val context = LocalContext.current
     val colors = MaterialTheme.colorScheme
     val snackbar = remember { SnackbarHostState() }
@@ -191,7 +206,7 @@ fun LoginScreen(modifier: Modifier = Modifier) {
                 Spacer(Modifier.weight(1f).heightIn(min = 40.dp))
                 Box(Modifier.widthIn(max = 460.dp).fillMaxWidth()) {
                     AnimatedContent(
-                        targetState = state.step(),
+                        targetState = loginStep(state, loggedIn),
                         transitionSpec = { fadeIn(tween(250)) togetherWith fadeOut(tween(150)) },
                         label = "loginStep",
                     ) { step ->

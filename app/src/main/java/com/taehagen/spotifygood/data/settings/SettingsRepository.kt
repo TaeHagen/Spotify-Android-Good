@@ -74,6 +74,7 @@ fun Settings.toEngineSettings(metered: Boolean, defaultDeviceName: String): Engi
     deviceName = deviceName.trim().ifBlank { defaultDeviceName },
     streamingCacheMb = streamingCacheMb,
     offline = offlineMode,
+    filterExplicit = hideExplicit,
 )
 
 /**
@@ -143,6 +144,11 @@ class SettingsRepository(context: Context, scope: CoroutineScope) {
         } catch (e: IOException) {
             Log.e(TAG, "Writing settings failed", e)
         }
+    }
+
+    /** Logout: back to the defaults. Throws when the settings file can't be written. */
+    suspend fun reset() {
+        dataStore.edit { it.clear() }
     }
 
     /** Engine settings for the current network type. */

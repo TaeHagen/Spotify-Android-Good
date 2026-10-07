@@ -25,6 +25,18 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 pub(crate) struct ZeroconfArgs {
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// The name to advertise (what the login screen tells the user to pick). Before the first
+    /// login no `session.start` delivered settings yet, so it can't come from them.
+    #[serde(default)]
+    device_name: Option<String>,
+}
+
+/// The advertised name: the argument, else the Connect name from the settings.
+fn advertised_name(arg: Option<&str>) -> String {
+    match arg.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => name.to_string(),
+        None => config::device_name(&super::settings()),
+    }
 }
 
 /// Owns the discovery; dropping it (normal end or cancellation) shuts the service down.
@@ -61,7 +73,7 @@ pub(crate) async fn login(args: ZeroconfArgs) -> AppResult<Value> {
     let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1_000, MAX_TIMEOUT_MS);
     let mut guard = Guard { discovery: None };
     let discovery = Discovery::builder(runtime::config().device_id.clone(), KEYMASTER_CLIENT_ID.to_string())
-        .name(config::device_name(&super::settings()))
+        .name(advertised_name(args.device_name.as_deref()))
         .device_type(DeviceType::Smartphone)
         .launch()
         .map_err(AppError::from)?;
@@ -84,5 +96,21 @@ pub(crate) async fn login(args: ZeroconfArgs) -> AppResult<Value> {
         }
         Ok(None) => Err(AppError::unavailable("Zeroconf discovery stopped (network or mDNS failure)")),
         Err(_) => Err(AppError::new(ErrorCode::Network, "No device handed over credentials in time")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertises_the_name_from_kotlin() {
+        let args: ZeroconfArgs = rpc::parse_args(json!({"timeoutMs": 1000, "deviceName": " Pixel 9 "})).expect("parse");
+        assert_eq!(advertised_name(args.device_name.as_deref()), "Pixel 9");
+        // Without one (or blank): the Connect name (no settings and no nativeInit here).
+        assert_eq!(advertised_name(Some("  ")), "Android");
+        assert_eq!(advertised_name(None), "Android");
+        let old: ZeroconfArgs = rpc::parse_args(json!({"timeoutMs": 1000})).expect("older callers");
+        assert!(old.device_name.is_none());
     }
 }

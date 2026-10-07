@@ -12,7 +12,6 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.security.GeneralSecurityException
 import java.security.KeyStore
-import java.security.ProviderException
 import java.security.SecureRandom
 import java.security.UnrecoverableKeyException
 import javax.crypto.AEADBadTagException
@@ -28,8 +27,13 @@ import javax.crypto.spec.GCMParameterSpec
  *
  * All methods are thread-safe and blocking (Keystore operations are binder calls): call them off
  * the main thread, except [deviceId], which only touches a tiny plain file once per process.
- * Corrupted ciphertext or an unusable Keystore key never crash: the affected secrets are deleted
- * and the load returns `null`, so the user simply logs in again.
+ *
+ * Failure policy (see [classifyKeystoreFailure]): the key seals the credentials and every
+ * downloaded track's audio key, so it is replaced only when it is gone for good
+ * ([android.security.keystore.KeyPermanentlyInvalidatedException], a corrupted or missing key).
+ * Corrupted ciphertext deletes only that secret. Every other Keystore failure (keystore2 busy,
+ * system errors) is retried and then thrown as [KeystoreUnavailableException], with nothing
+ * deleted and nothing cached, so a later call tries again.
  */
 class CredentialStore(context: Context) {
     private val appContext = context.applicationContext
@@ -64,6 +68,10 @@ class CredentialStore(context: Context) {
     fun hasCredentials(): Boolean =
         if (credentialsLoaded) cachedCredentials != null else File(dir, CREDENTIALS_FILE).exists()
 
+    /**
+     * The stored credentials, or `null` if there are none. Throws [KeystoreUnavailableException]
+     * (or an [IOException]) when they could not be read right now; nothing is cached then.
+     */
     fun loadCredentials(): StoredCredentials? = synchronized(fileLock) {
         if (!credentialsLoaded) {
             cachedCredentials = readSecret(CREDENTIALS_FILE)?.let { bytes ->
@@ -91,9 +99,17 @@ class CredentialStore(context: Context) {
         writeSecret(CREDENTIALS_FILE, json.encodeToString(StoredCredentials.serializer(), credentials).encodeToByteArray())
     }
 
+    /** The stored refresh token; `null` if there is none or it can't be read right now. */
     fun loadRefreshToken(): String? = synchronized(fileLock) {
         if (!refreshTokenLoaded) {
-            cachedRefreshToken = readSecret(REFRESH_TOKEN_FILE)?.decodeToString()?.takeIf { it.isNotBlank() }
+            val token = try {
+                readSecret(REFRESH_TOKEN_FILE)
+            } catch (e: Exception) {
+                // Transient: not cached, the next call tries again.
+                Log.w(TAG, "Refresh token unreadable for now (${e.javaClass.simpleName})")
+                return@synchronized null
+            }
+            cachedRefreshToken = token?.decodeToString()?.takeIf { it.isNotBlank() }
             refreshTokenLoaded = true
         }
         cachedRefreshToken
@@ -125,32 +141,37 @@ class CredentialStore(context: Context) {
 
     /**
      * Encrypts [plain] with the Keystore key. Output: 12-byte IV || ciphertext || 16-byte tag.
-     * A permanently unusable key is replaced (data sealed with it was unreadable anyway).
+     * A permanently invalidated key is replaced (data sealed with it was unreadable anyway).
+     * Throws [KeystoreUnavailableException] when the Keystore keeps failing; the key is kept.
      */
-    fun encrypt(plain: ByteArray): ByteArray {
+    fun encrypt(plain: ByteArray): ByteArray = withKeystoreRetry("encrypt") {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         try {
             cipher.init(Cipher.ENCRYPT_MODE, key())
         } catch (e: Exception) {
-            if (e !is GeneralSecurityException && e !is ProviderException) throw e
-            Log.w(TAG, "Keystore key unusable (${e.javaClass.simpleName}), regenerating")
+            if (classifyKeystoreFailure(e) != KeystoreFailure.PERMANENT) throw e
+            Log.w(TAG, "Keystore key permanently invalid (${e.javaClass.simpleName}), regenerating")
             resetKey()
             cipher.init(Cipher.ENCRYPT_MODE, key())
         }
         val iv = cipher.iv
         check(iv.size == IV_BYTES) { "Unexpected GCM IV length ${iv.size}" }
-        return iv + cipher.doFinal(plain)
+        iv + cipher.doFinal(plain)
     }
 
     /**
-     * Decrypts the output of [encrypt]. Throws [GeneralSecurityException] when the data is
-     * corrupt or was sealed with another key ([AEADBadTagException]) or the key is unusable.
+     * Decrypts the output of [encrypt]. Throws [AEADBadTagException] when the data is corrupt or
+     * was sealed with another key, [KeystoreUnavailableException] when the Keystore keeps failing
+     * (try again later: nothing is lost), or another [GeneralSecurityException] when the key is
+     * permanently invalid ([classifyKeystoreFailure] tells them apart).
      */
     fun decrypt(cipher: ByteArray): ByteArray {
-        if (cipher.size < IV_BYTES + TAG_BYTES) throw GeneralSecurityException("Ciphertext too short")
-        val c = Cipher.getInstance(TRANSFORMATION)
-        c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(TAG_BYTES * 8, cipher, 0, IV_BYTES))
-        return c.doFinal(cipher, IV_BYTES, cipher.size - IV_BYTES)
+        if (cipher.size < IV_BYTES + TAG_BYTES) throw AEADBadTagException("Ciphertext too short")
+        return withKeystoreRetry("decrypt") {
+            val c = Cipher.getInstance(TRANSFORMATION)
+            c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(TAG_BYTES * 8, cipher, 0, IV_BYTES))
+            c.doFinal(cipher, IV_BYTES, cipher.size - IV_BYTES)
+        }
     }
 
     // ---- key management ---------------------------------------------------------------------
@@ -163,7 +184,10 @@ class CredentialStore(context: Context) {
             val existing = try {
                 keyStore.getKey(KEY_ALIAS, null) as? SecretKey
             } catch (e: UnrecoverableKeyException) {
-                Log.w(TAG, "Keystore key unrecoverable, regenerating")
+                // Usually a transient keystore2 failure: rethrown (the caller retries), the key
+                // stays. Only a key that is gone for good is replaced.
+                if (classifyKeystoreFailure(e) != KeystoreFailure.PERMANENT) throw e
+                Log.w(TAG, "Keystore key permanently unrecoverable, regenerating")
                 runCatching { keyStore.deleteEntry(KEY_ALIAS) }
                 null
             }
@@ -197,39 +221,53 @@ class CredentialStore(context: Context) {
         }
     }
 
-    /** True when the current key can round-trip data (detects a silently broken Keystore). */
-    private fun keyWorks(): Boolean = try {
+    /**
+     * True only when the key definitely can't round-trip data (a silently broken Keystore). A
+     * transient failure of the probe says nothing about the key.
+     */
+    private fun keyIsBroken(): Boolean = try {
         val probe = byteArrayOf(0x53, 0x47)
-        decrypt(encrypt(probe)).contentEquals(probe)
+        !decrypt(encrypt(probe)).contentEquals(probe)
     } catch (e: Exception) {
-        false
+        when (classifyKeystoreFailure(e)) {
+            KeystoreFailure.PERMANENT, KeystoreFailure.DATA -> true
+            KeystoreFailure.RETRYABLE, KeystoreFailure.OTHER -> false
+        }
     }
 
     // ---- files (callers hold fileLock) ------------------------------------------------------
 
+    /**
+     * The decrypted secret, `null` if absent or discarded (corrupt, or the key is gone for good).
+     * Throws [KeystoreUnavailableException] or [IOException] when it can't be read right now:
+     * nothing is deleted then.
+     */
     private fun readSecret(name: String): ByteArray? {
         val file = File(dir, name)
         if (!file.exists()) return null
-        val blob = try {
-            file.readBytes()
-        } catch (e: IOException) {
-            Log.w(TAG, "Reading $name failed", e)
-            return null
-        }
+        val blob = file.readBytes()
         return try {
             decrypt(blob)
-        } catch (e: AEADBadTagException) {
-            // The file does not match the key: corrupt, or sealed by a key that no longer exists.
-            Log.w(TAG, "$name does not authenticate, discarding")
-            deleteFile(name)
-            if (!keyWorks()) discardKeyAndSecrets()
-            null
         } catch (e: Exception) {
-            // KeyPermanentlyInvalidatedException, UnrecoverableKeyException, KeyStoreException,
-            // ProviderException ...: the key itself is unusable, so nothing sealed with it is.
-            Log.w(TAG, "Keystore failure reading $name (${e.javaClass.simpleName}), discarding secrets")
-            discardKeyAndSecrets()
-            null
+            when (classifyKeystoreFailure(e)) {
+                KeystoreFailure.DATA -> {
+                    // The file does not match the key: corrupt, or sealed by a key that no longer exists.
+                    Log.w(TAG, "$name does not authenticate, discarding")
+                    deleteFile(name)
+                    if (keyIsBroken()) discardKeyAndSecrets()
+                    null
+                }
+                KeystoreFailure.PERMANENT -> {
+                    // The key itself is gone for good, so nothing sealed with it is readable.
+                    Log.w(TAG, "Keystore key permanently invalid reading $name (${e.javaClass.simpleName}), discarding secrets")
+                    discardKeyAndSecrets()
+                    null
+                }
+                KeystoreFailure.RETRYABLE, KeystoreFailure.OTHER -> {
+                    Log.w(TAG, "Reading $name failed for now (${e.javaClass.simpleName}); keeping it")
+                    throw e
+                }
+            }
         }
     }
 

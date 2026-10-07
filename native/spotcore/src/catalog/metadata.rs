@@ -506,6 +506,10 @@ impl<T: Send + Sync + 'static> Store<T> {
         }
     }
 
+    fn clear(&self) {
+        self.lru.lock().clear();
+    }
+
     /// Any cached value (regardless of age), without touching LRU order.
     pub(crate) fn peek(&self, uri: &str) -> Option<Arc<T>> {
         self.lru.lock().peek(uri).map(|e| e.value.clone())
@@ -632,6 +636,16 @@ impl<T: Send + Sync + 'static> Store<T> {
         .boxed()
         .shared()
     }
+}
+
+/// Forgets all cached entities: `playable` is computed with the session's country and explicit
+/// filter, so a change of either (logout, "Hide explicit content") makes them stale.
+pub(crate) fn clear_cache() {
+    TRACKS.clear();
+    EPISODES.clear();
+    ALBUMS.clear();
+    ARTISTS.clear();
+    SHOWS.clear();
 }
 
 static TRACKS: LazyLock<Store<Track>> = LazyLock::new(|| Store::new(4096, MAX_AGE));

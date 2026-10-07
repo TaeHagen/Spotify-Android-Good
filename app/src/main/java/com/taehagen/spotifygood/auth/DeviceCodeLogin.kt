@@ -160,6 +160,9 @@ internal class PendingDeviceLoginStore(
         if (!f.exists()) return null
         return try {
             oauthJson.decodeFromString<PendingDeviceLogin>(open(f.readBytes()).decodeToString())
+        } catch (e: KeystoreUnavailableException) {
+            // Can't read it right now; it is still valid, so keep it for the next try.
+            null
         } catch (e: Exception) {
             // Unreadable (corrupt, other key): forget it, a new code will be requested.
             f.delete()
