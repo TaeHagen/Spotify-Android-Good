@@ -143,10 +143,10 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
         .catch { emit(LibraryData(isInitialLoading = false, error = it)) }
         .onStart { emit(LibraryData()) }
 
-    private val downloaded: Flow<Set<String>> = graph.downloadedCollectionsFlow()
-        .map { list -> list.map { it.uri }.toSet() }
-        .catch { emit(emptySet()) }
-        .onStart { emit(emptySet()) }
+    /** Every downloaded collection: downloads need not be saved in the library. */
+    private val downloadedCollections: Flow<List<DownloadedCollection>> = graph.downloadedCollectionsFlow()
+        .catch { emit(emptyList()) }
+        .onStart { emit(emptyList()) }
         .distinctUntilChanged()
 
     private val presentation: Flow<Presentation> = combine(
@@ -165,7 +165,8 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
     }.distinctUntilChanged()
 
     /** Listing plus the inputs it was built from, so the UI never mixes old items with new chips. */
-    private val listing: Flow<ListingResult> = combine(data, presentation, downloaded, recentRank) { data, presentation, downloaded, ranks ->
+    private val listing: Flow<ListingResult> = combine(data, presentation, downloadedCollections, recentRank) { data, presentation, collections, ranks ->
+        val downloaded = collections.mapTo(HashSet()) { it.uri }
         ListingResult(
             listing = buildLibraryListing(
                 playlists = data.playlists,
@@ -174,6 +175,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
                 shows = data.shows,
                 query = presentation.query,
                 downloaded = downloaded,
+                downloadedItems = collections.mapNotNull { it.toLibraryItem() },
                 recentRank = ranks,
             ),
             data = data,
