@@ -127,6 +127,76 @@ class PlayerControllerTest {
     }
 
     @Test
+    fun pauseCancelsEveryStartQueuedWhileTheSessionStarts() = runTest {
+        val env = Env(EngineReach.CONNECTING).apply { gate = CompletableDeferred() }
+        val h = Harness(this, env)
+        val load = h.controller.playAsync(PlayRequest(contextUri = playlist, play = false))
+        val skip = h.controller.skipToAsync("uid-1")
+        runCurrent()
+        val pause = h.controller.pauseAsync()
+        env.reach = EngineReach.ONLINE
+        env.gate!!.complete(Unit)
+        assertFalse(load.await())
+        assertFalse(skip.await())
+        assertTrue(pause.await())
+        assertEquals(listOf("player.pause"), h.methods())
+        // A start queued after the pause runs normally.
+        assertTrue(h.controller.resumeAsync().await())
+        assertEquals(listOf("player.pause", "player.play"), h.methods())
+    }
+
+    @Test
+    fun playMergesIntoAPausedLoadThatWasNotSentYet() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE), resume = resumeState("spotify:album:stored"))
+        val controller = h.controller
+        // Media3: setMediaItems (load, play = false), then play().
+        val load = controller.playAsync(PlayRequest(contextUri = playlist, play = false))
+        val play = controller.resumeAsync()
+        assertTrue(load.await())
+        assertTrue(play.await())
+        assertEquals(listOf("player.load"), h.methods())
+        assertEquals("true", h.calls.single().second["play"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun playRightAfterALoadWaitsForActivationInsteadOfLoadingTheStoredSession() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE), resume = resumeState("spotify:album:stored"))
+        var plays = 0
+        h.fail = { method ->
+            when (method) {
+                // The engine activates this device asynchronously after the load.
+                "player.load" -> {
+                    backgroundScope.launch {
+                        kotlinx.coroutines.delay(200)
+                        h.snapshot.value = PlaybackSnapshot(source = PlaybackSource.LOCAL, status = PlaybackStatus.PAUSED, track = PlaybackTrack(uri = t(1)))
+                    }
+                    null
+                }
+                "player.play" -> if (plays++ == 0) NativeException(NativeErrorInfo(NativeErrorCode.NOT_ACTIVE_DEVICE, "inactive")) else null
+                else -> null
+            }
+        }
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, play = false)).await())
+        assertTrue(h.controller.resumeAsync().await())
+        assertEquals(listOf("player.load", "player.play", "player.play"), h.methods())
+    }
+
+    @Test
+    fun playQueuedBehindAFailingLoadIsDropped() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE), resume = resumeState("spotify:album:stored"))
+        h.fail = { if (it == "player.load") NativeException(NativeErrorInfo(NativeErrorCode.UNAVAILABLE, "gone")) else null }
+        val load = h.controller.playAsync(PlayRequest(contextUri = playlist, play = false))
+        // Something queued in between, so the play cannot merge into the load.
+        h.controller.seekAsync(0)
+        val play = h.controller.resumeAsync()
+        assertFalse(load.await())
+        assertFalse(play.await())
+        runCurrent()
+        assertEquals(listOf("player.load", "player.seek"), h.methods())
+        assertEquals("only the load's error", listOf(PlaybackErrorKind.UNAVAILABLE.name), h.errors)
+    }
+
+    @Test
     fun controlCommandsDoNotWaitForTheSession() = runTest {
         val env = Env(EngineReach.CONNECTING).apply { gate = CompletableDeferred() }
         val h = Harness(this, env)
