@@ -61,6 +61,17 @@ class SleepScheduleTest {
     }
 
     @Test
+    fun longHoldsOnlyForAPlayingRemoteDeviceNearTheEndOrTheFinalStage() {
+        val endsAt = now + 6 * minute
+        assertEquals(6 * minute + SleepSchedule.PAUSE_SLACK_MS, SleepSchedule.awakeHoldMs(endsAt, now, remotePlaying = true))
+        assertEquals(SleepSchedule.POKE_AWAKE_MS, SleepSchedule.awakeHoldMs(endsAt, now, remotePlaying = false))
+        // More than the lead before the end: a long hold would expire before it anyway.
+        assertEquals(SleepSchedule.POKE_AWAKE_MS, SleepSchedule.awakeHoldMs(now + 26 * minute, now, remotePlaying = true))
+        // Final stage, whatever plays.
+        assertEquals(8_000 + SleepSchedule.PAUSE_SLACK_MS, SleepSchedule.awakeHoldMs(now + 8_000, now, remotePlaying = false))
+    }
+
+    @Test
     fun trackEndIsTheRemainingTimeMinusTheMargin() {
         assertEquals(now + 149_600, SleepSchedule.trackEndsAt(now, durationMs = 200_000, positionMs = 50_000))
         assertEquals(now, SleepSchedule.trackEndsAt(now, durationMs = 200_000, positionMs = 199_900))

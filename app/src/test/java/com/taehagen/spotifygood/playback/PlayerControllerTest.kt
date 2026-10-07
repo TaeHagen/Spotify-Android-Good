@@ -282,17 +282,20 @@ class PlayerControllerTest {
     }
 
     @Test
-    fun aLoadStopsARunningBulkAdd() = runTest {
+    fun aLoadDoesNotStopARunningBulkAdd() = runTest {
+        // Spirc and remote devices keep the user queue across a load: the rest still belongs to it.
         val h = Harness(this, Env(EngineReach.ONLINE))
         val slow = CompletableDeferred<Unit>()
         h.hold = { method -> if (method == "queue.add") slow.await() }
         val bulk = h.controller.addToQueueCounted(listOf(t(1), t(2), t(3)))
         runCurrent()
         val load = h.controller.playAsync(PlayRequest(contextUri = playlist))
+        h.controller.startRadio(t(9))
         slow.complete(Unit)
-        assertEquals(NativeErrorCode.CANCELLED, bulk.await().error?.code)
         assertTrue(load.await())
-        assertEquals(listOf("queue.add", "player.load"), h.methods())
+        assertEquals(QueueAddResult(3, null), bulk.await())
+        runCurrent()
+        assertEquals(listOf("queue.add", "player.load", "catalog.radio", "queue.add", "queue.add"), h.methods())
     }
 
     @Test
