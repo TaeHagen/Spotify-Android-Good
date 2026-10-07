@@ -527,6 +527,9 @@ fn set_network_available(args: NetworkArgs) -> AppResult<Value> {
     let Some(msg) = report else {
         return ok();
     };
+    // Playback commands waiting for a cluster or a restore check again (nothing comes without a
+    // network, see `connect::should_wait`).
+    crate::connect::on_network_changed();
     match &msg {
         Msg::Network { available, .. } => {
             log::info!("network {}", if *available { "available" } else { "unavailable" });

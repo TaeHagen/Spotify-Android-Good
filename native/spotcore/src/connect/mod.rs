@@ -654,7 +654,6 @@ pub(crate) fn on_player_lost() {
 /// Android's network availability changed: commands waiting for a cluster or a restore check
 /// again (nothing comes without a network, see `should_wait`). Called by
 /// `engine::set_network_available`.
-#[allow(dead_code)] // until the engine side calls it
 pub(crate) fn on_network_changed() {
     hub::changed();
 }
