@@ -23,6 +23,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -238,7 +239,9 @@ fun <T> mergeUnique(existing: List<T>, page: List<T>, keyOf: (T) -> String): Lis
 
 /**
  * Offset paging driven by the UI ("load more near the end"). One request in flight at a time;
- * [reload] keeps the current items visible until the first page arrives. All jobs run in [scope].
+ * [reload] keeps the current items visible until the first page arrives, and that page replaces
+ * them even when it only arrives through a later [loadMore] (the reload failed). All jobs run in
+ * [scope].
  */
 class PagedLoader<T>(
     private val scope: CoroutineScope,
@@ -252,29 +255,39 @@ class PagedLoader<T>(
     private var job: Job? = null
     /** Server offset of the next page ([pageStep]). */
     private var nextOffset = 0
+    /**
+     * A [reload] has not succeeded yet: the next page fetched (offset 0, by a retry or [loadMore])
+     * replaces the items instead of being merged into the stale ones.
+     */
+    private var replacePending = false
 
     /** Loads the next page unless the end was reached or a request is running. Clears errors. */
     fun loadMore() {
         if (job?.isActive == true || _state.value.endReached) return
-        load(replace = false)
+        load()
     }
 
     /** Starts over from offset 0. */
     fun reload() {
         job?.cancel()
         nextOffset = 0
+        replacePending = true
         _state.update { it.copy(endReached = false, error = null) }
-        load(replace = true)
+        load()
     }
 
-    private fun load(replace: Boolean) {
+    private fun load() {
         _state.update { it.copy(isLoading = true, error = null) }
         val offset = nextOffset
+        val replace = replacePending
         job = scope.launch {
             try {
                 val page = fetch(offset, pageSize)
+                // Superseded by a reload meanwhile (a fetch that ignored the cancellation).
+                ensureActive()
                 val (next, ended) = pageStep(offset, pageSize, page.items.size, page.total)
                 nextOffset = next
+                if (replace) replacePending = false
                 _state.update { current ->
                     val base = if (replace) emptyList() else current.items
                     val total = page.total ?: if (replace) null else current.total

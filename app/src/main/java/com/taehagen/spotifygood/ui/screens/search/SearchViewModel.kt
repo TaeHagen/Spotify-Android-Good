@@ -307,10 +307,13 @@ class SearchResultsViewModel(private val graph: AppGraph, private val query: Str
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SearchResultsUiState(type))
 
     init {
-        // First page as soon as we are online (and again after coming back online with nothing loaded).
+        // First page as soon as we are online, and again after coming back online with nothing loaded
+        // or a failed load (e.g. the reload after an explicit-filter change: it then replaces the
+        // stale rows).
         viewModelScope.launch {
             offline.collect { isOffline ->
-                if (!isOffline && loader.state.value.items.isEmpty()) loader.loadMore()
+                val paged = loader.state.value
+                if (!isOffline && (paged.items.isEmpty() || paged.error != null)) loader.loadMore()
             }
         }
         // Loaded pages carry playable flags of the old explicit filter.
@@ -326,6 +329,9 @@ class SearchResultsViewModel(private val graph: AppGraph, private val query: Str
     }
 
     fun playTrack(track: Track) {
+        // Unplayable (explicit with the filter on, not available here): Spirc would skip to
+        // another track of the album.
+        if (!track.playable) return
         onOpened(track.toMediaRef())
         graph.playTrackInAlbum(track)
     }
