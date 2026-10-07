@@ -144,10 +144,10 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
                     state.tracks.isEmpty() && state.filter.isEmpty() -> item(key = "empty", contentType = "state") {
                         EmptyState(
                             title = stringResource(
-                                if (state.offline) R.string.browse_liked_offline_empty_title else R.string.browse_liked_empty_title,
+                                if (state.offline || state.fromDownload) R.string.browse_liked_offline_empty_title else R.string.browse_liked_empty_title,
                             ),
                             message = stringResource(
-                                if (state.offline) R.string.browse_liked_offline_empty_message else R.string.browse_liked_empty_message,
+                                if (state.offline || state.fromDownload) R.string.browse_liked_offline_empty_message else R.string.browse_liked_empty_message,
                             ),
                             icon = Icons.Rounded.Favorite,
                             modifier = Modifier.padding(vertical = 48.dp),

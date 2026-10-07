@@ -98,6 +98,7 @@ internal data class ShowUiState(
     val downloadedCopy: Boolean = false,
     /** The session is ONLINE: episodes that aren't downloaded can start ([canStartNow]). */
     val online: Boolean = true,
+    val filterExplicit: Boolean = false,
 )
 
 internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailViewModel(graph, uri) {
@@ -122,7 +123,10 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         // The show's own first page is listed only in newest-first order.
         val partial = page.partial || (page.sort == EpisodeSort.NEWEST && load.dataOrNull()?.show?.partial == true)
         val downloadedCopy = load.dataOrNull()?.downloadedCopy == true || page.fromDownloads
-        ShowUiState(load, page, playback, following, download, rows, connectivity.offline, partial, downloadedCopy, connectivity.online)
+        ShowUiState(
+            load, page, playback, following, download, rows, connectivity.offline, partial, downloadedCopy,
+            connectivity.online, connectivity.filterExplicit,
+        )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ShowUiState())
 
     init {
@@ -161,6 +165,19 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         val listedFromDownload = header.value.dataOrNull()?.downloadedCopy == true || list.value.fromDownloads
         total = show.total
         firstPage = show.episodes.distinctBy { it.uri }
+        // A stale cached page while the server can't be reached: episodes the sync downloaded since
+        // (this week's, auto-downloaded) go in by date, and the cached total no longer ends the list.
+        var mergedDownloads = false
+        if (resource is Resource.Error && downloadFallbackAllowed(resource.error)) {
+            downloadedCopy()?.let { copy ->
+                val merged = appendDownloadedEpisodes(firstPage, copy.episodes(), newestFirst = true)
+                if (merged.size > firstPage.size) {
+                    firstPage = merged
+                    total = maxOf(total, merged.size)
+                    mergedDownloads = true
+                }
+            }
+        }
         header.value = LoadState.Ready(
             ShowHeader(show.copy(episodes = emptyList()), description),
             refreshing = resource is Resource.Loading,
@@ -176,6 +193,7 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
                 list.update { it.copy(fromDownloads = true) }
             }
         }
+        if (mergedDownloads) list.update { it.copy(fromDownloads = true) }
         val current = list.value
         when {
             current.sort == EpisodeSort.NEWEST -> {

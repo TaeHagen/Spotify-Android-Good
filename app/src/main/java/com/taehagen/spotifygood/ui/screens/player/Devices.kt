@@ -87,6 +87,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 @Immutable
 internal data class DevicesUiState(
@@ -141,6 +142,19 @@ internal sealed interface DevicesEvent {
         val isThisDevice: Boolean,
         val selected: Boolean = false,
     ) : DevicesEvent
+}
+
+/**
+ * Counts the user's device choices (a transfer, a LAN device tapped, the pending target cleared),
+ * so a slow LAN login can tell whether it is still the latest one before moving playback.
+ */
+internal object DevicePicks {
+    private val seq = AtomicLong()
+
+    /** Records a new choice; returns its number. */
+    fun mark(): Long = seq.incrementAndGet()
+
+    fun isLatest(pick: Long): Boolean = seq.get() == pick
 }
 
 /**
@@ -216,6 +230,7 @@ internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
     /** Moves playback; keeps running if [sheet] is dismissed meanwhile (only its result is dropped). */
     fun transferTo(deviceId: String, deviceName: String, sheet: String) {
         if (transferring.value != null) return
+        DevicePicks.mark()
         viewModelScope.launch {
             transferring.value = deviceId
             try {
@@ -443,7 +458,7 @@ private fun DevicesList(
             }
         }
         // Spotify Connect receivers on the local network that aren't in the account yet (§8).
-        item(key = "local") { LocalDevicesSection(localDevices) }
+        item(key = "local") { LocalDevicesSection(localDevices, transferring = state.transferringId != null) }
         item(key = "hint") {
             Text(
                 text = stringResource(R.string.player_devices_hint),

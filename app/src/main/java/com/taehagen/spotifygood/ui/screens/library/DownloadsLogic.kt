@@ -124,6 +124,42 @@ fun canResumeDownloads(activity: DownloadActivity, pendingCount: Int): Boolean =
 
 private val PENDING_STATES = setOf(DownloadState.QUEUED, DownloadState.PREPARING, DownloadState.DOWNLOADING)
 
+/** Explicit per its stored metadata (which is always marked playable). */
+val DownloadEntry.isExplicit: Boolean get() = track?.explicit == true || episode?.explicit == true
+
+/** [content] as shown with Hide explicit content [filter]: explicit entries dimmed. */
+fun DownloadsContent.withExplicitFilter(filter: Boolean): DownloadsContent {
+    if (!filter) return this
+    fun DownloadEntry.filtered() = if (isExplicit) copy(track = track?.withExplicitFilter(true), episode = episode?.withExplicitFilter(true)) else this
+    return copy(songs = songs.map { it.filtered() }, episodes = episodes.map { it.filtered() }, active = active?.filtered())
+}
+
+/** What tapping a song or episode of the Downloads screen does ([planEntryPlay]). */
+sealed interface EntryPlay {
+    /** Play [uris] (the section) from [index]. */
+    data class Tracks(val uris: List<String>, val index: Int) : EntryPlay
+
+    /** Explicit while Hide explicit content is on: the player would refuse it and skip on. */
+    data object Unavailable : EntryPlay
+
+    /** Not downloaded while the session can't stream: another download would play instead. */
+    data object NotDownloaded : EntryPlay
+}
+
+/**
+ * Plays [entry] within its [section]. Unless the session is [online] only completed downloads can
+ * start (a track list loaded while connecting goes to the offline queue, which starts the next
+ * download after an item that isn't one); explicit entries are left out while [filterExplicit].
+ */
+fun planEntryPlay(entry: DownloadEntry, section: List<DownloadEntry>, online: Boolean, filterExplicit: Boolean): EntryPlay {
+    val skipped = { e: DownloadEntry -> filterExplicit && e.isExplicit }
+    if (skipped(entry)) return EntryPlay.Unavailable
+    if (!online && entry.state != DownloadState.COMPLETED) return EntryPlay.NotDownloaded
+    val uris = section.filter { !skipped(it) && (online || it.state == DownloadState.COMPLETED) }.map { it.uri }
+    val index = uris.indexOf(entry.uri)
+    return if (index >= 0) EntryPlay.Tracks(uris, index) else EntryPlay.Tracks(listOf(entry.uri), 0)
+}
+
 /** URIs to play for a downloaded collection: everything online, only completed items offline. */
 fun DownloadedCollection.playableUris(completed: Set<String>, offline: Boolean): List<String> =
     if (offline) itemUris.filter { it in completed } else itemUris

@@ -81,6 +81,7 @@ internal data class ArtistUiState(
     val offline: Boolean = false,
     /** The session is ONLINE: rows that aren't downloaded can start ([canStartNow]). */
     val online: Boolean = true,
+    val filterExplicit: Boolean = false,
 )
 
 internal class ArtistViewModel(graph: AppGraph, private val uri: String) : DetailViewModel(graph, uri) {
@@ -102,7 +103,7 @@ internal class ArtistViewModel(graph: AppGraph, private val uri: String) : Detai
         graph.downloads.statesFor(topTrackUris),
         connectivity,
     ) { load, playback, following, rows, connectivity ->
-        ArtistUiState(load, playback, following, rows, connectivity.offline, connectivity.online)
+        ArtistUiState(load, playback, following, rows, connectivity.offline, connectivity.online, connectivity.filterExplicit)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ArtistUiState())
 
     /** Plays the artist context starting at [track] (top tracks come first in an artist context). */

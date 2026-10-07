@@ -22,10 +22,11 @@ import com.taehagen.spotifygood.ui.screens.library.PagedLoader
 import com.taehagen.spotifygood.ui.screens.library.PagedState
 import com.taehagen.spotifygood.ui.screens.library.attempt
 import com.taehagen.spotifygood.ui.screens.library.debouncedInput
+import com.taehagen.spotifygood.ui.screens.library.explicitFilterChanges
 import com.taehagen.spotifygood.ui.screens.library.nowPlayingFlow
 import com.taehagen.spotifygood.ui.screens.library.offlineFlow
 import com.taehagen.spotifygood.ui.screens.library.playTrackInAlbum
-import com.taehagen.spotifygood.ui.screens.library.startTrack
+import com.taehagen.spotifygood.ui.screens.library.launchTrackStart
 import com.taehagen.spotifygood.ui.screens.library.toBrowseError
 import com.taehagen.spotifygood.ui.screens.library.toMediaRef
 import kotlinx.coroutines.CoroutineScope
@@ -41,9 +42,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
@@ -125,24 +124,6 @@ internal class KeptPages<K : Any, T>(
         pages.loadMore()
     }
 }
-
-/** Longest wait for the engine to apply a changed explicit filter (as Settings waits). */
-private const val EXPLICIT_APPLY_TIMEOUT_MS = 15_000L
-
-/**
- * Emits each time "Hide explicit content" changed and the engine applies it, so results fetched
- * under the old filter (their playable flags) can be dropped. Waiting for the engine keeps a
- * refetch from caching results with the old flags again.
- */
-private fun AppGraph.explicitFilterChanges(): Flow<Boolean> =
-    settings.settings
-        .map { it.hideExplicit }
-        .distinctUntilChanged()
-        .drop(1)
-        .mapLatest { hide ->
-            engine.awaitSettingsApplied(EXPLICIT_APPLY_TIMEOUT_MS) { it.filterExplicit == hide }
-            hide
-        }
 
 class SearchViewModel(private val graph: AppGraph) : ViewModel() {
     /** Text field content: Compose state, so typing never races the UI (debounced below). */
@@ -308,7 +289,7 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         onOpened(ref)
         when (ref.type) {
             MediaType.TRACK -> (sections.byUri[ref.uri] as? SearchItem.Song)?.let { graph.playTrackInAlbum(it.track) }
-                ?: graph.appScope.launch { graph.startTrack(ref.uri, track = null) }
+                ?: graph.launchTrackStart(ref.uri, track = null)
             MediaType.EPISODE -> graph.player.playTracks(listOf(ref.uri))
             else -> graph.player.playContext(ref.uri)
         }
