@@ -711,7 +711,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   so our own starts get the notification and the foreground. The exported service accepts its
   internal actions (START_PRESENCE, RESUME, LOCAL_PLAYBACK) only with a per-process token;
   notification actions (Tap to resume, presence Stop) go through the non-exported
-  `PlaybackActionReceiver`.
+  `PlaybackActionReceiver`. Any start that may have been a `startForegroundService` (ours for
+  LOCAL_PLAYBACK, media buttons, other apps; not our token-tagged plain starts or Media3's
+  start-self intent) that is not in the foreground 3 s later enters and leaves the foreground
+  (own notification id), so the system never kills the app; an unknown start then stops again.
+  Bulk queue adds send one `queue.add` command per item (≤ 80), interleaved with other commands.
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata) persisted on pause and every 15 s while playing.

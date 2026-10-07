@@ -129,6 +129,8 @@ class PlayerController internal constructor(
         val quietCodes: Set<String>,
         /** Starts playback: waits for a starting session, and its failure is kept in [failure]. */
         val startsPlayback: Boolean,
+        /** Failures are the caller's to report (nothing on [errors]). */
+        val silent: Boolean,
         /** Replaced (under [lock]) when a newer value of the same conflatable command arrives. */
         var block: suspend () -> Unit,
     ) {
@@ -384,42 +386,87 @@ class PlayerController internal constructor(
         conflateKey = "volume",
     )
 
+    /**
+     * Media3 controllers' adds (Auto, Wear): like [addToQueueCounted], but a failure is reported
+     * on [errors].
+     */
     internal fun addToQueueAsync(uris: List<String>): Deferred<Boolean> {
         if (uris.isEmpty()) return CompletableDeferred(true)
-        return enqueue("queue.add") {
-            uris.forEach { call("queue.add", buildJsonObject { put("uri", it) }) }
-        }
+        val result = startBulkAdd(uris, reportFailure = true)
+        val ok = CompletableDeferred<Boolean>()
+        result.invokeOnCompletion { ok.complete(runCatching { result.getCompleted().error == null }.getOrDefault(false)) }
+        return ok
     }
 
     /**
-     * Adds [uris] in order (one `queue.add` each) and stops at the first failure, which is returned
-     * instead of reported on [errors]: the caller says what happened (e.g. the engine's "The queue is
-     * full" after part of an album).
+     * Adds [uris] in order (one `queue.add` each, at most [MAX_QUEUE_ADD]) and stops at the first
+     * failure, which is returned instead of reported on [errors]: the caller says what happened
+     * (e.g. the engine's "The queue is full" after part of an album).
+     *
+     * Every add is its own queued command with its own timeout (a remote device costs one request
+     * per item), and the next one is queued only when the previous finished, so other commands
+     * (pause, skip) are not held up behind a long add. Bulk adds run one after the other.
      */
     internal fun addToQueueCounted(uris: List<String>): Deferred<QueueAddResult> {
+        if (uris.isEmpty()) return CompletableDeferred(QueueAddResult(0, null))
+        return startBulkAdd(uris, reportFailure = false)
+    }
+
+    private class BulkAdd(val items: List<String>, val capped: Boolean, val reportFailure: Boolean) {
         val result = CompletableDeferred<QueueAddResult>()
-        if (uris.isEmpty()) return result.apply { complete(QueueAddResult(0, null)) }
-        var added = 0
+        /** Index of the next item (guarded by [lock]). */
+        var next = 0
+    }
+
+    /** Running (first) and waiting bulk adds (guarded by [lock]). */
+    private val bulkAdds = ArrayDeque<BulkAdd>()
+
+    private fun startBulkAdd(uris: List<String>, reportFailure: Boolean): Deferred<QueueAddResult> {
+        val bulk = BulkAdd(uris.take(MAX_QUEUE_ADD), capped = uris.size > MAX_QUEUE_ADD, reportFailure = reportFailure)
+        synchronized(lock) {
+            bulkAdds.addLast(bulk)
+            // Queued right away when nothing else is being added, so it keeps its place in call order.
+            if (bulkAdds.size == 1) enqueueBulkItem(bulk)
+        }
+        return bulk.result
+    }
+
+    private fun enqueueBulkItem(bulk: BulkAdd) {
+        val uri = synchronized(lock) { bulk.items[bulk.next] }
         var error: NativeErrorInfo? = null
-        val done = enqueue("queue.add", timeoutMs = COMMAND_TIMEOUT_MS * (uris.size + 1)) {
-            for (uri in uris) {
-                try {
-                    withTimeout(COMMAND_TIMEOUT_MS) { call("queue.add", buildJsonObject { put("uri", uri) }) }
-                    added++
-                } catch (e: TimeoutCancellationException) {
-                    error = NativeErrorInfo(NativeErrorCode.NETWORK, "The device didn't respond")
-                    break
-                } catch (e: NativeException) {
-                    error = e.info
-                    break
-                }
+        val done = enqueue("queue.add", silent = !bulk.reportFailure) {
+            try {
+                call("queue.add", buildJsonObject { put("uri", uri) })
+            } catch (e: NativeException) {
+                error = e.info
+                throw e
             }
         }
         done.invokeOnCompletion {
-            val ran = runCatching { done.getCompleted() }.getOrDefault(false)
-            result.complete(QueueAddResult(added, error ?: if (ran) null else NativeErrorInfo(NativeErrorCode.CANCELLED, "Not sent")))
+            val ok = runCatching { done.getCompleted() }.getOrDefault(false)
+            onBulkItemDone(bulk, ok, error)
         }
-        return result
+    }
+
+    private fun onBulkItemDone(bulk: BulkAdd, ok: Boolean, error: NativeErrorInfo?) {
+        val next: BulkAdd?
+        synchronized(lock) {
+            if (ok) bulk.next++
+            if (ok && bulk.next < bulk.items.size) {
+                enqueueBulkItem(bulk)
+                return
+            }
+            bulkAdds.removeFirst()
+            next = bulkAdds.firstOrNull()
+        }
+        val failure = when {
+            !ok -> error ?: NativeErrorInfo(NativeErrorCode.NETWORK, "The device didn't respond")
+            // More than a queue holds: what is left would be refused anyway.
+            bulk.capped -> NativeErrorInfo(NativeErrorCode.UNAVAILABLE, "The queue is full")
+            else -> null
+        }
+        bulk.result.complete(QueueAddResult(bulk.next, failure))
+        next?.let(::enqueueBulkItem)
     }
 
     internal fun removeFromQueueAsync(uid: String): Deferred<Boolean> =
@@ -564,6 +611,7 @@ class PlayerController internal constructor(
         timeoutMs: Long = COMMAND_TIMEOUT_MS,
         quietCodes: Set<String> = emptySet(),
         startsPlayback: Boolean = false,
+        silent: Boolean = false,
         onQueued: (Command) -> Unit = {},
         block: suspend () -> Unit,
     ): Deferred<Boolean> {
@@ -577,7 +625,7 @@ class PlayerController internal constructor(
                 last.block = block
                 return last.done
             }
-            val command = Command(name, conflateKey, timeoutMs, quietCodes, startsPlayback, block)
+            val command = Command(name, conflateKey, timeoutMs, quietCodes, startsPlayback, silent, block)
             command.seq = nextSeq++
             onQueued(command)
             lastQueued = command
@@ -674,6 +722,7 @@ class PlayerController internal constructor(
         }
 
     private fun report(command: Command, kind: PlaybackErrorKind, detail: String?) {
+        if (command.silent) return
         val message = errorMessages.message(kind, detail)
         _errors.tryEmit(message)
         if (command.startsPlayback && !snapshot.value.isPlayingOrLoading()) _failure.value = PlaybackFailure(kind, message)
@@ -720,6 +769,9 @@ class PlayerController internal constructor(
 
         /** How long a play after a load waits for the engine to activate this device. */
         private const val ACTIVATION_WAIT_MS = 3_000L
+
+        /** Most items one add-to-queue sends: Connect's queue window holds no more. */
+        const val MAX_QUEUE_ADD = 80
 
         /** Nothing is (or can be) playing: nothing to pause / skip / seek, not worth a message. */
         private val INACTIVE_CODES = setOf(NativeErrorCode.NOT_ACTIVE_DEVICE, NativeErrorCode.NOT_CONNECTED)
