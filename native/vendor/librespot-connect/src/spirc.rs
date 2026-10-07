@@ -189,14 +189,25 @@ struct SuggestionFetch {
     retry_at: Option<Instant>,
     /// consecutive failures, for the backoff
     failures: u32,
+    /// the request in flight, it holds a strong session
+    task: Option<tokio::task::AbortHandle>,
 }
 
 impl SuggestionFetch {
     /// invalidates outstanding results and allows an immediate fetch
     fn restart(&mut self) {
+        self.cancel();
         self.generation += 1;
         self.retry_at = None;
         self.failures = 0;
+    }
+
+    /// aborts the request in flight
+    fn cancel(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.in_flight = false;
     }
 }
 
@@ -281,6 +292,7 @@ const SUGGESTION_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const SUGGESTION_EMPTY_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const SUGGESTION_ERROR_BACKOFF: Duration = Duration::from_secs(30);
 const SUGGESTION_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+const SUGGESTION_TIMEOUT: Duration = Duration::from_secs(20);
 
 // delay to update volume after a certain amount of time, instead on each update request
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
@@ -2285,8 +2297,24 @@ impl SpircTask {
         let session = self.session.clone();
         let tx = self.suggestions_tx.clone();
 
-        tokio::spawn(async move {
-            let result = session.spclient().get_autoplay_context(&request).await;
+        // the handle aborts it when the results become invalid and when the task ends (it holds
+        // a strong session, and spclient retries without an overall timeout)
+        let task = tokio::spawn(async move {
+            let result = if session.is_invalid() {
+                Err(Error::unavailable("the session is invalid"))
+            } else {
+                timeout(
+                    SUGGESTION_TIMEOUT,
+                    session.spclient().get_autoplay_context(&request),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Error::deadline_exceeded(
+                        "smart shuffle suggestions timed out",
+                    ))
+                })
+            };
+            drop(session);
             // fails only if the spirc task already ended
             let _ = tx.send(SuggestionResponse {
                 generation,
@@ -2294,14 +2322,21 @@ impl SpircTask {
                 result,
             });
         });
+        self.suggestion_fetch.task = Some(task.abort_handle());
     }
 
     // SPOTIFYGOOD: smart shuffle, applies fetched suggestions
     fn handle_suggestions(&mut self, response: SuggestionResponse) {
+        // SPOTIFYGOOD: a result of an earlier generation (sent before its task was aborted)
+        // doesn't end the current fetch
+        if response.generation != self.suggestion_fetch.generation {
+            debug!("smart shuffle: discarding outdated suggestions");
+            return;
+        }
         self.suggestion_fetch.in_flight = false;
+        self.suggestion_fetch.task = None;
 
-        if response.generation != self.suggestion_fetch.generation
-            || &response.context_uri != self.connect_state.context_uri()
+        if &response.context_uri != self.connect_state.context_uri()
             || !self.connect_state.smart_shuffle()
         {
             debug!("smart shuffle: discarding outdated suggestions");
@@ -2702,5 +2737,31 @@ impl SpircTask {
 impl Drop for SpircTask {
     fn drop(&mut self) {
         debug!("drop Spirc[{}]", self.spirc_id);
+        // SPOTIFYGOOD: covers every end of the task (also an abort of its future)
+        self.suggestion_fetch.cancel();
+    }
+}
+
+// SPOTIFYGOOD
+#[cfg(test)]
+mod tests {
+    use super::SuggestionFetch;
+
+    #[test]
+    fn restart_aborts_the_suggestion_fetch_in_flight() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut fetch = SuggestionFetch::default();
+            let task = tokio::spawn(std::future::pending::<()>());
+            fetch.in_flight = true;
+            fetch.task = Some(task.abort_handle());
+
+            fetch.restart();
+            assert!(!fetch.in_flight && fetch.task.is_none());
+            assert_eq!(fetch.generation, 1);
+            assert!(task.await.unwrap_err().is_cancelled());
+        });
     }
 }
