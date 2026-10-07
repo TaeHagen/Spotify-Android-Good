@@ -66,6 +66,11 @@ internal class SpotifyPlayer(
     private val playerError: () -> PlaybackException? = { null },
     /** A controller retries (`prepare()`, e.g. Android Auto's retry): drop sticky errors. */
     private val onRetry: () -> Unit = {},
+    /**
+     * A command that needs the engine (play, load, seek, queue, modes, volume) is about to be
+     * sent: the service then holds its engine holder (a pause or stop does not start anything).
+     */
+    private val onCommand: () -> Unit = {},
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
 
     private val context = context.applicationContext
@@ -264,10 +269,13 @@ internal class SpotifyPlayer(
 
     // ---- handlers -------------------------------------------------------------------------------
 
-    override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> =
-        track(if (playWhenReady) controller.resumeAsync() else controller.pauseAsync())
+    override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
+        if (playWhenReady) onCommand()
+        return track(if (playWhenReady) controller.resumeAsync() else controller.pauseAsync())
+    }
 
     override fun handlePrepare(): ListenableFuture<*> {
+        onCommand()
         // Auto's "retry" (and Media3's play button in STATE_IDLE) prepare first.
         controller.clearFailure()
         onRetry()
@@ -282,6 +290,7 @@ internal class SpotifyPlayer(
     }
 
     override fun handleSeek(mediaItemIndex: Int, positionMs: Long, seekCommand: Int): ListenableFuture<*> {
+        onCommand()
         val position = if (positionMs == C.TIME_UNSET) 0 else positionMs.coerceAtLeast(0)
         val w = queueWindow
         return when (seekCommand) {
@@ -312,6 +321,7 @@ internal class SpotifyPlayer(
     }
 
     override fun handleSetShuffleModeEnabled(shuffleModeEnabled: Boolean): ListenableFuture<*> {
+        onCommand()
         val s = playback.snapshot.value
         return if (!shuffleModeEnabled && s.smartShuffle) {
             track(controller.setSmartShuffleAsync(false), controller.setShuffleAsync(false))
@@ -320,17 +330,21 @@ internal class SpotifyPlayer(
         }
     }
 
-    override fun handleSetRepeatMode(repeatMode: Int): ListenableFuture<*> = track(
-        controller.setRepeatAsync(
-            when (repeatMode) {
-                REPEAT_MODE_ALL -> RepeatMode.CONTEXT
-                REPEAT_MODE_ONE -> RepeatMode.TRACK
-                else -> RepeatMode.OFF
-            },
-        ),
-    )
+    override fun handleSetRepeatMode(repeatMode: Int): ListenableFuture<*> {
+        onCommand()
+        return track(
+            controller.setRepeatAsync(
+                when (repeatMode) {
+                    REPEAT_MODE_ALL -> RepeatMode.CONTEXT
+                    REPEAT_MODE_ONE -> RepeatMode.TRACK
+                    else -> RepeatMode.OFF
+                },
+            ),
+        )
+    }
 
     override fun handleSetMediaItems(mediaItems: List<MediaItem>, startIndex: Int, startPositionMs: Long): ListenableFuture<*> {
+        onCommand()
         val plan = MediaIds.plan(mediaItems.map { it.mediaId }, startIndex, downloadedUris)
             ?: return Futures.immediateVoidFuture()
         val request = PlayRequest(
@@ -346,13 +360,15 @@ internal class SpotifyPlayer(
         // with its shuffle / repeat: its item carries them (LibraryTree.resumeItem).
         val withModes = ResumeModes.applyTo(request, mediaItems.singleOrNull()?.requestMetadata?.extras)
         // Media-session loads (Auto, Assistant, watches, resumption) play on this phone, never on
-        // the pending Connect target: in a car, a speaker picked earlier at home would be wrong.
-        return track(controller.playAsync(withModes, toPendingTarget = false), settleMs = LOAD_SETTLE_MS)
+        // the pending Connect target nor on another active device: in a car, a speaker at home
+        // would be wrong (and the stored session must not overwrite what it plays now).
+        return trackLoad(controller.playAsync(withModes, toPendingTarget = false, onThisPhone = true))
     }
 
     override fun handleAddMediaItems(index: Int, mediaItems: List<MediaItem>): ListenableFuture<*> {
         val uris = mediaItems.mapNotNull { MediaIds.itemUriOf(it.mediaId) }
         if (uris.isEmpty()) return Futures.immediateVoidFuture()
+        onCommand()
         return track(controller.addToQueueAsync(uris))
     }
 
@@ -362,6 +378,7 @@ internal class SpotifyPlayer(
         val ops = (maxOf(fromIndex, w.currentIndex + 1) until toIndex)
             .mapNotNull { w.entries.getOrNull(it)?.uid }
             .map { controller.removeFromQueueAsync(it) }
+        if (ops.isNotEmpty()) onCommand()
         return if (ops.isEmpty()) Futures.immediateVoidFuture() else track(*ops.toTypedArray())
     }
 
@@ -371,6 +388,7 @@ internal class SpotifyPlayer(
         if (uid == null || toIndex - fromIndex != 1 || fromIndex <= w.currentIndex || newIndex <= w.currentIndex) {
             return Futures.immediateVoidFuture()
         }
+        onCommand()
         return track(controller.moveInQueueAsync(uid, newIndex - w.currentIndex - 1))
     }
 
@@ -397,6 +415,7 @@ internal class SpotifyPlayer(
 
     /** Sends [percent] to the active (remote) device and remembers it as the base of the next step. */
     private fun sendRemoteVolume(percent: Int): ListenableFuture<*> {
+        onCommand()
         val target = percent.coerceIn(0, 100)
         remoteVolume.set(target, playback.snapshot.value.activeDevice?.id)
         // Re-publish from the snapshot once the target expires unconfirmed (e.g. a failed PUT).
@@ -428,11 +447,25 @@ internal class SpotifyPlayer(
         }
     }
 
+    /**
+     * [track] for a load: completes once the loaded item (or remote playback) shows, or the start
+     * failed ([LoadSettle]), so Media3's placeholder and foreground last over a cold session's
+     * activation; bounded by [LOAD_SETTLE_MS] after the command went through.
+     */
+    private fun trackLoad(op: Deferred<Boolean>): ListenableFuture<*> {
+        val before = playback.snapshot.value
+        return scope.future {
+            if (op.await()) LoadSettle.await(before, playback.snapshot, controller.failure, LOAD_SETTLE_MS)
+            Unit
+        }
+    }
+
     internal companion object {
         /** Skip back / forward of podcast episodes (the Now Playing ±15 s buttons). */
         const val EPISODE_SKIP_MS = 15_000L
         private const val SETTLE_MS = 2_000L
-        private const val LOAD_SETTLE_MS = 8_000L
+        /** A cold context resolve can take a while after the load command went through. */
+        private const val LOAD_SETTLE_MS = 15_000L
         private const val RESTART_THRESHOLD_MS = 3_000L
         private const val VOLUME_STEP_PERCENT = 5
         private const val DEFAULT_UNMUTE_PERCENT = 50

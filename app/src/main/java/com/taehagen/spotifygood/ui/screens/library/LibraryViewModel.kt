@@ -12,6 +12,7 @@ import com.taehagen.spotifygood.data.Resource
 import com.taehagen.spotifygood.data.dataOrNull
 import com.taehagen.spotifygood.data.settings.LibrarySort
 import com.taehagen.spotifygood.data.settings.LibraryView
+import com.taehagen.spotifygood.download.CollectionType
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.Rootlist
@@ -96,7 +97,17 @@ private data class ListingResult(
     val data: LibraryData,
     val presentation: Presentation,
     val downloaded: Set<String>,
+    val collections: List<DownloadedCollection>,
 )
+
+/**
+ * Whether Liked Songs is downloaded. From the downloaded collections themselves: the user (its
+ * URI) is known only after an online session, so a cold start offline would hide it. Logout wipes
+ * downloads, so a Liked Songs download is always this account's.
+ */
+internal fun likedSongsDownloaded(collections: List<DownloadedCollection>, username: String?): Boolean =
+    collections.any { it.type == CollectionType.LIKED_SONGS } ||
+        (username != null && collections.any { it.uri == likedSongsUri(username) })
 
 private data class Extras(
     val likedCount: Int?,
@@ -184,6 +195,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
             data = data,
             presentation = presentation,
             downloaded = downloaded,
+            collections = collections,
         )
     }.flowOn(Dispatchers.Default)
 
@@ -201,8 +213,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
         extras,
         episodesLoader.state,
         episodePartialPages.partial,
-    ) { (listing, data, presentation, downloaded), extras, episodes, episodesPartial ->
-        val likedUri = extras.user?.username?.let(::likedSongsUri)
+    ) { (listing, data, presentation, downloaded, collections), extras, episodes, episodesPartial ->
         val nothing = data.playlists.isEmpty() && data.albums.isEmpty() && data.artists.isEmpty() && data.shows.isEmpty()
         LibraryUiState(
             user = extras.user,
@@ -220,7 +231,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
                 pinnedEntries(
                     query = presentation.query,
                     likedCount = extras.likedCount,
-                    likedDownloaded = likedUri != null && likedUri in downloaded,
+                    likedDownloaded = likedSongsDownloaded(collections, extras.user?.username),
                     downloadCount = extras.downloadCount,
                 )
             },

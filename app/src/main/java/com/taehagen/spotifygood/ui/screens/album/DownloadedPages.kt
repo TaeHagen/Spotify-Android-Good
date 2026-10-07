@@ -15,6 +15,8 @@ import com.taehagen.spotifygood.ui.screens.library.DownloadMetadata
 import com.taehagen.spotifygood.ui.screens.library.DownloadedCollection
 import com.taehagen.spotifygood.ui.screens.library.decodeDownloadMetadata
 import com.taehagen.spotifygood.ui.screens.library.downloadedCollectionsFlow
+import com.taehagen.spotifygood.ui.screens.library.explicitFilterFlow
+import com.taehagen.spotifygood.ui.screens.library.withExplicitFilter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -30,7 +32,9 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * A downloaded album / playlist / show read from the download database: name, image and the items
  * in collection order with the metadata stored at download time ([DownloadedPage.metadata] null:
- * none stored, shown as a placeholder).
+ * none stored, shown as a placeholder). Stored metadata is always marked playable: with
+ * [filterExplicit] (Hide explicit content) explicit items are listed unplayable, as the player
+ * refuses them.
  */
 @Immutable
 internal data class DownloadedPage(
@@ -39,6 +43,7 @@ internal data class DownloadedPage(
     val imageUrl: String?,
     val itemUris: List<String>,
     val metadata: Map<String, DownloadMetadata>,
+    val filterExplicit: Boolean = false,
 ) {
     /** Some items have no stored metadata (placeholders). */
     val partial: Boolean get() = itemUris.any { it !in metadata }
@@ -47,19 +52,19 @@ internal data class DownloadedPage(
 
     /** Tracks in collection order; an item without metadata is a placeholder (docs §6.5). */
     fun tracks(): List<Track> = itemUris.map { uri ->
-        (metadata[uri] as? DownloadMetadata.OfTrack)?.track ?: Track(uri = uri, name = "", playable = false)
+        (metadata[uri] as? DownloadMetadata.OfTrack)?.track?.withExplicitFilter(filterExplicit) ?: Track(uri = uri, name = "", playable = false)
     }
 
     /** Episodes in collection order (newest first, as the show listed them when downloaded). */
     fun episodes(): List<Episode> = itemUris.map { uri ->
-        (metadata[uri] as? DownloadMetadata.OfEpisode)?.episode ?: Episode(uri = uri, name = "", playable = false)
+        (metadata[uri] as? DownloadMetadata.OfEpisode)?.episode?.withExplicitFilter(filterExplicit) ?: Episode(uri = uri, name = "", playable = false)
     }
 
     /** Playlist items in collection order (tracks or episodes). */
     fun playlistItems(): List<PlaylistItem> = itemUris.map { uri ->
         when (val meta = metadata[uri]) {
-            is DownloadMetadata.OfTrack -> PlaylistItem(track = meta.track)
-            is DownloadMetadata.OfEpisode -> PlaylistItem(episode = meta.episode)
+            is DownloadMetadata.OfTrack -> PlaylistItem(track = meta.track.withExplicitFilter(filterExplicit))
+            is DownloadMetadata.OfEpisode -> PlaylistItem(episode = meta.episode.withExplicitFilter(filterExplicit))
             null -> if (uri.startsWith("spotify:episode:")) {
                 PlaylistItem(episode = Episode(uri = uri, name = "", playable = false))
             } else {
@@ -114,14 +119,27 @@ internal fun DownloadedPage.remainingPlaylistItems(shown: Set<String>): List<Pla
     playlistItems().filter { it.uri !in shown }
 
 /**
- * [existing] episodes plus the downloaded ones not listed yet, in [newestFirst] order (or reversed
- * for an oldest-first list): an offline show lists everything it has on disk.
+ * [existing] episodes plus the downloaded ones not listed yet ([downloaded] is newest first), by
+ * release date in [newestFirst] order (or oldest first): an offline show lists everything it has
+ * on disk, and an episode the sync downloaded after the cached page was fetched goes where its
+ * date puts it, not after the cached ones. Equal or unknown dates keep the listed order.
  */
 internal fun appendDownloadedEpisodes(existing: List<Episode>, downloaded: List<Episode>, newestFirst: Boolean): List<Episode> {
     val listed = existing.mapTo(HashSet()) { it.uri }
     val ordered = if (newestFirst) downloaded else downloaded.asReversed()
-    return existing + ordered.filter { listed.add(it.uri) }
+    val added = ordered.filter { listed.add(it.uri) }
+    if (added.isEmpty()) return existing
+    val byDate: Comparator<String> = if (newestFirst) reverseOrder() else naturalOrder()
+    return (existing + added).sortedWith(compareBy(nullsLast(byDate)) { it.releaseDate?.takeIf(String::isNotBlank) })
 }
+
+/**
+ * Whether a cached first page ([pageUris] of [pageTotal] items) shows the playlist as downloaded
+ * ([downloaded], in collection order). When not (the sync added or removed items since the page
+ * was cached), the page offline should be the download: what is listed is what can play.
+ */
+internal fun cachedPageMatchesDownload(pageUris: List<String?>, pageTotal: Int, downloaded: List<String>): Boolean =
+    pageTotal == downloaded.size && pageUris == downloaded.take(pageUris.size)
 
 /** Builds the [DownloadedPage] of [collection]; [decode] reads an item's stored metadata. */
 internal fun downloadedPage(
@@ -146,7 +164,8 @@ internal fun AppGraph.downloadedPageFlow(uri: String): Flow<DownloadedPage?> {
     return combine(
         downloadedCollectionsFlow().map { list -> list.firstOrNull { it.uri == uri } }.distinctUntilChanged(),
         downloads.items,
-    ) { collection, items ->
+        explicitFilterFlow(),
+    ) { collection, items, filterExplicit ->
         if (collection == null) {
             null
         } else {
@@ -154,7 +173,7 @@ internal fun AppGraph.downloadedPageFlow(uri: String): Flow<DownloadedPage?> {
             downloadedPage(collection, byUri) { item ->
                 // Metadata stored with a download never changes: decode each once.
                 decoded[item.uri] ?: decodeDownloadMetadata(json, item.uri, item.metadataJson)?.also { decoded[item.uri] = it }
-            }
+            }.copy(filterExplicit = filterExplicit)
         }
     }.distinctUntilChanged().flowOn(Dispatchers.Default).catch { emit(null) }
 }

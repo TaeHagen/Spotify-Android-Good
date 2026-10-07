@@ -89,6 +89,7 @@ import com.taehagen.spotifygood.ui.navigation.MainTab
 import com.taehagen.spotifygood.ui.navigation.rememberMainNavigator
 import com.taehagen.spotifygood.ui.components.AddToPlaylistSheet
 import com.taehagen.spotifygood.ui.components.MediaActionsSheet
+import com.taehagen.spotifygood.ui.screens.player.DevicePicks
 import com.taehagen.spotifygood.ui.screens.player.DevicesSheet
 import com.taehagen.spotifygood.ui.screens.player.LyricsScreen
 import com.taehagen.spotifygood.ui.screens.player.MiniPlayer
@@ -243,7 +244,10 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
                     // Offline the next play stays on this phone (downloads).
                     pendingDevice = pendingDevice.takeIf { networkAvailable && !offlineMode },
                     onPendingDeviceClick = navigator::openDevices,
-                    onPendingDeviceCancel = graph.devices::clearPendingTarget,
+                    onPendingDeviceCancel = {
+                        DevicePicks.mark()
+                        graph.devices.clearPendingTarget()
+                    },
                 )
             }
 

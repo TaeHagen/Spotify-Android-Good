@@ -168,6 +168,8 @@ class PlayerController internal constructor(
         var sent = false
         /** `player.load` only: a user-started play, which may go to the pending Connect target. */
         var toPendingTarget = false
+        /** `player.load` only: plays on this phone, also over an active remote device (`local`). */
+        var onThisPhone = false
     }
 
     /** How the last start-playback command ended (queue consumer only). */
@@ -344,10 +346,16 @@ class PlayerController internal constructor(
 
     /**
      * `player.load` of [request]. [toPendingTarget]: an in-app play, sent to the pending Connect
-     * target when there is one (see [pendingTargetFor]). The media session's loads (Auto,
-     * Assistant, watches, resumption) never are: they play through this phone's own audio path.
+     * target when there is one (see [pendingTargetFor]). [onThisPhone]: the media session's loads
+     * (Auto, Assistant, watches, resumption, Tap to resume, "play something"), which play through
+     * this phone's own audio path: `local` makes the engine play them here even while another
+     * Connect device is active (a car must not start the speaker at home), never on a target.
      */
-    internal fun playAsync(request: PlayRequest, toPendingTarget: Boolean = false): Deferred<Boolean> {
+    internal fun playAsync(
+        request: PlayRequest,
+        toPendingTarget: Boolean = false,
+        onThisPhone: Boolean = false,
+    ): Deferred<Boolean> {
         if (request.play) onPlaybackRequested?.invoke()
         lateinit var self: Command
         // A running bulk add keeps going: Spirc and remote devices keep the user queue across a
@@ -359,7 +367,8 @@ class PlayerController internal constructor(
             onQueued = { command ->
                 self = command
                 command.request = request
-                command.toPendingTarget = toPendingTarget
+                command.toPendingTarget = toPendingTarget && !onThisPhone
+                command.onThisPhone = onThisPhone
                 latestLoad = command
             },
         ) { sendLoad(self) }
@@ -572,7 +581,7 @@ class PlayerController internal constructor(
             checkNotNull(command.request).play
         }
         val target = if (command.toPendingTarget) pendingTargetFor(prepared, play) else null
-        call("player.load", loadArgs(prepared.request.copy(play = play), deviceId = target))
+        call("player.load", loadArgs(prepared.request.copy(play = play), deviceId = target, local = command.onThisPhone))
     }
 
     /**
@@ -888,8 +897,9 @@ class PlayerController internal constructor(
         /**
          * Runs [method] (`player.play` / `player.togglePlay`). When it fails with a code accepted by
          * [fallBackOn] (see [shouldResumeLast]) it loads the [last] local session instead, through
-         * [prepare] (offline: its downloads). The original error is rethrown when there is nothing to
-         * resume.
+         * [prepare] (offline: its downloads), on this phone (`local`: this phone's session, never
+         * pushed onto a remote device that became active meanwhile). The original error is
+         * rethrown when there is nothing to resume.
          */
         suspend fun resumeOrLoadLast(
             method: String,
@@ -903,7 +913,7 @@ class PlayerController internal constructor(
             } catch (e: NativeException) {
                 if (!fallBackOn(e.code)) throw e
                 val state = last() ?: throw e
-                call("player.load", loadArgs(prepare(state.toPlayRequest())))
+                call("player.load", loadArgs(prepare(state.toPlayRequest()), local = true))
             }
         }
 
@@ -920,8 +930,11 @@ class PlayerController internal constructor(
             return request.copy(contextUri = null, trackUris = listOf(start), startIndex = 0, startUid = null)
         }
 
-        /** `player.load` arguments; [deviceId]: play on that Connect device (the pending target). */
-        fun loadArgs(request: PlayRequest, deviceId: String? = null): JsonObject = buildJsonObject {
+        /**
+         * `player.load` arguments; [deviceId]: play on that Connect device (the pending target);
+         * [local]: play on this phone, pulling playback from an active remote device.
+         */
+        fun loadArgs(request: PlayRequest, deviceId: String? = null, local: Boolean = false): JsonObject = buildJsonObject {
             request.contextUri?.let { put("contextUri", it) }
             request.trackUris?.let { uris -> putJsonArray("trackUris") { uris.forEach { add(it) } } }
             request.startUri?.let { put("startUri", it) }
@@ -933,6 +946,7 @@ class PlayerController internal constructor(
             request.repeat?.let { put("repeat", PlaybackModes.wire(it)) }
             put("play", request.play)
             deviceId?.let { put("deviceId", it) }
+            if (local) put("local", true)
         }
     }
 }

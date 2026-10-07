@@ -635,7 +635,9 @@ For a remote active device, smart shuffle is not supported (the command reports
   `DevicesRepository.pendingTarget`, and the next in-app play or radio start carries it as
   `player.load {deviceId}` (a connect-state `play` command there). Media-session loads (Auto,
   Assistant, watches, resumption), the stored session and offline plays never take it: they
-  play on this phone. It is used once and expires 10 minutes after the pick (also checked when
+  play on this phone, and media-session loads and the stored session are sent with
+  `"local": true`, so they also take playback over from an active remote device instead of
+  being routed onto it. It is used once and expires 10 minutes after the pick (also checked when
   taken, so a timer delayed by Doze cannot let an old pick through); it is cleared too when any
   device becomes active, when this phone is picked, and on logout.
 * **Remote playback in the app**: `PlaybackSnapshot.source == "remote"` is built from the
@@ -774,6 +776,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
   set-media-items (Auto/Assistant/resumption), device volume only when remote (relative
   steps accumulate from the last sent target for 2 s), seek back/forward 15 s for episodes.
+  Handlers complete once the next snapshot arrives (≤ 2 s); set-media-items only once a snapshot
+  shows a track or remote playback, or the start failed (≤ 15 s after the load went through), so
+  Media3's BUFFERING placeholder, and with it the notification and the foreground, lasts over a
+  cold session's trackless snapshots (engine start, Spirc activation before the context resolved).
+  With an empty timeline Media3 drops the notification and the foreground, so the service does
+  not count itself media-foreground then.
   Media button preferences: like/unlike, shuffle (3-state), repeat (3-state); for episodes
   −15 s / +15 s next to play/pause instead of shuffle/repeat. `onSetRating` (HeartRating)
   toggles like. Remote playback: the current item's artist reads "<artists> • Playing on
@@ -797,7 +805,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   active. Media-session loads (`SpotifyPlayer.handleSetMediaItems`: Auto, Assistant, watches,
   Media3 resumption, Tap to resume, "play something"), the Play fallback to the stored session
   and offline plans (offline reach, or rewritten for the offline queue) never take it: they play
-  through this phone (in a car, a speaker picked earlier at home would be wrong).
+  through this phone (in a car, a speaker picked earlier at home would be wrong). Media-session
+  loads and the Play fallback to the stored session carry `"local": true`: they play here even
+  while another Connect device is active (the stored session must not overwrite what that device
+  plays now); in-app plays and radio are routed as usual.
 * `onConnectAsync` grants full commands to Media3-trusted controllers (MEDIA_CONTENT_CONTROL /
   notification listener: SysUI, Bluetooth, watch apps), the media notification, Auto/AAOS, our
   own uid and known system packages (package name verified by Media3); connection hints are not
@@ -816,11 +827,18 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
-  on a mode change and every 15 s while playing. Every resume of it (resumption, Tap to
+  on a mode change and every 15 s while playing, from local snapshots only (`ResumeSaver`):
+  when playback leaves the phone (transfer, takeover, the engine's reset) it is saved once more
+  at that moment and then stays frozen; logging out clears it, through the same writer, so a
+  save in progress never lands after the clear. Every resume of it (resumption, Tap to
   resume, "play something", the Play fallback) loads with its modes, since a load without
   them resets both to off (the Media3 resume item carries them as request extras). Offline the
   load asks for a plain shuffle instead of smart shuffle. States from older versions read with
-  the modes off.
+  the modes off. Only a track of its context is stored with the context; a queued, autoplay or
+  suggested track (or a context that cannot be loaded again) is stored as a track list instead:
+  that track plus the visible next context / autoplay tracks in play order (≤ 50), resumed as a
+  `trackUris` load in that order (shuffle off), because loading the context would start its
+  first track at the saved position. The Media3 resume item carries the list in its extras.
 * Foreground: Media3 default (10 min after pause, then notification becomes dismissable).
   Local audio never plays without it: local audio starting in the background with no service
   (remote "play on this phone" during the idle grace or a download) starts the service with
@@ -830,7 +848,13 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   player so Media3 goes foreground at once). `onForegroundServiceStartNotAllowedException`
   → for local playback pause + "Tap to resume"; while mirroring a remote device the notification
   is posted without the foreground (the remote device is never paused).
-  `onTaskRemoved` default behaviour. Engine holder released when the service is destroyed.
+  `onTaskRemoved` default behaviour. The `PLAYBACK` engine holder is taken on the first
+  playback command (play, load, seek, queue, modes, volume; a pause or stop does not count),
+  a playback resumption for playback, voice "play", Tap to resume, our LOCAL_PLAYBACK start,
+  the media foreground, or a local / mirrored snapshot, and released when the service is
+  destroyed. A browse-only bind (SysUI's resumption card at boot: root + recent; Bluetooth
+  player discovery) never starts the engine; catalog browsing and search (Auto) hold a second
+  `PLAYBACK` holder until 60 s after the browser's last such request.
 * **Opt-in Connect presence** (setting "Stay available for Spotify Connect", default off):
   when enabled and the app goes to background while idle, the service keeps itself in the
   foreground as `connectedDevice` with a low-importance "Available on Spotify Connect"

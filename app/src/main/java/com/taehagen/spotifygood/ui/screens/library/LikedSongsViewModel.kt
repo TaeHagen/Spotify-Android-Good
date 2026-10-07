@@ -25,6 +25,7 @@ import com.taehagen.spotifygood.ui.screens.album.isNetworkClassError
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -34,6 +35,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
@@ -41,6 +43,7 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
@@ -58,7 +61,10 @@ data class LikedSongsUiState(
     val error: BrowseError? = null,
     /** Debounced filter text. */
     val filter: String = "",
+    /** The engine is offline (offline mode, no network, session offline): the banner. */
     val offline: Boolean = false,
+    /** The list is the download (offline, or while the session connects). */
+    val fromDownload: Boolean = false,
     val download: CollectionDownloadStatus = CollectionDownloadStatus.None,
     val isDownloaded: Boolean = false,
     val downloadStates: Map<String, DownloadState> = emptyMap(),
@@ -87,26 +93,67 @@ private data class LikedSource(
     val isLoading: Boolean,
     val canLoadMore: Boolean,
     val error: Throwable?,
+    /** Listing the download: plays then use its track list, not the online context. */
+    val fromDownload: Boolean,
+)
+
+private data class LikedMeta(
+    val download: LikedDownload,
+    val refreshing: Boolean,
+    val partial: Boolean,
     val offline: Boolean,
 )
 
+/** What Liked Songs lists. */
+internal enum class LikedView {
+    /** The downloaded Liked Songs. */
+    DOWNLOADS,
+
+    /** The server's pages (with their loading / error states). */
+    SERVER,
+
+    /** Nothing yet: the session is connecting and nothing is downloaded (a spinner). */
+    WAITING,
+}
+
 /**
- * Whether Liked Songs lists its download instead of the server's pages, by the engine's reach (as
- * playback routes): always offline; while the session isn't ONLINE (connecting, captive portal)
- * when nothing was loaded yet or loading failed for lack of connection; never while ONLINE.
+ * What Liked Songs lists, by the engine's reach (as playback routes): offline the download;
+ * ONLINE the server's pages. While the session connects: loaded pages stay; otherwise the download
+ * when there is one ([hasDownload]), or a spinner while the connect attempt is still worth waiting
+ * for ([awaitingSession]); after a connection failure the download (or the error).
  */
-internal fun likedSongsShowDownloads(reach: EngineReach, loaded: Boolean, error: Throwable?): Boolean = when (reach) {
-    EngineReach.OFFLINE -> true
-    EngineReach.CONNECTING -> !loaded || (error != null && isNetworkClassError(error))
-    EngineReach.ONLINE -> false
+internal fun likedSongsView(
+    reach: EngineReach,
+    loaded: Boolean,
+    error: Throwable?,
+    hasDownload: Boolean,
+    awaitingSession: Boolean,
+): LikedView = when (reach) {
+    EngineReach.OFFLINE -> LikedView.DOWNLOADS
+    EngineReach.ONLINE -> LikedView.SERVER
+    EngineReach.CONNECTING -> when {
+        error != null && isNetworkClassError(error) -> if (hasDownload) LikedView.DOWNLOADS else LikedView.SERVER
+        loaded -> LikedView.SERVER
+        hasDownload -> LikedView.DOWNLOADS
+        awaitingSession -> LikedView.WAITING
+        else -> LikedView.SERVER
+    }
 }
 
 /**
  * Whether the server's pages should be (re)requested: once the session is ONLINE, when nothing is
- * loaded or the last request failed (e.g. it ran while the session was still reconnecting).
+ * loaded or the last request failed (e.g. it ran while the session was still reconnecting). While
+ * it connects, one attempt once waiting stopped being worth it ([awaitingSession] false: captive
+ * portal, retry backoff), so the page shows an answer instead of a spinner.
  */
-internal fun likedSongsNeedsFetch(reach: EngineReach, page: PagedState<*>): Boolean =
-    reach == EngineReach.ONLINE && !page.isLoading && (page.items.isEmpty() || page.error != null)
+internal fun likedSongsNeedsFetch(reach: EngineReach, page: PagedState<*>, awaitingSession: Boolean = false): Boolean = when (reach) {
+    EngineReach.ONLINE -> !page.isLoading && (page.items.isEmpty() || page.error != null)
+    EngineReach.CONNECTING -> !awaitingSession && !page.isLoading && page.items.isEmpty() && page.error == null
+    EngineReach.OFFLINE -> false
+}
+
+/** How long Liked Songs shows a spinner for a connecting session before trying anyway. */
+private const val SESSION_WAIT_MS = 10_000L
 
 private data class LikedDownload(
     val status: CollectionDownloadStatus,
@@ -131,34 +178,73 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     val events: Flow<LibraryMessage> = messages.receiveAsFlow()
     private val messenger = SessionMessenger(graph.app)
 
-    private val contextUri: Flow<String?> = graph.engine.user.map { it?.username?.let(::likedSongsUri) }.distinctUntilChanged()
+    /**
+     * The user is known only after an online session; until then (cold start offline) the
+     * downloaded Liked Songs collection gives the URI (logout wipes downloads: it is this account's).
+     */
+    private val contextUri: Flow<String?> = combine(graph.engine.user, graph.downloadedCollectionsFlow()) { user, collections ->
+        user?.username?.let(::likedSongsUri) ?: collections.firstOrNull { it.type == CollectionType.LIKED_SONGS }?.uri
+    }.distinctUntilChanged()
+
+    private val hasDownload: Flow<Boolean> = graph.downloadedCollectionsFlow()
+        .map { collections -> collections.any { it.type == CollectionType.LIKED_SONGS } }
+        .distinctUntilChanged()
+
+    /**
+     * True while the session connects and waiting for it is still worth it: not once it reported a
+     * retry (backoff), nor after [SESSION_WAIT_MS] (e.g. a captive portal never lets it connect).
+     */
+    private val awaitingSession: Flow<Boolean> =
+        combine(reach, graph.engine.state.map { it.nextRetryMs != null }.distinctUntilChanged(), ::Pair)
+            .transformLatest { (reach, retrying) ->
+                if (reach != EngineReach.CONNECTING || retrying) {
+                    emit(false)
+                } else {
+                    emit(true)
+                    delay(SESSION_WAIT_MS)
+                    emit(false)
+                }
+            }
+            .distinctUntilChanged()
 
     private val filterQuery: Flow<String> = snapshotFlow { filterText }.debouncedInput(FILTER_DEBOUNCE_MS).onStart { emit("") }
 
     private val decoded = ConcurrentHashMap<String, Track>()
 
-    /** Downloaded Liked Songs in collection order (shown while the server can't be reached). */
-    private val offlineTracks: Flow<List<Track>> = combine(graph.downloadedCollectionsFlow(), graph.downloads.items) { collections, items ->
+    /**
+     * Downloaded Liked Songs in collection order (shown while the server can't be reached). Their
+     * stored metadata is always playable: the explicit filter is applied here ([decoded] keeps the
+     * raw tracks).
+     */
+    private val offlineTracks: Flow<List<Track>> = combine(
+        graph.downloadedCollectionsFlow(),
+        graph.downloads.items,
+        graph.explicitFilterFlow(),
+    ) { collections, items, filterExplicit ->
         val liked = collections.firstOrNull { it.type == CollectionType.LIKED_SONGS } ?: return@combine emptyList()
         val completed = items.filter { it.state == DownloadState.COMPLETED }.associateBy { it.uri }
         liked.itemUris.distinct().mapNotNull { uri ->
             val item = completed[uri] ?: return@mapNotNull null
-            decoded[uri] ?: (decodeDownloadMetadata(graph.json, uri, item.metadataJson) as? DownloadMetadata.OfTrack)
+            val track = decoded[uri] ?: (decodeDownloadMetadata(graph.json, uri, item.metadataJson) as? DownloadMetadata.OfTrack)
                 ?.track?.also { decoded[uri] = it }
+            track?.withExplicitFilter(filterExplicit)
         }
     }.distinctUntilChanged().flowOn(Dispatchers.Default)
 
-    private val showDownloads: Flow<Boolean> = combine(reach, pager.state) { reach, page ->
-        likedSongsShowDownloads(reach, loaded = page.items.isNotEmpty(), error = page.error)
+    private val view: Flow<LikedView> = combine(reach, pager.state, hasDownload, awaitingSession) { reach, page, hasDownload, awaiting ->
+        likedSongsView(reach, loaded = page.items.isNotEmpty(), error = page.error, hasDownload = hasDownload, awaitingSession = awaiting)
     }.distinctUntilChanged()
 
-    /** `offline` = listing the download: plays then use its track list, not the online context. */
-    private val source: Flow<LikedSource> = showDownloads.flatMapLatest { downloads ->
-        if (downloads) {
-            offlineTracks.map { LikedSource(it, it.size, isLoading = false, canLoadMore = false, error = null, offline = true) }
-        } else {
-            pager.state.map { page ->
-                LikedSource(page.items.map { it.track }, page.total, page.isLoading, page.canLoadMore, page.error, offline = false)
+    private val source: Flow<LikedSource> = view.flatMapLatest { view ->
+        when (view) {
+            LikedView.DOWNLOADS -> offlineTracks.map {
+                LikedSource(it, it.size, isLoading = false, canLoadMore = false, error = null, fromDownload = true)
+            }
+            LikedView.WAITING -> flowOf(
+                LikedSource(emptyList(), null, isLoading = true, canLoadMore = false, error = null, fromDownload = false),
+            )
+            LikedView.SERVER -> pager.state.map { page ->
+                LikedSource(page.items.map { it.track }, page.total, page.isLoading, page.canLoadMore, page.error, fromDownload = false)
             }
         }
     }
@@ -181,9 +267,11 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         source,
         filterQuery,
         contextUri,
-        combine(download, refreshing, partialPages.partial, ::Triple),
+        combine(download, refreshing, partialPages.partial, reach) { download, refreshing, partial, reach ->
+            LikedMeta(download, refreshing, partial, offline = reach == EngineReach.OFFLINE)
+        },
         graph.nowPlayingFlow(),
-    ) { source, filter, contextUri, (download, refreshing, partial), nowPlaying ->
+    ) { source, filter, contextUri, (download, refreshing, partial, offline), nowPlaying ->
         val visible = if (filter.isEmpty()) source.tracks else source.tracks.filter { it.matches(filter) }
         LikedSongsUiState(
             contextUri = contextUri,
@@ -195,12 +283,13 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             isRefreshing = refreshing,
             error = source.error?.toBrowseError(),
             filter = filter,
-            offline = source.offline,
+            offline = offline,
+            fromDownload = source.fromDownload,
             download = download.status,
             isDownloaded = download.downloaded,
             downloadStates = download.states,
             nowPlaying = nowPlaying,
-            partial = partial && !source.offline,
+            partial = partial && !source.fromDownload,
         )
     }.flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LikedSongsUiState())
@@ -209,7 +298,13 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         // First page once the session is ONLINE (not when a network merely appears: requests fail
         // NOT_CONNECTED while it reconnects); again after reconnecting with nothing loaded or a
         // failed load.
-        reach.onEach { if (likedSongsNeedsFetch(it, pager.state.value)) pager.loadMore() }
+        combine(reach, awaitingSession, ::Pair)
+            .onEach { (reach, awaiting) -> if (likedSongsNeedsFetch(reach, pager.state.value, awaiting)) pager.loadMore() }
+            .launchIn(viewModelScope)
+        // Loaded pages carry the playable flags of the old explicit filter.
+        graph.explicitFilterChanges()
+            .onEach { if (graph.engineReach() == EngineReach.ONLINE) pager.reload() }
+            .catch { }
             .launchIn(viewModelScope)
         // While filtering, fetch the remaining pages so the filter covers every liked song.
         combine(filterQuery, pager.state, reach) { filter, page, reach -> filter.isNotEmpty() && reach == EngineReach.ONLINE && page.canLoadMore }
@@ -244,7 +339,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
 
     /** URIs to play as a track list; placeholders (metadata failed) are left out. */
     private fun playableUris(): List<String> = state.value.let { s ->
-        val tracks = if (s.offline) s.tracks else pager.state.value.items.map { it.track }
+        val tracks = if (s.fromDownload) s.tracks else pager.state.value.items.map { it.track }
         tracks.filter { it.playable && !it.isPlaceholder }.map { it.uri }
     }
 
@@ -263,7 +358,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     private fun play(shuffle: Boolean) {
         val current = state.value
         val context = current.contextUri
-        if (!current.offline && context != null) {
+        if (!current.fromDownload && context != null) {
             graph.player.play(PlayRequest(contextUri = context, shuffle = shuffle))
             return
         }
@@ -279,7 +374,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         if (track.isPlaceholder || !track.playable) return
         val current = state.value
         val context = current.contextUri
-        if (!current.offline && context != null) {
+        if (!current.fromDownload && context != null) {
             graph.player.playContext(context, startUri = track.uri)
         } else {
             val uris = playableUris()

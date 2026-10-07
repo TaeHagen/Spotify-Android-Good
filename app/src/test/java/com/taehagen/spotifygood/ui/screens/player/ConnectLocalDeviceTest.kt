@@ -74,6 +74,37 @@ class ConnectLocalDeviceTest {
             assertEquals("gone", e.message)
         }
     }
+
+    @Test
+    fun aLaterDeviceChoiceKeepsPlaybackWhereItWent() = runTest {
+        // The user picked another device while the slow login ran.
+        var transferred = false
+        val event = connectLocalDevice(
+            "s",
+            "Kitchen",
+            login = { "dev-1" },
+            transfer = { transferred = true },
+            shouldTransfer = { false },
+        )
+        assertEquals(LocalConnectEvent.Added("s", "Kitchen"), event)
+        assertTrue(!transferred)
+    }
+
+    @Test
+    fun aLoginWithoutAnOnlineSessionIsNotAWifiProblem() = runTest {
+        val event = connectLocalDevice("s", "Kitchen", login = { throw native(NativeErrorCode.NOT_CONNECTED) }, transfer = {})
+        assertEquals(LocalConnectEvent.Failed("s", "Kitchen", network = false, offline = true), event)
+        val network = connectLocalDevice("s", "Kitchen", login = { throw native(NativeErrorCode.NETWORK) }, transfer = {})
+        assertEquals(LocalConnectEvent.Failed("s", "Kitchen", network = true, offline = false), network)
+    }
+
+    @Test
+    fun onlyTheLatestDeviceChoiceCounts() {
+        val lan = DevicePicks.mark()
+        assertTrue(DevicePicks.isLatest(lan))
+        DevicePicks.mark() // e.g. a Connect device tapped meanwhile
+        assertTrue(!DevicePicks.isLatest(lan))
+    }
 }
 
 class TransferFailureEventTest {

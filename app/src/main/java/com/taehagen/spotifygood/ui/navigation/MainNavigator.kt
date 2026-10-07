@@ -32,12 +32,10 @@ import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.MediaRef
 import com.taehagen.spotifygood.model.MediaType
-import com.taehagen.spotifygood.ui.screens.library.startTrack
+import com.taehagen.spotifygood.ui.screens.library.launchTrackStart
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 
 /** Top-level destinations shown in the navigation bar / rail. */
 enum class MainTab(
@@ -217,12 +215,9 @@ class MainNavigator internal constructor(
      * downloaded while the session can't stream, is not started: a different track would play.
      */
     fun playTrack(trackUri: String) {
-        graph.appScope.launch {
-            val track = withTimeoutOrNull(TRACK_LOOKUP_TIMEOUT_MS) {
-                runCatching { graph.catalog.tracks(listOf(trackUri)).firstOrNull() }.getOrNull()
-            }
-            graph.startTrack(trackUri, track)
-        }
+        // The track is looked up there, once the session can answer (links mostly arrive while it
+        // is still connecting: cold start, or after the session idled out in the background).
+        graph.launchTrackStart(trackUri, track = null)
     }
 
     private fun switchTo(tab: MainTab) {
@@ -251,7 +246,6 @@ class MainNavigator internal constructor(
     private fun normalized(uri: String): String = SpotifyLinks.canonicalUri(uri) ?: uri
 
     companion object {
-        private const val TRACK_LOOKUP_TIMEOUT_MS = 3_000L
 
         fun tabOf(backStack: List<NavBackStackEntry>): MainTab =
             backStack.asReversed().firstNotNullOfOrNull { entry ->

@@ -4,12 +4,15 @@ import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
+import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.download.DownloadActivity
 import com.taehagen.spotifygood.download.DownloadItem
 import com.taehagen.spotifygood.download.FailedCounts
-import com.taehagen.spotifygood.model.DownloadState
+import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.ui.components.SessionMessenger
+import com.taehagen.spotifygood.ui.screens.album.engineReach
+import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -31,7 +34,12 @@ data class DownloadsUiState(
     val isLoading: Boolean = true,
     val usedBytes: Long = 0,
     val content: DownloadsContent = DownloadsContent(),
+    /** Offline mode or no network: the banner. */
     val offline: Boolean = false,
+    /** The session is ONLINE: entries that aren't downloaded can start ([canStartNow]). */
+    val online: Boolean = true,
+    /** Hide explicit content (or the account's filter) is on: explicit entries don't start. */
+    val filterExplicit: Boolean = false,
     val nowPlaying: NowPlaying = NowPlaying(),
     /** Live downloader state (header progress, why a run stopped). */
     val activity: DownloadActivity = DownloadActivity(),
@@ -64,18 +72,26 @@ class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
         .catch { emit(DownloadsContent()) }
         .onStart<DownloadsContent?> { emit(null) }
 
+    private val connectivity: Flow<Triple<Boolean, Boolean, Boolean>> = combine(
+        graph.offlineFlow(),
+        graph.engineReachFlow(),
+        graph.explicitFilterFlow(),
+    ) { offline, reach, filterExplicit -> Triple(offline, reach == EngineReach.ONLINE, filterExplicit) }
+
     val state: StateFlow<DownloadsUiState> = combine(
         content,
         graph.downloads.usedBytes.onStart { emit(0L) }.catch { emit(0L) },
-        graph.offlineFlow(),
+        connectivity,
         graph.nowPlayingFlow(),
         combine(graph.downloads.activity, graph.downloads.failedCounts.onStart { emit(FailedCounts()) }.catch { emit(FailedCounts()) }, ::Pair),
-    ) { content, used, offline, nowPlaying, (activity, failed) ->
+    ) { content, used, (offline, online, filterExplicit), nowPlaying, (activity, failed) ->
         DownloadsUiState(
             isLoading = content == null,
             usedBytes = used,
-            content = content ?: DownloadsContent(),
+            content = (content ?: DownloadsContent()).withExplicitFilter(filterExplicit),
             offline = offline,
+            online = online,
+            filterExplicit = filterExplicit,
             nowPlaying = nowPlaying,
             activity = activity,
             failed = failed,
@@ -98,16 +114,18 @@ class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
         if (uris.isEmpty()) messages.trySend(LibraryMessage.NOTHING_TO_PLAY) else graph.player.playTracks(uris, 0)
     }
 
-    /** Plays [entry] within its section (songs or episodes); offline only completed items. */
+    /**
+     * Plays [entry] within its section (songs or episodes): unless the session is ONLINE (by the
+     * engine's reach, as playback routes) only completed items; never explicit ones while filtered.
+     */
     fun playEntry(entry: DownloadEntry) {
         val current = state.value
         val section = if (entry.isEpisode) current.content.episodes else current.content.songs
-        val playable = section.filter { !current.offline || it.state == DownloadState.COMPLETED }.map { it.uri }
-        val index = playable.indexOf(entry.uri)
-        when {
-            index >= 0 -> graph.player.playTracks(playable, index)
-            current.offline -> messages.trySend(LibraryMessage.NOTHING_TO_PLAY)
-            else -> graph.player.playTracks(listOf(entry.uri))
+        val online = graph.engineReach() == EngineReach.ONLINE
+        when (val plan = planEntryPlay(entry, section, online, current.filterExplicit)) {
+            is EntryPlay.Tracks -> graph.player.playTracks(plan.uris, plan.index)
+            EntryPlay.Unavailable -> messenger.post(R.string.player_unavailable)
+            EntryPlay.NotDownloaded -> messages.trySend(LibraryMessage.NOTHING_TO_PLAY)
         }
     }
 
