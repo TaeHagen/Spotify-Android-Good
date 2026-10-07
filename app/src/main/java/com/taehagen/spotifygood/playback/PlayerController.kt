@@ -296,8 +296,6 @@ class PlayerController internal constructor(
     /** Starts a radio station seeded by [uri] (track/artist/album/playlist). */
     fun startRadio(uri: String) {
         onPlaybackRequested?.invoke()
-        val cancelled = synchronized(lock) { cancelBulkAddsLocked() }
-        completeCancelled(cancelled)
         enqueue("catalog.radio", timeoutMs = LOAD_TIMEOUT_MS, startsPlayback = true) {
             val radio = json.decodeFromJsonElement<RadioContext>(transport("catalog.radio", buildJsonObject { put("uri", uri) }))
             // The station is normally a playlist context; the fallback station may be a bare track list.
@@ -325,23 +323,18 @@ class PlayerController internal constructor(
     internal fun playAsync(request: PlayRequest): Deferred<Boolean> {
         if (request.play) onPlaybackRequested?.invoke()
         lateinit var self: Command
-        val cancelled: List<BulkAdd>
-        // Something else is loaded: bulk adds still running belong to what was playing.
-        val done = synchronized(lock) {
-            cancelled = cancelBulkAddsLocked()
-            enqueue(
-                "player.load",
-                timeoutMs = LOAD_TIMEOUT_MS,
-                startsPlayback = true,
-                onQueued = { command ->
-                    self = command
-                    command.request = request
-                    latestLoad = command
-                },
-            ) { sendLoad(self) }
-        }
-        completeCancelled(cancelled)
-        return done
+        // A running bulk add keeps going: Spirc and remote devices keep the user queue across a
+        // load, so its remaining items still belong to it.
+        return enqueue(
+            "player.load",
+            timeoutMs = LOAD_TIMEOUT_MS,
+            startsPlayback = true,
+            onQueued = { command ->
+                self = command
+                command.request = request
+                latestLoad = command
+            },
+        ) { sendLoad(self) }
     }
 
     /** Also used by the media session (play button, Bluetooth play after a cold start). */
@@ -436,14 +429,16 @@ class PlayerController internal constructor(
         val result = CompletableDeferred<QueueAddResult>()
         /** Index of the next item (guarded by [lock]). */
         var next = 0
-        /** A queue clear or a load came after it: no further items (guarded by [lock]). */
+        /** A queue clear came after it: no further items (guarded by [lock]). */
         var cancelled = false
     }
 
     /**
-     * Must hold [lock]. Cancels every bulk add queued so far: the running one stops after its
-     * current item (already queued ahead, so it keeps its place before the clear / load); waiting
-     * ones are removed and returned, to be completed outside the lock ([completeCancelled]).
+     * Must hold [lock]. A queue clear cancels every bulk add queued so far (their remaining items
+     * would refill the cleared queue): the running one stops after its current item (already queued
+     * ahead, so it keeps its place before the clear); waiting ones are removed and returned, to be
+     * completed outside the lock ([completeCancelled]). Loads do not cancel: the user queue survives
+     * them.
      */
     private fun cancelBulkAddsLocked(): List<BulkAdd> {
         if (bulkAdds.isEmpty()) return emptyList()
@@ -815,7 +810,7 @@ class PlayerController internal constructor(
         /** Most items one add-to-queue sends: Connect's queue window holds no more. */
         const val MAX_QUEUE_ADD = 80
 
-        /** Result error of a bulk add stopped by a queue clear or a load (callers stay silent). */
+        /** Result error of a bulk add stopped by a queue clear (the user's own action: callers stay silent). */
         private val QUEUE_CHANGED = NativeErrorInfo(NativeErrorCode.CANCELLED, "The queue changed")
 
         /** Nothing is (or can be) playing: nothing to pause / skip / seek, not worth a message. */

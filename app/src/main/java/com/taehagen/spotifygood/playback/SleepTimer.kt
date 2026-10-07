@@ -90,6 +90,21 @@ internal object SleepSchedule {
     /** A wake-up at [now] needs another stage: more than [MIN_FUZZ_MS] are left. */
     fun needsAnotherStage(endsAt: Long, now: Long): Boolean = endsAt - now > MIN_FUZZ_MS
 
+    /** Awake time for an early stage: enough for the poked wait to re-check the clock and re-sleep. */
+    const val POKE_AWAKE_MS = 2_000L
+
+    /**
+     * Hold when a wake-up alarm is delivered at [now]: until the end plus slack ([awakeMs]) when a
+     * remote device plays ([remotePlaying], it must be paused on time) and the end is within
+     * [LEAD_MS], or at the final stage (≤ [MIN_FUZZ_MS] left: the end and the pause); otherwise
+     * [POKE_AWAKE_MS] — a hold that ends before the end would be wasted, the next stage is armed.
+     */
+    fun awakeHoldMs(endsAt: Long, now: Long, remotePlaying: Boolean): Long = when {
+        remotePlaying && endsAt - now <= LEAD_MS -> awakeMs(endsAt, now)
+        !needsAnotherStage(endsAt, now) -> awakeMs(endsAt, now)
+        else -> POKE_AWAKE_MS
+    }
+
     /** How long to keep the CPU awake when the alarm fires at [now]: until the end plus slack. */
     fun awakeMs(endsAt: Long, now: Long): Long = (endsAt - now).coerceIn(0L, LEAD_MS) + PAUSE_SLACK_MS
 
@@ -186,14 +201,17 @@ class SleepTimer(
     }
 
     /**
-     * The wake-up alarm fired: keep the CPU up until the end, arm the next stage while the end is
-     * still more than a few seconds away (an inexact alarm may come early), and let the wait
-     * re-check the clock.
+     * The wake-up alarm fired: arm the next stage while the end is still more than a few seconds
+     * away (an inexact alarm may come early) and let the wait re-check the clock. The CPU is held
+     * awake until the end only where that is needed and can reach it: a playing remote device within
+     * the last [SleepSchedule.LEAD_MS], or the final stage; otherwise just long enough for the
+     * re-check ([SleepSchedule.awakeHoldMs]).
      */
     fun onWakeupAlarm() {
         val target = wakeTarget ?: return
         val now = clock()
-        wakeups?.holdAwake(SleepSchedule.awakeMs(target, now))
+        val s = playback.snapshot.value
+        wakeups?.holdAwake(SleepSchedule.awakeHoldMs(target, now, remotePlaying = s.source == PlaybackSource.REMOTE && s.isPlaying))
         if (SleepSchedule.needsAnotherStage(target, now)) wakeups?.schedule(target)
         pokes.trySend(Unit)
     }
@@ -230,7 +248,8 @@ class SleepTimer(
         // Remote playback holds no wake lock: when the end is near anyway (short timer, end of
         // track), keep the CPU up from now on instead of relying on the alarm alone.
         val now = clock()
-        if (playback.snapshot.value.source == PlaybackSource.REMOTE && endsAt - now <= SleepSchedule.LEAD_MS) {
+        val s = playback.snapshot.value
+        if (s.source == PlaybackSource.REMOTE && s.isPlaying && endsAt - now <= SleepSchedule.LEAD_MS) {
             wakeups.holdAwake(SleepSchedule.awakeMs(endsAt, now))
         }
     }
