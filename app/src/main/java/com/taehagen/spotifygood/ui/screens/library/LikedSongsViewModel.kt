@@ -15,6 +15,7 @@ import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.SavedTrack
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.playback.PlayRequest
+import com.taehagen.spotifygood.ui.components.isPlaceholder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.channels.Channel
@@ -57,6 +58,8 @@ data class LikedSongsUiState(
     val isDownloaded: Boolean = false,
     val downloadStates: Map<String, DownloadState> = emptyMap(),
     val nowPlaying: NowPlaying = NowPlaying(),
+    /** Some loaded pages hold placeholders (metadata failed right now): offer a retry. */
+    val partial: Boolean = false,
 )
 
 enum class LibraryMessage { DOWNLOAD_FAILED, DOWNLOAD_STARTED, DOWNLOAD_REMOVED, NOTHING_TO_PLAY }
@@ -82,8 +85,10 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     var filterText by mutableStateOf("")
         private set
 
+    private val partialPages = PartialPages()
     private val pager = PagedLoader<SavedTrack>(viewModelScope, PAGE_SIZE, { it.track.uri }) { offset, limit ->
         val page = graph.library.likedTracks(offset, limit)
+        partialPages.record(offset, page.partial)
         PageResult(page.items, page.total)
     }
     private val offline = graph.offlineFlow()
@@ -136,9 +141,9 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         source,
         filterQuery,
         contextUri,
-        combine(download, refreshing, ::Pair),
+        combine(download, refreshing, partialPages.partial, ::Triple),
         graph.nowPlayingFlow(),
-    ) { source, filter, contextUri, (download, refreshing), nowPlaying ->
+    ) { source, filter, contextUri, (download, refreshing, partial), nowPlaying ->
         val visible = if (filter.isEmpty()) source.tracks else source.tracks.filter { it.matches(filter) }
         LikedSongsUiState(
             contextUri = contextUri,
@@ -155,6 +160,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             isDownloaded = download.downloaded,
             downloadStates = download.states,
             nowPlaying = nowPlaying,
+            partial = partial && !source.offline,
         )
     }.flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LikedSongsUiState())
@@ -192,8 +198,10 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
 
     fun retry() = pager.loadMore()
 
+    /** URIs to play as a track list; placeholders (metadata failed) are left out. */
     private fun playableUris(): List<String> = state.value.let { s ->
-        if (s.offline) s.tracks.map { it.uri } else pager.state.value.items.map { it.track.uri }
+        val tracks = if (s.offline) s.tracks else pager.state.value.items.map { it.track }
+        tracks.filter { it.playable && !it.isPlaceholder }.map { it.uri }
     }
 
     /** Play button: toggles when Liked Songs is already playing. */
@@ -224,6 +232,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     }
 
     fun playTrack(track: Track) {
+        if (track.isPlaceholder || !track.playable) return
         val current = state.value
         val context = current.contextUri
         if (!current.offline && context != null) {

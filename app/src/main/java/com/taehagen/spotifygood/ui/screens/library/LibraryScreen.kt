@@ -94,6 +94,7 @@ import com.taehagen.spotifygood.ui.components.LoadingState
 import com.taehagen.spotifygood.ui.components.MediaCard
 import com.taehagen.spotifygood.ui.components.MediaRow
 import com.taehagen.spotifygood.ui.components.OfflineBanner
+import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
@@ -157,6 +158,7 @@ fun LibraryScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier) 
                     onActions = { navigator.showActions(MediaActionTarget.EpisodeTarget(it)) },
                     onLoadMore = viewModel::loadMoreEpisodes,
                     onRetry = viewModel::openEpisodes,
+                    onRetryPartial = viewModel::retryEpisodes,
                 )
                 state.isInitialLoading -> LoadingState()
                 error != null && state.items.isEmpty() -> StateBox {
@@ -685,6 +687,7 @@ private fun YourEpisodesList(
     onActions: (Episode) -> Unit,
     onLoadMore: () -> Unit,
     onRetry: () -> Unit,
+    onRetryPartial: () -> Unit,
 ) {
     val listState = rememberLazyListState()
     val episodes = state.episodes
@@ -692,6 +695,9 @@ private fun YourEpisodesList(
     LazyColumn(state = listState, contentPadding = contentPaddingWith(contentPadding), modifier = Modifier.fillMaxSize()) {
         item(key = "back", contentType = "back") {
             BackRow(title = stringResource(R.string.browse_library_your_episodes), onClick = onBack)
+        }
+        if (state.episodesPartial) {
+            item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetryPartial) }
         }
         items(episodes.items, key = { "episode:${it.uri}" }, contentType = { "episode" }) { episode ->
             EpisodeRow(

@@ -260,7 +260,8 @@ internal fun EditableRow(
     modifier: Modifier = Modifier,
 ) {
     val item = row.row.item
-    val title = item.track?.name ?: item.episode?.name.orEmpty()
+    // A placeholder (metadata failed) has no name; it can still be removed or moved.
+    val title = (item.track?.name ?: item.episode?.name).orEmpty().ifBlank { stringResource(R.string.shell_state_unavailable) }
     val index = row.index
     val moveUp = stringResource(R.string.detail_move_up)
     val moveDown = stringResource(R.string.detail_move_down)

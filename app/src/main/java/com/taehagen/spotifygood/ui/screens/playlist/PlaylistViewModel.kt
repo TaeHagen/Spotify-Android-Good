@@ -17,6 +17,7 @@ import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.playback.PlayRequest
+import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadUi
 import com.taehagen.spotifygood.ui.screens.album.DetailViewModel
 import com.taehagen.spotifygood.ui.screens.album.LoadState
@@ -81,6 +82,11 @@ internal data class PlaylistData(
     val rows: List<PlaylistRow>,
     val total: Int,
     val revision: String?,
+    /**
+     * Some loaded rows are placeholders (their metadata failed right now, docs §6.5). Such rows are
+     * never kept in place of a fresh fetch, and the page offers a retry.
+     */
+    val partial: Boolean = false,
 ) {
     val allLoaded: Boolean get() = rows.size >= total
 }
@@ -224,14 +230,16 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val description = withContext(Dispatchers.Default) { parseHtml(page.description.orEmpty()) }
         val current = data.value.dataOrNull()
         val sameRevision = current != null && page.revision != null && current.revision == page.revision
-        // A new revision while more than the first page is loaded: keep showing the loaded rows
-        // (no scroll jump) and reload the whole loaded range in the background.
-        val reloadRange = current != null && !sameRevision && current.rows.size > page.items.size
+        // Loaded rows are kept for the same revision, unless they hold placeholders: then a refetch
+        // (this one, or the data layer's retries of a partial page) replaces them.
+        val keepRows = current != null && sameRevision && !current.partial && current.rows.size >= page.items.size
+        // A new revision (or placeholders) while more than the first page is loaded: keep showing the
+        // loaded rows (no scroll jump) and reload the whole loaded range in the background.
+        val reloadRange = current != null && (!sameRevision || current.partial) && current.rows.size > page.items.size
         val playlist = when {
-            current != null && sameRevision && current.rows.size >= page.items.size ->
-                PlaylistData(page.copy(items = emptyList()), description, current.rows, maxOf(page.total, current.rows.size), page.revision)
+            keepRows -> PlaylistData(page.copy(items = emptyList()), description, current.rows, maxOf(page.total, current.rows.size), page.revision)
             reloadRange -> current.copy(meta = page.copy(items = emptyList()), description = description)
-            else -> PlaylistData(page.copy(items = emptyList()), description, buildRows(page.items), page.total, page.revision)
+            else -> PlaylistData(page.copy(items = emptyList()), description, buildRows(page.items), page.total, page.revision, page.partial)
         }
         data.value = LoadState.Ready(
             playlist,
@@ -241,7 +249,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         if (reloadRange) {
             viewModelScope.launch {
                 mutationMutex.withLock {
-                    if (canApplyServerRows() && data.value.dataOrNull()?.revision != page.revision) refreshLoaded(force = false)
+                    val latest = data.value.dataOrNull()
+                    if (canApplyServerRows() && (latest?.revision != page.revision || latest?.partial == true)) refreshLoaded(force = false)
                 }
             }
         }
@@ -273,7 +282,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             val used = latest.rows.mapTo(HashSet()) { it.key }
             val rows = latest.rows + buildRows(page.items, used)
             val total = if (page.items.isEmpty()) rows.size else maxOf(page.total, rows.size)
-            data.value = LoadState.Ready(latest.copy(rows = rows, total = total))
+            data.value = LoadState.Ready(latest.copy(rows = rows, total = total, partial = latest.partial || page.partial))
             return page.items.isNotEmpty() && rows.size < total
         } catch (e: CancellationException) {
             throw e
@@ -332,6 +341,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
 
     fun playItem(row: VisibleRow) {
         val item = row.row.item
+        // Placeholders (metadata failed) are not played; the row does not offer it either.
+        if (item.track?.isPlaceholder == true || item.episode?.isPlaceholder == true) return
         graph.player.play(
             PlayRequest(contextUri = uri, startUri = item.uri, startIndex = row.index, startUid = item.uid),
         )
@@ -452,6 +463,13 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         }
     }
 
+    /** Some rows came back as placeholders: re-fetch the loaded range (not while edits are pending). */
+    fun retryPartial() {
+        viewModelScope.launch {
+            mutationMutex.withLock { if (canApplyServerRows()) refreshLoaded(force = false) }
+        }
+    }
+
     fun setAddQuery(query: String) {
         addQuery.value = query
     }
@@ -519,19 +537,21 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             // Only the revision is needed while local edits are pending.
             val first = graph.catalog.playlistPage(uri, 0, if (applyRows) PAGE_SIZE else 1)
             val items = first.items.toMutableList()
+            var partial = first.partial
             val wanted = minOf(maxOf(PAGE_SIZE, before.rows.size), first.total)
             if (applyRows) {
                 while (items.size < wanted) {
                     val next = graph.catalog.playlistPage(uri, items.size, PAGE_SIZE)
                     if (next.items.isEmpty()) break
                     items += next.items
+                    partial = partial || next.partial
                 }
             }
             val latest = data.value.dataOrNull() ?: return
             if (applyRows && (force || canApplyServerRows())) {
                 val description = withContext(Dispatchers.Default) { parseHtml(first.description.orEmpty()) }
                 data.value = LoadState.Ready(
-                    PlaylistData(first.copy(items = emptyList()), description, buildRows(items), first.total, first.revision),
+                    PlaylistData(first.copy(items = emptyList()), description, buildRows(items), first.total, first.revision, partial),
                 )
                 // Mutations queued against the replaced optimistic list are no longer valid.
                 if (force) generation++

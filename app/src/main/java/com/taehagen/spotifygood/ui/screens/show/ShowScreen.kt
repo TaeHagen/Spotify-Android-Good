@@ -54,6 +54,7 @@ import com.taehagen.spotifygood.ui.appViewModel
 import com.taehagen.spotifygood.ui.components.DetailHeader
 import com.taehagen.spotifygood.ui.components.EmptyState
 import com.taehagen.spotifygood.ui.components.EpisodeRow
+import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.components.PlayFab
 import com.taehagen.spotifygood.ui.components.SectionHeader
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
@@ -116,6 +117,7 @@ fun ShowScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier = 
                 onPlayEpisode = viewModel::playEpisode,
                 onSort = viewModel::setSort,
                 onRetryPage = viewModel::loadMore,
+                onRetryPartial = viewModel::retryPartial,
             )
         }
     }
@@ -135,6 +137,7 @@ private fun ShowList(
     onPlayEpisode: (Episode) -> Unit,
     onSort: (EpisodeSort) -> Unit,
     onRetryPage: () -> Unit,
+    onRetryPartial: () -> Unit,
 ) {
     val show = header.show
     LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
@@ -193,6 +196,9 @@ private fun ShowList(
                     }
                 },
             )
+        }
+        if (state.partial) {
+            item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetryPartial) }
         }
         items(state.list.episodes, key = { it.uri }, contentType = { "episode" }) { episode ->
             val downloadState = state.rowDownloads[episode.uri]

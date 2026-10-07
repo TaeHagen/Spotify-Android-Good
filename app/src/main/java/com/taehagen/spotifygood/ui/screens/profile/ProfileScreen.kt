@@ -33,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -46,9 +47,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
-import com.taehagen.spotifygood.model.MediaRef
-import com.taehagen.spotifygood.model.PlaylistOwner
-import com.taehagen.spotifygood.model.PlaylistRef
 import com.taehagen.spotifygood.model.User
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.ui.appViewModel
@@ -58,12 +56,12 @@ import com.taehagen.spotifygood.ui.components.LoadingState
 import com.taehagen.spotifygood.ui.components.MediaRow
 import com.taehagen.spotifygood.ui.components.SectionHeader
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
-import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
 import com.taehagen.spotifygood.ui.screens.library.ConfirmDialog
 import com.taehagen.spotifygood.ui.screens.library.StateBox
 import com.taehagen.spotifygood.ui.screens.library.contentPaddingWith
 import com.taehagen.spotifygood.ui.screens.library.messageRes
+import com.taehagen.spotifygood.ui.screens.library.toMediaRef
 
 /** [username] null = the logged-in user. */
 @Composable
@@ -101,11 +99,13 @@ fun ProfileScreen(username: String?, contentPadding: PaddingValues, modifier: Mo
                             modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 4.dp),
                         )
                     }
-                    items(state.playlists, key = { "playlist:${it.uri}" }, contentType = { "playlist" }) { ref ->
+                    items(state.playlists, key = { "playlist:${it.uri}" }, contentType = { "playlist" }) { playlist ->
+                        val ref = remember(playlist) { playlist.toMediaRef() }
                         MediaRow(
                             ref = ref,
                             onClick = { navigator.open(ref) },
-                            onLongClick = { navigator.showActions(ref.toOwnedPlaylistTarget(user.username)) },
+                            // Edit / delete only for my own playlists, never for another user's.
+                            onLongClick = { navigator.showActions(profilePlaylistTarget(playlist, state.myUsername)) },
                         )
                     }
                 }
@@ -127,12 +127,6 @@ fun ProfileScreen(username: String?, contentPadding: PaddingValues, modifier: Mo
         )
     }
 }
-
-private fun MediaRef.toOwnedPlaylistTarget(username: String): MediaActionTarget =
-    MediaActionTarget.PlaylistTarget(
-        PlaylistRef(uri = uri, name = name, images = images, owner = PlaylistOwner(username, subtitle)),
-        isOwned = true,
-    )
 
 @Composable
 private fun ProfileHeader(user: User, playlistCount: Int?, following: Int?) {

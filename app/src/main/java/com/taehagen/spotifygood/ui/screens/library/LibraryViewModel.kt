@@ -60,6 +60,8 @@ data class LibraryUiState(
     val isRefreshing: Boolean = false,
     val error: BrowseError? = null,
     val episodes: PagedState<Episode> = PagedState(),
+    /** Some loaded Your Episodes pages hold placeholders: offer a retry. */
+    val episodesPartial: Boolean = false,
     val nowPlaying: NowPlaying = NowPlaying(),
 )
 
@@ -117,8 +119,10 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
     private val likedCount = MutableStateFlow<Int?>(null)
     private val offline = graph.offlineFlow()
 
+    private val episodePartialPages = PartialPages()
     private val episodesLoader = PagedLoader(viewModelScope, EPISODE_PAGE, Episode::uri) { offset, limit ->
         val page = graph.library.episodes(offset, limit)
+        episodePartialPages.record(offset, page.partial)
         PageResult(page.items.map { it.episode }, page.total)
     }
 
@@ -191,7 +195,8 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
         listing,
         extras,
         episodesLoader.state,
-    ) { (listing, data, presentation, downloaded), extras, episodes ->
+        episodePartialPages.partial,
+    ) { (listing, data, presentation, downloaded), extras, episodes, episodesPartial ->
         val likedUri = extras.user?.username?.let(::likedSongsUri)
         val nothing = data.playlists.isEmpty() && data.albums.isEmpty() && data.artists.isEmpty() && data.shows.isEmpty()
         LibraryUiState(
@@ -220,6 +225,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
             isRefreshing = extras.refreshing,
             error = if (nothing && !presentation.query.offline) data.error?.toBrowseError() else null,
             episodes = episodes,
+            episodesPartial = episodesPartial,
             nowPlaying = extras.nowPlaying,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LibraryUiState())
@@ -282,6 +288,9 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
     }
 
     fun loadMoreEpisodes() = episodesLoader.loadMore()
+
+    /** Your Episodes came back with placeholders: load it again from the start. */
+    fun retryEpisodes() = episodesLoader.reload()
 
     fun setSearchActive(active: Boolean) {
         searchActive.value = active
