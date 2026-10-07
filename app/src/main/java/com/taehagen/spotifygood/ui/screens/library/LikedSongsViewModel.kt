@@ -15,9 +15,13 @@ import com.taehagen.spotifygood.download.CollectionType
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.SavedTrack
 import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.SessionMessenger
 import com.taehagen.spotifygood.ui.components.isPlaceholder
+import com.taehagen.spotifygood.ui.screens.album.engineReach
+import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
+import com.taehagen.spotifygood.ui.screens.album.isNetworkClassError
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.channels.Channel
@@ -29,7 +33,6 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.launchIn
@@ -87,6 +90,24 @@ private data class LikedSource(
     val offline: Boolean,
 )
 
+/**
+ * Whether Liked Songs lists its download instead of the server's pages, by the engine's reach (as
+ * playback routes): always offline; while the session isn't ONLINE (connecting, captive portal)
+ * when nothing was loaded yet or loading failed for lack of connection; never while ONLINE.
+ */
+internal fun likedSongsShowDownloads(reach: EngineReach, loaded: Boolean, error: Throwable?): Boolean = when (reach) {
+    EngineReach.OFFLINE -> true
+    EngineReach.CONNECTING -> !loaded || (error != null && isNetworkClassError(error))
+    EngineReach.ONLINE -> false
+}
+
+/**
+ * Whether the server's pages should be (re)requested: once the session is ONLINE, when nothing is
+ * loaded or the last request failed (e.g. it ran while the session was still reconnecting).
+ */
+internal fun likedSongsNeedsFetch(reach: EngineReach, page: PagedState<*>): Boolean =
+    reach == EngineReach.ONLINE && !page.isLoading && (page.items.isEmpty() || page.error != null)
+
 private data class LikedDownload(
     val status: CollectionDownloadStatus,
     val downloaded: Boolean,
@@ -104,7 +125,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         partialPages.record(offset, page.partial)
         PageResult(page.items, page.total)
     }
-    private val offline = graph.offlineFlow()
+    private val reach = graph.engineReachFlow()
     private val refreshing = MutableStateFlow(false)
     private val messages = Channel<LibraryMessage>(Channel.BUFFERED)
     val events: Flow<LibraryMessage> = messages.receiveAsFlow()
@@ -116,7 +137,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
 
     private val decoded = ConcurrentHashMap<String, Track>()
 
-    /** Downloaded Liked Songs in collection order (offline mode). */
+    /** Downloaded Liked Songs in collection order (shown while the server can't be reached). */
     private val offlineTracks: Flow<List<Track>> = combine(graph.downloadedCollectionsFlow(), graph.downloads.items) { collections, items ->
         val liked = collections.firstOrNull { it.type == CollectionType.LIKED_SONGS } ?: return@combine emptyList()
         val completed = items.filter { it.state == DownloadState.COMPLETED }.associateBy { it.uri }
@@ -127,8 +148,13 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         }
     }.distinctUntilChanged().flowOn(Dispatchers.Default)
 
-    private val source: Flow<LikedSource> = offline.flatMapLatest { isOffline ->
-        if (isOffline) {
+    private val showDownloads: Flow<Boolean> = combine(reach, pager.state) { reach, page ->
+        likedSongsShowDownloads(reach, loaded = page.items.isNotEmpty(), error = page.error)
+    }.distinctUntilChanged()
+
+    /** `offline` = listing the download: plays then use its track list, not the online context. */
+    private val source: Flow<LikedSource> = showDownloads.flatMapLatest { downloads ->
+        if (downloads) {
             offlineTracks.map { LikedSource(it, it.size, isLoading = false, canLoadMore = false, error = null, offline = true) }
         } else {
             pager.state.map { page ->
@@ -180,16 +206,18 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LikedSongsUiState())
 
     init {
-        // First page once online; again after reconnecting with nothing loaded.
-        offline.onEach { isOffline -> if (!isOffline && pager.state.value.items.isEmpty()) pager.loadMore() }
+        // First page once the session is ONLINE (not when a network merely appears: requests fail
+        // NOT_CONNECTED while it reconnects); again after reconnecting with nothing loaded or a
+        // failed load.
+        reach.onEach { if (likedSongsNeedsFetch(it, pager.state.value)) pager.loadMore() }
             .launchIn(viewModelScope)
         // While filtering, fetch the remaining pages so the filter covers every liked song.
-        combine(filterQuery, pager.state, offline) { filter, page, isOffline -> filter.isNotEmpty() && !isOffline && page.canLoadMore }
+        combine(filterQuery, pager.state, reach) { filter, page, reach -> filter.isNotEmpty() && reach == EngineReach.ONLINE && page.canLoadMore }
             .onEach { if (it) pager.loadMore() }
             .launchIn(viewModelScope)
         // Liked Songs pages are not cached: start over after library edits (likes/unlikes).
         graph.library.changes.debounce(CHANGE_DEBOUNCE_MS)
-            .onEach { if (!offline.first()) pager.reload() }
+            .onEach { if (graph.engineReach() == EngineReach.ONLINE) pager.reload() }
             .catch { }
             .launchIn(viewModelScope)
         // Refresh indicator ends with the reload.
@@ -204,7 +232,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
 
     fun refresh() {
         viewModelScope.launch {
-            if (offline.first()) return@launch
+            if (graph.engineReach() != EngineReach.ONLINE) return@launch
             refreshing.value = true
             // Drops the engine's and the app's cached library lists first, so the reload reaches
             // the server; the pager reloads on the resulting library change.
