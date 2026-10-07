@@ -1,13 +1,20 @@
 package com.taehagen.spotifygood.connect
 
+import android.os.SystemClock
 import com.taehagen.spotifygood.model.DeviceList
+import com.taehagen.spotifygood.model.PlaybackSnapshot
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeEvents
+import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.nativebridge.NativeRpc
+import com.taehagen.spotifygood.playback.PlaybackModes
 import com.taehagen.spotifygood.playback.ResumeState
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -25,11 +32,24 @@ class DevicesRepository(
     private val rpc: NativeRpc,
     events: NativeEvents,
     private val lastSession: suspend () -> ResumeState? = { null },
+    /** Monotonic clock (ms, counting deep sleep) for the pending target's expiry. */
+    clock: () -> Long = SystemClock::elapsedRealtime,
 ) {
     private val _devices = MutableStateFlow(events.devices.value)
 
-    /** Latest device list: `devices` events, or the result of [refresh] if newer. */
+    /** Latest device list: the latest `devices` event. */
     val devices: StateFlow<DeviceList> = _devices.asStateFlow()
+
+    private val pending = PendingTarget(clock)
+
+    /**
+     * The Connect device picked while nothing played anywhere (and there was no session to
+     * resume): the next in-app play goes there (`player.load {deviceId}`, see
+     * [consumePendingTarget]). Cleared once any device is active, when this phone is picked, on
+     * logout, once used, and [PendingTarget.TTL_MS] after it was picked (a pick made long ago
+     * must not take over a play).
+     */
+    val pendingTarget: StateFlow<String?> = pending.value
 
     /**
      * Invoked before playback is pulled to this phone, so the playback service can start while the
@@ -38,7 +58,33 @@ class DevicesRepository(
     @Volatile var onTransferToThisDevice: (() -> Unit)? = null
 
     init {
-        scope.launch { events.devices.collect { _devices.value = it } }
+        scope.launch {
+            events.devices.collect {
+                _devices.value = it
+                if (activeIn(it)) pending.clear()
+            }
+        }
+        scope.launch { events.playback.collect { if (activeIn(it)) pending.clear() } }
+        scope.launch {
+            // Expiry; consume() checks it too, in case this timer ran late (Doze, a frozen process).
+            pending.value.collectLatest { target ->
+                if (target == null) return@collectLatest
+                while (!pending.expire(target)) delay(pending.remainingMs().coerceAtLeast(1))
+            }
+        }
+    }
+
+    /** The pending target for the next play, cleared (it is used once); null once expired. */
+    fun consumePendingTarget(): String? = pending.consume()
+
+    /** Forgets the pending target (logout). */
+    fun clearPendingTarget() {
+        pending.clear()
+    }
+
+    /** [deviceId] becomes the pending target (a transfer found nothing to play). */
+    internal fun pick(deviceId: String) {
+        pending.set(deviceId)
     }
 
     /**
@@ -49,22 +95,43 @@ class DevicesRepository(
     suspend fun transferTo(deviceId: String, play: Boolean = true) {
         val list = _devices.value
         val isThisDevice = deviceId == list.thisDeviceId || list.devices.any { it.id == deviceId && it.isThisDevice }
-        if (isThisDevice) onTransferToThisDevice?.invoke()
+        if (isThisDevice) {
+            pending.clear()
+            onTransferToThisDevice?.invoke()
+        }
         // Sent whether or not the (possibly stale) list shows an active device: the engine decides.
-        rpc.callUnit("connect.transfer", transferArgs(deviceId, play, lastSession()))
+        val args = transferArgs(deviceId, play, lastSession())
+        try {
+            rpc.callUnit("connect.transfer", args)
+        } catch (e: NativeException) {
+            // Nothing to transfer or resume: the device stays picked for the next play (the
+            // error still reaches the caller, which says so).
+            pendingAfterFailure(e.code, deviceId, isThisDevice, args)?.let(::pick)
+            throw e
+        }
     }
 
     /**
      * Fetches the device list from Spotify again (e.g. when the device picker opens or refresh is
      * tapped). The engine sends at most one request every 2.5 s and waits up to 3 s for it; when
-     * debounced, offline or timed out it returns the cached list. The list is also emitted as a
-     * `devices` event.
+     * debounced, offline or timed out it keeps the cached list. The refreshed list arrives as a
+     * `devices` event, which the engine posts before the call returns: the result itself isn't
+     * assigned, so it can't overwrite a newer event (cluster updates come in bursts).
      */
     suspend fun refresh() {
-        _devices.value = rpc.call<DeviceList>("connect.refreshDevices")
+        rpc.callUnit("connect.refreshDevices")
     }
 
     internal companion object {
+        /** The pending target a failed transfer leaves (see [pendingTarget]), or null. */
+        fun pendingAfterFailure(code: String, deviceId: String, isThisDevice: Boolean, args: JsonObject): String? =
+            deviceId.takeIf { code == NativeErrorCode.NOT_ACTIVE_DEVICE && !isThisDevice && args["resume"] == null }
+
+        /** A device is active: a pending target is moot. */
+        fun activeIn(list: DeviceList): Boolean = !list.activeDeviceId.isNullOrEmpty()
+
+        fun activeIn(snapshot: PlaybackSnapshot): Boolean = snapshot.activeDevice != null
+
         /** `connect.transfer` arguments (docs/ARCHITECTURE.md §6.2). */
         fun transferArgs(deviceId: String, play: Boolean, resume: ResumeState?): JsonObject = buildJsonObject {
             put("deviceId", deviceId)
@@ -74,8 +141,55 @@ class DevicesRepository(
                     resume.contextUri?.takeIf { it.isNotBlank() && it != resume.trackUri }?.let { put("contextUri", it) }
                     put("trackUri", resume.trackUri)
                     put("positionMs", resume.positionMs.coerceAtLeast(0))
+                    // The session's modes; the engine plays smart shuffle as a plain shuffle on
+                    // another device.
+                    put("shuffle", resume.shuffle || resume.smartShuffle)
+                    put("smartShuffle", resume.smartShuffle)
+                    put("repeat", PlaybackModes.wire(resume.repeat))
                 }
             }
         }
+    }
+}
+
+/**
+ * The pending Connect target ([DevicesRepository.pendingTarget]): picked at [clock] time, it
+ * expires [ttlMs] later. Thread-safe.
+ */
+internal class PendingTarget(private val clock: () -> Long, private val ttlMs: Long = TTL_MS) {
+    private val _value = MutableStateFlow<String?>(null)
+    val value: StateFlow<String?> = _value.asStateFlow()
+    private var pickedAt = 0L
+
+    @Synchronized fun set(deviceId: String) {
+        pickedAt = clock()
+        _value.value = deviceId
+    }
+
+    @Synchronized fun clear() {
+        _value.value = null
+    }
+
+    /** The target, cleared (it is used once); null when there is none or it expired. */
+    @Synchronized fun consume(): String? {
+        val target = _value.value ?: return null
+        _value.value = null
+        return target.takeIf { remainingMs() > 0 }
+    }
+
+    /** Time left before the current target expires (≤ 0: expired). */
+    @Synchronized fun remainingMs(): Long = pickedAt + ttlMs - clock()
+
+    /** Clears [target] if it is still the target and expired; true when it is no longer pending. */
+    @Synchronized fun expire(target: String): Boolean {
+        if (_value.value != target) return true
+        if (remainingMs() > 0) return false
+        _value.value = null
+        return true
+    }
+
+    companion object {
+        /** How long a picked device waits for the next play. */
+        const val TTL_MS = 10 * 60 * 1000L
     }
 }

@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.playback
 
+import com.taehagen.spotifygood.model.ActiveDeviceRef
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
@@ -17,6 +18,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
@@ -46,6 +48,11 @@ class PlayerControllerTest {
         var fail: (String) -> NativeException? = { null }
         /** Suspends inside the transport (e.g. a slow request to a remote device). */
         var hold: suspend (String) -> Unit = {}
+        /** Result of a successful call. */
+        var respond: (String) -> JsonElement = { JsonObject(emptyMap()) }
+        /** The pending Connect target ([DevicesRepository.pendingTarget]) and how often it was taken. */
+        var target: String? = null
+        var targetTaken = 0
         val snapshot = MutableStateFlow(PlaybackSnapshot())
         val controller = PlayerController(
             scope = scope.backgroundScope,
@@ -53,11 +60,15 @@ class PlayerControllerTest {
                 calls += method to args
                 hold(method)
                 fail(method)?.let { throw it }
-                JsonObject(emptyMap()) as JsonElement
+                respond(method)
             },
             json = Json,
             snapshot = snapshot,
             lastSession = { resume },
+            consumePendingTarget = {
+                targetTaken++
+                target.also { target = null }
+            },
         ).also { c ->
             env?.let { c.environment = it }
             c.errorMessages = PlaybackErrorMessages { kind, _ -> kind.name }
@@ -393,5 +404,113 @@ class PlayerControllerTest {
             assertTrue(h.controller.resumeAsync().await())
             assertEquals("true", h.calls[1].second["smartShuffle"]?.jsonPrimitive?.content)
         }
+    }
+
+    private fun JsonObject.deviceId(): String? = this["deviceId"]?.jsonPrimitive?.content
+
+    private fun JsonObject.local(): Boolean = this["local"]?.jsonPrimitive?.content == "true"
+
+    @Test
+    fun aPlayWhileNothingIsActiveGoesToThePendingTargetOnce() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE))
+        h.target = "speaker"
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(1)), toPendingTarget = true).await())
+        assertEquals("speaker", h.calls.single().second.deviceId())
+        assertFalse(h.calls.single().second.local()) // in-app plays are routed as usual
+        // Used once: the next play is routed as usual.
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist), toPendingTarget = true).await())
+        assertNull(h.calls[1].second.deviceId())
+        assertNull(h.target)
+    }
+
+    @Test
+    fun mediaSessionLoadsPlayOnThisPhone() = runTest {
+        // Auto, Assistant, watches: here, also over an active remote device, never on the target.
+        val h = Harness(this, Env(EngineReach.ONLINE))
+        h.target = "speaker"
+        h.snapshot.value = PlaybackSnapshot(
+            source = PlaybackSource.REMOTE,
+            activeDevice = ActiveDeviceRef("tv", "TV"),
+            track = PlaybackTrack(uri = t(5)),
+        )
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(1)), onThisPhone = true).await())
+        val load = h.calls.single().second
+        assertTrue(load.local())
+        assertNull(load.deviceId())
+        // Even a play asking for the target goes here when it is the media session's.
+        h.snapshot.value = PlaybackSnapshot()
+        assertTrue(h.controller.playAsync(PlayRequest(trackUris = listOf(t(1))), toPendingTarget = true, onThisPhone = true).await())
+        assertNull(h.calls[1].second.deviceId())
+        assertEquals(0, h.targetTaken)
+        assertEquals("speaker", h.target)
+    }
+
+    @Test
+    fun theTargetIsLeftAloneWhileADeviceIsActive() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE))
+        h.target = "speaker"
+        h.snapshot.value = PlaybackSnapshot(activeDevice = ActiveDeviceRef("kitchen", "Kitchen"), track = PlaybackTrack(uri = t(5)))
+        assertTrue(h.controller.playAsync(PlayRequest(trackUris = listOf(t(1))), toPendingTarget = true).await())
+        assertNull(h.calls.single().second.deviceId())
+        assertEquals(0, h.targetTaken)
+    }
+
+    @Test
+    fun theStoredSessionAlwaysPlaysOnThisPhone() = runTest {
+        // The resume fallback (no active device).
+        val h = Harness(this, Env(EngineReach.ONLINE), resume = resumeState(playlist))
+        h.target = "speaker"
+        h.fail = { if (it == "player.play") NativeException(NativeErrorInfo(NativeErrorCode.NOT_ACTIVE_DEVICE, "none")) else null }
+        assertTrue(h.controller.resumeAsync().await())
+        assertEquals(listOf("player.play", "player.load"), h.methods())
+        assertNull(h.calls[1].second.deviceId())
+        assertTrue(h.calls[1].second.local())
+        // Media3 resumption, "Tap to resume", "play something" (media-session loads).
+        h.fail = { null }
+        assertTrue(h.controller.playAsync(resumeState(playlist).toPlayRequest(), onThisPhone = true).await())
+        assertNull(h.calls[2].second.deviceId())
+        assertTrue(h.calls[2].second.local())
+        assertEquals(0, h.targetTaken)
+        assertEquals("speaker", h.target)
+    }
+
+    @Test
+    fun offlinePlansAndPausedLoadsPlayOnThisPhone() = runTest {
+        val members = OfflineMembers(listOf(t(1), t(2)), setOf(t(1), t(2)))
+        for (reach in listOf(EngineReach.OFFLINE, EngineReach.CONNECTING)) {
+            // Rewritten for the offline queue (connecting: it may still go to Spirc).
+            val h = Harness(this, Env(reach, members))
+            h.target = "speaker"
+            assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(2)), toPendingTarget = true).await())
+            val load = h.calls.single().second
+            assertEquals(listOf(t(1), t(2)), load["trackUris"]?.jsonArray?.map { it.jsonPrimitive.content })
+            assertNull(load.deviceId())
+            assertEquals(0, h.targetTaken)
+        }
+        // Offline, a track list too.
+        val offline = Harness(this, Env(EngineReach.OFFLINE))
+        offline.target = "speaker"
+        assertTrue(offline.controller.playAsync(PlayRequest(trackUris = listOf(t(1))), toPendingTarget = true).await())
+        assertNull(offline.calls.single().second.deviceId())
+        // A load that does not play (Media3 setMediaItems before play) keeps it for the play.
+        val paused = Harness(this, Env(EngineReach.ONLINE))
+        paused.target = "speaker"
+        assertTrue(paused.controller.playAsync(PlayRequest(trackUris = listOf(t(1)), play = false), toPendingTarget = true).await())
+        assertNull(paused.calls.single().second.deviceId())
+        assertEquals(0, offline.targetTaken + paused.targetTaken)
+    }
+
+    @Test
+    fun radioGoesToThePendingTarget() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE))
+        h.target = "speaker"
+        h.respond = { method ->
+            if (method == "catalog.radio") JsonObject(mapOf("contextUri" to JsonPrimitive("spotify:playlist:radio"))) else JsonObject(emptyMap())
+        }
+        h.controller.startRadio(t(1))
+        runCurrent()
+        assertEquals(listOf("catalog.radio", "player.load"), h.methods())
+        assertEquals("speaker", h.calls[1].second.deviceId())
+        assertEquals("spotify:playlist:radio", h.calls[1].second["contextUri"]?.jsonPrimitive?.content)
     }
 }

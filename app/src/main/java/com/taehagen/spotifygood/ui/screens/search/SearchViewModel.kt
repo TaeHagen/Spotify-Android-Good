@@ -22,24 +22,27 @@ import com.taehagen.spotifygood.ui.screens.library.PagedLoader
 import com.taehagen.spotifygood.ui.screens.library.PagedState
 import com.taehagen.spotifygood.ui.screens.library.attempt
 import com.taehagen.spotifygood.ui.screens.library.debouncedInput
+import com.taehagen.spotifygood.ui.screens.library.explicitFilterChanges
 import com.taehagen.spotifygood.ui.screens.library.nowPlayingFlow
 import com.taehagen.spotifygood.ui.screens.library.offlineFlow
 import com.taehagen.spotifygood.ui.screens.library.playTrackInAlbum
-import com.taehagen.spotifygood.ui.screens.library.startTrack
+import com.taehagen.spotifygood.ui.screens.library.launchTrackStart
 import com.taehagen.spotifygood.ui.screens.library.toBrowseError
 import com.taehagen.spotifygood.ui.screens.library.toMediaRef
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
@@ -74,23 +77,53 @@ private data class SearchInput(val query: String, val filter: SearchFilter, val 
 internal fun retriesFailedPage(filter: SearchFilter, paged: PagedState<*>?): Boolean =
     filter.type != null && paged != null && paged.items.isNotEmpty() && paged.error != null
 
-/** Longest wait for the engine to apply a changed explicit filter (as Settings waits). */
-private const val EXPLICIT_APPLY_TIMEOUT_MS = 15_000L
+/** One typed result list: its query and type, and the Retry generation it was loaded for. */
+private data class TypedKey(val query: String, val type: SearchType, val generation: Int)
+
+private fun SearchInput.typedKey(): TypedKey? =
+    filter.type?.takeIf { query.isNotEmpty() && !offline }?.let { TypedKey(query, it, retry) }
 
 /**
- * Emits each time "Hide explicit content" changed and the engine applies it, so results fetched
- * under the old filter (their playable flags) can be dropped. Waiting for the engine keeps a
- * refetch from caching results with the old flags again.
+ * The paged list for one key at a time, held in [scope] (the ViewModel) instead of a screen
+ * subscription: leaving the screen (a result page, another tab, a rotation) and coming back shows
+ * the loaded pages again without refetching. Selecting another key drops the list and cancels its
+ * requests; selecting the same key keeps it.
  */
-private fun AppGraph.explicitFilterChanges(): Flow<Boolean> =
-    settings.settings
-        .map { it.hideExplicit }
-        .distinctUntilChanged()
-        .drop(1)
-        .mapLatest { hide ->
-            engine.awaitSettingsApplied(EXPLICIT_APPLY_TIMEOUT_MS) { it.filterExplicit == hide }
-            hide
+internal class KeptPages<K : Any, T>(
+    private val scope: CoroutineScope,
+    private val pageSize: Int,
+    private val keyOf: (T) -> String,
+    private val fetch: suspend (key: K, offset: Int, limit: Int) -> PageResult<T>,
+) {
+    private val _state = MutableStateFlow<PagedState<T>?>(null)
+    val state: StateFlow<PagedState<T>?> = _state.asStateFlow()
+
+    /** The loader of the list on screen (null without a key). */
+    @Volatile var loader: PagedLoader<T>? = null
+        private set
+    private var key: K? = null
+    private var listScope: CoroutineScope? = null
+
+    @Synchronized
+    fun select(next: K?) {
+        if (next == key) return
+        listScope?.cancel()
+        key = next
+        if (next == null) {
+            listScope = null
+            loader = null
+            _state.value = null
+            return
         }
+        val child = CoroutineScope(scope.coroutineContext + SupervisorJob(scope.coroutineContext[Job]))
+        val pages = PagedLoader(child, pageSize, keyOf) { offset, limit -> fetch(next, offset, limit) }
+        listScope = child
+        loader = pages
+        _state.value = pages.state.value
+        child.launch { pages.state.collect { if (loader === pages) _state.value = it } }
+        pages.loadMore()
+    }
+}
 
 class SearchViewModel(private val graph: AppGraph) : ViewModel() {
     /** Text field content: Compose state, so typing never races the UI (debounced below). */
@@ -103,7 +136,10 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
     private val immediate = MutableSharedFlow<String>(extraBufferCapacity = 1)
     private val cache = SearchCache<SearchResults>()
 
-    @Volatile private var typedLoader: PagedLoader<SearchItem>? = null
+    /** The selected type filter's list, kept while the screen is away (back from a result, tabs). */
+    private val typedPages = KeptPages<TypedKey, SearchItem>(viewModelScope, TYPED_PAGE_SIZE, SearchItem::key) { key, offset, limit ->
+        graph.search.search(key.query, setOf(key.type), offset, limit).let { PageResult(it.itemsOf(key.type), total = it.totalOf(key.type)) }
+    }
     @Volatile private var lastReady: TopResultsState.Ready? = null
 
     private val query: Flow<String> = merge(
@@ -128,15 +164,10 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         }
     }
 
-    private val typed: Flow<PagedState<SearchItem>?> = input.flatMapLatest { input ->
-        val type = input.filter.type
-        if (input.query.isEmpty() || type == null || input.offline) {
-            typedLoader = null
-            flowOf(null)
-        } else {
-            typedResults(input.query, type)
-        }
-    }
+    // Resubscribing (the screen came back) selects the same key again, which keeps the list.
+    private val typed: Flow<PagedState<SearchItem>?> = input
+        .onEach { typedPages.select(it.typedKey()) }
+        .flatMapLatest { typedPages.state }
 
     init {
         // The in-memory results carry playable flags of the old explicit filter: drop them and
@@ -182,9 +213,9 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         emit(lastReady?.copy(isRefreshing = true) ?: TopResultsState.Loading)
         attempt { graph.search.search(query).distinct() }
             .onSuccess { results ->
-                // Empty results are not kept: revisiting the query or Retry asks the engine again
-                // (an empty answer can be transient).
-                if (results.hasAnyResult()) cache[key] = results
+                // Empty or partial results are not kept: revisiting the query or Retry asks the
+                // engine again (a failed source can be transient).
+                if (results.cacheable()) cache[key] = results
                 emit(readyOrEmpty(query, results))
             }
             .onFailure { emit(TopResultsState.Failed(query, it.toBrowseError())) }
@@ -196,16 +227,6 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         } else {
             TopResultsState.Ready(query, results.toTopSections())
         }
-
-    private fun typedResults(query: String, type: SearchType): Flow<PagedState<SearchItem>> = channelFlow {
-        // The loader lives in this producer scope: a newer query/filter cancels its requests.
-        val loader = PagedLoader(this, TYPED_PAGE_SIZE, SearchItem::key) { offset, limit ->
-            graph.search.search(query, setOf(type), offset, limit).let { PageResult(it.itemsOf(type), total = it.totalOf(type)) }
-        }
-        typedLoader = loader
-        loader.loadMore()
-        loader.state.collect { send(it) }
-    }
 
     fun onQueryChange(text: String) {
         queryText = text
@@ -239,7 +260,7 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
      * searches again.
      */
     fun retry() {
-        val loader = typedLoader
+        val loader = typedPages.loader
         if (loader != null && retriesFailedPage(filter.value, loader.state.value)) {
             loader.loadMore()
         } else {
@@ -248,7 +269,7 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
     }
 
     fun loadMore() {
-        typedLoader?.loadMore()
+        typedPages.loader?.loadMore()
     }
 
     /** A result was opened: remember it. */
@@ -268,7 +289,7 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         onOpened(ref)
         when (ref.type) {
             MediaType.TRACK -> (sections.byUri[ref.uri] as? SearchItem.Song)?.let { graph.playTrackInAlbum(it.track) }
-                ?: graph.appScope.launch { graph.startTrack(ref.uri, track = null) }
+                ?: graph.launchTrackStart(ref.uri, track = null)
             MediaType.EPISODE -> graph.player.playTracks(listOf(ref.uri))
             else -> graph.player.playContext(ref.uri)
         }

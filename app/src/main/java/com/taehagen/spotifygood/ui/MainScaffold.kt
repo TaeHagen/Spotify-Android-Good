@@ -89,10 +89,13 @@ import com.taehagen.spotifygood.ui.navigation.MainTab
 import com.taehagen.spotifygood.ui.navigation.rememberMainNavigator
 import com.taehagen.spotifygood.ui.components.AddToPlaylistSheet
 import com.taehagen.spotifygood.ui.components.MediaActionsSheet
+import com.taehagen.spotifygood.ui.screens.player.DevicePicks
 import com.taehagen.spotifygood.ui.screens.player.DevicesSheet
 import com.taehagen.spotifygood.ui.screens.player.LyricsScreen
 import com.taehagen.spotifygood.ui.screens.player.MiniPlayer
 import com.taehagen.spotifygood.ui.screens.player.NowPlayingScreen
+import com.taehagen.spotifygood.ui.screens.player.PendingDeviceBanner
+import com.taehagen.spotifygood.ui.screens.player.pendingTargetNameFlow
 import com.taehagen.spotifygood.ui.screens.player.QueueScreen
 import com.taehagen.spotifygood.ui.screens.player.SleepTimerSheet
 import com.taehagen.spotifygood.ui.screens.player.rememberPlayerHasContent
@@ -132,6 +135,9 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
         graph.settings.settings.map { it.offlineMode }.distinctUntilChanged()
     }.collectAsStateWithLifecycle(initialValue = graph.settings.settings.value.offlineMode)
     val refusal by shell.playbackRefusal.collectAsStateWithLifecycle()
+    // A Connect device picked for the next play while nothing plays anywhere.
+    val pendingDevice by remember(graph) { graph.devices.pendingTargetNameFlow() }
+        .collectAsStateWithLifecycle(initialValue = null)
     val overlayOpen = navigator.isNowPlayingOpen || navigator.isQueueOpen || navigator.isLyricsOpen ||
         refusal == PlaybackRefusal.SCREEN
 
@@ -235,6 +241,13 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
                     showOffline = !networkAvailable || offlineMode,
                     refusal = refusal,
                     onRefusalDetails = shell::showRefusalDetails,
+                    // Offline the next play stays on this phone (downloads).
+                    pendingDevice = pendingDevice.takeIf { networkAvailable && !offlineMode },
+                    onPendingDeviceClick = navigator::openDevices,
+                    onPendingDeviceCancel = {
+                        DevicePicks.mark()
+                        graph.devices.clearPendingTarget()
+                    },
                 )
             }
 
@@ -285,6 +298,9 @@ private fun MainContent(
     showOffline: Boolean,
     refusal: PlaybackRefusal,
     onRefusalDetails: () -> Unit,
+    pendingDevice: String?,
+    onPendingDeviceClick: () -> Unit,
+    onPendingDeviceCancel: () -> Unit,
 ) {
     // Screens only get bottom padding (contract); keep them clear of side system bars / cutouts
     // (landscape 3-button navigation). A navigation rail already consumed its side.
@@ -321,6 +337,18 @@ private fun MainContent(
                 exit = shrinkVertically() + fadeOut(),
             ) {
                 OfflineBanner()
+            }
+            // Keeps the last name while animating out.
+            var shownPendingDevice by remember { mutableStateOf(pendingDevice) }
+            LaunchedEffect(pendingDevice) { if (pendingDevice != null) shownPendingDevice = pendingDevice }
+            AnimatedVisibility(
+                visible = pendingDevice != null,
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut(),
+            ) {
+                (pendingDevice ?: shownPendingDevice)?.let { name ->
+                    PendingDeviceBanner(deviceName = name, onClick = onPendingDeviceClick, onCancel = onPendingDeviceCancel)
+                }
             }
             AnimatedVisibility(
                 visible = hasTrack,

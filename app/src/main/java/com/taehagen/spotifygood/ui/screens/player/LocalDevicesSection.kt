@@ -43,7 +43,9 @@ import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.connect.LocalConnectDevice
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
+import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.ui.appViewModel
+import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -51,7 +53,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -61,6 +67,11 @@ internal data class LocalDevicesUiState(
     val devices: List<LocalConnectDevice> = emptyList(),
     val discovering: Boolean = false,
     val connectingId: String? = null,
+    /**
+     * The session is ONLINE. Otherwise the section is hidden: there is no cluster to tell which
+     * speakers are already in the account, and a LAN login needs an online session.
+     */
+    val online: Boolean = true,
 )
 
 /** Results for one open devices sheet ([sheet], see [DevicesEvent]); other sheets ignore them. */
@@ -70,11 +81,28 @@ internal sealed interface LocalConnectEvent {
     /** Logged in and playing there (the sheet closes). */
     data class Connected(override val sheet: String) : LocalConnectEvent
 
-    /** Logged in, but nothing was playing and there was no saved session to start there. */
-    data class Ready(override val sheet: String, val deviceName: String) : LocalConnectEvent
+    /**
+     * Logged in, but nothing was playing and there was no saved session to start there. [selected]:
+     * the device became the pending target, so the next play goes there.
+     */
+    data class Ready(override val sheet: String, val deviceName: String, val selected: Boolean = false) : LocalConnectEvent
 
-    /** `connect.localLogin` failed: the device did not join the account. */
-    data class Failed(override val sheet: String, val deviceName: String, val network: Boolean) : LocalConnectEvent
+    /**
+     * Logged in, but playback was not moved there: the user picked another device (or playback
+     * moved) during the login.
+     */
+    data class Added(override val sheet: String, val deviceName: String) : LocalConnectEvent
+
+    /**
+     * `connect.localLogin` failed: the device did not join the account. [offline]: the session
+     * wasn't online (NOT_CONNECTED), not a Wi-Fi problem.
+     */
+    data class Failed(
+        override val sheet: String,
+        val deviceName: String,
+        val network: Boolean,
+        val offline: Boolean = false,
+    ) : LocalConnectEvent
 
     /** The device joined the account, but moving playback to it failed. */
     data class TransferFailed(override val sheet: String, val deviceName: String, val network: Boolean) : LocalConnectEvent
@@ -91,16 +119,21 @@ internal suspend fun connectLocalDevice(
     deviceName: String,
     login: suspend () -> String,
     transfer: suspend (String) -> Unit,
+    isSelected: (String) -> Boolean = { false },
+    shouldTransfer: () -> Boolean = { true },
 ): LocalConnectEvent {
     val deviceId = try {
         login()
     } catch (e: CancellationException) {
         throw e
     } catch (e: NativeException) {
+        if (e.code == NativeErrorCode.NOT_CONNECTED) return LocalConnectEvent.Failed(sheet, deviceName, network = false, offline = true)
         return LocalConnectEvent.Failed(sheet, deviceName, e.isNetwork)
     } catch (e: Exception) {
         return LocalConnectEvent.Failed(sheet, deviceName, network = false)
     }
+    // A login can take long (wake-up, polling, the cluster wait): a later choice wins.
+    if (!shouldTransfer()) return LocalConnectEvent.Added(sheet, deviceName)
     return try {
         transfer(deviceId)
         LocalConnectEvent.Connected(sheet)
@@ -108,7 +141,7 @@ internal suspend fun connectLocalDevice(
         throw e
     } catch (e: NativeException) {
         if (e.code == NativeErrorCode.NOT_ACTIVE_DEVICE) {
-            LocalConnectEvent.Ready(sheet, deviceName)
+            LocalConnectEvent.Ready(sheet, deviceName, selected = isSelected(deviceId))
         } else {
             LocalConnectEvent.TransferFailed(sheet, deviceName, e.isNetwork)
         }
@@ -121,6 +154,9 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
     private val discovery = graph.localDiscovery
     private val devicesRepository = graph.devices
     private val loggedIn = graph.engine.isLoggedIn
+    private val online = graph.engineReachFlow().map { it == EngineReach.ONLINE }.distinctUntilChanged()
+    /** A sheet is open and STARTED ([startDiscovery] / [stopDiscovery]). */
+    private val started = MutableStateFlow(false)
     private val connecting = MutableStateFlow<String?>(null)
     private val eventChannel = Channel<LocalConnectEvent>(Channel.BUFFERED)
     /** The sheet whose results [discovery] currently holds. */
@@ -132,15 +168,26 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
         discovery.devices,
         devicesRepository.devices,
         discovery.discovering,
-        connecting,
-    ) { found, cluster, discovering, connectingId ->
+        combine(connecting, online, ::Pair),
+    ) { found, cluster, discovering, (connectingId, online) ->
         val clusterIds = cluster.devices.map { it.id }.toSet()
         LocalDevicesUiState(
             devices = found.filter { it.deviceId !in clusterIds },
             discovering = discovering,
             connectingId = connectingId,
+            online = online,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LocalDevicesUiState())
+
+    init {
+        // Browse (mDNS, the multicast lock, the speaker probes) only while a sheet shows the
+        // section and the session is ONLINE: offline nothing filters out the account's own
+        // speakers and a login would fail anyway.
+        combine(started, online, loggedIn) { started, online, loggedIn -> started && online && loggedIn }
+            .distinctUntilChanged()
+            .onEach { browse -> if (browse) discovery.start() else discovery.pause() }
+            .launchIn(viewModelScope)
+    }
 
     /**
      * Browses while [sheet] is open and STARTED. A new sheet starts from scratch; the same sheet
@@ -151,11 +198,13 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
             discovery.clear()
             resultsSheet = sheet
         }
-        if (loggedIn.value) discovery.start()
+        started.value = true
     }
 
     /** The sheet stopped or went away: browsing (and the multicast lock) ends, results stay. */
-    fun stopDiscovery() = discovery.pause()
+    fun stopDiscovery() {
+        started.value = false
+    }
 
     /**
      * Logs the device into the account and transfers playback to it; the result goes to [sheet]
@@ -163,6 +212,9 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
      */
     fun connect(device: LocalConnectDevice, sheet: String) {
         if (connecting.value != null) return
+        // Another device picked (or playback moved) before the login finishes: don't move it here.
+        val pick = DevicePicks.mark()
+        val activeBefore = devicesRepository.devices.value.activeDeviceId
         viewModelScope.launch {
             connecting.value = device.deviceId
             try {
@@ -173,6 +225,11 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
                     deviceName = device.name,
                     login = { discovery.login(device) },
                     transfer = { id -> devicesRepository.transferTo(id) },
+                    // A failed transfer with nothing to resume keeps the device for the next play.
+                    isSelected = { id -> devicesRepository.pendingTarget.value == id },
+                    shouldTransfer = {
+                        DevicePicks.isLatest(pick) && devicesRepository.devices.value.activeDeviceId == activeBefore
+                    },
                 )
                 eventChannel.trySend(event)
             } finally {
@@ -234,10 +291,18 @@ internal fun rememberLocalDevices(sheet: String, onConnected: () -> Unit): Local
             when (event) {
                 is LocalConnectEvent.Connected -> currentOnConnected()
                 // The device is in the account now (listed under Connect devices): not a failure.
-                is LocalConnectEvent.Ready -> notice.value = context.getString(R.string.local_connect_ready, event.deviceName)
+                is LocalConnectEvent.Ready -> notice.value = context.getString(
+                    if (event.selected) R.string.player_devices_selected else R.string.local_connect_ready,
+                    event.deviceName,
+                )
+                is LocalConnectEvent.Added -> notice.value = context.getString(R.string.local_connect_added, event.deviceName)
                 is LocalConnectEvent.Failed -> {
                     error.value = context.getString(
-                        if (event.network) R.string.local_connect_login_failed_network else R.string.local_connect_login_failed,
+                        when {
+                            event.offline -> R.string.local_connect_login_failed_offline
+                            event.network -> R.string.local_connect_login_failed_network
+                            else -> R.string.local_connect_login_failed
+                        },
                         event.deviceName,
                     )
                 }
@@ -266,10 +331,13 @@ internal fun rememberLocalDevices(sheet: String, onConnected: () -> Unit): Local
  * discovery and the results. Tapping a device logs it in, transfers playback and closes the sheet.
  */
 @Composable
-internal fun LocalDevicesSection(local: LocalDevicesHolder) {
+internal fun LocalDevicesSection(local: LocalDevicesHolder, transferring: Boolean = false) {
     val state = local.state
     val error = local.error
     val notice = local.notice
+    // Offline the account's own speakers can't be told apart (no cluster), and adding one needs
+    // the session: no section.
+    if (!state.online) return
     if (state.devices.isEmpty() && error == null && notice == null && !state.discovering) return
 
     Column {
@@ -299,7 +367,8 @@ internal fun LocalDevicesSection(local: LocalDevicesHolder) {
                 LocalDeviceRow(
                     device = device,
                     busy = state.connectingId == device.deviceId,
-                    enabled = state.connectingId == null,
+                    // Not while a Connect transfer from this sheet is running either.
+                    enabled = state.connectingId == null && !transferring,
                     onClick = { local.connect(device) },
                 )
             }

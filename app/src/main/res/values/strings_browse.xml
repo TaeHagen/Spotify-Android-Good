@@ -208,4 +208,5 @@
         <item quantity="one">%d artist followed</item>
         <item quantity="other">%d artists followed</item>
     </plurals>
+    <string name="browse_track_start_waiting">Connecting to Spotify… Your song starts in a moment.</string>
 </resources>

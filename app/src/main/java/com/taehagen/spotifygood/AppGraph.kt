@@ -77,7 +77,7 @@ class AppGraph(val app: Application) {
     val playback: PlaybackRepository by lazy { PlaybackRepository(appScope, events) }
     /** Last local session (playback resumption, cold-start play); one DataStore per process. */
     val resumeStore: ResumeStore by lazy { ResumeStore(app) }
-    val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore) }
+    val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore, devices) }
     val devices: DevicesRepository by lazy { DevicesRepository(appScope, rpc, events, resumeStore::read) }
     private val localDiscoveryLazy = lazy {
         LocalDeviceDiscovery(app, rpc) { devices.devices.value.devices.map { it.id }.toSet() }
@@ -106,7 +106,10 @@ class AppGraph(val app: Application) {
     val playlists: PlaylistEditor by lazy { PlaylistEditor(appScope, rpc, library, catalog) }
 
     val downloads: DownloadManager by lazy {
-        DownloadManager(app, appScope, database, rpc, events, engine, settings, credentialStore)
+        DownloadManager(app, appScope, database, rpc, events, engine, settings, credentialStore).also { manager ->
+            // Likes and playlist edits made in the app re-sync the downloaded collection they affect.
+            appScope.launch { library.edits.collect(manager::onLibraryEdit) }
+        }
     }
 
     /**
@@ -144,6 +147,8 @@ class AppGraph(val app: Application) {
             }
             step("settings") { settings.reset() }
             step("events") { events.reset() }
+            // A device picked for the next play was the old account's.
+            step("pending device") { devices.clearPendingTarget() }
             failure?.let { throw it }
         }
     }

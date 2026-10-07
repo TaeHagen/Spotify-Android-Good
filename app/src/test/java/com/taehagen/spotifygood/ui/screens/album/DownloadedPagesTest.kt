@@ -137,6 +137,37 @@ class DownloadedPagesTest {
         val oldest = appendDownloadedEpisodes(emptyList(), listOf(e[1], e[3], e[4]), newestFirst = false)
         assertEquals(listOf("E5", "E4", "E2"), oldest.map { it.name })
     }
+
+    @Test
+    fun aNewerDownloadedEpisodeGoesByDateNotAfterTheCachedOnes() {
+        fun ep(n: Int, date: String) = Episode(uri = "spotify:episode:$n", name = "E$n", releaseDate = date)
+        val cached = listOf(ep(2, "2024-05-08"), ep(1, "2024-05-01"))
+        val downloaded = listOf(ep(3, "2024-05-15"), ep(2, "2024-05-08"))
+        assertEquals(listOf("E3", "E2", "E1"), appendDownloadedEpisodes(cached, downloaded, newestFirst = true).map { it.name })
+        assertEquals(listOf("E1", "E2", "E3"), appendDownloadedEpisodes(cached.asReversed(), downloaded, newestFirst = false).map { it.name })
+    }
+
+    @Test
+    fun aCachedPageOutOfStepWithTheDownloadIsReplacedOffline() {
+        val downloaded = listOf("a", "b", "c")
+        assertTrue(cachedPageMatchesDownload(listOf("a", "b"), pageTotal = 3, downloaded))
+        assertFalse("the sync removed and added tracks", cachedPageMatchesDownload(listOf("a", "x"), pageTotal = 3, downloaded))
+        assertFalse("the sync added tracks", cachedPageMatchesDownload(listOf("a", "b"), pageTotal = 2, downloaded.take(2) + "d"))
+    }
+
+    @Test
+    fun explicitDownloadsAreUnplayableWhileFiltered() {
+        val explicit = track(1).copy(explicit = true)
+        val uris = listOf(explicit.uri, track(2).uri)
+        val copy = page(uris, mapOf(uris[0] to DownloadMetadata.OfTrack(explicit), uris[1] to DownloadMetadata.OfTrack(track(2))))
+        assertEquals(listOf(true, true), copy.tracks().map { it.playable })
+        val filtered = copy.copy(filterExplicit = true)
+        assertEquals(listOf(false, true), filtered.tracks().map { it.playable })
+        assertEquals(listOf(false, true), filtered.playlistItems().map { it.track!!.playable })
+        // Detail rows from a stale cached page (flags from before the filter) are dimmed too.
+        assertFalse(canStartNow(playable = true, online = true, downloadState = null, explicit = true, filterExplicit = true))
+        assertTrue(canStartNow(playable = true, online = true, downloadState = null, explicit = true, filterExplicit = false))
+    }
 }
 
 class DownloadFallbackTest {

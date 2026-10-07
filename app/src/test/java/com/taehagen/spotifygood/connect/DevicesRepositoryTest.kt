@@ -1,12 +1,25 @@
 package com.taehagen.spotifygood.connect
 
+import com.taehagen.spotifygood.model.ActiveDeviceRef
+import com.taehagen.spotifygood.model.DeviceList
+import com.taehagen.spotifygood.model.PlaybackSnapshot
+import com.taehagen.spotifygood.model.RepeatMode
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.nativebridge.NativeEvents
+import com.taehagen.spotifygood.nativebridge.NativeRpc
 import com.taehagen.spotifygood.playback.ResumeState
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DevicesRepositoryTest {
@@ -31,6 +44,40 @@ class DevicesRepositoryTest {
         assertEquals("spotify:playlist:p", resume["contextUri"]?.jsonPrimitive?.content)
         assertEquals("spotify:track:t", resume["trackUri"]?.jsonPrimitive?.content)
         assertEquals(42_000L, resume["positionMs"]?.jsonPrimitive?.long)
+        // modes off unless the session had them
+        assertEquals(false, resume["shuffle"]?.jsonPrimitive?.boolean)
+        assertEquals(false, resume["smartShuffle"]?.jsonPrimitive?.boolean)
+        assertEquals("off", resume["repeat"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun transferCarriesTheSessionModes() {
+        val session = state("spotify:playlist:p").copy(smartShuffle = true, repeat = RepeatMode.TRACK)
+        val resume = DevicesRepository.transferArgs("speaker", play = true, resume = session)["resume"]!!.jsonObject
+        assertEquals(true, resume["shuffle"]?.jsonPrimitive?.boolean)
+        assertEquals(true, resume["smartShuffle"]?.jsonPrimitive?.boolean)
+        assertEquals("track", resume["repeat"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun aDevicePickedWithNothingToPlayStaysPicked() {
+        val noResume = DevicesRepository.transferArgs("speaker", play = true, resume = null)
+        val pending = DevicesRepository.pendingAfterFailure(NativeErrorCode.NOT_ACTIVE_DEVICE, "speaker", false, noResume)
+        assertEquals("speaker", pending)
+        // other failures, this phone, or a session that was sent along: nothing pending
+        assertNull(DevicesRepository.pendingAfterFailure(NativeErrorCode.NETWORK, "speaker", false, noResume))
+        assertNull(DevicesRepository.pendingAfterFailure(NativeErrorCode.NOT_ACTIVE_DEVICE, "phone", true, noResume))
+        val withResume = DevicesRepository.transferArgs("speaker", play = true, resume = state("spotify:playlist:p"))
+        assertNull(DevicesRepository.pendingAfterFailure(NativeErrorCode.NOT_ACTIVE_DEVICE, "speaker", false, withResume))
+    }
+
+    @Test
+    fun anActiveDeviceEndsThePendingTarget() {
+        assertTrue(DevicesRepository.activeIn(DeviceList(activeDeviceId = "tv")))
+        assertFalse(DevicesRepository.activeIn(DeviceList(activeDeviceId = "")))
+        assertFalse(DevicesRepository.activeIn(DeviceList()))
+        assertTrue(DevicesRepository.activeIn(PlaybackSnapshot(activeDevice = ActiveDeviceRef(id = "me", name = "Phone"))))
+        assertFalse(DevicesRepository.activeIn(PlaybackSnapshot.EMPTY))
     }
 
     @Test
@@ -40,5 +87,48 @@ class DevicesRepositoryTest {
         // the track as its own "context" is sent without one
         val resume = DevicesRepository.transferArgs("phone", play = true, resume = state("spotify:track:t"))["resume"]!!.jsonObject
         assertFalse(resume.containsKey("contextUri"))
+    }
+
+    @Test
+    fun thePendingTargetExpiresTenMinutesAfterItWasPicked() {
+        var now = 1_000L
+        val pending = PendingTarget({ now })
+        pending.set("speaker")
+        now += PendingTarget.TTL_MS - 1
+        assertEquals("speaker", pending.consume())
+        assertNull(pending.consume()) // used once
+
+        pending.set("speaker")
+        now += PendingTarget.TTL_MS
+        assertNull(pending.consume()) // too old, even if nothing cleared it yet
+        assertNull(pending.value.value)
+
+        // Picking again starts over; expire() only clears the expired target it names.
+        pending.set("speaker")
+        now += PendingTarget.TTL_MS / 2
+        pending.set("speaker")
+        now += PendingTarget.TTL_MS / 2
+        assertFalse(pending.expire("speaker"))
+        assertTrue(pending.expire("tv"))
+        assertEquals("speaker", pending.value.value)
+        now += PendingTarget.TTL_MS / 2
+        assertTrue(pending.expire("speaker"))
+        assertNull(pending.value.value)
+    }
+
+    @Test
+    fun theRepositoryClearsAnExpiredPendingTarget() = runTest {
+        val repo = DevicesRepository(backgroundScope, NativeRpc(Json), NativeEvents(Json), clock = { testScheduler.currentTime })
+        runCurrent()
+        repo.pick("speaker")
+        runCurrent()
+        assertEquals("speaker", repo.pendingTarget.value)
+        advanceTimeBy(PendingTarget.TTL_MS - 1)
+        runCurrent()
+        assertEquals("speaker", repo.pendingTarget.value)
+        advanceTimeBy(1)
+        runCurrent()
+        assertNull(repo.pendingTarget.value)
+        assertNull(repo.consumePendingTarget())
     }
 }
