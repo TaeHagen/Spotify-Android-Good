@@ -80,6 +80,9 @@ fun SearchResults.itemsOf(type: SearchType): List<SearchItem> = when (type) {
  * episode the results mark unplayable (explicit with the filter on, not available here) is never
  * the top result: its card would start a different track.
  */
+/** Something to show (the Top tab is "No results" otherwise); only such results are cached. */
+fun SearchResults.hasAnyResult(): Boolean = !isEmpty || topResult != null
+
 fun SearchResults.topResultOrBest(): MediaRef? = topResult?.takeIf { isPlayableRef(it) }
     ?: artists.firstOrNull()?.toMediaRef()
     ?: tracks.firstOrNull { it.playable }?.toMediaRef()
