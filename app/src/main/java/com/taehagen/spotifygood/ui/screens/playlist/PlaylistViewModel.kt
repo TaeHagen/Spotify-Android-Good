@@ -128,6 +128,8 @@ internal data class PlaylistUiState(
     val download: CollectionDownloadUi = CollectionDownloadUi(),
     val rowDownloads: Map<String, DownloadState> = emptyMap(),
     val offline: Boolean = false,
+    /** The session is ONLINE: rows that aren't downloaded can start ([canStartNow]). */
+    val online: Boolean = true,
 )
 
 @Immutable
@@ -200,9 +202,12 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         playbackInfo,
         graph.savedFlow(uri),
         graph.downloads.collectionUi(uri),
-        combine(graph.downloads.statesFor(itemUris), offline, ::Pair),
-    ) { core, playback, following, download, (rows, offline) ->
-        PlaylistUiState(core.load, core.list, core.paging, core.editMode, playback, following, download, rows, offline)
+        combine(graph.downloads.statesFor(itemUris), connectivity, ::Pair),
+    ) { core, playback, following, download, (rows, connectivity) ->
+        PlaylistUiState(
+            core.load, core.list, core.paging, core.editMode, playback, following, download, rows,
+            connectivity.offline, connectivity.online,
+        )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlaylistUiState())
 
     val addSongs: StateFlow<AddSongsUi> = combine(

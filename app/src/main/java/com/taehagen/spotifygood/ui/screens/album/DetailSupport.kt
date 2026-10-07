@@ -158,6 +158,21 @@ internal fun useDownloadFallback(reach: EngineReach, error: Throwable): Boolean 
     EngineReach.ONLINE -> false
 }
 
+/**
+ * Whether a row's item can be started right now. Playback routes by the engine's reach: unless the
+ * session is ONLINE ([online]) a context load is rewritten to its downloads, so tapping an item
+ * that isn't downloaded would start a different, downloaded one.
+ */
+internal fun canStartNow(playable: Boolean, online: Boolean, downloadState: DownloadState?): Boolean =
+    playable && (online || downloadState == DownloadState.COMPLETED)
+
+/**
+ * [offline]: offline mode or no network (banner, Retry visibility); [online]: the engine's reach is
+ * ONLINE (rows that aren't downloaded can start, see [canStartNow]).
+ */
+@Immutable
+internal data class Connectivity(val offline: Boolean = false, val online: Boolean = true)
+
 /** True while offline mode is on or there is no network. */
 internal fun AppGraph.offlineFlow(): Flow<Boolean> =
     combine(settings.settings.map { it.offlineMode }, engine.isNetworkAvailable) { offlineMode, network ->
@@ -194,6 +209,11 @@ internal abstract class DetailViewModel(
 
     protected val offline: StateFlow<Boolean> = graph.offlineFlow()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    /** See [Connectivity]. */
+    protected val connectivity: Flow<Connectivity> =
+        combine(offline, graph.engineReachFlow()) { offline, reach -> Connectivity(offline, reach == EngineReach.ONLINE) }
+            .distinctUntilChanged()
 
     fun retry() {
         retryTrigger.update { it + 1 }

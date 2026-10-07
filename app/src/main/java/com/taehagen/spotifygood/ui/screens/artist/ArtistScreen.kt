@@ -59,7 +59,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.ArtistRef
-import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.MediaRef
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.ui.appViewModel
@@ -76,6 +75,7 @@ import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
+import com.taehagen.spotifygood.ui.screens.album.canStartNow
 import com.taehagen.spotifygood.ui.screens.album.DetailActionRow
 import com.taehagen.spotifygood.ui.screens.album.DetailScaffold
 import com.taehagen.spotifygood.ui.screens.album.ExpandableText
@@ -182,7 +182,7 @@ private fun ArtistList(
             }
             itemsIndexed(popular, key = { index, track -> "pop-$index-${track.uri}" }, contentType = { _, _ -> "track" }) { index, track ->
                 val downloadState = state.rowDownloads[track.uri]
-                val playable = track.playable && (!state.offline || downloadState == DownloadState.COMPLETED)
+                val playable = canStartNow(track.playable, state.online, downloadState)
                 val showActions = { navigator.showActions(MediaActionTarget.TrackTarget(track, contextUri = uri)) }
                 TrackRow(
                     track = track,
@@ -195,7 +195,7 @@ private fun ArtistList(
                     downloadState = downloadState,
                     onMoreClick = showActions,
                     onLongClick = showActions,
-                    // Unplayable (or not downloaded while offline): dimmed, actions still in the overflow.
+                    // Unplayable (or not downloaded while the session isn't online): dimmed, actions still in the overflow.
                     enabled = playable,
                 )
             }
