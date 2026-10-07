@@ -529,7 +529,7 @@ impl Supervisor {
                         connector::teardown(live, true).await;
                         return Phase::Gate;
                     }
-                    log::info!("network lost, but this device is playing: staying online for now");
+                    log::debug!("network lost, but this device is playing: staying online for now");
                 }
                 _ = spirc_ended(&mut live.device) => {
                     self.backoff.note_uptime(connected_at, std::time::Instant::now());
