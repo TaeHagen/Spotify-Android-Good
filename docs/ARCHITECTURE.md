@@ -791,7 +791,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   set-media-items (Auto/Assistant/resumption), device volume only when remote (relative
   steps accumulate from the last sent target for 2 s), seek back/forward 15 s for episodes.
   Handlers complete once the next snapshot arrives (≤ 2 s); set-media-items only once a snapshot
-  shows a track or remote playback, or the start failed (≤ 15 s after the load went through), so
+  shows a local track (never another device's remote snapshot, which a cold pull passes
+  through), or the start failed (≤ 15 s after the load went through), so
   Media3's BUFFERING placeholder, and with it the notification and the foreground, lasts over a
   cold session's trackless snapshots (engine start, Spirc activation before the context resolved).
   With an empty timeline Media3 drops the notification and the foreground, so the service does
