@@ -10,8 +10,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** Connectivity of the default network as the engine sees it. */
-data class NetworkStatus(val available: Boolean, val metered: Boolean)
+/**
+ * Connectivity of the default network as the engine sees it. [handle] identifies the default
+ * network (`Network.getNetworkHandle`): it changes when Android moves the default to another
+ * network while one stays available (Wi-Fi without internet -> mobile data), and the engine
+ * then checks its connection (docs/ARCHITECTURE.md §4.2).
+ */
+data class NetworkStatus(val available: Boolean, val metered: Boolean, val handle: Long? = null)
 
 /**
  * Tracks the default network with `ConnectivityManager.registerDefaultNetworkCallback`.
@@ -57,7 +62,7 @@ class NetworkMonitor(context: Context) {
         val cm = connectivity ?: return NetworkStatus(available = true, metered = false)
         return try {
             val network = cm.activeNetwork ?: return NetworkStatus(available = false, metered = false)
-            statusOf(cm.getNetworkCapabilities(network))
+            statusOf(network, cm.getNetworkCapabilities(network))
         } catch (e: RuntimeException) {
             Log.w(TAG, "Reading network state failed", e)
             _status.value
@@ -70,27 +75,29 @@ class NetworkMonitor(context: Context) {
 
         override fun onAvailable(network: Network) {
             current = network
-            // onCapabilitiesChanged follows immediately with the real capabilities.
-            _status.value = _status.value.copy(available = true)
+            // onCapabilitiesChanged follows immediately with the real capabilities. The handle
+            // also keeps a quick onLost(A) -> onAvailable(B) apart from "still A" when the
+            // StateFlow conflates the two.
+            _status.value = _status.value.copy(available = true, handle = network.networkHandle)
         }
 
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
             if (current != null && network != current) return
             current = network
-            _status.value = statusOf(networkCapabilities)
+            _status.value = statusOf(network, networkCapabilities)
         }
 
         override fun onLost(network: Network) {
             if (network != current) return
             current = null
-            _status.value = _status.value.copy(available = false)
+            _status.value = _status.value.copy(available = false, handle = null)
         }
     }
 
     private companion object {
         const val TAG = "NetworkMonitor"
 
-        fun statusOf(caps: NetworkCapabilities?): NetworkStatus {
+        fun statusOf(network: Network, caps: NetworkCapabilities?): NetworkStatus {
             if (caps == null) return NetworkStatus(available = false, metered = false)
             val internet = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             val notSuspended = Build.VERSION.SDK_INT < Build.VERSION_CODES.P ||
@@ -98,7 +105,7 @@ class NetworkMonitor(context: Context) {
             val unmetered = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) ||
                 (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
                     caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED))
-            return NetworkStatus(available = internet && notSuspended, metered = !unmetered)
+            return NetworkStatus(available = internet && notSuspended, metered = !unmetered, handle = network.networkHandle)
         }
     }
 }
