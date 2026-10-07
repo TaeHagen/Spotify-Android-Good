@@ -152,7 +152,8 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
                 state.editMode -> TextButton(onClick = exitEditMode) {
                     Text(stringResource(R.string.detail_done), fontWeight = FontWeight.Bold)
                 }
-                data?.meta?.canEdit == true -> IconButton(
+                // Rows from the download are read-only (setEditMode refuses them).
+                data?.meta?.canEdit == true && !data.downloadedCopy -> IconButton(
                     onClick = {
                         query = ""
                         viewModel.setEditMode(true)

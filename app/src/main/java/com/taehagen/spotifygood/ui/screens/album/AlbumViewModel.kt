@@ -55,22 +55,40 @@ internal data class AlbumUiState(
 
 internal class AlbumViewModel(graph: AppGraph, private val uri: String) : DetailViewModel(graph, uri) {
 
+    /** Refetching after the session came back while the download was shown: keep it until then. */
+    @Volatile private var refetchingCopy = false
+
     private val content: StateFlow<LoadState<AlbumContent>> = retryTrigger
         .flatMapLatest { graph.catalog.album(uri).catch { emit(Resource.Error(it)) } }
         .map { resource -> resource.toLoadState { toContent(it) } }
         // No page and no cached copy (offline, cache cleared or pruned): a downloaded album still
         // opens, from the download database.
         .flatMapLatest { load ->
-            if (load !is LoadState.Failed) {
+            val keepCopy = load is LoadState.Loading && refetchingCopy
+            if (load !is LoadState.Loading) refetchingCopy = false
+            if (load !is LoadState.Failed && !keepCopy) {
                 flowOf(load)
             } else {
                 graph.downloadedPageFlow(uri).map { copy ->
-                    copy?.let { LoadState.Ready(toContent(it.toAlbum(), downloadedCopy = true), stale = true) } ?: load
+                    copy?.let {
+                        LoadState.Ready(toContent(it.toAlbum(), downloadedCopy = true), refreshing = keepCopy, stale = !keepCopy)
+                    } ?: load
                 }
             }
         }
         .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LoadState.Loading)
+
+    init {
+        // Session back ONLINE while showing the download: fetch the album (it replaces the copy).
+        refetchWhenOnline(
+            showingDownload = { content.value.dataOrNull()?.downloadedCopy == true },
+            refetch = {
+                refetchingCopy = true
+                retry()
+            },
+        )
+    }
 
     private val primaryArtist: Flow<ArtistRef?> = content
         .map { it.dataOrNull()?.album?.artists?.firstOrNull() }

@@ -8,7 +8,12 @@ import com.taehagen.spotifygood.model.ArtistRef
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.ShowRef
+import com.taehagen.spotifygood.model.NativeErrorInfo
+import com.taehagen.spotifygood.model.SessionState
 import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.nativebridge.NativeException
+import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.library.DownloadMetadata
 import com.taehagen.spotifygood.ui.screens.library.DownloadedCollection
@@ -16,6 +21,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.IOException
+import java.net.SocketTimeoutException
+import java.util.concurrent.TimeoutException
 
 class DownloadedPagesTest {
     private val albumRef = AlbumRef(
@@ -128,5 +136,39 @@ class DownloadedPagesTest {
         assertEquals(listOf("E1", "E2", "E4", "E5"), newest.map { it.name })
         val oldest = appendDownloadedEpisodes(emptyList(), listOf(e[1], e[3], e[4]), newestFirst = false)
         assertEquals(listOf("E5", "E4", "E2"), oldest.map { it.name })
+    }
+}
+
+class DownloadFallbackTest {
+    private fun native(code: String) = NativeException(NativeErrorInfo(code, "boom"))
+
+    @Test
+    fun offlineAlwaysUsesTheDownload() {
+        val reach = EngineReach.of(offlineMode = false, session = SessionState.ONLINE, networkAvailable = false)
+        assertEquals(EngineReach.OFFLINE, reach)
+        assertTrue(useDownloadFallback(reach, native(NativeErrorCode.INTERNAL)))
+        assertTrue(useDownloadFallback(EngineReach.OFFLINE, native(NativeErrorCode.NOT_CONNECTED)))
+    }
+
+    @Test
+    fun aSessionThatCantConnectUsesTheDownloadAfterConnectionFailures() {
+        // Captive portal: Android reports a network, the session never gets ONLINE.
+        val reach = EngineReach.of(offlineMode = false, session = SessionState.CONNECTING, networkAvailable = true)
+        assertEquals(EngineReach.CONNECTING, reach)
+        assertTrue(useDownloadFallback(reach, native(NativeErrorCode.NOT_CONNECTED)))
+        assertTrue(useDownloadFallback(reach, native(NativeErrorCode.NETWORK)))
+        assertTrue(useDownloadFallback(reach, IOException("reset")))
+        assertTrue(useDownloadFallback(reach, SocketTimeoutException()))
+        assertTrue(useDownloadFallback(reach, TimeoutException()))
+        assertFalse(useDownloadFallback(reach, native(NativeErrorCode.INTERNAL)))
+        assertFalse(useDownloadFallback(reach, native(NativeErrorCode.RATE_LIMITED)))
+    }
+
+    @Test
+    fun anOnlineSessionKeepsTheServerList() {
+        val reach = EngineReach.of(offlineMode = false, session = SessionState.ONLINE, networkAvailable = true)
+        assertEquals(EngineReach.ONLINE, reach)
+        assertFalse(useDownloadFallback(reach, native(NativeErrorCode.NETWORK)))
+        assertFalse(useDownloadFallback(reach, IOException()))
     }
 }
