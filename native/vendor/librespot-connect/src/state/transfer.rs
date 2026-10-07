@@ -163,6 +163,8 @@ impl ConnectState {
                 ..Default::default()
             };
             self.update_context(context, ContextType::Default)?;
+            // SPOTIFYGOOD: a load of it resolves it for real, see different_context_uri
+            self.mark_default_context_incomplete();
         }
 
         self.finish_transfer(transfer)

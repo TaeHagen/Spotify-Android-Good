@@ -174,8 +174,27 @@ impl ConnectState {
     }
 
     fn different_context_uri(&self, uri: &str) -> bool {
-        // search identifier is always different
-        self.context_uri() != uri || uri.starts_with(SEARCH_IDENTIFIER)
+        // SPOTIFYGOOD: also without a context (a transfer still resolving it), or one that isn't
+        // all there (made of what a failed transfer brought, or a page failed): a load of that
+        // uri ran on it (the tapped song wasn't found and the first one played), or failed with
+        // NoContext, it was never resolved again
+        self.context.is_none()
+            || self.default_context_incomplete
+            // search identifier is always different
+            || self.context_uri() != uri
+            || uri.starts_with(SEARCH_IDENTIFIER)
+    }
+
+    // SPOTIFYGOOD: for Spirc's load, see different_context_uri
+    /// Whether `uri` is the context that plays, resolved and all there
+    pub fn is_current_context(&self, uri: &str) -> bool {
+        !self.different_context_uri(uri)
+    }
+
+    // SPOTIFYGOOD: see different_context_uri
+    /// The default context isn't all there (a resolve of it, or of one of its pages, failed)
+    pub fn mark_default_context_incomplete(&mut self) {
+        self.default_context_incomplete = true;
     }
 
     // SPOTIFYGOOD: returns whether the context was reset completely (handle_load drops the
@@ -200,6 +219,7 @@ impl ConnectState {
                 // SPOTIFYGOOD: removed tracks and smart shuffle belong to the old context
                 self.skipped_uids.clear();
                 self.clear_smart_shuffle();
+                self.default_context_incomplete = false;
 
                 let player = self.player_mut();
                 player.context_uri.clear();
@@ -271,17 +291,26 @@ impl ConnectState {
         }
     }
 
+    // SPOTIFYGOOD: factored out of update_context, Spirc's load checks a fetched context with
+    // it before it tears down the playing one
+    /// Whether the context can be played
+    pub fn check_context(context: &Context) -> Result<(), StateError> {
+        if context.pages.iter().all(|p| p.tracks.is_empty()) {
+            error!("context didn't have any tracks: {context:#?}");
+            Err(StateError::ContextHasNoTracks)
+        } else if matches!(context.uri, Some(ref uri) if uri.starts_with(LOCAL_FILES_IDENTIFIER)) {
+            Err(StateError::UnsupportedLocalPlayback)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn update_context(
         &mut self,
         mut context: Context,
         ty: ContextType,
     ) -> Result<Option<Vec<String>>, Error> {
-        if context.pages.iter().all(|p| p.tracks.is_empty()) {
-            error!("context didn't have any tracks: {context:#?}");
-            Err(StateError::ContextHasNoTracks)?;
-        } else if matches!(context.uri, Some(ref uri) if uri.starts_with(LOCAL_FILES_IDENTIFIER)) {
-            Err(StateError::UnsupportedLocalPlayback)?;
-        }
+        Self::check_context(&context)?;
 
         let mut next_contexts = Vec::new();
         let mut first_page = None;
@@ -355,6 +384,8 @@ impl ConnectState {
                 }
 
                 self.context = Some(new_context);
+                // SPOTIFYGOOD: resolved (again), see different_context_uri
+                self.default_context_incomplete = false;
 
                 if !matches!(context.url, Some(ref url) if url.contains(SEARCH_IDENTIFIER)) {
                     self.player_mut().context_url = context.url.take().unwrap_or_default();
