@@ -1,6 +1,6 @@
 //! Resolving arbitrary entity/context URIs into `MediaRef` tiles (recently played, home).
 
-use super::metadata;
+use super::metadata::{self, Fetched};
 use super::playlist;
 use super::util::{parse_uri, UriKind};
 use crate::models::{AlbumRef, ArtistRef, MediaRef, MediaType, PlaylistRef, ShowRef, Track};
@@ -79,6 +79,12 @@ pub(crate) fn collection_media(uri: &str) -> Option<MediaRef> {
 /// Resolves `uris` into tiles (order kept, duplicates and unresolvable URIs dropped). Every
 /// lookup is batched per kind; failures of one kind only drop that kind.
 pub(crate) async fn resolve(session: &Session, uris: &[String]) -> Vec<MediaRef> {
+    resolve_checked(session, uris).await.0
+}
+
+/// [`resolve`], also telling whether some tiles are missing because a lookup failed (network,
+/// rate limit, a header lookup left for later) rather than because the item has no data.
+pub(crate) async fn resolve_checked(session: &Session, uris: &[String]) -> (Vec<MediaRef>, bool) {
     let mut seen = HashSet::new();
     let mut ordered: Vec<(String, Option<UriKind>)> = Vec::new();
     for uri in uris {
@@ -100,32 +106,39 @@ pub(crate) async fn resolve(session: &Session, uris: &[String]) -> Vec<MediaRef>
         of(UriKind::Playlist),
     );
     let (albums, artists, shows, tracks, episodes, playlists) = tokio::join!(
-        metadata::albums(session, &album_uris),
-        metadata::artists(session, &artist_uris),
-        metadata::shows(session, &show_uris),
-        metadata::track_map(session, &track_uris),
-        metadata::episode_map(session, &episode_uris),
+        metadata::album_lookup(session, &album_uris),
+        metadata::artist_lookup(session, &artist_uris),
+        metadata::show_lookup(session, &show_uris),
+        metadata::track_lookup(session, &track_uris),
+        metadata::episode_lookup(session, &episode_uris),
         playlist::headers(session, &playlist_uris, usize::MAX),
     );
-    let albums = albums.unwrap_or_default();
-    let artists = artists.unwrap_or_default();
-    let shows = shows.unwrap_or_default();
-    let tracks = tracks.unwrap_or_default();
-    let episodes = episodes.unwrap_or_default();
+    let albums = Fetched::or_all_failed(albums, &album_uris);
+    let artists = Fetched::or_all_failed(artists, &artist_uris);
+    let shows = Fetched::or_all_failed(shows, &show_uris);
+    let tracks = Fetched::or_all_failed(tracks, &track_uris);
+    let episodes = Fetched::or_all_failed(episodes, &episode_uris);
+    let incomplete = playlists.incomplete
+        || albums.any_failed(album_uris.iter())
+        || artists.any_failed(artist_uris.iter())
+        || shows.any_failed(show_uris.iter())
+        || tracks.any_failed(track_uris.iter())
+        || episodes.any_failed(episode_uris.iter());
     let playlists: HashMap<String, PlaylistRef> = playlists.refs;
-    ordered
+    let tiles = ordered
         .iter()
         .filter_map(|(uri, kind)| match kind {
-            Some(UriKind::Album) => albums.get(uri).map(|a| album_media(&a.album)),
-            Some(UriKind::Artist) => artists.get(uri).map(|a| artist_media(&a.artist)),
-            Some(UriKind::Show) => shows.get(uri).map(|s| show_media(&s.show)),
-            Some(UriKind::Track) => tracks.get(uri).map(|t| track_media(t)),
-            Some(UriKind::Episode) => episodes.get(uri).map(|e| episode_media(e)),
+            Some(UriKind::Album) => albums.map.get(uri).map(|a| album_media(&a.album)),
+            Some(UriKind::Artist) => artists.map.get(uri).map(|a| artist_media(&a.artist)),
+            Some(UriKind::Show) => shows.map.get(uri).map(|s| show_media(&s.show)),
+            Some(UriKind::Track) => tracks.map.get(uri).map(|t| track_media(t)),
+            Some(UriKind::Episode) => episodes.map.get(uri).map(|e| episode_media(e)),
             Some(UriKind::Playlist) => playlists.get(uri).map(playlist_media),
             None => collection_media(uri),
         })
         .filter(|m| !m.name.is_empty())
-        .collect()
+        .collect();
+    (tiles, incomplete)
 }
 
 #[cfg(test)]

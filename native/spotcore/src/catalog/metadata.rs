@@ -216,14 +216,6 @@ pub(crate) async fn show_lookup(session: &Session, uris: &[String]) -> AppResult
     Ok(lookup(&SHOWS, session, uris, UriKind::Show, fetch_shows).await?.1)
 }
 
-pub(crate) async fn track_map(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<Track>>> {
-    Ok(track_lookup(session, uris).await?.map)
-}
-
-pub(crate) async fn episode_map(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<Episode>>> {
-    Ok(episode_lookup(session, uris).await?.map)
-}
-
 pub(crate) async fn albums(session: &Session, uris: &[String]) -> AppResult<HashMap<String, Arc<AlbumMeta>>> {
     Ok(album_lookup(session, uris).await?.map)
 }
