@@ -329,8 +329,12 @@ reads Online) Kotlin's `PlayerController` sends context loads of a playlist / Li
 Songs / album / show with `trackUris` = that context's downloads in context order (Room
 collection membership; albums/shows not downloaded as a whole by metadata), keeping
 `contextUri`/`startUri`/`startUid` for Spirc. Nothing downloaded while offline → "not
-available offline" without a native call. Smart shuffle is not offered for `offline:true`
-snapshots.
+available offline" without a native call. While the session is still connecting (it may come
+online), a requested start item that is not downloaded is sent alone as `trackUris` (any context,
+artists too): Spirc plays it in its context if the session comes online, otherwise the engine
+answers "not available offline" — another download is never swapped in. Only offline does a
+start that is not downloaded move on to the next download. Smart shuffle is not offered for
+`offline:true` snapshots.
 
 ## 5. Events (Rust → Kotlin `onEvent(type, json)`)
 

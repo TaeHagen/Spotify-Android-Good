@@ -22,7 +22,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.ArtistRef
-import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.ui.appViewModel
@@ -123,7 +122,7 @@ private fun AlbumList(
             items(disc.tracks, key = { "t-${it.index}" }, contentType = { "track" }) { indexed ->
                 val track = indexed.track
                 val downloadState = state.rowDownloads[track.uri]
-                val playable = track.playable && (!state.offline || downloadState == DownloadState.COMPLETED)
+                val playable = canStartNow(track.playable, state.online, downloadState)
                 val showActions = { navigator.showActions(MediaActionTarget.TrackTarget(track, contextUri = uri)) }
                 TrackRow(
                     track = track,
@@ -136,7 +135,7 @@ private fun AlbumList(
                     downloadState = downloadState,
                     onMoreClick = showActions,
                     onLongClick = showActions,
-                    // Unplayable (or not downloaded while offline): dimmed, actions still in the overflow.
+                    // Unplayable (or not downloaded while the session isn't online): dimmed, actions still in the overflow.
                     enabled = playable,
                 )
             }

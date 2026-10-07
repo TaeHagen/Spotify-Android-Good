@@ -52,7 +52,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
-import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.PlaylistOwner
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.ui.appViewModel
@@ -67,6 +66,7 @@ import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MainNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
+import com.taehagen.spotifygood.ui.screens.album.canStartNow
 import com.taehagen.spotifygood.ui.screens.album.AddedButton
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadButton
 import com.taehagen.spotifygood.ui.screens.album.DetailActionRow
@@ -487,9 +487,8 @@ private fun PlaylistItemRow(
     val episode = item.episode
     val itemUri = item.uri ?: return
     val downloadState = state.rowDownloads[itemUri]
-    // Unplayable (or not downloaded while offline): dimmed, actions still in the overflow.
-    val playable = (track?.playable ?: episode?.playable ?: false) &&
-        (!state.offline || downloadState == DownloadState.COMPLETED)
+    // Unplayable (or not downloaded while the session isn't online): dimmed, actions still in the overflow.
+    val playable = canStartNow(track?.playable ?: episode?.playable ?: false, state.online, downloadState)
     val onClick = { onPlay(visible) }
     val editable = playlist.meta.canEdit && !playlist.downloadedCopy
     when {

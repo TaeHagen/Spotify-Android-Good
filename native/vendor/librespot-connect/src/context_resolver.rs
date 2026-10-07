@@ -143,6 +143,9 @@ pub struct ContextResolver {
     session: Session,
     queue: VecDeque<ResolveContext>,
     unavailable_contexts: HashMap<ResolveContext, Instant>,
+    /// SPOTIFYGOOD: the next resolve failed transiently: when it is fetched again, and how many
+    /// retries it had (see [ContextResolver::retry_next_later])
+    retry: Option<(Instant, usize)>,
 }
 
 // time after which an unavailable context is retried
@@ -150,6 +153,13 @@ pub struct ContextResolver {
 const RETRY_UNAVAILABLE: Duration = Duration::from_secs(60);
 // SPOTIFYGOOD: upper bound for one context fetch, see get_next_context
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+// SPOTIFYGOOD: the delays before the retries of a resolve that failed transiently, see
+// ContextResolver::retry_next_later
+const RESOLVE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
 
 impl ContextResolver {
     pub fn new(session: Session) -> Self {
@@ -157,6 +167,7 @@ impl ContextResolver {
             session,
             queue: VecDeque::new(),
             unavailable_contexts: HashMap::new(),
+            retry: None,
         }
     }
 
@@ -226,16 +237,43 @@ impl ContextResolver {
             let _ = self.queue.drain(0..remove); // remove invalid
         }
         self.queue.pop_front(); // remove used
+        // SPOTIFYGOOD: see retry_next_later
+        self.retry = None;
     }
 
     pub fn clear(&mut self) {
-        self.queue = VecDeque::new()
+        self.queue = VecDeque::new();
+        // SPOTIFYGOOD: see retry_next_later
+        self.retry = None;
     }
 
     // SPOTIFYGOOD: see Spirc::set_autoplay
     pub fn remove_autoplay(&mut self) {
+        let next = self.find_next().map(|(next, _, _)| next.clone());
         self.queue
-            .retain(|resolve| resolve.update != ContextType::Autoplay)
+            .retain(|resolve| resolve.update != ContextType::Autoplay);
+        if next != self.find_next().map(|(next, _, _)| next.clone()) {
+            self.retry = None;
+        }
+    }
+
+    // SPOTIFYGOOD: a transient failure (network, timeout, rate limit) of the next resolve used to
+    // drop it. Nothing asked again for the resolve a pending transfer or the deferred shuffle of
+    // a multi-page load waits for, so their state was never set up.
+    /// Keeps the next resolve after a transient failure, it is fetched again after a delay
+    /// ([RESOLVE_RETRY_DELAYS]). Returns false, without keeping it, once its retries are used up.
+    pub fn retry_next_later(&mut self) -> bool {
+        let retries = self.retry.map_or(0, |(_, retries)| retries);
+        match RESOLVE_RETRY_DELAYS.get(retries) {
+            Some(delay) => {
+                self.retry = Some((Instant::now() + *delay, retries + 1));
+                true
+            }
+            None => {
+                self.retry = None;
+                false
+            }
+        }
     }
 
     fn find_next(&self) -> Option<(&ResolveContext, &str, usize)> {
@@ -266,6 +304,12 @@ impl ContextResolver {
         recent_track_uri: impl Fn() -> Vec<String>,
     ) -> Result<Context, Error> {
         let (next, resolve_uri, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
+
+        // SPOTIFYGOOD: a retry waits for its time (absolute, so a future that the loop dropped
+        // and created again doesn't start the delay over)
+        if let Some((at, _)) = self.retry {
+            tokio::time::sleep_until(at).await;
+        }
 
         // SPOTIFYGOOD: bounded. spclient retries without a timeout of its own (and sleeps out a
         // 429's Retry-After), so a load sent just before the network died hung the Spirc loop
@@ -355,15 +399,10 @@ impl ContextResolver {
         }))
     }
 
-    pub fn try_finish(
-        &self,
-        state: &mut ConnectState,
-        transfer_state: &mut Option<TransferState>,
-    ) -> bool {
-        let (next, _, _) = match self.find_next() {
-            None => return false,
-            Some(next) => next,
-        };
+    // SPOTIFYGOOD: factored out of try_finish, see finish_after_failure
+    /// The next resolve, if it is the last of its update type and the state is set up after it
+    fn last_of_kind(&self, state: &ConnectState) -> Option<&ResolveContext> {
+        let (next, _, _) = self.find_next()?;
 
         // when there is only one update type, we are the last of our kind, so we should update the state
         if self
@@ -373,7 +412,7 @@ impl ContextResolver {
             .count()
             != 1
         {
-            return false;
+            return None;
         }
 
         match (next.update, state.active_context) {
@@ -382,12 +421,59 @@ impl ContextResolver {
                     "last item of type <{:?}>, finishing state setup",
                     next.update
                 );
+                Some(next)
             }
             (ContextType::Default, _) => {
                 debug!("skipped finishing default, because it isn't the active context");
-                return false;
+                None
             }
         }
+    }
+
+    // SPOTIFYGOOD: a failed last resolve left the state as it was: a pending transfer never
+    // finished (no next tracks, the transferred queue lost) and the deferred shuffle of a
+    // multi-page load never ran (no next tracks either), so the playback stopped after the
+    // current track
+    /// Sets the state up with what there is, after the next resolve failed for good (call it
+    /// before the resolve is removed). Returns whether it did, i.e. whether the failed resolve
+    /// was the last default one.
+    pub fn finish_after_failure(
+        &self,
+        state: &mut ConnectState,
+        transfer_state: &mut Option<TransferState>,
+    ) -> bool {
+        match self.last_of_kind(state) {
+            Some(next) if next.update == ContextType::Default => {}
+            // an autoplay resolve: nothing waits for it
+            _ => return false,
+        }
+
+        let res = if let Some(transfer) = transfer_state.take() {
+            state.finish_transfer_without_context(transfer)
+        } else if state.shuffling_context() && !state.default_context_shuffled() {
+            // the shuffle a load deferred until its pages were resolved
+            state.shuffle_new()
+        } else {
+            state.fill_up_next_tracks()
+        };
+
+        if let Err(why) = res {
+            error!("setup of state after a failed resolve failed: {why}")
+        }
+
+        state.update_restrictions();
+        state.update_queue_revision();
+        true
+    }
+
+    pub fn try_finish(
+        &self,
+        state: &mut ConnectState,
+        transfer_state: &mut Option<TransferState>,
+    ) -> bool {
+        let Some(next) = self.last_of_kind(state) else {
+            return false;
+        };
 
         let active_ctx = state.get_context(state.active_context);
         let res = if let Some(transfer_state) = transfer_state.take() {

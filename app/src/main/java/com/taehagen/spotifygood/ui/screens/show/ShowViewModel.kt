@@ -96,6 +96,8 @@ internal data class ShowUiState(
     val partial: Boolean = false,
     /** Showing the download (offline): the header or part of the list comes from it. */
     val downloadedCopy: Boolean = false,
+    /** The session is ONLINE: episodes that aren't downloaded can start ([canStartNow]). */
+    val online: Boolean = true,
 )
 
 internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailViewModel(graph, uri) {
@@ -115,12 +117,12 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         playbackInfo,
         graph.savedFlow(uri),
         graph.downloads.collectionUi(uri),
-        combine(graph.downloads.statesFor(episodeUris), offline, ::Pair),
-    ) { (load, page), playback, following, download, (rows, offline) ->
+        combine(graph.downloads.statesFor(episodeUris), connectivity, ::Pair),
+    ) { (load, page), playback, following, download, (rows, connectivity) ->
         // The show's own first page is listed only in newest-first order.
         val partial = page.partial || (page.sort == EpisodeSort.NEWEST && load.dataOrNull()?.show?.partial == true)
         val downloadedCopy = load.dataOrNull()?.downloadedCopy == true || page.fromDownloads
-        ShowUiState(load, page, playback, following, download, rows, offline, partial, downloadedCopy)
+        ShowUiState(load, page, playback, following, download, rows, connectivity.offline, partial, downloadedCopy, connectivity.online)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ShowUiState())
 
     init {

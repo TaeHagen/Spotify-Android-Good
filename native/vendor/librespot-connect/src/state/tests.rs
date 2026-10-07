@@ -1479,6 +1479,158 @@ fn reset_context_reports_a_complete_reset() {
     assert!(state.reset_context(ResetContext::Completely));
 }
 
+fn resolver(rt: &tokio::runtime::Runtime) -> crate::context_resolver::ContextResolver {
+    let session = {
+        let _guard = rt.enter();
+        Session::new(SessionConfig::default(), None)
+    };
+    crate::context_resolver::ContextResolver::new(session)
+}
+
+#[test]
+fn a_failed_resolve_still_finishes_a_transfer() {
+    use crate::{
+        context_resolver::{ContextAction, ResolveContext},
+        protocol::{
+            playback::Playback, queue::Queue, session::Session as PlayingSession,
+            transfer_state::TransferState,
+        },
+    };
+
+    // with the tracks the transfer brought, and with none
+    for with_pages in [true, false] {
+        let (rt, mut state) = state(3);
+        state.reset_context(ResetContext::Completely);
+        let mut transfer = TransferState {
+            playback: MessageField::some(Playback {
+                current_track: MessageField::some(ContextTrack {
+                    uri: Some(track_uri(2, 0)),
+                    uid: Some("uid2".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            current_session: MessageField::some(PlayingSession {
+                context: MessageField::some(Context {
+                    uri: Some(CONTEXT_URI.to_string()),
+                    pages: if with_pages {
+                        context(10, 0).pages
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            queue: MessageField::some(Queue {
+                tracks: vec![ContextTrack {
+                    uri: Some(track_uri(1, 9)),
+                    ..Default::default()
+                }],
+                is_playing_queue: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // what handle_transfer does before the context is resolved
+        let track = state.current_track_from_transfer(&transfer).unwrap();
+        state.set_track(track);
+        state.handle_initial_transfer(&mut transfer, Some(CONTEXT_URI.to_string()));
+        assert!(state.next_tracks().is_empty());
+
+        // the resolve of the transfer's context fails for good
+        let mut resolver = resolver(&rt);
+        resolver.add(ResolveContext::from_uri(
+            CONTEXT_URI,
+            "",
+            ContextType::Default,
+            ContextAction::Replace,
+        ));
+        let mut transfer_state = Some(transfer);
+        assert!(resolver.finish_after_failure(&mut state, &mut transfer_state));
+
+        assert!(transfer_state.is_none(), "the transfer is finished");
+        assert_eq!(state.current_track(|t| t.uid.clone()), "uid2");
+        // the transferred queue, then the transferred context after the current track
+        let next = next_uids(&state);
+        assert!(state.next_tracks()[0].is_queue());
+        if with_pages {
+            assert_eq!(next[1..], uids(3..10));
+        } else {
+            assert_eq!(next.len(), 1);
+        }
+        assert_eq!(state.context_uri(), CONTEXT_URI);
+    }
+}
+
+#[test]
+fn a_failed_last_page_still_shuffles_a_load() {
+    use crate::context_resolver::{ContextAction, ResolveContext};
+
+    // a shuffled load of a multi-page context: the shuffle waits for the further pages
+    let (rt, mut state) = state(20);
+    state.set_shuffle(true);
+    state.clear_next_tracks();
+    state.set_current_track(5).unwrap();
+
+    let mut resolver = resolver(&rt);
+    for page in ["spotify:album:1", "spotify:album:2"] {
+        resolver.add(ResolveContext::from_uri(
+            page,
+            "",
+            ContextType::Default,
+            ContextAction::Append,
+        ));
+    }
+
+    // a failure that isn't the last of its kind changes nothing
+    assert!(!resolver.finish_after_failure(&mut state, &mut None));
+    assert!(state.next_tracks().is_empty());
+    resolver.remove_used_and_invalid();
+
+    // the last one: shuffled with the pages there are
+    assert!(resolver.finish_after_failure(&mut state, &mut None));
+    assert!(state.default_context_shuffled());
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid5");
+    let mut next = next_uids(&state);
+    next.sort();
+    let mut expected = uids(0..20);
+    expected.retain(|uid| uid != "uid5");
+    expected.sort();
+    assert_eq!(next, expected);
+}
+
+#[test]
+fn a_transient_resolve_failure_is_retried_a_few_times() {
+    use crate::context_resolver::{ContextAction, ResolveContext};
+
+    let (rt, _state) = state(1);
+    let mut resolver = resolver(&rt);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Default,
+        ContextAction::Replace,
+    ));
+    for _ in 0..3 {
+        assert!(resolver.retry_next_later());
+    }
+    assert!(!resolver.retry_next_later(), "given up after three retries");
+
+    // the next resolve gets its own retries
+    resolver.add(ResolveContext::from_uri(
+        "spotify:album:1",
+        "",
+        ContextType::Default,
+        ContextAction::Append,
+    ));
+    assert!(resolver.retry_next_later());
+    resolver.remove_used_and_invalid();
+    for _ in 0..3 {
+        assert!(resolver.retry_next_later());
+    }
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(
