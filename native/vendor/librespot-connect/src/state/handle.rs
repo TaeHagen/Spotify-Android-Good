@@ -12,32 +12,57 @@ use crate::{
 };
 use protobuf::MessageField;
 
+// SPOTIFYGOOD: see ConnectState::playback_anchor
+/// Where the playback continues in the default context, worked out before its order or the
+/// repeat option change and applied after
+enum Anchor {
+    /// after the context track with this uid: the current track, the track a playing smart
+    /// shuffle suggestion follows, or the last context track played before a queued track
+    After(String),
+    /// before the context track with this uid, the first upcoming one
+    Before(String),
+    /// at the start of the context
+    Start,
+}
+
 impl ConnectState {
     pub fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {
-        self.set_shuffle(shuffle);
-
         if shuffle {
+            // SPOTIFYGOOD: checked first, a refused shuffle left the option set
+            self.validate_shuffle_allowed()?;
+            self.set_shuffle(true);
             return self.shuffle_new();
         }
 
+        self.set_shuffle(false);
         // SPOTIFYGOOD: smart shuffle only exists on top of shuffle
         self.clear_smart_shuffle();
 
-        self.reset_context(ResetContext::DefaultIndex);
-
-        if self.current_track(MessageField::is_none) {
+        if matches!(self.active_context, ContextType::Autoplay) {
+            // SPOTIFYGOOD: the default context was played to its end, unshuffling it changes no
+            // next track (resetting the playback switched back to the default context and
+            // replaced the playing autoplay track)
+            if let Ok(ctx) = self.get_context_mut(ContextType::Default) {
+                ctx.remove_shuffle_seed();
+                ctx.remove_initial_track();
+                ctx.tracks.unshuffle();
+                ctx.index.track = ctx.tracks.len() as u32;
+            }
+            self.update_restrictions();
             return Ok(());
         }
 
-        match self.current_track(|t| t.get_context_index()) {
-            Some(current_index) => self.reset_playback_to_position(Some(current_index)),
-            None => {
-                let ctx = self.get_context(ContextType::Default)?;
-                let current_index = ConnectState::find_index_in_context(ctx, |c| {
-                    self.current_track(|t| c.uri == t.uri)
-                })?;
-                self.reset_playback_to_position(Some(current_index))
-            }
+        // SPOTIFYGOOD: where the playback continues is worked out before the context is
+        // unshuffled. A queued current track was looked up by uri after that: when it wasn't in
+        // the context the unshuffle failed half applied (the shuffled next tracks and suggestions
+        // stayed, the fill up started over at the first track), when it was the playback jumped
+        // there.
+        let anchor = self.playback_anchor();
+        self.reset_context(ResetContext::DefaultIndex);
+
+        match anchor {
+            None => Ok(()),
+            Some(anchor) => self.reset_playback_to_position(self.anchor_position(&anchor)),
         }
     }
 
@@ -48,26 +73,81 @@ impl ConnectState {
     }
 
     pub fn handle_set_repeat_context(&mut self, repeat: bool) -> Result<(), Error> {
-        self.set_repeat_context(repeat);
-
-        if repeat {
-            if let ContextType::Autoplay = self.fill_up_context {
-                self.fill_up_context = ContextType::Default;
-            }
+        // SPOTIFYGOOD: checks and where the playback continues come before any change. A queued
+        // current track was looked up by uri: when it wasn't in the context the toggle failed
+        // half applied (the option and fill up context changed, the next tracks didn't, so the
+        // wraps of a repeated context stayed), when it was the playback jumped there.
+        if matches!(self.active_context, ContextType::Autoplay) {
+            // the default context was played to its end (see update_restrictions)
+            Err(StateError::CurrentlyDisallowed {
+                action: "repeat",
+                reason: "autoplay".to_string(),
+            })?
         }
 
-        let ctx = self.get_context(ContextType::Default)?;
-        // SPOTIFYGOOD: a smart shuffle suggestion isn't part of the context, use the position of
-        // the context track it follows
-        let current_track = if self.current_track(|t| t.is_suggestion()) {
-            let anchor = self.current_track(|t| t.get_context_index());
-            ConnectState::find_index_in_context(ctx, |t| {
-                anchor.is_some() && t.get_context_index() == anchor
-            })?
-        } else {
-            ConnectState::find_index_in_context(ctx, |t| self.current_track(|t| &t.uri) == &t.uri)?
+        let Some(anchor) = self.playback_anchor() else {
+            // nothing plays, there are no next tracks to rebuild
+            self.set_repeat_context(repeat);
+            return Ok(());
         };
-        self.reset_playback_to_position(Some(current_track))
+
+        self.set_repeat_context(repeat);
+        // the reset also switches the fill up back from autoplay to the default context
+        self.reset_playback_to_position(self.anchor_position(&anchor))
+    }
+
+    // SPOTIFYGOOD: see Anchor
+    /// Where the playback continues in the default context, `None` without a current track or
+    /// default context
+    fn playback_anchor(&self) -> Option<Anchor> {
+        if self.current_track(MessageField::is_none) {
+            return None;
+        }
+        let ctx = self.get_context(ContextType::Default).ok()?;
+
+        // the uid of the context track that `track` is or follows
+        let context_uid = |track: &ProvidedTrack| -> Option<String> {
+            let position = if track.is_suggestion() {
+                let index = track.get_context_index()?;
+                ctx.tracks
+                    .iter()
+                    .position(|t| t.get_context_index() == Some(index))
+            } else if Self::is_plain_context_track(track) {
+                Self::position_in_context(ctx, track)
+            } else {
+                None
+            };
+            Some(ctx.tracks.get(position?)?.uid.clone())
+        };
+
+        let anchor = self
+            .current_track(|t| t.as_ref().and_then(&context_uid))
+            // a queued track (or one an update removed from the context) follows the last
+            // played context track
+            .or_else(|| self.prev_tracks().iter().rev().find_map(&context_uid))
+            .map(Anchor::After)
+            .or_else(|| {
+                self.next_tracks()
+                    .iter()
+                    .take_while(|t| !t.uid.starts_with(IDENTIFIER_DELIMITER))
+                    .filter(|t| Self::is_plain_context_track(t))
+                    .find_map(&context_uid)
+                    .map(Anchor::Before)
+            })
+            .unwrap_or(Anchor::Start);
+        Some(anchor)
+    }
+
+    /// The position in the (current order of the) default context that the playback continues
+    /// after, see [ConnectState::reset_playback_to_position]
+    fn anchor_position(&self, anchor: &Anchor) -> Option<usize> {
+        let ctx = self.get_context(ContextType::Default).ok()?;
+        let position = |uid: &str| ctx.tracks.iter().position(|t| t.uid == uid);
+        match anchor {
+            Anchor::After(uid) => position(uid),
+            Anchor::Before(uid) => position(uid)?.checked_sub(1),
+            Anchor::Start => None,
+        }
     }
 
     // SPOTIFYGOOD: local queue commands. Invariant kept by all of them: queued tracks are

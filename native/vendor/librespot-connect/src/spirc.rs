@@ -2640,10 +2640,9 @@ impl SpircTask {
                     self.connect_state.reset_playback_to_position(None)?;
                     self.load_track(self.connect_state.is_playing(), 0)?
                 }
-                None => {
-                    self.connect_state.reset_playback_to_position(None)?;
-                    self.handle_stop()
-                }
+                // SPOTIFYGOOD: without a previous track, previous restarts the current one
+                // (prev_track no longer touches the state then); it used to stop playback.
+                None => self.handle_seek(0),
                 Some(_) => self.load_track(self.connect_state.is_playing(), 0)?,
             }
         } else {

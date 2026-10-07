@@ -169,6 +169,17 @@ impl<'ct> ConnectState {
     /// to next tracks (when from the context) and fills up the prev tracks from the
     /// current context
     pub fn prev_track(&mut self) -> Result<Option<&MessageField<ProvidedTrack>>, Error> {
+        // SPOTIFYGOOD: without a previous track nothing changes, so that the caller can restart
+        // the current track. The current track was moved to the next tracks, which left the
+        // state without one.
+        if self
+            .prev_tracks()
+            .iter()
+            .all(|t| t.uid.starts_with(IDENTIFIER_DELIMITER))
+        {
+            return Ok(None);
+        }
+
         let old_track = self.player_mut().track.take();
 
         // SPOTIFYGOOD: entries go back in after the queued tracks (they were inserted in front
@@ -286,9 +297,24 @@ impl<'ct> ConnectState {
             .find(|(_, track)| !track.is_queue());
 
         if let Some((non_queued_track, _)) = first_non_queued_track {
+            // SPOTIFYGOOD: the autoplay fill up continues at the first dropped autoplay track,
+            // a later transition to autoplay skipped the dropped ones
+            let first_autoplay = self.next_tracks()[non_queued_track..]
+                .iter()
+                .find(|t| t.is_autoplay())
+                .map(|t| t.uid.clone());
+
             while self.next_tracks().len() > non_queued_track
                 && self.next_tracks_mut().pop().is_some()
             {}
+
+            if let (Some(uid), Ok(ctx)) =
+                (first_autoplay, self.get_context_mut(ContextType::Autoplay))
+            {
+                if let Some(position) = ctx.tracks.iter().position(|t| t.uid == uid) {
+                    ctx.index.track = position as u32;
+                }
+            }
         }
     }
 
@@ -355,8 +381,16 @@ impl<'ct> ConnectState {
                     continue;
                 }
                 Some(ct) => {
-                    // SPOTIFYGOOD: smart shuffle
+                    // SPOTIFYGOOD: smart shuffle. The context track and its suggestion go in
+                    // together: when only the context track fits, the fill up stops before it
+                    // and continues there next time. A suggestion that didn't fit used to be
+                    // lost, the next fill up continued after the context track it follows.
                     suggestion = self.suggestion_after(iteration, new_index, ct);
+                    if suggestion.is_some()
+                        && self.next_tracks().len() + 2 > SPOTIFY_MAX_NEXT_TRACKS_SIZE
+                    {
+                        break;
+                    }
                     new_index += 1;
                     ct.clone()
                 }
@@ -364,11 +398,9 @@ impl<'ct> ConnectState {
 
             self.next_tracks_mut().push(track);
 
-            // SPOTIFYGOOD: smart shuffle, the suggestion never displaces a context track
+            // SPOTIFYGOOD: smart shuffle, there is room for it (see above)
             if let Some(suggestion) = suggestion {
-                if self.next_tracks().len() < SPOTIFY_MAX_NEXT_TRACKS_SIZE {
-                    self.next_tracks_mut().push(suggestion)
-                }
+                self.next_tracks_mut().push(suggestion)
             }
         }
 
@@ -387,6 +419,30 @@ impl<'ct> ConnectState {
         self.update_queue_revision();
 
         Ok(())
+    }
+
+    // SPOTIFYGOOD: see fill_up_next_tracks, smart shuffle suggestions are keyed by the pass
+    /// The pass through the default context (the `index.page` of its fill up, counting the wraps
+    /// with repeat) that the current track belongs to
+    pub(super) fn current_pass(&self) -> u32 {
+        let page = self
+            .get_context(ContextType::Default)
+            .map(|ctx| ctx.index.page)
+            .unwrap_or_default();
+
+        // the first delimiter of the next tracks ends the pass of the current track (a wrap, or
+        // the transition to autoplay), its iteration is that pass
+        let mut delimiters = self
+            .next_tracks()
+            .iter()
+            .filter(|t| t.uid.starts_with(IDENTIFIER_DELIMITER));
+        match delimiters.next() {
+            None => page,
+            Some(first) => first
+                .get_iteration()
+                .and_then(|iteration| iteration.parse().ok())
+                .unwrap_or_else(|| page.saturating_sub(1 + delimiters.count() as u32)),
+        }
     }
 
     pub fn preview_next_track(&mut self) -> Option<SpotifyUri> {
@@ -503,7 +559,8 @@ impl<'ct> ConnectState {
     ///
     /// The fill up continues at the earliest dropped context (or autoplay) track, so that the
     /// dropped tracks are filled in again later. Upstream only popped them, and because the fill
-    /// up index already pointed past them, they were never played.
+    /// up index already pointed past them, they were never played. A dropped smart shuffle
+    /// suggestion takes the context track it follows along (so at most `max - 1` may be left).
     fn truncate_next_tracks(&mut self, max: usize) {
         while self.next_tracks().len() > max {
             let Some(dropped) = self.next_tracks_mut().pop() else {
@@ -535,7 +592,25 @@ impl<'ct> ConnectState {
             return;
         }
         if dropped.is_suggestion() {
-            // injected again by the fill up after the (dropped) context track it follows
+            // the fill up only inserts a suggestion together with the context track it follows
+            // (its anchor), so drop the anchor as well and continue the fill up there
+            let anchor_is_last = matches!(
+                self.next_tracks().last(),
+                Some(t) if Self::is_plain_context_track(t)
+                    && t.get_context_index() == dropped.get_context_index()
+            );
+            if anchor_is_last {
+                let anchor = self
+                    .next_tracks_mut()
+                    .pop()
+                    .expect("item that was prechecked");
+                self.rewind_fill_up(&anchor);
+            } else {
+                debug!(
+                    "dropped the suggestion <{}>, the track it follows was already played",
+                    dropped.uri
+                );
+            }
             return;
         }
 
@@ -552,10 +627,7 @@ impl<'ct> ConnectState {
                 ctx.index.track = position as u32;
                 self.fill_up_context = ty;
             }
-            None => debug!(
-                "dropped next track <{}> isn't in the context",
-                dropped.uri
-            ),
+            None => debug!("dropped next track <{}> isn't in the context", dropped.uri),
         }
     }
 
