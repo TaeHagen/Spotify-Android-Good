@@ -8,7 +8,7 @@ import java.io.File
 /**
  * On-disk layout of downloads (docs/ARCHITECTURE.md §9.7): encrypted audio in
  * `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part` while incomplete, resumed natively) and
- * cover art in `noBackupFilesDir/offline/images/<imageHex>`. Both directories belong to downloads
+ * cover art in `noBackupFilesDir/offline/images/<imageHex>.jpg`. Both directories belong to downloads
  * only. Files can be shared by several downloads (see [DownloadRules.audioToDelete]). All methods do
  * blocking file I/O: call them off the main thread.
  */
