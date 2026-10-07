@@ -132,7 +132,8 @@ mod tests {
         assert!(format!("{req:?}").contains("Tracks("));
         let req = load_request(&args(r#"{"contextUri":"spotify:track:a"}"#)).expect("request");
         assert!(format!("{req:?}").contains("Tracks([\"spotify:track:a\"])"));
-        assert!(load_request(&args(r#"{"contextUri":"spotify:web-api"}"#)).is_err());
+        // nothing playable at all is rejected before (LoadArgs::validate)
+        assert!(serde_json::from_str::<LoadArgs>(r#"{"contextUri":"spotify:web-api"}"#).expect("parse").validate().is_err());
     }
 
     #[test]

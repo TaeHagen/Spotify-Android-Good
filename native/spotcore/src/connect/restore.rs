@@ -2,26 +2,38 @@
 //! (network switch, lost AP connection, dead player). A new Spirc starts inactive and empty, so
 //! without this every Wi-Fi ↔ cellular switch would silently end local playback.
 //!
-//! Flow: the engine calls `prepare_reconnect` before tearing the old Spirc down (or right after it
-//! died); the last active snapshot is frozen (shown paused meanwhile, see `hub::compose`). After
-//! the new Spirc is online, `schedule` waits for its first cluster: if no other device took over
-//! in the meantime, nothing else was started (an explicit load or offline playback drops the
-//! restore point) it activates and reloads context, track, position, options and user queue.
+//! States (see `HubState`): **pending** (`reconnect` holds the frozen state, shown paused) →
+//! **restoring** (activate + load sent to the new Spirc, `activation` set until its snapshot is
+//! active) → done; or **abandoned** (`clear`: skipped, replaced, stopped).
 //!
-//! The Player outlives the Spirc. A Spirc that is shut down pauses it; one that ended by itself
-//! (lost connection, failed dealer setup) leaves it playing, so `prepare_reconnect` pauses it, and
-//! a restore point that is dropped stops the paused track nobody owns anymore.
+//! * The engine calls `prepare_reconnect` before tearing the old Spirc down (or right after it
+//!   died): the last active snapshot is frozen and the Player paused.
+//! * Once the new Spirc is online, `schedule` waits for its first cluster (never deciding without
+//!   one) while no command holds the restore. If no other device took over meanwhile and nothing
+//!   else was started (an explicit load or offline playback drops the restore point), it
+//!   activates and reloads context, track, position, options and user queue.
+//! * Commands consult the state instead of destroying it: play / pause set the restore's
+//!   [`intent`](set_intent) (whether it starts playing), other controls wait for the decision and
+//!   then go to the restored Spirc, a load or transfer [`hold`]s the decision while it is routed
+//!   and replaces the restore point only once it is known to be valid.
+//!
+//! The Player outlives the Spirc and nothing else controls it: `prepare_reconnect` pauses it, a
+//! dropped restore point stops the paused track nobody owns anymore (the offline queue or an
+//! active Spirc excepted), and Spirc pauses it itself when its task ends or is aborted.
 
-use super::hub::{self, HubState, CLUSTER_CHANGED, HUB};
+use super::args::LoadArgs;
+use super::hub::{self, HubState, HUB};
 use super::{local, now_ms, offline, uri};
+use crate::models::RepeatMode;
 use librespot_connect::{
     ConnectSnapshot, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack, SnapshotPlayStatus,
-    TrackProvider as SpircProvider,
+    SnapshotTrack, TrackProvider as SpircProvider,
 };
 use std::time::{Duration, Instant};
 
-/// How long the new Spirc may take to deliver its first cluster.
-const CLUSTER_WAIT: Duration = Duration::from_secs(15);
+/// How long the new Spirc may take to deliver its first cluster (its dealer start is bounded by
+/// 30 s); without one the restore never runs (another device may have taken over).
+const FIRST_CLUSTER_MAX: Duration = Duration::from_secs(60);
 /// Playback only resumes playing automatically if the interruption was shorter than this.
 const RESUME_PLAYING_MAX_GAP: Duration = Duration::from_secs(120);
 
@@ -32,6 +44,15 @@ pub(crate) struct Frozen {
     pub at_ms: i64,
     pub since: Instant,
     pub was_playing: bool,
+    /// A user's play / pause while the restore was pending: whether it starts playing.
+    pub intent: Option<bool>,
+}
+
+impl Frozen {
+    /// Whether the restored playback starts playing after a gap of `gap`.
+    fn start_playing(&self, gap: Duration) -> bool {
+        self.intent.unwrap_or(self.was_playing && gap < RESUME_PLAYING_MAX_GAP)
+    }
 }
 
 /// Position of `s` at `now_ms` (local epoch ms).
@@ -48,53 +69,104 @@ pub(crate) fn position_now(s: &ConnectSnapshot, now_ms: i64) -> i64 {
 
 pub(crate) fn freeze(snap: ConnectSnapshot, now_ms: i64, since: Instant) -> Frozen {
     let was_playing = matches!(snap.status, SnapshotPlayStatus::Playing | SnapshotPlayStatus::LoadingPlay);
-    Frozen { position_ms: position_now(&snap, now_ms), at_ms: now_ms, since, was_playing, snap }
+    Frozen { position_ms: position_now(&snap, now_ms), at_ms: now_ms, since, was_playing, snap, intent: None }
 }
 
 #[derive(Debug)]
 pub(crate) struct Plan {
     pub request: LoadRequest,
+    /// Added to the queue after the load (in order).
     pub queued: Vec<String>,
+    /// Skip to the first queued entry after that (a queued or suggested track was playing; the
+    /// context was loaded at the track before it).
+    pub then_next: bool,
+    /// Start playing after the skip (the load itself starts paused then).
+    pub then_play: bool,
 }
 
-fn visible(t: &&librespot_connect::SnapshotTrack) -> bool {
+fn visible(t: &&SnapshotTrack) -> bool {
     !t.hidden && t.uri != uri::DELIMITER_URI
+}
+
+fn options_of(s: &ConnectSnapshot) -> Options {
+    Options {
+        shuffle: s.shuffle || s.smart_shuffle,
+        repeat: s.repeat_context,
+        repeat_track: s.repeat_track,
+        smart_shuffle: s.smart_shuffle,
+    }
 }
 
 /// What to load to get back to `f`. `gap`: time since the playback was interrupted.
 pub(crate) fn plan(f: &Frozen, gap: Duration) -> Option<Plan> {
     let s = &f.snap;
     let current = s.track.as_ref().filter(|t| !t.hidden)?;
-    let options = |playing_track| LoadRequestOptions {
-        start_playing: f.was_playing && gap < RESUME_PLAYING_MAX_GAP,
-        seek_to: f.position_ms.clamp(0, u32::MAX as i64) as u32,
+    let start_playing = f.start_playing(gap);
+    let options = |playing_track, start_playing, seek_to| LoadRequestOptions {
+        start_playing,
+        seek_to,
         playing_track: Some(playing_track),
-        context_options: Some(LoadContextOptions::Options(Options {
-            shuffle: s.shuffle || s.smart_shuffle,
-            repeat: s.repeat_context,
-            repeat_track: s.repeat_track,
-            smart_shuffle: s.smart_shuffle,
-        })),
+        context_options: Some(LoadContextOptions::Options(options_of(s))),
     };
+    let seek_to = f.position_ms.clamp(0, u32::MAX as i64) as u32;
     let queued: Vec<String> =
         s.next_tracks.iter().filter(visible).filter(|t| t.provider == SpircProvider::Queue).map(|t| t.uri.clone()).collect();
-    let current_in_context = current.provider == SpircProvider::Context;
-    let request = if uri::is_resolvable_context(&s.context_uri) && current_in_context {
-        LoadRequest::from_context_uri(s.context_uri.clone(), options(PlayingTrack::Uri(current.uri.clone())))
+    let resolvable = uri::is_resolvable_context(&s.context_uri);
+    if resolvable && current.provider == SpircProvider::Context {
+        let request = LoadRequest::from_context_uri(
+            s.context_uri.clone(),
+            options(PlayingTrack::Uri(current.uri.clone()), start_playing, seek_to),
+        );
+        return Some(Plan { request, queued, then_next: false, then_play: false });
+    }
+    // A queued or suggested track was playing: keep the context, loaded (paused) at the context
+    // track played before it, with the track queued in front of the user queue and skipped to.
+    // Its position is lost (it restarts), the playlist isn't.
+    let anchor = s.prev_tracks.iter().rev().filter(visible).find(|t| t.provider == SpircProvider::Context);
+    if resolvable && matches!(current.provider, SpircProvider::Queue | SpircProvider::Suggestion) {
+        if let Some(anchor) = anchor {
+            let request =
+                LoadRequest::from_context_uri(s.context_uri.clone(), options(PlayingTrack::Uri(anchor.uri.clone()), false, 0));
+            let mut requeue = vec![current.uri.clone()];
+            requeue.extend(queued);
+            return Some(Plan { request, queued: requeue, then_next: true, then_play: start_playing });
+        }
+    }
+    // Plain track lists (or nothing to anchor the context at): rebuild the visible window.
+    let is_ctx = |t: &&SnapshotTrack| matches!(t.provider, SpircProvider::Context | SpircProvider::Autoplay);
+    let prev: Vec<String> = s.prev_tracks.iter().filter(visible).filter(is_ctx).map(|t| t.uri.clone()).collect();
+    let next = s.next_tracks.iter().filter(visible).filter(is_ctx).map(|t| t.uri.clone());
+    let index = prev.len() as u32;
+    let mut tracks = prev;
+    tracks.push(current.uri.clone());
+    tracks.extend(next);
+    let request = LoadRequest::from_tracks(tracks, options(PlayingTrack::Index(index), start_playing, seek_to));
+    Some(Plan { request, queued, then_next: false, then_play: false })
+}
+
+/// The frozen session as a `player.load` (for another device: context, track, position, options).
+pub(crate) fn load_args(f: &Frozen, play: bool) -> Option<LoadArgs> {
+    let s = &f.snap;
+    let current = s.track.as_ref().filter(|t| !t.hidden)?;
+    let repeat = if s.repeat_track {
+        RepeatMode::Track
+    } else if s.repeat_context {
+        RepeatMode::Context
     } else {
-        // Plain track lists (or a queued/suggested current track): rebuild the visible window.
-        let is_ctx = |t: &&librespot_connect::SnapshotTrack| {
-            matches!(t.provider, SpircProvider::Context | SpircProvider::Autoplay)
-        };
-        let prev: Vec<String> = s.prev_tracks.iter().filter(visible).filter(is_ctx).map(|t| t.uri.clone()).collect();
-        let next = s.next_tracks.iter().filter(visible).filter(is_ctx).map(|t| t.uri.clone());
-        let index = prev.len() as u32;
-        let mut tracks = prev;
-        tracks.push(current.uri.clone());
-        tracks.extend(next);
-        LoadRequest::from_tracks(tracks, options(PlayingTrack::Index(index)))
+        RepeatMode::Off
     };
-    Some(Plan { request, queued })
+    let base = LoadArgs {
+        position_ms: f.position_ms.max(0) as u64,
+        shuffle: Some(s.shuffle || s.smart_shuffle),
+        repeat: Some(repeat),
+        play,
+        ..Default::default()
+    };
+    Some(if uri::is_resolvable_context(&s.context_uri) {
+        LoadArgs { context_uri: Some(s.context_uri.clone()), start_uri: Some(current.uri.clone()), ..base }
+    } else {
+        LoadArgs { track_uris: Some(vec![current.uri.clone()]), start_index: Some(0), shuffle: Some(false), ..base }
+    })
 }
 
 /// Whether the attached Spirc still runs (and with that controls the Player it played on).
@@ -112,26 +184,31 @@ pub(crate) fn freeze_restore_point(hub: &mut HubState, now_ms: i64, now: Instant
     hub.reconnect = match active {
         Some(s) => Some(freeze(s, now_ms, now)),
         None => hub.last_active.take().map(|last| {
-            let mut f = freeze(last.snap, last.ended_at_ms.unwrap_or(now_ms).min(now_ms), now);
+            let ended = last.ended_at_ms.unwrap_or(now_ms).min(now_ms);
+            let mut f = freeze(last.snap, ended, now);
             f.at_ms = now_ms;
+            // An old restore point is never played automatically.
+            if now_ms - ended > RESUME_PLAYING_MAX_GAP.as_millis() as i64 {
+                f.was_playing = false;
+            }
             f
         }),
     };
 }
 
-/// Freezes the current local playback before a reconnect (no-op if nothing was active). If the
-/// Spirc task already ended by itself, the Player it drove plays on (CDN fetches don't need the
-/// session) while nothing can control it: it is paused here, after freezing (so that the restore
-/// point is the playing state). On a deliberate teardown Spirc's shutdown pauses it.
+/// Freezes the current local playback before a reconnect (no-op if nothing was active) and pauses
+/// the Player, after freezing (so that the restore point is the playing state). A Spirc that is
+/// shut down pauses it too; one that ended by itself (lost connection, failed dealer setup) or is
+/// stuck in a request doesn't, and CDN fetches don't need the session, so it would play on with
+/// nothing able to control it.
 pub(crate) fn prepare_reconnect() {
     let pause = {
         let mut hub = HUB.lock();
         freeze_restore_point(&mut hub, now_ms(), Instant::now());
-        !spirc_running(&hub) && hub.snapshot.as_ref().is_some_and(|s| s.is_active)
+        hub.snapshot.as_ref().is_some_and(|s| s.is_active && s.status != SnapshotPlayStatus::Stopped)
     };
     if pause && !offline::is_active() {
         if let Some(player) = crate::engine::player_host::player() {
-            log::info!("spirc ended by itself, pausing its player");
             player.pause();
         }
     }
@@ -143,24 +220,23 @@ pub(crate) fn prepare_reconnect() {
 /// that ended by itself) has no owner anymore and is stopped, unless the offline queue or an
 /// active Spirc owns the Player.
 pub(crate) fn clear() {
-    drop_restore(true);
+    drop_restore();
 }
 
-/// A user command while a restore is pending: the user took over, the restore is dropped (like
-/// `clear`, but the restore point of the attached Spirc for a later reconnect is kept).
-pub(crate) fn cancel() {
-    if HUB.lock().reconnect.is_some() {
-        log::info!("user command while a restore is pending, not restoring");
-        drop_restore(false);
+/// Takes the pending restore point out (it won't run here): a transfer of this session to
+/// another device. The paused track is stopped like by [`clear`].
+pub(crate) fn take() -> Option<Frozen> {
+    let frozen = HUB.lock().reconnect.clone();
+    if frozen.is_some() {
+        drop_restore();
     }
+    frozen
 }
 
-fn drop_restore(forget_last_active: bool) {
+fn drop_restore() {
     let (dropped, orphaned) = {
         let mut hub = HUB.lock();
-        if forget_last_active {
-            hub.last_active = None;
-        }
+        hub.last_active = None;
         let dropped = hub.reconnect.take().is_some();
         let running = spirc_running(&hub);
         let owned = running && hub.snapshot.as_ref().is_some_and(|s| s.is_active);
@@ -172,7 +248,45 @@ fn drop_restore(forget_last_active: bool) {
         }
     }
     if dropped {
+        hub::changed();
         hub::publish();
+    }
+}
+
+/// Whether a restore point is pending.
+pub(crate) fn is_pending() -> bool {
+    HUB.lock().reconnect.is_some()
+}
+
+/// A play (`true`) or pause (`false`) while a restore is pending: the restored playback starts
+/// playing or paused. Returns whether a restore is pending.
+pub(crate) fn set_intent(play: bool) -> bool {
+    let mut hub = HUB.lock();
+    match hub.reconnect.as_mut() {
+        Some(f) => {
+            f.intent = Some(play);
+            true
+        }
+        None => false,
+    }
+}
+
+/// While held, the pending restore doesn't run (a load or transfer is being routed, it replaces
+/// the restore point if it goes through, and leaves it untouched if it fails).
+pub(crate) struct Hold(());
+
+pub(crate) fn hold() -> Hold {
+    HUB.lock().restore_holds += 1;
+    Hold(())
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        {
+            let mut hub = HUB.lock();
+            hub.restore_holds = hub.restore_holds.saturating_sub(1);
+        }
+        hub::changed();
     }
 }
 
@@ -180,17 +294,19 @@ fn drop_restore(forget_last_active: bool) {
 enum Decision {
     /// The restore point was dropped meanwhile.
     Cancelled,
+    /// The first cluster isn't known yet (it shows whether another device took over).
+    NoCluster,
     /// Not restoring (the reason is logged); the restore point is to be cleared.
     Skip(&'static str),
     /// Restore with this plan (the restore point was taken).
     Restore(Plan),
 }
 
-/// Whether to restore now, after the new Spirc's first cluster (or the wait timed out).
+/// Whether to restore now, after the new Spirc's first cluster.
 fn decide(hub: &mut HubState, me: &str, offline_active: bool) -> Decision {
     let Some(frozen) = hub.reconnect.as_ref() else { return Decision::Cancelled };
-    let other_active =
-        hub.cluster.as_ref().is_some_and(|c| !c.active_device_id.is_empty() && c.active_device_id != me);
+    let Some(cluster) = hub.cluster.as_ref() else { return Decision::NoCluster };
+    let other_active = !cluster.active_device_id.is_empty() && cluster.active_device_id != me;
     if other_active || hub.snapshot.as_ref().is_some_and(|s| s.is_active) {
         return Decision::Skip("another device is active");
     }
@@ -210,9 +326,9 @@ pub(crate) fn schedule(generation: u64) {
         return;
     }
     crate::runtime::handle().spawn(async move {
-        let deadline = tokio::time::Instant::now() + CLUSTER_WAIT;
+        let deadline = tokio::time::Instant::now() + FIRST_CLUSTER_MAX;
         loop {
-            let notified = CLUSTER_CHANGED.notified();
+            let notified = hub::CHANGED.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             {
@@ -220,12 +336,18 @@ pub(crate) fn schedule(generation: u64) {
                 if hub.link.as_ref().map(|l| l.generation) != Some(generation) {
                     return; // superseded; a newer Spirc schedules its own restore
                 }
-                if hub.cluster.is_some() {
+                if hub.reconnect.is_none() {
+                    return; // replaced meanwhile
+                }
+                if hub.cluster.is_some() && hub.restore_holds == 0 {
                     break;
                 }
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                break;
+                // Without a cluster another device may have taken over: never restore blind.
+                // The restore point stays for the next Spirc (this one most likely died).
+                log::warn!("no cluster from spirc {generation}, not restoring for now");
+                return;
             }
         }
         let me = hub::me();
@@ -237,19 +359,23 @@ pub(crate) fn schedule(generation: u64) {
                 return; // superseded; a newer Spirc schedules its own restore
             };
             match decide(&mut hub, &me, offline_active) {
-                Decision::Cancelled => return,
+                Decision::Cancelled | Decision::NoCluster => return,
                 Decision::Skip(reason) => reason,
                 Decision::Restore(plan) => {
-                    // Sent while holding the hub, so that a concurrent explicit load (which clears
-                    // the restore point first) reaches Spirc after the restore, not before it.
+                    // Sent while holding the hub, so that a command routed meanwhile reaches Spirc
+                    // after the restore, not before it.
                     log::info!("restoring local playback after reconnect");
+                    hub.activation = Some(hub::Activation { generation, at: Instant::now() });
                     let result = local::sent(spirc.activate())
                         .and_then(|_| local::sent(spirc.load(plan.request)))
-                        .and_then(|_| plan.queued.into_iter().try_for_each(|q| local::sent(spirc.add_to_queue(q))));
+                        .and_then(|_| plan.queued.into_iter().try_for_each(|q| local::sent(spirc.add_to_queue(q))))
+                        .and_then(|_| if plan.then_next { local::sent(spirc.next()) } else { Ok(()) })
+                        .and_then(|_| if plan.then_play { local::sent(spirc.play()) } else { Ok(()) });
                     drop(hub);
                     if let Err(e) = result {
                         log::warn!("restore failed: {e}");
                     }
+                    hub::changed();
                     hub::publish();
                     return;
                 }
@@ -325,14 +451,102 @@ mod tests {
         assert!(dbg.contains("Tracks([\"spotify:track:p\", \"spotify:track:cur\", \"spotify:track:n\"])"), "{dbg}");
     }
 
+    fn cluster(active: &str) -> Option<std::sync::Arc<librespot_protocol::connect::Cluster>> {
+        Some(std::sync::Arc::new(librespot_protocol::connect::Cluster { active_device_id: active.into(), ..Default::default() }))
+    }
+
+    /// A frozen restore point, the new Spirc attached (inactive) with its first cluster (nobody
+    /// active).
     fn frozen_hub() -> HubState {
         let mut hub = HubState::default();
         hub::apply_snapshot(&mut hub, snap("spotify:album:a", SpircProvider::Context), false, 1_000_000);
         freeze_restore_point(&mut hub, 1_002_000, Instant::now());
-        // the new Spirc: attached, inactive
+        hub::forget_previous_link(&mut hub);
         hub::apply_snapshot(&mut hub, ConnectSnapshot::default(), false, 1_003_000);
+        hub.cluster = cluster("");
         assert!(hub.reconnect.is_some());
         hub
+    }
+
+    #[test]
+    fn never_restores_without_the_first_cluster() {
+        let mut hub = frozen_hub();
+        hub.cluster = None;
+        assert!(matches!(decide(&mut hub, "me", false), Decision::NoCluster));
+        assert!(hub.reconnect.is_some(), "kept for when the cluster comes (or the next Spirc)");
+    }
+
+    #[test]
+    fn play_and_pause_while_pending_decide_how_it_comes_back() {
+        let mut hub = frozen_hub();
+        // a pause while pending: back paused, even after a short gap
+        hub.reconnect.as_mut().unwrap().intent = Some(false);
+        let p = plan(hub.reconnect.as_ref().unwrap(), Duration::from_secs(1)).expect("plan");
+        assert!(!p.request.start_playing);
+        // a play: playing, even after a long gap
+        hub.reconnect.as_mut().unwrap().intent = Some(true);
+        let p = plan(hub.reconnect.as_ref().unwrap(), Duration::from_secs(3600)).expect("plan");
+        assert!(p.request.start_playing);
+        let Decision::Restore(p) = decide(&mut hub, "me", false) else { panic!("restore") };
+        assert!(p.request.start_playing);
+    }
+
+    #[test]
+    fn a_dropped_restore_point_never_comes_back() {
+        // the restore was dropped while pending (a command, a transfer elsewhere); the dead
+        // Spirc's last active snapshot is gone with the new link, so a later reconnect of the
+        // idle new Spirc has nothing to restore
+        let mut hub = frozen_hub();
+        hub.reconnect = None;
+        freeze_restore_point(&mut hub, 9_000_000, Instant::now());
+        assert!(hub.reconnect.is_none());
+    }
+
+    #[test]
+    fn an_old_restore_point_comes_back_paused() {
+        let mut hub = HubState::default();
+        hub::apply_snapshot(&mut hub, snap("spotify:album:a", SpircProvider::Context), false, 1_000_000);
+        hub::apply_snapshot(&mut hub, ConnectSnapshot::default(), true, 1_003_000);
+        freeze_restore_point(&mut hub, 1_003_000 + 600_000, Instant::now());
+        assert!(!hub.reconnect.as_ref().expect("restore point").was_playing);
+    }
+
+    #[test]
+    fn a_queued_or_suggested_track_keeps_the_context() {
+        for provider in [SpircProvider::Queue, SpircProvider::Suggestion] {
+            let f = freeze(snap("spotify:playlist:x", provider.clone()), 1_000_000, Instant::now());
+            let p = plan(&f, Duration::ZERO).expect("plan");
+            let dbg = format!("{:?}", p.request);
+            assert!(dbg.contains("Uri(\"spotify:playlist:x\")"), "{dbg}");
+            // loaded paused at the context track before it, the track requeued first and skipped to
+            assert!(matches!(p.request.playing_track, Some(PlayingTrack::Uri(ref u)) if u == "spotify:track:p"));
+            assert!(!p.request.start_playing);
+            assert_eq!(p.queued, vec!["spotify:track:cur".to_string(), "spotify:track:q".to_string()]);
+            assert!(p.then_next && p.then_play, "{provider:?}");
+        }
+        // without a track before it there is nothing to anchor the context at: the track list
+        let mut s = snap("spotify:playlist:x", SpircProvider::Queue);
+        s.prev_tracks.clear();
+        let p = plan(&freeze(s, 1_000_000, Instant::now()), Duration::ZERO).expect("plan");
+        assert!(format!("{:?}", p.request).contains("Tracks("));
+        assert!(!p.then_next);
+    }
+
+    #[test]
+    fn a_frozen_session_handed_to_another_device() {
+        let mut s = snap("spotify:album:a", SpircProvider::Context);
+        s.repeat_track = true;
+        let f = freeze(s, 1_002_000, Instant::now());
+        let a = load_args(&f, false).expect("load");
+        assert_eq!(a.context_uri.as_deref(), Some("spotify:album:a"));
+        assert_eq!(a.start_uri.as_deref(), Some("spotify:track:cur"));
+        assert_eq!(a.position_ms, 12_000);
+        assert_eq!(a.shuffle, Some(true));
+        assert_eq!(a.repeat, Some(RepeatMode::Track));
+        assert!(!a.play);
+        let f = freeze(snap("spotify:web-api", SpircProvider::Context), 1_000_000, Instant::now());
+        let a = load_args(&f, true).expect("load");
+        assert_eq!(a.track_uris, Some(vec!["spotify:track:cur".to_string()]));
     }
 
     #[test]
@@ -350,15 +564,9 @@ mod tests {
     #[test]
     fn restore_skipped_when_another_device_took_over() {
         let mut hub = frozen_hub();
-        hub.cluster = Some(std::sync::Arc::new(librespot_protocol::connect::Cluster {
-            active_device_id: "speaker".into(),
-            ..Default::default()
-        }));
+        hub.cluster = cluster("speaker");
         assert!(matches!(decide(&mut hub, "me", false), Decision::Skip(_)));
-        hub.cluster = Some(std::sync::Arc::new(librespot_protocol::connect::Cluster {
-            active_device_id: "me".into(),
-            ..Default::default()
-        }));
+        hub.cluster = cluster("me");
         assert!(matches!(decide(&mut hub, "me", false), Decision::Restore(_)));
     }
 

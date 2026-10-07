@@ -35,6 +35,23 @@ impl LoadArgs {
         if self.context_uri.is_none() && self.track_uris.is_none() {
             return Err(AppError::invalid("player.load needs contextUri or trackUris"));
         }
+        // A context that can't be resolved and isn't an item itself (the "spotify:web-api" a plain
+        // track list shows as its context, e.g. a resumed Liked Songs session): play the start item
+        // as a one-track list, like `ResumeArgs::load_args`. Every target rejected it otherwise.
+        let unresolvable = self.track_uris.is_none()
+            && self.context_uri.as_deref().is_some_and(|c| {
+                !super::uri::is_resolvable_context(c) && !super::uri::is_track(c) && !super::uri::is_episode(c)
+            });
+        if unresolvable {
+            let start = self.start_uri.as_deref().map(str::trim).filter(|u| super::uri::is_track(u) || super::uri::is_episode(u));
+            let Some(start) = start.map(str::to_string) else {
+                return Err(AppError::invalid("player.load: this context can't be played, give trackUris or a startUri"));
+            };
+            self.context_uri = None;
+            self.track_uris = Some(vec![start]);
+            self.start_index = Some(0);
+            self.start_uid = None;
+        }
         Ok(self)
     }
 }
@@ -151,6 +168,31 @@ mod tests {
         assert_eq!(a.repeat, Some(RepeatMode::Track));
         let empty: LoadArgs = serde_json::from_str(r#"{"contextUri":" "}"#).expect("parse");
         assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn unresolvable_context_plays_the_start_item() {
+        let a: LoadArgs =
+            serde_json::from_str(r#"{"contextUri":"spotify:web-api","startUri":"spotify:track:x","startIndex":7,"positionMs":9}"#)
+                .expect("parse");
+        let a = a.validate().expect("valid");
+        assert!(a.context_uri.is_none());
+        assert_eq!(a.track_uris, Some(vec!["spotify:track:x".to_string()]));
+        assert_eq!(a.start_index, Some(0));
+        assert_eq!(a.position_ms, 9);
+        // every target can play it
+        let request = format!("{:?}", super::super::local::load_request(&a).expect("local request"));
+        assert!(request.contains("Tracks([\"spotify:track:x\"])"), "{request}");
+        let play = super::super::remote::play(&a, "id").to_string();
+        assert!(play.contains("spotify:track:x") && !play.contains("web-api"), "{play}");
+        // nothing to play without a start item
+        let a: LoadArgs = serde_json::from_str(r#"{"contextUri":"spotify:web-api"}"#).expect("parse");
+        assert!(a.validate().is_err());
+        // resolvable contexts and bare items are untouched
+        let a: LoadArgs = serde_json::from_str(r#"{"contextUri":"spotify:album:a","startUri":"spotify:track:x"}"#).expect("parse");
+        assert_eq!(a.validate().expect("valid").context_uri.as_deref(), Some("spotify:album:a"));
+        let a: LoadArgs = serde_json::from_str(r#"{"contextUri":"spotify:track:x"}"#).expect("parse");
+        assert_eq!(a.validate().expect("valid").context_uri.as_deref(), Some("spotify:track:x"));
     }
 
     #[test]
