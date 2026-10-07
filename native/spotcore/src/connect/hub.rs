@@ -19,11 +19,14 @@ use librespot_core::Session;
 use librespot_protocol::connect::Cluster;
 use parking_lot::Mutex;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch, Notify};
 
 /// A placeholder of the last local playback is shown while reconnecting, for at most this long.
 const RECONNECT_PLACEHOLDER_MAX: Duration = Duration::from_secs(30 * 60);
+/// A local activation (load or restore) counts as "this device is active" for this long until
+/// the Spirc's snapshot says so (or it failed).
+const ACTIVATION_GRACE: Duration = Duration::from_secs(10);
 
 pub(crate) struct Link {
     pub generation: u64,
@@ -42,8 +45,20 @@ pub(crate) struct HubState {
     pub last_active: Option<LastActive>,
     /// A reconnect with a pending restore is in progress (frozen playback state).
     pub reconnect: Option<restore::Frozen>,
+    /// Commands holding the pending restore's decision (see `restore::hold`).
+    pub restore_holds: u32,
+    /// Activate + load were sent to the attached Spirc (a local load or the restore) and its
+    /// snapshot isn't active yet: commands go to it, not "nobody is active".
+    pub activation: Option<Activation>,
     /// `lastError` override after the load brake stopped playback (see `player_events`).
     pub refused_error: Option<String>,
+}
+
+/// See [`HubState::activation`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Activation {
+    pub generation: u64,
+    pub at: Instant,
 }
 
 /// The reconnect restore point while the attached Spirc is not active (anymore).
@@ -59,6 +74,14 @@ pub(crate) static HUB: LazyLock<Mutex<HubState>> = LazyLock::new(|| Mutex::new(H
 
 /// Woken on every cluster update (restore waits for the first cluster of a new Spirc).
 pub(crate) static CLUSTER_CHANGED: Notify = Notify::const_new();
+
+/// Woken whenever something commands and the restore wait for changes: a Spirc attached or
+/// detached, a cluster, this device becoming active, the restore decided, held or dropped.
+pub(crate) static CHANGED: Notify = Notify::const_new();
+
+pub(crate) fn changed() {
+    CHANGED.notify_waiters();
+}
 
 #[derive(Default)]
 pub(crate) struct EmitState {
@@ -102,6 +125,32 @@ pub(crate) fn local_active() -> bool {
     HUB.lock().snapshot.as_ref().is_some_and(|s| s.is_active)
 }
 
+/// This device is active, or an activation was just sent to its Spirc (a load, the restore).
+pub(crate) fn local_active_or_activating() -> bool {
+    activating_or_active(&HUB.lock())
+}
+
+pub(crate) fn activating_or_active(hub: &HubState) -> bool {
+    hub.snapshot.as_ref().is_some_and(|s| s.is_active)
+        || hub.activation.is_some_and(|a| {
+            hub.link.as_ref().is_some_and(|l| l.generation == a.generation) && a.at.elapsed() < ACTIVATION_GRACE
+        })
+}
+
+/// An activation was sent to the attached Spirc and it doesn't report itself active yet.
+pub(crate) fn activating() -> bool {
+    let hub = HUB.lock();
+    !hub.snapshot.as_ref().is_some_and(|s| s.is_active) && activating_or_active(&hub)
+}
+
+/// A local load with activation was sent to the attached Spirc.
+pub(crate) fn set_activating() {
+    let mut hub = HUB.lock();
+    if let Some(generation) = hub.link.as_ref().map(|l| l.generation) {
+        hub.activation = Some(Activation { generation, at: Instant::now() });
+    }
+}
+
 pub(crate) fn cluster() -> Option<Arc<Cluster>> {
     HUB.lock().cluster.clone()
 }
@@ -115,11 +164,11 @@ pub(crate) fn attach(a: Attachment) {
     let Attachment { generation, spirc, session, state, cluster, errors } = a;
     let audio_output = {
         let mut hub = HUB.lock();
+        forget_previous_link(&mut hub);
         hub.link = Some(Link { generation, spirc: spirc.clone() });
-        hub.snapshot = None;
-        hub.cluster = None;
         hub.audio_output.clone()
     };
+    changed();
     if let Some(out) = audio_output {
         let kind = super::local::audio_output_kind(&out.kind);
         if let Err(e) = spirc.set_audio_output(kind, out.name) {
@@ -129,23 +178,47 @@ pub(crate) fn attach(a: Attachment) {
     runtime::handle().spawn(observe(generation, session, state, cluster, errors));
 }
 
+/// A new Spirc starts with nothing of the previous one. Its restore point was frozen before it
+/// went (or there is none): its last active snapshot must not come back on a later reconnect.
+pub(crate) fn forget_previous_link(hub: &mut HubState) {
+    hub.snapshot = None;
+    hub.cluster = None;
+    hub.activation = None;
+    hub.last_active = None;
+}
+
+/// [`detach`] on the state. `online`: the session stays (hidden from Spotify Connect), so the last
+/// cluster is kept for the remote player state; once there is neither a link nor a session, a
+/// kept cluster is dropped too.
+pub(crate) fn detach_state(hub: &mut HubState, generation: u64, online: bool) {
+    if hub.link.as_ref().is_some_and(|l| l.generation == generation) {
+        hub.link = None;
+        hub.snapshot = None;
+        hub.activation = None;
+    }
+    if hub.link.is_none() && !online {
+        hub.cluster = None;
+    }
+}
+
 /// Called by the engine when a Spirc goes away (teardown or death, or hiding from Spotify
 /// Connect while the session stays online).
 pub(crate) fn detach(generation: u64) {
-    // Hidden (the session stays online): keep the last cluster for the remote player state.
-    let hiding = engine::is_online();
-    {
-        let mut hub = HUB.lock();
-        if hub.link.as_ref().is_some_and(|l| l.generation == generation) {
-            hub.link = None;
-            hub.snapshot = None;
-            if !hiding {
-                hub.cluster = None;
-            }
-        }
-    }
+    // Hidden (the session stays online): keep the last cluster for the remote player state. A
+    // later teardown of the hidden session (offline, stopped) drops it, there is no link then.
+    let online = engine::is_online();
+    detach_state(&mut HUB.lock(), generation, online);
+    changed();
     publish();
     publish_devices();
+}
+
+/// The engine is neither online nor attached to a Spirc: a cluster kept while hidden is stale.
+pub(crate) fn drop_stale_cluster() {
+    let mut hub = HUB.lock();
+    if hub.link.is_none() && !engine::is_online() {
+        hub.cluster = None;
+    }
 }
 
 /// Forgets any attached Spirc (forced cleanup after an aborted supervisor).
@@ -155,7 +228,9 @@ pub(crate) fn detach_all() {
         hub.link = None;
         hub.snapshot = None;
         hub.cluster = None;
+        hub.activation = None;
     }
+    changed();
     publish();
     publish_devices();
 }
@@ -168,6 +243,7 @@ async fn observe(
     mut errors: broadcast::Receiver<SpircCommandError>,
 ) {
     let initial = state.borrow_and_update().clone();
+    let mut last = initial.clone();
     on_snapshot(generation, initial, &session);
     let initial_cluster = cluster.borrow_and_update().clone();
     if let Some(c) = initial_cluster {
@@ -180,6 +256,7 @@ async fn observe(
                     break;
                 }
                 let s = state.borrow_and_update().clone();
+                last = s.clone();
                 on_snapshot(generation, s, &session);
             }
             r = cluster.changed() => {
@@ -199,6 +276,33 @@ async fn observe(
         }
     }
     log::debug!("spirc observer {generation} ended");
+    on_spirc_ended(generation, &last);
+}
+
+/// The Spirc task is gone (its state channel closed): if it was the active device playing, the
+/// Player is released (Spirc pauses it itself when it ends; this also covers a task whose
+/// future was dropped before its last snapshot). Not if a newer Spirc or the offline queue
+/// owns the Player by now.
+fn on_spirc_ended(generation: u64, last: &ConnectSnapshot) {
+    let playing = last.is_active
+        && matches!(
+            last.status,
+            librespot_connect::SnapshotPlayStatus::Playing | librespot_connect::SnapshotPlayStatus::LoadingPlay
+        );
+    if !playing {
+        return;
+    }
+    let newer_owner = {
+        let hub = HUB.lock();
+        hub.link.as_ref().is_some_and(|l| l.generation != generation) && activating_or_active(&hub)
+    };
+    if newer_owner || offline::is_active() {
+        return;
+    }
+    if let Some(player) = engine::player_host::player() {
+        log::info!("spirc {generation} ended while playing, pausing its player");
+        player.pause();
+    }
 }
 
 fn on_snapshot(generation: u64, snap: ConnectSnapshot, session: &Session) {
@@ -215,6 +319,7 @@ fn on_snapshot(generation: u64, snap: ConnectSnapshot, session: &Session) {
     if became_active {
         // Spirc owns the Player now.
         offline::deactivate();
+        changed();
     }
     player_events::check_exhausted(&snap);
     publish();
@@ -225,6 +330,9 @@ fn on_snapshot(generation: u64, snap: ConnectSnapshot, session: &Session) {
 pub(crate) fn apply_snapshot(hub: &mut HubState, snap: ConnectSnapshot, session_invalid: bool, now_ms: i64) -> bool {
     let was_active = hub.snapshot.as_ref().is_some_and(|s| s.is_active);
     let became_active = snap.is_active && !was_active;
+    if became_active {
+        hub.activation = None;
+    }
     if snap.is_active && snap.track.is_some() {
         hub.last_active = Some(LastActive { snap: snap.clone(), ended_at_ms: None });
     } else if !snap.is_active {
@@ -249,6 +357,9 @@ fn on_cluster(generation: u64, cluster: Arc<Cluster>) {
         hub.cluster = Some(cluster);
     }
     CLUSTER_CHANGED.notify_waiters();
+    changed();
+    // A paused offline queue gives way to a device that became active.
+    offline::yield_to_active_device();
     publish_devices();
     publish();
 }
@@ -284,9 +395,13 @@ pub(crate) fn compose() -> PlaybackSnapshot {
         let placeholder = hub.reconnect.as_ref().filter(|f| f.since.elapsed() < RECONNECT_PLACEHOLDER_MAX).cloned();
         (local, hub.cluster.clone(), placeholder, hub.refused_error.clone())
     };
+    // A paused or finished offline queue doesn't hide another active device.
+    let other_active = cluster.as_deref().is_some_and(|c| !c.active_device_id.is_empty() && c.active_device_id != device.id);
+    let offline = offline::snapshot(device.clone(), mixer_volume())
+        .filter(|s| !other_active || matches!(s.status, PlaybackStatus::Playing | PlaybackStatus::Loading));
     let mut snap = if let Some(s) = local {
         snapshot::map_local(&s, device.clone())
-    } else if let Some(s) = offline::snapshot(device.clone(), mixer_volume()) {
+    } else if let Some(s) = offline {
         s
     } else if let Some(f) = placeholder {
         // Reconnecting: keep showing what was playing (paused) instead of flashing "nothing".
@@ -427,5 +542,46 @@ mod tests {
         assert!(!refresh_due(&mut last, t0 + Duration::from_millis(2400)));
         assert!(refresh_due(&mut last, t0 + Duration::from_millis(2600)));
         assert!(!refresh_due(&mut last, t0 + Duration::from_millis(3000)));
+    }
+}
+
+#[cfg(test)]
+mod hub_tests {
+    use super::*;
+
+    fn cluster(active: &str) -> Arc<Cluster> {
+        Arc::new(Cluster { active_device_id: active.into(), ..Default::default() })
+    }
+
+    #[test]
+    fn a_cluster_kept_while_hidden_goes_with_the_session() {
+        let mut hub = HubState { cluster: Some(cluster("tv")), ..Default::default() };
+        // hiding (online, the link already gone): the remote state is kept
+        detach_state(&mut hub, 1, true);
+        assert!(hub.cluster.is_some());
+        // a later teardown of the hidden session (offline, stopped): no stale "Playing on tv"
+        detach_state(&mut hub, 1, false);
+        assert!(hub.cluster.is_none());
+    }
+
+    #[test]
+    fn a_new_link_forgets_the_previous_restore_point() {
+        let mut hub = HubState { cluster: Some(cluster("")), ..Default::default() };
+        let snap = ConnectSnapshot {
+            is_active: true,
+            track: Some(librespot_connect::SnapshotTrack {
+                uri: "spotify:track:a".into(),
+                uid: "a".into(),
+                provider: librespot_connect::TrackProvider::Context,
+                context_index: None,
+                hidden: false,
+                metadata: Default::default(),
+            }),
+            ..Default::default()
+        };
+        apply_snapshot(&mut hub, snap, false, 0);
+        assert!(hub.last_active.is_some());
+        forget_previous_link(&mut hub);
+        assert!(hub.last_active.is_none() && hub.cluster.is_none() && hub.snapshot.is_none());
     }
 }

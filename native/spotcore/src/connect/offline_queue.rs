@@ -81,6 +81,12 @@ pub(crate) struct OfflineQueue {
     shuffle: bool,
     seed: u64,
     repeat: RepeatMode,
+    /// Repeat context is on (Spirc keeps it separately from repeat-track, which a manual skip
+    /// turns off: then the mode falls back to this).
+    repeat_context: bool,
+    /// Whether the current item plays or is meant to (also while it loads: a paused load stays
+    /// paused through next / unavailable).
+    play_intent: bool,
     skipped: HashSet<usize>,
     unavailable: HashSet<String>,
     next_queue_id: u64,
@@ -107,6 +113,8 @@ impl Default for OfflineQueue {
             shuffle: false,
             seed: 0,
             repeat: RepeatMode::Off,
+            repeat_context: false,
+            play_intent: false,
             skipped: HashSet::new(),
             unavailable: HashSet::new(),
             next_queue_id: 0,
@@ -125,7 +133,8 @@ impl Default for OfflineQueue {
 pub(crate) struct LoadSpec {
     pub context_uri: Option<String>,
     pub uris: Vec<String>,
-    pub start: usize,
+    /// The start item; `None`: none was asked for (a shuffle starts anywhere).
+    pub start: Option<usize>,
     pub position_ms: u64,
     pub shuffle: bool,
     pub repeat: RepeatMode,
@@ -133,10 +142,15 @@ pub(crate) struct LoadSpec {
     pub seed: u64,
 }
 
-fn shuffled_order(len: usize, first: usize, seed: u64) -> Vec<usize> {
+fn shuffled(len: usize, seed: u64) -> Vec<usize> {
     let mut order: Vec<usize> = (0..len).collect();
     let mut rng = SmallRng::seed_from_u64(seed);
     order.shuffle(&mut rng);
+    order
+}
+
+fn shuffled_order(len: usize, first: usize, seed: u64) -> Vec<usize> {
+    let mut order = shuffled(len, seed);
     if let Some(p) = order.iter().position(|&i| i == first) {
         order.swap(0, p);
     }
@@ -149,8 +163,9 @@ impl OfflineQueue {
         self.status
     }
 
+    /// Playing, or loading to play.
     pub fn is_playing(&self) -> bool {
-        matches!(self.status, PlaybackStatus::Playing | PlaybackStatus::Loading)
+        self.status == PlaybackStatus::Playing || (self.status == PlaybackStatus::Loading && self.play_intent)
     }
 
     pub fn current_uri(&self) -> Option<&str> {
@@ -207,6 +222,7 @@ impl OfflineQueue {
     fn begin_load(&mut self, uri: String, play: bool, position_ms: u64, now_ms: i64) -> Action {
         self.pending_loads = self.pending_loads.saturating_add(1);
         self.status = PlaybackStatus::Loading;
+        self.play_intent = play;
         self.position_ms = position_ms;
         self.position_ts = now_ms;
         self.duration_ms = 0;
@@ -219,15 +235,22 @@ impl OfflineQueue {
         }
         let items: Vec<Item> =
             spec.uris.iter().enumerate().map(|(i, u)| Item { uri: u.clone(), uid: format!("o{i}") }).collect();
-        let start = spec.start.min(items.len() - 1);
+        let order = match (spec.shuffle, spec.start) {
+            (true, Some(start)) => shuffled_order(items.len(), start.min(items.len() - 1), spec.seed),
+            // No start asked for: a shuffle starts anywhere (like Spirc).
+            (true, None) => shuffled(items.len(), spec.seed),
+            (false, _) => (0..items.len()).collect(),
+        };
+        let start = spec.start.map(|s| s.min(items.len() - 1)).unwrap_or(order[0]);
         *self = OfflineQueue {
             active: true,
             context_uri: spec.context_uri,
-            order: if spec.shuffle { shuffled_order(items.len(), start, spec.seed) } else { (0..items.len()).collect() },
+            order,
             items,
             shuffle: spec.shuffle,
             seed: spec.seed,
             repeat: spec.repeat,
+            repeat_context: spec.repeat == RepeatMode::Context,
             next_queue_id: self.next_queue_id,
             pending_loads: self.pending_loads,
             ..Default::default()
@@ -249,8 +272,16 @@ impl OfflineQueue {
 
     fn stop_at_end(&mut self) -> Action {
         self.status = PlaybackStatus::Stopped;
+        self.play_intent = false;
         self.position_ms = 0;
         Action::Stop
+    }
+
+    /// A manual skip leaves repeat-track (like Spirc): back to repeat-context or off.
+    fn leave_repeat_track(&mut self) {
+        if self.repeat == RepeatMode::Track {
+            self.repeat = if self.repeat_context { RepeatMode::Context } else { RepeatMode::Off };
+        }
     }
 
     /// `auto`: end of track (repeat-track applies); otherwise a user skip.
@@ -276,6 +307,7 @@ impl OfflineQueue {
         match self.status {
             PlaybackStatus::Paused => {
                 self.status = PlaybackStatus::Playing;
+                self.play_intent = true;
                 self.position_ts = now_ms;
                 Some(Action::Play)
             }
@@ -283,7 +315,10 @@ impl OfflineQueue {
                 let item = self.current_item()?;
                 Some(self.begin_load(item.uri, true, 0, now_ms))
             }
-            PlaybackStatus::Loading | PlaybackStatus::Playing => Some(Action::Play),
+            PlaybackStatus::Loading | PlaybackStatus::Playing => {
+                self.play_intent = true;
+                Some(Action::Play)
+            }
         }
     }
 
@@ -292,10 +327,14 @@ impl OfflineQueue {
             PlaybackStatus::Playing => {
                 self.position_ms = self.position_at(now_ms);
                 self.status = PlaybackStatus::Paused;
+                self.play_intent = false;
                 self.position_ts = now_ms;
                 Some(Action::Pause)
             }
-            PlaybackStatus::Loading => Some(Action::Pause),
+            PlaybackStatus::Loading => {
+                self.play_intent = false;
+                Some(Action::Pause)
+            }
             _ => None,
         }
     }
@@ -306,13 +345,14 @@ impl OfflineQueue {
 
     pub fn next(&mut self, now_ms: i64) -> Option<Action> {
         self.current.as_ref()?;
-        let play = self.status != PlaybackStatus::Paused;
+        self.leave_repeat_track();
+        let play = self.play_intent;
         Some(self.advance(false, play, now_ms))
     }
 
     pub fn prev(&mut self, now_ms: i64) -> Option<Action> {
         self.current.as_ref()?;
-        let play = self.status != PlaybackStatus::Paused;
+        let play = self.play_intent;
         if self.position_at(now_ms) > PREV_RESTART_MS {
             return self.seek(0, now_ms);
         }
@@ -358,13 +398,25 @@ impl OfflineQueue {
     }
 
     pub fn set_repeat(&mut self, mode: RepeatMode) {
+        match mode {
+            RepeatMode::Off => self.repeat_context = false,
+            RepeatMode::Context => self.repeat_context = true,
+            // like Spirc's repeat-track flag, on top of the context flag
+            RepeatMode::Track => {}
+        }
         self.repeat = mode;
     }
 
-    pub fn add_to_queue(&mut self, uri: String) {
+    /// Adds to the user queue; false (not added) when it already holds [`MAX_NEXT`] entries,
+    /// the same limit as Spirc's next tracks.
+    pub fn add_to_queue(&mut self, uri: String) -> bool {
+        if self.queue.len() >= MAX_NEXT {
+            return false;
+        }
         let uid = format!("q{}", self.next_queue_id);
         self.next_queue_id += 1;
         self.queue.push_back(Item { uri, uid });
+        true
     }
 
     fn context_index_of(&self, uid: &str) -> Option<usize> {
@@ -422,8 +474,9 @@ impl OfflineQueue {
     /// Jumps to an upcoming entry. Queued entries before it are dropped; skipping to a context
     /// entry keeps the queue.
     pub fn skip_to(&mut self, uid: &str, now_ms: i64) -> Option<Action> {
-        let play = self.status != PlaybackStatus::Paused;
+        let play = self.play_intent;
         if let Some(p) = self.queue.iter().position(|q| q.uid == uid) {
+            self.leave_repeat_track();
             self.queue.drain(..p);
             let item = self.queue.pop_front()?;
             let uri = item.uri.clone();
@@ -435,6 +488,7 @@ impl OfflineQueue {
             return None;
         }
         let p = self.order.iter().position(|&i| i == idx)?;
+        self.leave_repeat_track();
         Some(self.play_context_pos(p, play, now_ms))
     }
 
@@ -489,12 +543,14 @@ impl OfflineQueue {
             }
             Event::Playing { id, position_ms } if self.own(id) => {
                 self.status = PlaybackStatus::Playing;
+                self.play_intent = true;
                 self.position_ms = position_ms as u64;
                 self.position_ts = now_ms;
                 out.changed = true;
             }
             Event::Paused { id, position_ms } if self.own(id) => {
                 self.status = PlaybackStatus::Paused;
+                self.play_intent = false;
                 self.position_ms = position_ms as u64;
                 self.position_ts = now_ms;
                 out.changed = true;
@@ -507,6 +563,7 @@ impl OfflineQueue {
             Event::Stopped(id) if self.own(id) => {
                 out.changed = self.status != PlaybackStatus::Stopped;
                 self.status = PlaybackStatus::Stopped;
+                self.play_intent = false;
                 self.position_ms = 0;
             }
             Event::TimeToPreload(id) if self.own(id) => {
@@ -519,7 +576,7 @@ impl OfflineQueue {
             Event::Unavailable { id, uri } if self.own(id) => {
                 self.unavailable.insert(uri.clone());
                 if self.current_uri() == Some(uri.as_str()) {
-                    let play = self.status != PlaybackStatus::Paused;
+                    let play = self.play_intent;
                     let action = self.advance(false, play, now_ms);
                     out.exhausted_after_error = action == Action::Stop;
                     out.action = Some(action);
@@ -546,7 +603,8 @@ impl OfflineQueue {
     }
 
     fn next_tracks(&self) -> Vec<PlaybackTrack> {
-        let mut next: Vec<PlaybackTrack> = self.queue.iter().map(|q| Self::track(q, TrackProvider::Queue)).collect();
+        let mut next: Vec<PlaybackTrack> =
+            self.queue.iter().take(MAX_NEXT).map(|q| Self::track(q, TrackProvider::Queue)).collect();
         let current_idx = match self.current {
             Some(Current::Context(i)) => Some(i),
             _ => None,
@@ -587,10 +645,10 @@ impl OfflineQueue {
 
     /// What to hand over to another device: the current item followed by up to `max_next` next
     /// items, and the position at `now_ms` (the snapshot only carries the last anchor).
-    pub fn handover(&self, now_ms: i64, max_next: usize) -> (Vec<String>, u64) {
+    pub fn handover(&self, now_ms: i64, max_next: usize) -> Handover {
         let mut uris: Vec<String> = self.current_uri().map(str::to_string).into_iter().collect();
         uris.extend(self.next_tracks().into_iter().take(max_next).map(|t| t.uri));
-        (uris, self.position_at(now_ms))
+        Handover { uris, position_ms: self.position_at(now_ms), repeat: self.repeat, playing: self.is_playing() }
     }
 
     /// The snapshot (bare tracks; metadata is filled by the caller). Positions are reported as
@@ -639,6 +697,26 @@ impl OfflineQueue {
     }
 }
 
+/// What a transfer to another device takes over (see [`OfflineQueue::handover`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Handover {
+    /// The current item and the next ones, in play order.
+    pub uris: Vec<String>,
+    pub position_ms: u64,
+    pub repeat: RepeatMode,
+    pub playing: bool,
+}
+
+/// The downloaded subset of a request and where it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Selection {
+    pub items: Vec<String>,
+    /// `None`: no start was asked for.
+    pub start: Option<usize>,
+    /// The start item is the one asked for (so a requested position applies to it).
+    pub exact: bool,
+}
+
 /// Picks the downloaded subset of `uris` and the start index within it.
 /// `start_index` refers to `uris`; if that item isn't downloaded the next downloaded one starts.
 pub(crate) fn select_downloaded(
@@ -646,20 +724,25 @@ pub(crate) fn select_downloaded(
     is_downloaded: impl Fn(&str) -> bool,
     start_index: Option<usize>,
     start_uri: Option<&str>,
-) -> (Vec<String>, usize) {
-    let mut selected = Vec::new();
+) -> Selection {
+    let mut items = Vec::new();
     let mut start = None;
+    let requested = start_uri.is_some() || start_index.is_some();
+    let mut exact = !requested;
     let wanted_index = start_uri.and_then(|u| uris.iter().position(|x| x == u)).or(start_index);
     for (i, u) in uris.iter().enumerate() {
         if !is_downloaded(u) {
             continue;
         }
         if start.is_none() && wanted_index.is_some_and(|w| i >= w) {
-            start = Some(selected.len());
+            start = Some(items.len());
+            exact = wanted_index == Some(i);
         }
-        selected.push(u.clone());
+        items.push(u.clone());
     }
-    (selected, start.unwrap_or(0))
+    // Asked for a start after the last download: the first one.
+    let start = start.or(wanted_index.map(|_| 0));
+    Selection { items, start, exact }
 }
 
 #[cfg(test)]
@@ -678,7 +761,7 @@ mod tests {
         LoadSpec {
             context_uri: Some("spotify:album:a".into()),
             uris: uris(n),
-            start,
+            start: Some(start),
             position_ms: 0,
             shuffle,
             repeat,
@@ -738,11 +821,88 @@ mod tests {
         let out = q.on_event(Event::EndOfTrack(2), 0);
         assert_eq!(load_uri(&out.action).as_deref(), Some("spotify:track:0"), "repeats the track");
         started(&mut q, 3);
-        // a manual next still advances with repeat-track
-        assert_eq!(load_uri(&q.next(0)).as_deref(), Some("spotify:track:1"));
         // preload with repeat track = the current track
+        assert_eq!(q.on_event(Event::TimeToPreload(3), 0).action, Some(Action::Preload("spotify:track:0".into())));
+        // a manual next advances and leaves repeat-track (back to repeat context, like Spirc)
+        assert_eq!(load_uri(&q.next(0)).as_deref(), Some("spotify:track:1"));
+        assert_eq!(q.snapshot(dev(), 0).repeat, RepeatMode::Context);
         started(&mut q, 4);
-        assert_eq!(q.on_event(Event::TimeToPreload(4), 0).action, Some(Action::Preload("spotify:track:1".into())));
+        assert_eq!(q.on_event(Event::TimeToPreload(4), 0).action, Some(Action::Preload("spotify:track:0".into())), "wraps");
+
+        // repeat-track without repeat context: a skip goes back to off
+        let mut q = OfflineQueue::default();
+        q.load(spec(3, 0, false, RepeatMode::Off), 0);
+        started(&mut q, 1);
+        q.set_repeat(RepeatMode::Track);
+        q.next(0);
+        assert_eq!(q.snapshot(dev(), 0).repeat, RepeatMode::Off);
+        // and so does skipping to an entry; a skip to nothing changes nothing
+        q.set_repeat(RepeatMode::Track);
+        assert!(q.skip_to("nothing", 0).is_none());
+        assert_eq!(q.snapshot(dev(), 0).repeat, RepeatMode::Track);
+        assert!(q.skip_to("o2", 0).is_some());
+        assert_eq!(q.snapshot(dev(), 0).repeat, RepeatMode::Off);
+    }
+
+    #[test]
+    fn a_paused_load_stays_paused() {
+        let paused = |n| LoadSpec { play: false, ..spec(n, 0, false, RepeatMode::Off) };
+        let play_of = |a: Option<Action>| match a {
+            Some(Action::Load { play, .. }) => play,
+            other => panic!("{other:?}"),
+        };
+        let mut q = OfflineQueue::default();
+        q.load(paused(4), 0);
+        assert!(!play_of(q.next(0)), "next during a paused load");
+        assert!(!play_of(q.next(0)), "and again before any player event");
+        // the current file can't be read: the next one loads paused too
+        let mut q = OfflineQueue::default();
+        q.load(paused(4), 0);
+        q.on_event(Event::RequestId(1), 0);
+        let out = q.on_event(Event::Unavailable { id: 1, uri: "spotify:track:0".into() }, 0);
+        assert!(!play_of(out.action));
+        // a toggle during a paused load plays
+        let mut q = OfflineQueue::default();
+        q.load(paused(4), 0);
+        assert_eq!(q.toggle(0), Some(Action::Play));
+        // pausing a playing load, then the file fails: the next one stays paused
+        let mut q = OfflineQueue::default();
+        q.load(spec(4, 0, false, RepeatMode::Off), 0);
+        q.on_event(Event::RequestId(1), 0);
+        assert_eq!(q.pause(0), Some(Action::Pause));
+        let out = q.on_event(Event::Unavailable { id: 1, uri: "spotify:track:0".into() }, 0);
+        assert!(!play_of(out.action));
+    }
+
+    #[test]
+    fn a_shuffle_without_a_start_starts_anywhere() {
+        let firsts = (0..20u64)
+            .map(|seed| {
+                let mut q = OfflineQueue::default();
+                q.load(LoadSpec { start: None, seed, ..spec(10, 0, true, RepeatMode::Off) }, 0);
+                let mut sorted = q.order.clone();
+                sorted.sort();
+                assert_eq!(sorted, (0..10).collect::<Vec<_>>(), "a permutation");
+                assert_eq!(q.current_uri().map(str::to_string), Some(format!("spotify:track:{}", q.order[0])));
+                q.order[0]
+            })
+            .collect::<HashSet<_>>();
+        assert!(firsts.len() > 1, "{firsts:?}");
+        // without shuffle it starts at the first item
+        let mut q = OfflineQueue::default();
+        q.load(LoadSpec { start: None, ..spec(10, 0, false, RepeatMode::Off) }, 0);
+        assert_eq!(q.current_uri(), Some("spotify:track:0"));
+    }
+
+    #[test]
+    fn the_user_queue_is_capped_like_spirc() {
+        let mut q = OfflineQueue::default();
+        q.load(spec(2, 0, false, RepeatMode::Off), 0);
+        for i in 0..MAX_NEXT {
+            assert!(q.add_to_queue(format!("spotify:track:q{i}")));
+        }
+        assert!(!q.add_to_queue("spotify:track:more".into()));
+        assert!(q.snapshot(dev(), 0).next_tracks.len() <= MAX_NEXT);
     }
 
     #[test]
@@ -881,10 +1041,20 @@ mod tests {
         assert_eq!(q.play(7000), Some(Action::Play));
         assert_eq!(q.position_at(8000), 6000);
         // a transfer hands over the extrapolated position, not the last anchor
-        let (items, position) = q.handover(68_000, 50);
-        assert_eq!(items, vec!["spotify:track:0", "spotify:track:1"]);
-        assert_eq!(position, 60_000, "clamped to the duration");
-        assert_eq!(q.handover(30_000, 0), (vec!["spotify:track:0".to_string()], 28_000));
+        let h = q.handover(68_000, 50);
+        assert_eq!(h.uris, vec!["spotify:track:0", "spotify:track:1"]);
+        assert_eq!(h.position_ms, 60_000, "clamped to the duration");
+        assert!(h.playing);
+        assert_eq!(h.repeat, RepeatMode::Off);
+        let h = q.handover(30_000, 0);
+        assert_eq!((h.uris, h.position_ms), (vec!["spotify:track:0".to_string()], 28_000));
+        q.set_repeat(RepeatMode::Track);
+        q.pause(31_000);
+        let h = q.handover(40_000, 0);
+        assert!(!h.playing);
+        assert_eq!(h.repeat, RepeatMode::Track);
+        q.set_repeat(RepeatMode::Off);
+        q.play(41_000);
         let s = q.snapshot(dev(), 123);
         assert!(s.offline);
         assert_eq!(s.source, PlaybackSource::Local);
@@ -897,13 +1067,20 @@ mod tests {
     fn select_downloaded_items() {
         let all = uris(5);
         let dl = |u: &str| u != "spotify:track:1" && u != "spotify:track:2";
-        let (sel, start) = select_downloaded(&all, dl, Some(1), None);
-        assert_eq!(sel, vec!["spotify:track:0", "spotify:track:3", "spotify:track:4"]);
-        assert_eq!(start, 1, "next downloaded after the requested start");
-        let (_, start) = select_downloaded(&all, dl, None, Some("spotify:track:4"));
-        assert_eq!(start, 2);
-        let (sel, start) = select_downloaded(&all, |_| false, Some(0), None);
-        assert!(sel.is_empty());
-        assert_eq!(start, 0);
+        let s = select_downloaded(&all, dl, Some(1), None);
+        assert_eq!(s.items, vec!["spotify:track:0", "spotify:track:3", "spotify:track:4"]);
+        assert_eq!(s.start, Some(1), "next downloaded after the requested start");
+        assert!(!s.exact, "not the requested item: its position doesn't apply");
+        let s = select_downloaded(&all, dl, None, Some("spotify:track:4"));
+        assert_eq!((s.start, s.exact), (Some(2), true));
+        let s = select_downloaded(&all, |_| false, Some(0), None);
+        assert!(s.items.is_empty());
+        assert_eq!(s.start, Some(0));
+        // no start asked for (a shuffle starts anywhere)
+        let s = select_downloaded(&all, dl, None, None);
+        assert_eq!((s.start, s.exact), (None, true));
+        // a start uri that isn't in the list
+        let s = select_downloaded(&all, dl, None, Some("spotify:track:9"));
+        assert_eq!((s.start, s.exact), (None, false));
     }
 }

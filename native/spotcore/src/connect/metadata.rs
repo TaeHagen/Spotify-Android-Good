@@ -65,7 +65,9 @@ struct MetaState {
     failed: LruCache<String, (Instant, Duration)>,
     pending: VecDeque<String>,
     in_flight: bool,
-    contexts: LruCache<String, (Option<String>, Instant)>,
+    /// Context names: the name (or none), when, and for how long a missing name isn't looked
+    /// up again.
+    contexts: LruCache<String, (Option<String>, Instant, Duration)>,
     contexts_in_flight: HashSet<String>,
 }
 
@@ -412,11 +414,11 @@ fn fill_context(ctx: &mut PlaybackContext) {
     {
         let mut st = META.lock();
         match st.contexts.get(&ctx.uri) {
-            Some((Some(name), _)) => {
+            Some((Some(name), ..)) => {
                 ctx.name = Some(name.clone());
                 return;
             }
-            Some((None, at)) if at.elapsed() < RETRY_AFTER => return,
+            Some((None, at, backoff)) if at.elapsed() < *backoff => return,
             _ => {}
         }
         if st.contexts_in_flight.contains(&ctx.uri) {
@@ -427,8 +429,11 @@ fn fill_context(ctx: &mut PlaybackContext) {
         }
     }
     if !online {
+        // The downloads only know album / artist / show names: a miss is looked up again soon
+        // (and as soon as the session is online).
         let name = offline_context_name(&ctx.uri);
-        META.lock().contexts.put(ctx.uri.clone(), (name.clone(), Instant::now()));
+        let backoff = context_backoff(&ContextLookup::Offline);
+        META.lock().contexts.put(ctx.uri.clone(), (name.clone(), Instant::now(), backoff));
         ctx.name = name;
         return;
     }
@@ -438,27 +443,51 @@ fn fill_context(ctx: &mut PlaybackContext) {
         return;
     };
     handle.spawn(async move {
-        let name = match engine::try_session() {
+        let lookup = match engine::try_session() {
             Some(session) => match tokio::time::timeout(CONTEXT_TIMEOUT, resolve_context_name(&session, &u)).await {
-                Ok(Ok(name)) => name,
+                Ok(Ok(name)) => ContextLookup::Answered(name),
                 Ok(Err(e)) => {
                     log::debug!("context name for {u} failed: {e}");
-                    None
+                    ContextLookup::Failed
                 }
-                Err(_) => None,
+                Err(_) => ContextLookup::Failed,
             },
-            None => None,
+            None => ContextLookup::Failed,
+        };
+        let backoff = context_backoff(&lookup);
+        let name = match lookup {
+            ContextLookup::Answered(name) => name,
+            _ => None,
         };
         let found = name.is_some();
         {
             let mut st = META.lock();
             st.contexts_in_flight.remove(&u);
-            st.contexts.put(u, (name, Instant::now()));
+            st.contexts.put(u, (name, Instant::now(), backoff));
         }
         if found {
             hub::publish();
         }
     });
+}
+
+/// How a context name lookup went.
+enum ContextLookup {
+    /// The catalog answered (with or without a name).
+    Answered(Option<String>),
+    /// The request failed or timed out, or there was no session.
+    Failed,
+    /// Looked up in the downloads only.
+    Offline,
+}
+
+/// How long a missing context name isn't looked up again: long only when the catalog said there
+/// is none.
+fn context_backoff(lookup: &ContextLookup) -> Duration {
+    match lookup {
+        ContextLookup::Answered(None) => RETRY_AFTER,
+        _ => RETRY_AFTER_ERROR,
+    }
 }
 
 async fn playlist_name(session: &Session, id: &SpotifyUri) -> Result<Option<String>, librespot_core::Error> {
@@ -482,13 +511,23 @@ async fn resolve_context_name(session: &Session, u: &str) -> Result<Option<Strin
     Ok(name.filter(|n| !n.is_empty()))
 }
 
-/// The session is online (again): items whose request failed meanwhile are fetched right away.
+/// The session is online (again): items and context names whose lookup failed meanwhile (or
+/// that only the downloads were asked for) are fetched right away.
 pub(crate) fn on_online() {
     let mut st = META.lock();
     let transient: Vec<String> =
         st.failed.iter().filter(|(_, (_, backoff))| *backoff < RETRY_AFTER).map(|(u, _)| u.clone()).collect();
     for u in transient {
         st.failed.pop(&u);
+    }
+    let unnamed: Vec<String> = st
+        .contexts
+        .iter()
+        .filter(|(_, (name, _, backoff))| name.is_none() && *backoff < RETRY_AFTER)
+        .map(|(u, _)| u.clone())
+        .collect();
+    for u in unnamed {
+        st.contexts.pop(&u);
     }
 }
 
@@ -534,6 +573,15 @@ mod tests {
         assert_eq!(backoff_for("spotify:track:x", false, true), RETRY_AFTER_ERROR);
         assert_eq!(backoff_for("spotify:episode:x", true, false), RETRY_AFTER_ERROR);
         assert!(RETRY_AFTER_ERROR < RETRY_AFTER);
+    }
+
+    #[test]
+    fn missing_context_names_back_off_by_cause() {
+        // the catalog has no name: not asked again for a while
+        assert_eq!(context_backoff(&ContextLookup::Answered(None)), RETRY_AFTER);
+        // a failed or timed out request, or offline: looked up again soon
+        assert_eq!(context_backoff(&ContextLookup::Failed), RETRY_AFTER_ERROR);
+        assert_eq!(context_backoff(&ContextLookup::Offline), RETRY_AFTER_ERROR);
     }
 
     #[test]

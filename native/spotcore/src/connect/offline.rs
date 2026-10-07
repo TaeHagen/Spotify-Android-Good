@@ -3,7 +3,7 @@
 //! them through the vendored offline hook without any network access.
 
 use super::args::LoadArgs;
-use super::offline_queue::{select_downloaded, Action, Event, LoadSpec, OfflineQueue};
+use super::offline_queue::{select_downloaded, Action, Event, Handover, LoadSpec, OfflineQueue};
 use super::{hub, now_ms, player_events, uri, Ctl};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{ActiveDeviceRef, OfflineTrackRecord, PlaybackSnapshot, RepeatMode};
@@ -19,13 +19,34 @@ pub(crate) fn is_active() -> bool {
     QUEUE.lock().active
 }
 
+/// Active and playing (or loading to play).
+pub(crate) fn is_playing() -> bool {
+    let q = QUEUE.lock();
+    q.active && q.is_playing()
+}
+
+/// A paused or finished queue gives way to another active device: it is stopped (frees the
+/// Player), so commands, the snapshot and transfers follow that device. A playing one keeps
+/// playing until something takes over.
+pub(crate) fn yield_to_active_device() {
+    if !engine::is_online() || !is_active() || is_playing() {
+        return;
+    }
+    let me = hub::me();
+    if hub::active_device_id().is_some_and(|id| id != me) {
+        log::info!("another device is active, ending the paused offline queue");
+        stop();
+    }
+}
+
 pub(crate) fn snapshot(device: ActiveDeviceRef, volume: u16) -> Option<PlaybackSnapshot> {
     let q = QUEUE.lock();
     q.active.then(|| q.snapshot(device, volume))
 }
 
-/// The current and up to `max_next` next items, and the current position, while active.
-pub(crate) fn handover(max_next: usize) -> Option<(Vec<String>, u64)> {
+/// The current and up to `max_next` next items, the current position, repeat mode and whether it
+/// plays, while active.
+pub(crate) fn handover(max_next: usize) -> Option<Handover> {
     let q = QUEUE.lock();
     q.active.then(|| q.handover(now_ms(), max_next))
 }
@@ -124,43 +145,53 @@ fn context_members(context_uri: &str, records: &[OfflineTrackRecord]) -> Vec<Str
     members.into_iter().map(|r| r.uri.clone()).collect()
 }
 
-/// The downloaded items `args` asks for and the start index among them.
-pub(crate) fn resolve(args: &LoadArgs) -> (Vec<String>, usize) {
+/// The downloaded items `args` asks for and where they start (see [`select_downloaded`]; a
+/// start uid minted by the offline queue counts as the requested item).
+pub(crate) fn resolve(args: &LoadArgs) -> super::offline_queue::Selection {
+    use super::offline_queue::Selection;
     let uid_index = args.start_uid.as_deref().and_then(|u| u.strip_prefix('o')).and_then(|n| n.parse::<usize>().ok());
-    match &args.track_uris {
-        Some(tracks) if !tracks.is_empty() => {
-            let (items, start) = select_downloaded(
-                tracks,
-                downloads::is_downloaded,
-                args.start_index.map(|i| i as usize),
-                args.start_uri.as_deref(),
-            );
-            let start = uid_index.filter(|&i| i < items.len()).unwrap_or(start);
-            (items, start)
-        }
+    let mut selection = match &args.track_uris {
+        Some(tracks) if !tracks.is_empty() => select_downloaded(
+            tracks,
+            downloads::is_downloaded,
+            args.start_index.map(|i| i as usize),
+            args.start_uri.as_deref(),
+        ),
         _ => {
-            let Some(ctx) = args.context_uri.as_deref() else { return (Vec::new(), 0) };
+            let none = Selection { items: Vec::new(), start: None, exact: false };
+            let Some(ctx) = args.context_uri.as_deref() else { return none };
             if uri::is_track(ctx) || uri::is_episode(ctx) {
-                return if downloads::is_downloaded(ctx) { (vec![ctx.to_string()], 0) } else { (Vec::new(), 0) };
+                return if downloads::is_downloaded(ctx) {
+                    Selection { items: vec![ctx.to_string()], start: Some(0), exact: true }
+                } else {
+                    none
+                };
             }
             let members = context_members(ctx, &downloads::all_records());
             // `startIndex` refers to the caller's whole context, not to the downloaded members.
-            let (items, start) = select_downloaded(&members, |_| true, None, args.start_uri.as_deref());
-            let start = uid_index.filter(|&i| i < items.len()).unwrap_or(start);
-            (items, start)
+            select_downloaded(&members, |_| true, None, args.start_uri.as_deref())
         }
+    };
+    if let Some(i) = uid_index.filter(|&i| i < selection.items.len()) {
+        selection.start = Some(i);
+        selection.exact = true;
     }
+    selection
 }
 
 pub(crate) fn has_downloaded(args: &LoadArgs) -> bool {
-    !resolve(args).0.is_empty()
+    !resolve(args).items.is_empty()
 }
 
 pub(crate) async fn load(args: &LoadArgs) -> AppResult<()> {
-    let (uris, start) = resolve(args);
+    let selection = resolve(args);
+    let (uris, start) = (selection.items, selection.start);
     if uris.is_empty() {
         return Err(AppError::unavailable("Not available offline"));
     }
+    // The requested position belongs to the requested item: another start item starts at 0
+    // (the requested track isn't downloaded, an artist context, …).
+    let position_ms = if selection.exact { args.position_ms } else { 0 };
     // Offline playback started during an outage replaces the reconnect restore point (callers
     // through `connect::load` already dropped it).
     super::restore::clear();
@@ -169,7 +200,7 @@ pub(crate) async fn load(args: &LoadArgs) -> AppResult<()> {
         context_uri: args.context_uri.clone(),
         uris,
         start,
-        position_ms: args.position_ms,
+        position_ms,
         shuffle: args.shuffle.unwrap_or(false) || args.smart_shuffle.unwrap_or(false),
         repeat: args.repeat.unwrap_or(RepeatMode::Off),
         play: args.play,
@@ -216,7 +247,9 @@ pub(crate) fn control(cmd: &Ctl) -> AppResult<()> {
                 if !downloads::is_downloaded(u) {
                     return Err(AppError::unavailable("Not available offline"));
                 }
-                q.add_to_queue(u.clone());
+                if !q.add_to_queue(u.clone()) {
+                    return Err(AppError::unavailable("The queue is full"));
+                }
                 None
             }
             Ctl::QueueRemove(uid) => {
@@ -242,6 +275,9 @@ pub(crate) fn control(cmd: &Ctl) -> AppResult<()> {
         apply(action)?;
     }
     hub::publish();
+    if matches!(cmd, Ctl::Pause | Ctl::Toggle) {
+        yield_to_active_device();
+    }
     Ok(())
 }
 
@@ -293,6 +329,8 @@ pub(crate) fn on_player_event(event: &PlayerEvent) {
     }
     if outcome.changed {
         hub::publish();
+        // paused elsewhere, or the end of the queue
+        yield_to_active_device();
     }
 }
 

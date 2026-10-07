@@ -150,6 +150,8 @@ struct SpircTask {
     queue_gauge: Arc<QueueGauge>,
     /// the local autoplay value set with Spirc::set_autoplay, it wins over the account value
     autoplay_override: Option<bool>,
+    /// the loop ended while the player played (or was paused), pause it when the task ends
+    pause_on_drop: bool,
 }
 
 // SPOTIFYGOOD: lets Spirc::add_to_queue reject an add right away when the queue is full, the
@@ -287,6 +289,8 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 // SPOTIFYGOOD: upper bound for starting the dealer, the task ends after it
 const DEALER_START_TIMEOUT: Duration = Duration::from_secs(30);
+// SPOTIFYGOOD: upper bound for the delayed (background) state and volume puts of the loop
+const STATE_PUT_TIMEOUT: Duration = Duration::from_secs(5);
 // SPOTIFYGOOD: capacity of the command error broadcast, slow receivers lag (skip) old errors
 const ERROR_CHANNEL_CAPACITY: usize = 16;
 // SPOTIFYGOOD: smart shuffle fetch pacing
@@ -444,6 +448,7 @@ impl Spirc {
             suggestion_fetch: SuggestionFetch::default(),
             queue_gauge: queue_gauge.clone(),
             autoplay_override: None,
+            pause_on_drop: false,
         };
 
         let spirc = Spirc {
@@ -614,8 +619,9 @@ impl Spirc {
 
     /// Whether the spirc task still handles commands
     ///
-    /// False once the task ended (by itself, for example after the connection was lost, or
-    /// after [Spirc::shutdown]), or while it is shutting down. Commands then fail to send.
+    /// False from the moment its loop stops taking commands: after [Spirc::shutdown] was handled,
+    /// or when the loop ended by itself (for example after the connection was lost), already
+    /// while the task still disconnects. Commands then fail to send.
     pub fn is_running(&self) -> bool {
         !self.commands.is_closed()
     }
@@ -921,25 +927,32 @@ impl SpircTask {
                 _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
                     self.update_state = false;
 
-                    if let Err(why) = self.notify().await {
-                        error!("state update: {why}")
+                    // SPOTIFYGOOD: bounded, so that a stalled put can't keep a shutdown waiting
+                    match timeout(STATE_PUT_TIMEOUT, self.notify()).await {
+                        Ok(Ok(())) => (),
+                        Ok(Err(why)) => error!("state update: {why}"),
+                        Err(_) => error!("state update timed out"),
                     }
                 },
                 _ = async { sleep(VOLUME_UPDATE_DELAY).await }, if self.update_volume => {
                     self.update_volume = false;
 
                     info!("delayed volume update for all devices: volume is now {}", self.connect_state.device_info().volume);
-                    match self.connect_state.notify_volume_changed(&self.session).await {
+                    // SPOTIFYGOOD: both puts are bounded, see above
+                    match timeout(STATE_PUT_TIMEOUT, self.connect_state.notify_volume_changed(&self.session)).await {
                         // SPOTIFYGOOD: the response may contain the cluster
-                        Ok(response) => self.publish_cluster_from_response(&response),
-                        Err(why) => error!("error updating connect state for volume update: {why}"),
+                        Ok(Ok(response)) => self.publish_cluster_from_response(&response),
+                        Ok(Err(why)) => error!("error updating connect state for volume update: {why}"),
+                        Err(_) => error!("volume update timed out"),
                     }
 
                     // for some reason the web-player does need two separate updates, so that the
                     // position of the current track is retained, other clients also send a state
                     // update before they send the volume update
-                    if let Err(why) = self.notify().await {
-                        error!("error updating connect state for volume update: {why}")
+                    match timeout(STATE_PUT_TIMEOUT, self.notify()).await {
+                        Ok(Ok(())) => (),
+                        Ok(Err(why)) => error!("error updating connect state for volume update: {why}"),
+                        Err(_) => error!("state update after the volume update timed out"),
                     }
                 },
                 // context resolver handling, the idea/reason behind it the following:
@@ -978,6 +991,25 @@ impl SpircTask {
                 .queued
                 .store(self.connect_state.queued_count(), Ordering::Release);
         }
+
+        // SPOTIFYGOOD: no more commands are handled from here on: close the channel, so that
+        // Spirc::is_running() turns false right now (it stayed true for the whole epilogue), and
+        // handle a shutdown that arrived while the last handler ran (the loop ended on an invalid
+        // session before reading it, so the player was never paused)
+        if let Some(rx) = self.commands.as_mut() {
+            rx.close();
+            while let Ok(cmd) = rx.try_recv() {
+                if matches!(cmd, SpircCommand::Shutdown) {
+                    self.shutdown = true;
+                }
+            }
+            if self.shutdown {
+                self.handle_pause();
+            }
+        }
+        // SPOTIFYGOOD: the player of a task that ended by itself is still playing, it is paused
+        // when the task is dropped (after the epilogue), see Drop
+        self.pause_on_drop = !matches!(self.play_status, SpircPlayStatus::Stopped);
 
         // SPOTIFYGOOD: the final snapshot is the state when the loop ended (see
         // ConnectSnapshot::ending), the disconnect below only describes the teardown (stopped,
@@ -1234,6 +1266,14 @@ impl SpircTask {
     }
 
     fn handle_player_event(&mut self, event: PlayerEvent) -> Result<(), Error> {
+        // SPOTIFYGOOD: an inactive device doesn't own the player (an app's offline playback may
+        // drive the same player): never adopt its request ids or act on its events. It used to
+        // stop the player at the end of every offline track. Spirc's own loads happen after it
+        // became active (in this task), their events arrive later.
+        if !self.connect_state.is_active() {
+            return Ok(());
+        }
+
         if let PlayerEvent::TrackChanged { audio_item } = event {
             self.connect_state.update_duration(audio_item.duration_ms);
             self.update_state = true;
@@ -1521,8 +1561,12 @@ impl SpircTask {
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
                 info!("device became inactive");
-                // SPOTIFYGOOD: always stop the local player, even if the requests fail (it kept
-                // playing next to the device that took over), like below
+                // SPOTIFYGOOD: silence the local player first (it kept playing next to the device
+                // that took over until both requests below gave up, or for good when they failed),
+                // and show it; the state is cleaned up after the requests, like below
+                self.play_status = SpircPlayStatus::Stopped;
+                self.player.stop();
+                self.publish_snapshot();
                 let res = self.handle_disconnect().await;
                 self.handle_stop();
                 res?;
@@ -1533,9 +1577,12 @@ impl SpircTask {
                 self.update_state = true;
             }
         } else if self.connect_state.is_active() {
-            // SPOTIFYGOOD: also stop the local player (even if the request fails), it used to
-            // keep playing while the device reported itself as inactive
+            // SPOTIFYGOOD: also stop the local player (before the request, and even if it
+            // fails), it used to keep playing while the device reported itself as inactive
             self.play_status = SpircPlayStatus::Stopped;
+            self.player.stop();
+            self.publish_snapshot();
+            self.play_request_id = None;
             let res = self.connect_state.became_inactive(&self.session).await;
             self.handle_stop();
             res?;
@@ -1844,6 +1891,8 @@ impl SpircTask {
         // SPOTIFYGOOD: become inactive (locally) even if the state update fails, it used to
         // return early and the device kept reporting itself as active
         let notified = self.notify().await;
+        // SPOTIFYGOOD: the player isn't ours anymore, a stale id must never match its events
+        self.play_request_id = None;
 
         let inactive = self.connect_state.became_inactive(&self.session).await;
 
@@ -2773,6 +2822,12 @@ impl Drop for SpircTask {
         debug!("drop Spirc[{}]", self.spirc_id);
         // SPOTIFYGOOD: covers every end of the task (also an abort of its future)
         self.suggestion_fetch.cancel();
+        // SPOTIFYGOOD: nothing controls the player after this. A task that ended by itself, or
+        // was aborted in the middle of a handler (handle_shutdown never ran), left it playing.
+        // An inactive spirc doesn't touch it (the app may drive it, see handle_player_event).
+        if self.pause_on_drop || !matches!(self.play_status, SpircPlayStatus::Stopped) {
+            self.player.pause();
+        }
     }
 }
 
