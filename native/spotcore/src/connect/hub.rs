@@ -136,10 +136,33 @@ pub(crate) fn local_active_or_activating() -> bool {
 }
 
 pub(crate) fn activating_or_active(hub: &HubState) -> bool {
+    let link = hub.link.as_ref().map(|l| l.generation);
     hub.snapshot.as_ref().is_some_and(|s| s.is_active)
-        || hub.activation.is_some_and(|a| {
-            hub.link.as_ref().is_some_and(|l| l.generation == a.generation) && a.at.elapsed() < ACTIVATION_GRACE
-        })
+        || hub.activation.is_some_and(|a| link == Some(a.generation) && a.at.elapsed() < ACTIVATION_GRACE)
+        || restore_applying(hub.restoring.as_ref(), link, Instant::now())
+}
+
+/// A restore is being applied to the attached Spirc (`link`): commands queue behind it there,
+/// also once its activation outlived [`ACTIVATION_GRACE`] (the activation's state put alone can
+/// take longer on a weak link).
+fn restore_applying(restoring: Option<&restore::Restoring>, link: Option<u64>, now: Instant) -> bool {
+    restoring.is_some_and(|r| link == Some(r.generation) && now.saturating_duration_since(r.at) < restore::RESTORING_MAX)
+}
+
+/// The Spirc `generation` (if attached) and its latest snapshot.
+pub(crate) fn link_snapshot(generation: u64) -> Option<(Arc<Spirc>, ConnectSnapshot)> {
+    let hub = HUB.lock();
+    let link = hub.link.as_ref().filter(|l| l.generation == generation)?;
+    Some((link.spirc.clone(), hub.snapshot.clone()?))
+}
+
+/// Detaches whatever Spirc is attached (see [`detach`]): the session goes offline for a load of
+/// downloads without a network (`connect::load`).
+pub(crate) fn detach_current() {
+    let generation = HUB.lock().link.as_ref().map(|l| l.generation);
+    if let Some(generation) = generation {
+        detach(generation);
+    }
 }
 
 /// A local load with activation was sent to the attached Spirc.
@@ -594,6 +617,18 @@ mod hub_tests {
 
     fn cluster(active: &str) -> Arc<Cluster> {
         Arc::new(Cluster { active_device_id: active.into(), ..Default::default() })
+    }
+
+    #[test]
+    fn a_restore_being_applied_counts_as_an_activation() {
+        let now = Instant::now();
+        let frozen = restore::freeze(ConnectSnapshot::default(), 0, now);
+        let r = restore::Restoring { generation: 3, frozen, at: now };
+        assert!(restore_applying(Some(&r), Some(3), now + Duration::from_secs(15)), "past the activation grace");
+        assert!(!restore_applying(Some(&r), Some(4), now), "another Spirc");
+        assert!(!restore_applying(Some(&r), None, now));
+        assert!(!restore_applying(Some(&r), Some(3), now + restore::RESTORING_MAX), "never took");
+        assert!(!restore_applying(None, Some(3), now));
     }
 
     #[test]

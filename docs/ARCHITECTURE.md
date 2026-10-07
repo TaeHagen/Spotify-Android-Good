@@ -173,8 +173,8 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
  Stopped ───────────────▶ Connecting ─────────▶ Online ───────────────────────────────┐
     ▲   ◀── session.stop ──┤  ▲  failed (retryable)  │                                │
     │                      │  └──────────── Reconnecting(backoff 1s,2s,4s…60s) ◀──────┘
-    │                      │                         │ network lost ≥ 12 s (deferred while
-    │                      │                         ▼ this device plays from its buffer)
+    │                      │                         │ network lost ≥ 12 s (deferred ≤ 60 s while
+    │                      │                         ▼ this device streams from its buffer)
     │                      │                      Offline ── network back ──▶ Connecting
     │                      └─ BAD_CREDENTIALS / PREMIUM_REQUIRED ─▶ Error (no retry)
     └── session.stop (from any state; graceful, bounded to 10 s)
@@ -204,9 +204,13 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   while Online (cheap, no network), reacts to `session.setNetworkAvailable`. A network loss
   reported while Online tears the session down after 12 s (restoring local playback once it
   is back) and goes Offline, unless the network came back first; while this device is the
-  active one playing from its buffer, that is re-checked every 5 s instead (a suspended mobile
-  network keeps the AP socket open, so librespot alone would notice only after its 80 s
-  keep-alive). Backoff
+  active one streaming from its buffer (a track that isn't downloaded), that is re-checked
+  every 5 s instead, for at most 60 s after the loss (a suspended mobile network keeps the AP
+  socket open, so librespot alone would notice only after its 80 s keep-alive). A load of
+  downloads without a network ends that wait at once (the session goes offline without a
+  restore point, see §4.6). When the session is lost (no network, or it died) while this
+  device plays or paused a downloaded track, that playback is not frozen for the reconnect
+  but handed to the OfflineController (§4.6). Backoff
   1→60 s, reset once a connection stayed up 60 s (or when the network comes back), so a
   connection that drops right after connecting keeps backing off; at most one attempt in
   flight; no attempts while the network is known to be down. At most 10 attempts per
@@ -279,13 +283,27 @@ decode failure of an offline file is reported (`playback` error event) and the f
 ### 4.6 Offline mode controller
 
 When `settings.offline == true` or the network is down and no session is Online (the session
-leaves Online at most ~12 s after the network is reported lost, see §4.2), playback
-commands are handled by `OfflineController`: a local queue of downloaded tracks with
+leaves Online 12 s after the network is reported lost, up to 60 s while this device streams
+from its buffer, see §4.2), playback commands are handled by `OfflineController`: a local queue of downloaded tracks with
 shuffle (seeded), repeat context/track, user queue (add/remove/move/clear/skipTo),
 prev/next semantics identical to Spirc (prev restarts if position > 3 s). It drives the
 same Player and emits the same `playback` snapshots with `source:"local"`,
 `isActiveDevice:true`, `offline:true`. When the session comes back Online, the offline
-queue keeps playing; the next `player.load` goes through Spirc again. A paused or finished
+queue keeps playing; the next `player.load` goes through Spirc again, and while the session is
+Online and visible, `queue.add` may also queue a track that isn't downloaded (it streams).
+Without a network a `player.load` of downloads plays offline also while the session still reads
+Online (its network-loss wait): Spirc lets go of the Player and the session goes offline; one
+of anything else fails with `UNAVAILABLE` "Not available offline".
+**Handoff**: when the session is lost (no network, or it died) while this device plays (or
+paused) a downloaded track through Spirc, the OfflineController takes that playback over as it
+is, before anything pauses the Player: the track keeps playing without a reload, with the
+visible tracks around it in play order (user queue included) up to the first one on either side
+that isn't downloaded (the queue ends there), the position, repeat mode, shuffle flag and play
+state. No restore point is kept for that session; when it is back, the queue plays on as above.
+A streamed current track is frozen for the reconnect as before (§8).
+The OfflineController notices a Player whose thread died: the queue stops where it was (so its
+snapshot no longer shows playing), and the next control starts a new Player (a play loads the
+track there again at that position). A paused or finished
 offline queue gives way only to a device that took over after it paused here (or after it first
 saw a cluster): one that became the active device, or the active one starting to play (the
 queue is stopped, commands and the snapshot follow that device). A device that only sits paused
@@ -294,7 +312,8 @@ phone (user, call, headphones unplugged) never hands the session away. The user 
 most 80 tracks like Spirc's (`UNAVAILABLE` "The queue is full"); a manual next / skip leaves
 repeat-track like Spirc; repeat-one entered from repeat-all keeps wrapping (next / prev /
 upcoming tracks); a shuffle load without a start begins anywhere; a paused load stays paused
-through next / unavailable items.
+through next / unavailable items; a load keeps the user queue (like Spirc), `queue.clear`
+clears it.
 Native resolution of an offline `player.load`: `trackUris` queues the downloaded ones among
 them; a bare album / artist / show `contextUri` queues its downloads in context order (disc
 and track number; newest episode first); a playlist / Liked Songs / other `contextUri`

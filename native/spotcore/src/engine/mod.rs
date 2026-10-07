@@ -68,6 +68,18 @@ pub fn is_online() -> bool {
     *shared().online.borrow() && try_session().is_some()
 }
 
+/// Android reports a usable network (`session.setNetworkAvailable`). The session can still read
+/// online for a while without one (see the supervisor's network-loss grace).
+pub(crate) fn network_available() -> bool {
+    state::network_available()
+}
+
+/// No network but the session still reads online, and a load of downloads takes the Player:
+/// the session goes offline now (torn down without a restore point), see `connect::load`.
+pub(crate) fn go_offline() {
+    state::send_to_supervisor(Msg::GoOffline);
+}
+
 /// Becomes `true` whenever a session is online. Useful for work that must wait for a connection.
 pub fn online_watch() -> watch::Receiver<bool> {
     shared().online.subscribe()

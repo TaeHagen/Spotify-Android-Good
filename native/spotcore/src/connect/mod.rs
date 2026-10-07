@@ -111,6 +111,7 @@ fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     let active = hub::active_device_id();
     let input = RouteInput {
         online: engine::is_online(),
+        network: engine::network_available(),
         spirc: hub::spirc().is_some(),
         // An activation just sent (a load, the restore) counts: commands queue behind it.
         local_active: hub::local_active_or_activating(),
@@ -126,6 +127,8 @@ fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
 #[derive(Debug, Clone, Copy)]
 struct WaitInput {
     online: bool,
+    /// Android reports a usable network.
+    network: bool,
     /// A Spirc is attached (visible to Spotify Connect).
     spirc: bool,
     /// The attached Spirc's first cluster arrived (it tells which device is active).
@@ -148,6 +151,7 @@ impl WaitInput {
         };
         WaitInput {
             online: engine::is_online(),
+            network: engine::network_available(),
             spirc,
             cluster_known,
             restore_deciding,
@@ -166,6 +170,11 @@ impl WaitInput {
 /// right away; a load replaces it, so it waits too.
 fn should_wait(kind: CommandKind, i: WaitInput, for_restore: bool) -> bool {
     if kind != CommandKind::Load && i.offline_active {
+        return false;
+    }
+    if !i.network {
+        // Nothing comes without a network (a session still online in its network-loss grace
+        // gets no cluster and decides no restore).
         return false;
     }
     if !i.online {
@@ -214,7 +223,8 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
     // go through: the restore doesn't run meanwhile, and stays if the load fails.
     let _hold = restore::hold();
     await_ready(CommandKind::Load, false).await;
-    let downloaded = !engine::is_online() && offline::has_downloaded(&args);
+    // Without a network downloads play offline, also while the session still reads online.
+    let downloaded = (!engine::is_online() || !engine::network_available()) && offline::has_downloaded(&args);
     match decide(CommandKind::Load, downloaded)? {
         Target::Local { activate } => {
             let spirc = spirc()?;
@@ -233,8 +243,17 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
             restore::clear();
             remote::send(&device, remote::play(&args, &uri::random_command_id())).await.map_err(remote::remote_error)?;
         }
-        // Drops the restore point once the downloads are known.
-        Target::Offline => offline::load(&args).await?,
+        Target::Offline => {
+            if engine::is_online() {
+                // No network, but the session still reads online (its network-loss grace): Spirc
+                // lets go of the Player now (it can't load anything without the network), and
+                // the session goes offline without a restore point.
+                hub::detach_current();
+                engine::go_offline();
+            }
+            // Drops the restore point once the downloads are known.
+            offline::load(&args).await?
+        }
     }
     ok()
 }
@@ -278,7 +297,7 @@ async fn control(mut cmd: Ctl) -> AppResult<Value> {
     match decide(cmd.kind(), false)? {
         Target::Local { activate } => local_control(&cmd, activate)?,
         Target::Remote(device) => remote_control(&cmd, &device).await.map_err(remote::remote_error)?,
-        Target::Offline => offline::control(&cmd)?,
+        Target::Offline => offline::control(&cmd).await?,
     }
     ok()
 }
@@ -451,9 +470,18 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
         }
     } else {
         frozen = restore::take();
+        if frozen.as_ref().is_some_and(|t| t.applying) {
+            // The restore being applied here goes to the target instead: this device lets go
+            // once its Spirc got through the restore's commands.
+            if let Some(spirc) = hub::spirc() {
+                if let Err(e) = spirc.disconnect(true) {
+                    log::debug!("spirc gone: {e}");
+                }
+            }
+        }
     }
     await_ready(CommandKind::Load, false).await;
-    if !engine::is_online() {
+    if !engine::is_online() || (args.device_id != me && !engine::network_available()) {
         return Err(AppError::not_connected());
     }
     if hub::spirc().is_none() {
@@ -480,7 +508,7 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
         } else if offline_owns {
             // Already playing here (downloads).
             if args.play {
-                offline::control(&Ctl::Play)?;
+                offline::control(&Ctl::Play).await?;
             }
         } else {
             // Nothing is active anywhere: start the given session here.
@@ -505,11 +533,13 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
             return ok();
         }
     }
-    if !hub::local_active_or_activating() && !other_active {
-        // Nothing to transfer: start the frozen (or the given) session on the target.
+    let applying = frozen.as_ref().is_some_and(|t| t.applying);
+    if applying || (!hub::local_active_or_activating() && !other_active) {
+        // Nothing to transfer (or a restore still being applied here): start the frozen (or the
+        // given) session on the target.
         let resume = frozen
             .as_ref()
-            .and_then(|f| restore::load_args(f, args.play))
+            .and_then(|t| restore::load_args(&t.frozen, args.play))
             .or_else(|| args.resume.as_ref().and_then(|r| r.load_args(args.play)))
             .ok_or_else(nothing_active)?;
         player_events::on_user_load();
@@ -556,6 +586,19 @@ pub(crate) fn clear_restore() {
     restore::clear();
 }
 
+/// The session of the Spirc `generation` is lost (no network, or it died) while this device plays
+/// a downloaded track: the OfflineController takes the playback over without a gap instead of a
+/// restore point being frozen. Called before the teardown pauses anything; returns whether it
+/// did (docs/ARCHITECTURE.md §4.6).
+pub(crate) fn hand_off_to_offline(generation: u64) -> bool {
+    offline::take_over(generation)
+}
+
+/// The Player's thread died (see `offline::player_lost`).
+pub(crate) fn on_player_lost() {
+    offline::player_lost();
+}
+
 /// The engine's session state changed (online / offline …): recompute what is shown.
 pub(crate) fn on_engine_state_changed() {
     if engine::is_online() {
@@ -581,6 +624,8 @@ pub(crate) fn on_engine_stopped(release_player: bool) {
     restore::clear();
     if release_player {
         offline::stop();
+        // A new Player numbers its requests anew.
+        offline::player_lost();
     }
     on_engine_state_changed();
 }
@@ -631,6 +676,7 @@ mod tests {
 
     const CONNECTING: WaitInput = WaitInput {
         online: false,
+        network: true,
         spirc: false,
         cluster_known: false,
         restore_deciding: false,
@@ -656,6 +702,15 @@ mod tests {
         let idle = WaitInput { connecting: false, ..CONNECTING };
         assert!(!should_wait(Load, idle, false));
         assert!(!should_wait(Control, idle, true));
+    }
+
+    #[test]
+    fn nothing_waits_without_a_network() {
+        use CommandKind::*;
+        // the session still online in its network-loss grace: no cluster, no restore comes
+        let no_network = WaitInput { network: false, cluster_known: false, restore_deciding: true, ..READY };
+        assert!(!should_wait(Load, no_network, false));
+        assert!(!should_wait(Control, no_network, true));
     }
 
     #[test]

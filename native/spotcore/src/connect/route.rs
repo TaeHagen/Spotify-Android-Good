@@ -29,6 +29,8 @@ pub(crate) enum Target {
 pub(crate) struct RouteInput<'a> {
     /// The engine session is online.
     pub online: bool,
+    /// Android reports a usable network (the session can still read online without one).
+    pub network: bool,
     /// A Spirc is attached: this device is visible to Spotify Connect. An online session can be
     /// hidden (no UI or playback holder), then there is no Spirc and no fresh cluster.
     pub spirc: bool,
@@ -56,6 +58,13 @@ pub(crate) fn hidden() -> AppError {
 /// Decides the target. `downloaded`: for `Load`, whether every requested item is downloaded.
 pub(crate) fn route(input: &RouteInput, kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     let other_active = input.active_device.filter(|id| !id.is_empty() && *id != input.me).map(str::to_string);
+
+    // Without a network nothing can be loaded through Connect (Spirc's context resolve and state
+    // puts would hang), also while the session still reads online: downloads play offline (the
+    // session then goes offline).
+    if kind == CommandKind::Load && !input.network {
+        return if downloaded { Ok(Target::Offline) } else { Err(not_offline()) };
+    }
 
     // The offline queue keeps the session until another device takes it over from a paused or
     // finished queue; a device that only sits paused as the account's active one doesn't.
@@ -109,6 +118,7 @@ mod tests {
     fn input<'a>(online: bool, local: bool, offline: bool, active: Option<&'a str>) -> RouteInput<'a> {
         RouteInput {
             online,
+            network: true,
             spirc: online,
             local_active: local,
             offline_active: offline,
@@ -131,6 +141,20 @@ mod tests {
         let i = hidden(true);
         assert_eq!(route(&i, CommandKind::Control, false).ok(), Some(Target::Offline));
         assert_eq!(route(&i, CommandKind::Load, true).err().map(|e| e.code), Some(ErrorCode::NotConnected));
+    }
+
+    #[test]
+    fn without_a_network_downloads_load_offline_even_while_online() {
+        // this device plays (the session still reads online in its network-loss grace)
+        let i = RouteInput { network: false, ..input(true, true, false, Some("me")) };
+        assert_eq!(route(&i, CommandKind::Load, true).ok(), Some(Target::Offline));
+        assert_eq!(route(&i, CommandKind::Load, false).err().map(|e| e.code), Some(ErrorCode::Unavailable));
+        // controls still go to the playback that runs
+        assert_eq!(route(&i, CommandKind::Control, false).ok(), Some(Target::Local { activate: false }));
+        // another device active, or a paused offline queue: the same for loads
+        let i = RouteInput { network: false, ..input(true, false, true, Some("tv")) };
+        assert_eq!(route(&i, CommandKind::Load, true).ok(), Some(Target::Offline));
+        assert_eq!(route(&i, CommandKind::Control, false).ok(), Some(Target::Offline));
     }
 
     #[test]
