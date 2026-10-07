@@ -204,6 +204,8 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
     // This sheet instance (kept across configuration changes): results of a dismissed sheet's
     // transfer or refresh are for that sheet only and must not close or message this one.
     val sheetToken = rememberSaveable { UUID.randomUUID().toString() }
+    // LAN discovery lives as long as this sheet (not the list row that shows it).
+    val localDevices = rememberLocalDevices(sheetToken) { scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() } }
 
     LaunchedEffect(Unit) { viewModel.refresh(sheetToken, userInitiated = false) }
     LaunchedEffect(viewModel, sheetToken) {
@@ -227,8 +229,7 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
             Box {
                 DevicesList(
                     state = state,
-                    sheetToken = sheetToken,
-                    onConnectedLocal = { scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() } },
+                    localDevices = localDevices,
                     onRefresh = { viewModel.refresh(sheetToken, userInitiated = true) },
                     onTransfer = { id, name -> viewModel.transferTo(id, name, sheetToken) },
                     onSelectOutput = viewModel::selectOutput,
@@ -248,8 +249,7 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
 @Composable
 private fun DevicesList(
     state: DevicesUiState,
-    sheetToken: String,
-    onConnectedLocal: () -> Unit,
+    localDevices: LocalDevicesHolder,
     onRefresh: () -> Unit,
     onTransfer: (id: String, name: String) -> Unit,
     onSelectOutput: (AudioOutput?) -> Unit,
@@ -381,7 +381,7 @@ private fun DevicesList(
             }
         }
         // Spotify Connect receivers on the local network that aren't in the account yet (§8).
-        item(key = "local") { LocalDevicesSection(sheet = sheetToken, onConnected = onConnectedLocal) }
+        item(key = "local") { LocalDevicesSection(localDevices) }
         item(key = "hint") {
             Text(
                 text = stringResource(R.string.player_devices_hint),

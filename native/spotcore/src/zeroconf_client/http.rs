@@ -10,7 +10,7 @@ use http::header::{ACCEPT, CONNECTION, CONTENT_TYPE, HOST};
 use http::{Method, Request};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::rt::TokioIo;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use url::{Host, Url};
@@ -55,10 +55,20 @@ pub(crate) fn is_local_ip(ip: IpAddr) -> bool {
     }
 }
 
-async fn resolve(url: &Url) -> AppResult<SocketAddr> {
+/// The socket address to connect to. A link-local IPv6 host (`fe80::/10`) is only reachable
+/// through a specific interface, and a URL cannot carry the zone, so the caller passes the
+/// interface index as `scope_id`; without one the address is rejected rather than failing with
+/// EINVAL in `connect`.
+pub(crate) async fn resolve(url: &Url, scope_id: Option<u32>) -> AppResult<SocketAddr> {
     let port = url.port_or_known_default().unwrap_or(80);
     let addrs: Vec<SocketAddr> = match url.host() {
         Some(Host::Ipv4(ip)) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
+        Some(Host::Ipv6(ip)) if ip.is_unicast_link_local() => {
+            let scope = scope_id
+                .filter(|s| *s != 0)
+                .ok_or_else(|| AppError::invalid("A link-local IPv6 address needs an interface (scopeId)"))?;
+            vec![SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope))]
+        }
         Some(Host::Ipv6(ip)) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
         Some(Host::Domain(d)) => tokio::net::lookup_host((d, port))
             .await
@@ -91,24 +101,24 @@ fn network(message: impl std::fmt::Display) -> AppError {
     AppError::new(ErrorCode::Network, format!("Could not reach the device: {message}"))
 }
 
-/// `GET url` within `timeout`.
-pub(crate) async fn get(url: &Url, timeout: Duration) -> AppResult<Reply> {
-    request(url, Method::GET, None, timeout).await
+/// `GET url` within `timeout` (`scope_id`: see [`resolve`]).
+pub(crate) async fn get(url: &Url, scope_id: Option<u32>, timeout: Duration) -> AppResult<Reply> {
+    request(url, scope_id, Method::GET, None, timeout).await
 }
 
-/// `POST url` with a form body within `timeout`.
-pub(crate) async fn post_form(url: &Url, form: String, timeout: Duration) -> AppResult<Reply> {
-    request(url, Method::POST, Some(Bytes::from(form)), timeout).await
+/// `POST url` with a form body within `timeout` (`scope_id`: see [`resolve`]).
+pub(crate) async fn post_form(url: &Url, scope_id: Option<u32>, form: String, timeout: Duration) -> AppResult<Reply> {
+    request(url, scope_id, Method::POST, Some(Bytes::from(form)), timeout).await
 }
 
-async fn request(url: &Url, method: Method, body: Option<Bytes>, timeout: Duration) -> AppResult<Reply> {
-    tokio::time::timeout(timeout, exchange(url, method, body))
+async fn request(url: &Url, scope_id: Option<u32>, method: Method, body: Option<Bytes>, timeout: Duration) -> AppResult<Reply> {
+    tokio::time::timeout(timeout, exchange(url, scope_id, method, body))
         .await
         .map_err(|_| AppError::new(ErrorCode::Network, "The device did not answer in time"))?
 }
 
-async fn exchange(url: &Url, method: Method, body: Option<Bytes>) -> AppResult<Reply> {
-    let addr = resolve(url).await?;
+async fn exchange(url: &Url, scope_id: Option<u32>, method: Method, body: Option<Bytes>) -> AppResult<Reply> {
+    let addr = resolve(url, scope_id).await?;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
         .map_err(|_| AppError::new(ErrorCode::Network, "Timed out connecting to the device"))?
@@ -181,6 +191,27 @@ mod tests {
         ] {
             assert!(parse_base_url(bad).is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn link_local_ipv6_needs_a_scope() {
+        let url = parse_base_url("http://[fe80::1234]:4070/").expect("link-local is a LAN address");
+        let err = resolve(&url, None).await.expect_err("no interface");
+        assert!(err.message.contains("scopeId"), "{}", err.message);
+        assert!(resolve(&url, Some(0)).await.is_err(), "0 is not an interface");
+        match resolve(&url, Some(3)).await.expect("scoped") {
+            SocketAddr::V6(v6) => {
+                assert_eq!(v6.scope_id(), 3);
+                assert_eq!(v6.port(), 4070);
+                assert_eq!(v6.ip().to_string(), "fe80::1234");
+            }
+            other => panic!("expected IPv6, got {other}"),
+        }
+        // Other hosts ignore the scope.
+        let v4 = parse_base_url("http://192.168.1.20:4070/").expect("url");
+        assert_eq!(resolve(&v4, Some(3)).await.expect("v4").to_string(), "192.168.1.20:4070");
+        let ula = parse_base_url("http://[fd00::1]:80/").expect("url");
+        assert!(matches!(resolve(&ula, None).await.expect("ula"), SocketAddr::V6(a) if a.scope_id() == 0));
     }
 
     #[test]

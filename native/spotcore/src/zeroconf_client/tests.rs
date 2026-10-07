@@ -151,3 +151,289 @@ fn rejects_unusable_public_key() {
     assert!(seal(b"", b"x").is_err());
     assert!(seal(&[1u8], b"x").is_err());
 }
+
+// ---------------------------------------------------------------------------------------------
+// The device-facing login flow against a scripted fake device over real HTTP (127.0.0.1)
+// ---------------------------------------------------------------------------------------------
+
+use super::{add_user_flow, needs_wake_up, wake_up_form, Account, Endpoint};
+use crate::error::{AppError, AppResult};
+use crate::models::StoredCredentials;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+const INVALID_KEY_B64: &str = "SU5WQUxJRA==";
+const FAKE_DEVICE_ID: &str = "fakedevice0001";
+const FAKE_CLIENT_ID: &str = "0123456789abcdef0123456789abcdef";
+const ADD_USER_OK: &str = r#"{"status":101,"spotifyError":0,"statusString":"OK"}"#;
+const ADD_USER_INVALID_KEY: &str = r#"{"status":203,"spotifyError":0,"statusString":"ERROR-INVALID-PUBLICKEY"}"#;
+
+fn account(auth_data: &[u8]) -> Account {
+    Account {
+        username: "alice".into(),
+        credentials: Some(StoredCredentials { username: "alice".into(), auth_type: 1, auth_data: BASE64.encode(auth_data) }),
+        device_name: "Test Phone".into(),
+        device_id: "phone-device-id".into(),
+    }
+}
+
+async fn no_token() -> AppResult<String> {
+    Err(AppError::internal("this test mints no token"))
+}
+
+#[derive(Default)]
+struct FakeState {
+    /// The service is unloaded (NOT-LOADED + "INVALID" key) until an addUser arrives.
+    needs_wake_up: bool,
+    woken: bool,
+    /// After the wake-up, this many more getInfo calls still report NOT-LOADED.
+    loading_polls: u32,
+    /// The action of every request, in order.
+    actions: Vec<String>,
+    /// Params of every addUser.
+    add_users: Vec<BTreeMap<String, String>>,
+    /// What a key-based addUser decoded to (through librespot's own `with_blob`).
+    credentials: Option<Credentials>,
+}
+
+/// A ZeroConf device: getInfo / addUser handled like librespot-discovery 0.8.0's server (same
+/// decrypt and `with_blob`), plus the NOT-LOADED wake-up behaviour of eSDK speakers.
+struct FakeDevice {
+    keys: DhLocalKeys,
+    token_type: &'static str,
+    state: Mutex<FakeState>,
+}
+
+impl FakeDevice {
+    fn new(token_type: &'static str, needs_wake_up: bool, loading_polls: u32) -> Arc<Self> {
+        Arc::new(Self {
+            keys: DhLocalKeys::random(&mut rand::rng()),
+            token_type,
+            state: Mutex::new(FakeState { needs_wake_up, loading_polls, ..Default::default() }),
+        })
+    }
+
+    fn loaded(state: &FakeState) -> bool {
+        !state.needs_wake_up || (state.woken && state.loading_polls == 0)
+    }
+
+    fn handle(&self, method: &str, path: &str, params: &BTreeMap<String, String>) -> String {
+        assert_eq!(path, "/zc", "requests go to the CPath");
+        let action = params.get("action").cloned().unwrap_or_default();
+        let mut state = self.state.lock().unwrap();
+        state.actions.push(action.clone());
+        match (method, action.as_str()) {
+            ("GET", "getInfo") => {
+                let loaded = Self::loaded(&state);
+                if state.woken && state.loading_polls > 0 {
+                    state.loading_polls -= 1;
+                }
+                let (availability, key) = if loaded {
+                    ("", BASE64.encode(self.keys.public_key()))
+                } else {
+                    ("NOT-LOADED", INVALID_KEY_B64.to_string())
+                };
+                serde_json::json!({
+                    "status": 101, "statusString": "OK", "spotifyError": 0, "version": "2.9.0",
+                    "deviceID": FAKE_DEVICE_ID, "deviceType": "SPEAKER", "remoteName": "Fake Speaker",
+                    "publicKey": key, "tokenType": self.token_type, "clientID": FAKE_CLIENT_ID,
+                    "availability": availability, "activeUser": ""
+                })
+                .to_string()
+            }
+            ("POST", "addUser") => {
+                state.add_users.push(params.clone());
+                if !Self::loaded(&state) {
+                    // The first addUser loads the service; its key isn't valid yet.
+                    state.woken = true;
+                    return ADD_USER_INVALID_KEY.into();
+                }
+                if params.get("tokenType").map(String::as_str) == Some("accesstoken") {
+                    return ADD_USER_OK.into();
+                }
+                let username = params.get("userName").cloned().unwrap_or_default();
+                let client_key = BASE64.decode(params.get("clientKey").cloned().unwrap_or_default()).expect("clientKey");
+                let shared = self.keys.shared_secret(&client_key);
+                let decrypted = server_decrypt(&shared, params.get("blob").map(String::as_str).unwrap_or_default());
+                state.credentials = Some(Credentials::with_blob(username, decrypted, FAKE_DEVICE_ID).expect("with_blob"));
+                ADD_USER_OK.into()
+            }
+            _ => r#"{"status":302,"statusString":"ERROR-INVALID-ACTION"}"#.into(),
+        }
+    }
+}
+
+async fn serve_one(mut stream: TcpStream, device: Arc<FakeDevice>) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        let n = stream.read(&mut chunk).await.expect("read");
+        if n == 0 {
+            return;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next().expect("request line").split(' ');
+    let method = request_line.next().expect("method").to_string();
+    let target = request_line.next().expect("target").to_string();
+    let content_length = lines
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        .map(|(_, v)| v.trim().parse::<usize>().expect("content-length"))
+        .unwrap_or(0);
+    while buf.len() < header_end + content_length {
+        let n = stream.read(&mut chunk).await.expect("read body");
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body = &buf[header_end..header_end + content_length];
+    let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+    // Like librespot's server: query parameters, then the form body.
+    let mut params = BTreeMap::new();
+    params.extend(form_urlencoded::parse(query.as_bytes()).into_owned());
+    params.extend(form_urlencoded::parse(body).into_owned());
+    let json = device.handle(&method, path, &params);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+        json.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+/// Serves `device` on 127.0.0.1; returns its endpoint and the server task.
+async fn serve(device: Arc<FakeDevice>) -> (Endpoint, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(serve_one(stream, device.clone()));
+        }
+    });
+    let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}/zc"), None).expect("endpoint");
+    (endpoint, task)
+}
+
+fn info_with(availability: &str, key: &str, token_type: &str) -> super::LocalDeviceInfo {
+    let body = serde_json::json!({
+        "deviceID": "d", "availability": availability, "publicKey": key, "tokenType": token_type
+    })
+    .to_string();
+    super::info::parse_info(body.as_bytes()).expect("info")
+}
+
+#[test]
+fn wake_up_only_for_unloaded_key_based_devices() {
+    let good_key = BASE64.encode([0x42u8; 96]);
+    assert!(needs_wake_up(&info_with("NOT-LOADED", INVALID_KEY_B64, "default")));
+    assert!(needs_wake_up(&info_with("NOT-LOADED", "", "default")), "a missing key is as bad");
+    assert!(!needs_wake_up(&info_with("NOT-LOADED", &good_key, "default")), "a usable key: just wait");
+    assert!(!needs_wake_up(&info_with("", INVALID_KEY_B64, "default")), "loaded: nothing to wake");
+    assert!(!needs_wake_up(&info_with("NOT-LOADED", INVALID_KEY_B64, "accesstoken")), "a token login wakes it");
+}
+
+#[test]
+fn wake_up_form_carries_no_credentials() {
+    let auth_data = b"secret-reusable-credentials";
+    let account = account(auth_data);
+    let info = info_with("NOT-LOADED", INVALID_KEY_B64, "default");
+    let form: BTreeMap<String, String> = wake_up_form(&info, &account).into_iter().collect();
+    assert_eq!(form["action"], "addUser");
+    assert_eq!(form["blob"], "", "no blob");
+    assert_eq!(form["clientKey"], "", "no key exchange");
+    assert_eq!(form["tokenType"], "default");
+    assert_eq!(form["userName"], "alice");
+    assert_eq!(form["deviceName"], "Test Phone");
+    assert_eq!(form["deviceId"], "phone-device-id");
+    assert_eq!(form["version"], "2.7.1", "fallback version when the device reports none");
+    let stored = BASE64.encode(auth_data);
+    assert!(form.values().all(|v| !v.contains(&stored)), "credential material never in the wake-up");
+}
+
+#[tokio::test]
+async fn logs_into_a_loaded_device_over_http() {
+    let device = FakeDevice::new("default", false, 0);
+    let (endpoint, server) = serve(device.clone()).await;
+    let auth_data: Vec<u8> = (0..150u8).collect();
+    let info = add_user_flow(&endpoint, Some(FAKE_DEVICE_ID), &account(&auth_data), no_token).await.expect("login");
+    server.abort();
+    assert_eq!(info.device_id, FAKE_DEVICE_ID);
+    let state = device.state.lock().unwrap();
+    assert_eq!(state.actions, ["getInfo", "addUser"]);
+    let creds = state.credentials.as_ref().expect("the device decoded credentials");
+    assert_eq!(creds.username.as_deref(), Some("alice"));
+    assert_eq!(creds.auth_type, AuthenticationType::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS);
+    assert_eq!(creds.auth_data, auth_data);
+    assert_eq!(state.add_users[0]["tokenType"], "default");
+    assert_eq!(state.add_users[0]["version"], "2.9.0", "echoes the device's version");
+}
+
+#[tokio::test]
+async fn wakes_a_not_loaded_device_then_logs_in() {
+    // Unloaded until the first addUser, then still loading for one more getInfo.
+    let device = FakeDevice::new("default", true, 1);
+    let (endpoint, server) = serve(device.clone()).await;
+    let info = add_user_flow(&endpoint, None, &account(b"reusable"), no_token).await.expect("login");
+    server.abort();
+    assert!(!info.not_loaded());
+    let state = device.state.lock().unwrap();
+    // getInfo (NOT-LOADED) → wake-up addUser → getInfo (still loading) → getInfo (loaded) → addUser.
+    assert_eq!(state.actions, ["getInfo", "addUser", "getInfo", "getInfo", "addUser"]);
+    assert_eq!(state.add_users.len(), 2);
+    let wake = &state.add_users[0];
+    assert_eq!(wake["blob"], "", "the wake-up holds no credentials");
+    assert_eq!(wake["clientKey"], "");
+    assert_eq!(wake["deviceName"], "Test Phone");
+    assert!(!state.add_users[1]["blob"].is_empty(), "the real addUser carries the blob");
+    let creds = state.credentials.as_ref().expect("decoded after the wake-up");
+    assert_eq!(creds.auth_data, b"reusable");
+}
+
+#[tokio::test]
+async fn a_device_that_never_loads_gets_one_wake_up_and_a_clear_error() {
+    let device = FakeDevice::new("default", true, u32::MAX);
+    let (endpoint, server) = serve(device.clone()).await;
+    let err = add_user_flow(&endpoint, None, &account(b"reusable"), no_token).await.expect_err("never loads");
+    server.abort();
+    assert!(err.message.contains("public key"), "{}", err.message);
+    let state = device.state.lock().unwrap();
+    assert_eq!(state.add_users.len(), 1, "exactly one wake-up, never credentials to an unloaded device");
+    assert_eq!(state.add_users[0]["blob"], "");
+    assert!(state.actions.iter().filter(|a| *a == "getInfo").count() >= 3, "polled while loading");
+}
+
+#[tokio::test]
+async fn sends_a_fresh_token_to_accesstoken_devices() {
+    let device = FakeDevice::new("accesstoken", false, 0);
+    let (endpoint, server) = serve(device.clone()).await;
+    let mut account = account(b"unused");
+    account.credentials = None; // a token login must not need stored credentials
+    add_user_flow(&endpoint, None, &account, || async { Ok("fresh-token".to_string()) }).await.expect("login");
+    server.abort();
+    let state = device.state.lock().unwrap();
+    assert_eq!(state.add_users.len(), 1);
+    let form = &state.add_users[0];
+    assert_eq!(form["tokenType"], "accesstoken");
+    assert_eq!(form["blob"], "fresh-token");
+    assert_eq!(form["clientKey"], FAKE_CLIENT_ID, "the device's own client id");
+    assert!(state.credentials.is_none());
+}
+
+#[tokio::test]
+async fn refuses_a_different_device_at_the_address() {
+    let device = FakeDevice::new("default", false, 0);
+    let (endpoint, server) = serve(device.clone()).await;
+    let err = add_user_flow(&endpoint, Some("someone-else"), &account(b"x"), no_token).await.expect_err("mismatch");
+    server.abort();
+    assert!(err.message.contains("different device"), "{}", err.message);
+    assert!(device.state.lock().unwrap().add_users.is_empty(), "nothing sent to the wrong device");
+}

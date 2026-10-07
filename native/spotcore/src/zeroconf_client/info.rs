@@ -41,7 +41,8 @@ pub(crate) struct LocalDeviceInfo {
 }
 
 impl LocalDeviceInfo {
-    /// The device's ZeroConf service is not loaded yet (some devices need a wake-up `addUser`).
+    /// The device's ZeroConf service is not loaded yet. If it also has no usable public key, the
+    /// client sends a wake-up `addUser` without credentials first (`needs_wake_up` in mod.rs).
     pub fn not_loaded(&self) -> bool {
         self.availability.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(AVAILABILITY_NOT_LOADED))
     }

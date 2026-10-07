@@ -17,11 +17,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -72,8 +73,11 @@ internal sealed interface LocalConnectEvent {
 internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
     private val discovery = graph.localDiscovery
     private val devicesRepository = graph.devices
+    private val loggedIn = graph.engine.isLoggedIn
     private val connecting = MutableStateFlow<String?>(null)
     private val eventChannel = Channel<LocalConnectEvent>(Channel.BUFFERED)
+    /** The sheet whose results [discovery] currently holds. */
+    private var resultsSheet: String? = null
 
     val events: Flow<LocalConnectEvent> = eventChannel.receiveAsFlow()
 
@@ -91,9 +95,20 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LocalDevicesUiState())
 
-    fun startDiscovery() = discovery.start()
+    /**
+     * Browses while [sheet] is open and STARTED. A new sheet starts from scratch; the same sheet
+     * coming back (background, rotation) keeps what it found.
+     */
+    fun startDiscovery(sheet: String) {
+        if (sheet != resultsSheet) {
+            discovery.clear()
+            resultsSheet = sheet
+        }
+        if (loggedIn.value) discovery.start()
+    }
 
-    fun stopDiscovery() = discovery.stop()
+    /** The sheet stopped or went away: browsing (and the multicast lock) ends, results stay. */
+    fun stopDiscovery() = discovery.pause()
 
     /**
      * Logs the device into the account and transfers playback to it; the result goes to [sheet]
@@ -125,21 +140,40 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
 }
 
 /**
- * "Other devices on your network": Spotify Connect receivers found on the LAN that aren't in the
- * account yet (docs/ARCHITECTURE.md §8). Discovery runs only while this is in the STARTED devices
- * sheet. Tapping a device logs it in, transfers playback and closes the sheet via [onConnected].
+ * The local-network section's state for one devices sheet. Created by [rememberLocalDevices] at
+ * sheet level, so it lives exactly as long as the sheet, not as long as a list row.
+ */
+@Stable
+internal class LocalDevicesHolder(
+    private val stateValue: State<LocalDevicesUiState>,
+    private val errorValue: State<String?>,
+    private val onConnect: (LocalConnectDevice) -> Unit,
+) {
+    val state: LocalDevicesUiState get() = stateValue.value
+
+    /** The last login failure of this sheet, if any. */
+    val error: String? get() = errorValue.value
+
+    fun connect(device: LocalConnectDevice) = onConnect(device)
+}
+
+/**
+ * Drives "Other devices on your network" for the devices sheet [sheet]. Call it from the sheet
+ * itself (not from a LazyColumn item: those are disposed when scrolled away). Discovery and the
+ * Wi-Fi multicast lock run while this is in composition and the lifecycle is STARTED; results
+ * and login outcomes for [sheet] are collected here, so none is lost while the row is off screen.
+ * [onConnected] closes the sheet after a successful login + transfer.
  */
 @Composable
-internal fun LocalDevicesSection(sheet: String, onConnected: () -> Unit) {
+internal fun rememberLocalDevices(sheet: String, onConnected: () -> Unit): LocalDevicesHolder {
     val viewModel = appViewModel { graph -> LocalDevicesViewModel(graph) }
-    val state by viewModel.state.collectAsStateWithLifecycle()
+    val state = viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
-    var error by remember { mutableStateOf<String?>(null) }
+    val error = remember(sheet) { mutableStateOf<String?>(null) }
     val currentOnConnected by rememberUpdatedState(onConnected)
 
-    // Discovery (and the Wi-Fi multicast lock) live only while the sheet is STARTED.
-    LifecycleStartEffect(viewModel) {
-        viewModel.startDiscovery()
+    LifecycleStartEffect(viewModel, sheet) {
+        viewModel.startDiscovery(sheet)
         onStopOrDispose { viewModel.stopDiscovery() }
     }
 
@@ -148,7 +182,7 @@ internal fun LocalDevicesSection(sheet: String, onConnected: () -> Unit) {
             when (event) {
                 is LocalConnectEvent.Connected -> currentOnConnected()
                 is LocalConnectEvent.Failed -> {
-                    error = context.getString(
+                    error.value = context.getString(
                         if (event.network) R.string.local_connect_login_failed_network else R.string.local_connect_login_failed,
                         event.deviceName,
                     )
@@ -157,8 +191,24 @@ internal fun LocalDevicesSection(sheet: String, onConnected: () -> Unit) {
         }
     }
 
-    val nothingYet = state.devices.isEmpty() && error == null
-    if (nothingYet && !state.discovering) return
+    return remember(viewModel, sheet, state) {
+        LocalDevicesHolder(state, error) { device ->
+            error.value = null
+            viewModel.connect(device, sheet)
+        }
+    }
+}
+
+/**
+ * "Other devices on your network": Spotify Connect receivers found on the LAN that aren't in the
+ * account yet (docs/ARCHITECTURE.md §8). Rendering only; [rememberLocalDevices] in the sheet owns
+ * discovery and the results. Tapping a device logs it in, transfers playback and closes the sheet.
+ */
+@Composable
+internal fun LocalDevicesSection(local: LocalDevicesHolder) {
+    val state = local.state
+    val error = local.error
+    if (state.devices.isEmpty() && error == null && !state.discovering) return
 
     Column {
         Text(
@@ -184,15 +234,11 @@ internal fun LocalDevicesSection(sheet: String, onConnected: () -> Unit) {
             }
         } else {
             state.devices.forEach { device ->
-                val busy = state.connectingId == device.deviceId
                 LocalDeviceRow(
                     device = device,
-                    busy = busy,
+                    busy = state.connectingId == device.deviceId,
                     enabled = state.connectingId == null,
-                    onClick = {
-                        error = null
-                        viewModel.connect(device, sheet)
-                    },
+                    onClick = { local.connect(device) },
                 )
             }
         }
