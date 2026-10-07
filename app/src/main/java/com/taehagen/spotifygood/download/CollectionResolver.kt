@@ -75,7 +75,8 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
 
     /**
      * Liked Songs as URIs only (`urisOnly`): membership needs no metadata, and tracks whose metadata
-     * fails cannot drop out. New rows get their metadata from [metadataBestEffort].
+     * fails cannot drop out. Members that need it (new rows, failed ones) get metadata and their
+     * playability from [itemsBestEffort].
      */
     private suspend fun resolveLikedSongs(): Resolved {
         val uris = ArrayList<String>()
@@ -103,17 +104,28 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
     }
 
     /**
-     * Display metadata for [uris] like [metadata], batch by batch within [timeoutMs]: what arrived in
-     * time is kept, failed batches are skipped.
+     * Members for [uris] from catalog metadata ([trackItem] / [episodeItem]: display metadata and
+     * whether they are playable here), batch by batch within [timeoutMs]: what arrived in time is
+     * kept, failed batches are skipped (those items stay unknown).
      */
-    suspend fun metadataBestEffort(uris: List<String>, timeoutMs: Long): Map<String, String> {
-        val out = HashMap<String, String>()
+    suspend fun itemsBestEffort(uris: List<String>, timeoutMs: Long): Map<String, Item> {
+        val out = HashMap<String, Item>()
         val deadline = System.currentTimeMillis() + timeoutMs
-        for (chunk in uris.chunked(CatalogRepository.METADATA_BATCH)) {
+        val (tracks, others) = uris.partition { SpotifyUris.typeOf(it) == "track" }
+        val episodes = others.filter { SpotifyUris.typeOf(it) == "episode" }
+        val batches = tracks.chunked(CatalogRepository.METADATA_BATCH).map { true to it } +
+            episodes.chunked(CatalogRepository.METADATA_BATCH).map { false to it }
+        for ((isTrack, chunk) in batches) {
             val left = deadline - System.currentTimeMillis()
             if (left <= 0) break
             try {
-                withTimeoutOrNull(left) { out += metadata(chunk) } ?: break
+                withTimeoutOrNull(left) {
+                    if (isTrack) {
+                        fetchTracks(chunk).forEach { out[it.uri] = trackItem(it, json) }
+                    } else {
+                        fetchEpisodes(chunk).forEach { out[it.uri] = episodeItem(it, json) }
+                    }
+                } ?: break
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {

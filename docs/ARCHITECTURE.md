@@ -843,8 +843,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
   of another downloaded collection). Liked Songs are listed with `library.tracks
-  {urisOnly:true}`; new rows get metadata from `catalog.tracks` (also placeholders: they are stored
-  without metadata). Only a *complete* resolution removes items (not `partial`, not empty, and for
+  {urisOnly:true}`; members without a row and members whose row failed get metadata and their
+  playability from `catalog.tracks` (batched, ≤ 60 s; completed and pending rows are not looked up
+  again; placeholders are stored without metadata). Re-validation adds a member found not playable
+  to the unavailable set of every collection containing it (and removes it when playable again). Only a *complete* resolution removes items (not `partial`, not empty, and for
   playlists / Liked Songs every slot listed): an empty, short or partial one only adds, and is
   retried. A collection whose sync fails or is incomplete is retried after 1 h,
   doubling up to 24 h (`lastAttemptAt`, `syncFailures`), instead of at every reconnect.
