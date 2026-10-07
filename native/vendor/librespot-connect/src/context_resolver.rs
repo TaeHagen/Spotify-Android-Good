@@ -508,6 +508,8 @@ impl ContextResolver {
         if let Err(why) = res {
             error!("setup of state after a failed resolve failed: {why}")
         }
+        // SPOTIFYGOOD: no page with it is to come
+        state.forget_current_track_placement();
 
         state.update_restrictions();
         state.update_queue_revision();
@@ -551,6 +553,10 @@ impl ContextResolver {
 
         if let Err(why) = res {
             error!("setup of state failed: {why}, last used resolve {next:#?}")
+        }
+        // SPOTIFYGOOD: no page with it is to come (see place_current_track_when_resolved)
+        if next.update == ContextType::Default {
+            state.forget_current_track_placement();
         }
 
         state.update_restrictions();

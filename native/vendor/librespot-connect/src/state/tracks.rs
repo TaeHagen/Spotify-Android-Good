@@ -104,6 +104,9 @@ impl<'ct> ConnectState {
     /// Updates the current track to the next track. Adds the old track
     /// to prev tracks and fills up the next tracks from the current context
     pub fn next_track(&mut self) -> Result<Option<u32>, Error> {
+        // SPOTIFYGOOD: another track plays, see place_current_track_when_resolved
+        self.place_current_track = false;
+
         // when we skip in repeat track, we don't repeat the current track anymore
         if self.repeat_track() {
             self.set_repeat_track(false);
@@ -179,6 +182,8 @@ impl<'ct> ConnectState {
         {
             return Ok(None);
         }
+        // SPOTIFYGOOD: another track plays, see place_current_track_when_resolved
+        self.place_current_track = false;
 
         let old_track = self.player_mut().track.take();
 
@@ -647,6 +652,8 @@ impl<'ct> ConnectState {
                 t.uid == uid && !t.uid.starts_with(IDENTIFIER_DELIMITER) && !t.is_unavailable()
             })
             .ok_or_else(|| StateError::CanNotFindTrackInQueue(uid.to_string()))?;
+        // SPOTIFYGOOD: another track plays, see place_current_track_when_resolved
+        self.place_current_track = false;
 
         // when we skip in repeat track, we don't repeat the current track anymore
         if self.repeat_track() {
