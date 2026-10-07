@@ -848,7 +848,13 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   player so Media3 goes foreground at once). `onForegroundServiceStartNotAllowedException`
   → for local playback pause + "Tap to resume"; while mirroring a remote device the notification
   is posted without the foreground (the remote device is never paused).
-  `onTaskRemoved` default behaviour. Engine holder released when the service is destroyed.
+  `onTaskRemoved` default behaviour. The `PLAYBACK` engine holder is taken on the first
+  playback command (play, load, seek, queue, modes, volume; a pause or stop does not count),
+  a playback resumption for playback, voice "play", Tap to resume, our LOCAL_PLAYBACK start,
+  the media foreground, or a local / mirrored snapshot, and released when the service is
+  destroyed. A browse-only bind (SysUI's resumption card at boot: root + recent; Bluetooth
+  player discovery) never starts the engine; catalog browsing and search (Auto) hold a second
+  `PLAYBACK` holder until 60 s after the browser's last such request.
 * **Opt-in Connect presence** (setting "Stay available for Spotify Connect", default off):
   when enabled and the app goes to background while idle, the service keeps itself in the
   foreground as `connectedDevice` with a low-importance "Available on Spotify Connect"
