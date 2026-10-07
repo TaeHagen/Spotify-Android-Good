@@ -168,6 +168,55 @@ class BrowseLogicTest {
         assertFalse(loader.state.value.endReached)
     }
 
+    private data class Row(val key: String, val playable: Boolean)
+
+    @Test
+    fun pagerFailedReloadStillReplacesOnTheNextLoad() = runTest {
+        // Generation 0: four playable rows; generation 1: "b" is no longer playable, "d" is gone.
+        var generation = 0
+        var fail = false
+        val requests = mutableListOf<Int>()
+        val loader = PagedLoader(this, pageSize = 2, keyOf = Row::key) { offset, _ ->
+            requests += offset
+            if (fail) throw IOException("offline")
+            val rows = if (generation == 0) {
+                listOf(Row("a", true), Row("b", true), Row("c", true), Row("d", true))
+            } else {
+                listOf(Row("a", true), Row("b", false), Row("c", true))
+            }
+            PageResult(rows.drop(offset).take(2), total = rows.size)
+        }
+        loader.loadMore()
+        advanceUntilIdle()
+        loader.loadMore()
+        advanceUntilIdle()
+        assertEquals(4, loader.state.value.items.size)
+
+        // The reload fails: the old rows stay visible behind the error.
+        generation = 1
+        fail = true
+        loader.reload()
+        advanceUntilIdle()
+        assertTrue(loader.state.value.error is IOException)
+        assertEquals(4, loader.state.value.items.size)
+
+        // Retry (loadMore) fetches page 0 again; it replaces the stale list instead of merging.
+        fail = false
+        loader.loadMore()
+        advanceUntilIdle()
+        assertEquals(listOf(Row("a", true), Row("b", false)), loader.state.value.items)
+        assertEquals(3, loader.state.value.total)
+        assertNull(loader.state.value.error)
+        assertFalse(loader.state.value.endReached)
+
+        // Paging continues normally (merging) after the replace.
+        loader.loadMore()
+        advanceUntilIdle()
+        assertEquals(listOf(Row("a", true), Row("b", false), Row("c", true)), loader.state.value.items)
+        assertTrue(loader.state.value.endReached)
+        assertEquals(listOf(0, 2, 0, 0, 2), requests)
+    }
+
     @Test
     fun downloadedCollectionMapping() {
         val stored = StoredCollection(

@@ -16,12 +16,14 @@ import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
+import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import com.taehagen.spotifygood.ui.components.SessionMessenger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -29,6 +31,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -120,6 +124,40 @@ internal fun DownloadManager.statesFor(uris: Flow<Set<String>>): Flow<Map<String
         }
     }.onStart { emit(emptyMap()) }.distinctUntilChanged().catch { emit(emptyMap()) }.flowOn(Dispatchers.Default)
 
+/**
+ * The engine's reach, as playback routes by it ([EngineReach.of]): only ONLINE means catalog calls
+ * can succeed. The network flag alone is not enough — an unvalidated Wi-Fi (captive portal) counts
+ * as a network while the session can't connect.
+ */
+internal fun AppGraph.engineReach(): EngineReach {
+    val engineState = engine.state.value
+    return EngineReach.of(settings.settings.value.offlineMode, engineState.session, engineState.networkAvailable)
+}
+
+internal fun AppGraph.engineReachFlow(): Flow<EngineReach> =
+    combine(settings.settings.map { it.offlineMode }, engine.state) { offlineMode, engineState ->
+        EngineReach.of(offlineMode, engineState.session, engineState.networkAvailable)
+    }.distinctUntilChanged()
+
+/** A failure of the connection rather than of the request (NETWORK, NOT_CONNECTED, I/O, timeout). */
+internal fun isNetworkClassError(error: Throwable): Boolean =
+    (error is NativeException && error.isNetwork) ||
+        error is java.io.IOException ||
+        error is java.util.concurrent.TimeoutException ||
+        error is TimeoutCancellationException
+
+/**
+ * Whether a page may show (or extend itself with) the download after [error]: always when the
+ * engine is offline, after a connection failure while the session isn't ONLINE (still connecting,
+ * e.g. behind a captive portal), never while it is ONLINE (a transient error keeps the server's
+ * list and its Retry). Data from the download is read-only either way.
+ */
+internal fun useDownloadFallback(reach: EngineReach, error: Throwable): Boolean = when (reach) {
+    EngineReach.OFFLINE -> true
+    EngineReach.CONNECTING -> isNetworkClassError(error)
+    EngineReach.ONLINE -> false
+}
+
 /** True while offline mode is on or there is no network. */
 internal fun AppGraph.offlineFlow(): Flow<Boolean> =
     combine(settings.settings.map { it.offlineMode }, engine.isNetworkAvailable) { offlineMode, network ->
@@ -159,6 +197,22 @@ internal abstract class DetailViewModel(
 
     fun retry() {
         retryTrigger.update { it + 1 }
+    }
+
+    /** See [useDownloadFallback]: decided by the engine's reach at the time of the failure. */
+    protected fun downloadFallbackAllowed(error: Throwable): Boolean = useDownloadFallback(graph.engineReach(), error)
+
+    /**
+     * Each time the engine reaches ONLINE (the session connected, not merely a network appearing)
+     * while [showingDownload] — the page or part of it was built from the download — [refetch]es
+     * the server's data, which replaces it. Call from the subclass's init.
+     */
+    protected fun refetchWhenOnline(showingDownload: () -> Boolean, refetch: () -> Unit = ::retry) {
+        viewModelScope.launch {
+            graph.engineReachFlow().drop(1).filter { it == EngineReach.ONLINE }.collect {
+                if (showingDownload()) refetch()
+            }
+        }
     }
 
     /**

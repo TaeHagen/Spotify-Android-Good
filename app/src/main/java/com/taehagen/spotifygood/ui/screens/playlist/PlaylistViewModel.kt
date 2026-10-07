@@ -53,8 +53,6 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.drop
-import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
@@ -222,12 +220,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
                     .collect { onFirstPage(it) }
             }
         }
-        // Back online while showing the download: fetch the server's rows (they replace it).
-        viewModelScope.launch {
-            offline.drop(1).filter { !it }.collect {
-                if (data.value.dataOrNull()?.downloadedCopy == true) retry()
-            }
-        }
+        // Session back ONLINE while showing the download: fetch the server's rows (they replace it).
+        refetchWhenOnline(showingDownload = { data.value.dataOrNull()?.downloadedCopy == true })
     }
 
     // -----------------------------------------------------------------------------------------
@@ -238,10 +232,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val page = resource.dataOrNull
         if (page == null) {
             if (data.value !is LoadState.Ready) {
-                // No page and no cached copy while offline (cache cleared or pruned), or the playlist
-                // is gone: a downloaded playlist still opens, read-only, from the download database.
+                // No page and no cached copy while the session can't reach the server (cache cleared
+                // or pruned), or the playlist is gone: a downloaded playlist still opens, read-only,
+                // from the download database.
                 val useCopy = resource is Resource.Error &&
-                    (offline.value || failureReason(resource.error) == FailureReason.NOT_FOUND)
+                    (downloadFallbackAllowed(resource.error) || failureReason(resource.error) == FailureReason.NOT_FOUND)
                 val copy = if (useCopy) downloadedCopy() else null
                 data.value = when {
                     copy != null -> LoadState.Ready(downloadedData(copy), stale = true)
@@ -266,7 +261,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val reloadRange = current != null && (!sameRevision || replaceable) && current.rows.size > page.items.size
         val playlist = when {
             keepRows -> PlaylistData(page.copy(items = emptyList()), description, current.rows, maxOf(page.total, current.rows.size), page.revision)
-            reloadRange -> current.copy(meta = page.copy(items = emptyList()), description = description)
+            // Rows still from the download stay read-only until the reload replaces them.
+            reloadRange -> current.copy(
+                meta = page.copy(items = emptyList(), canEdit = page.canEdit && !current.downloadedCopy),
+                description = description,
+            )
             else -> PlaylistData(page.copy(items = emptyList()), description, buildRows(page.items), page.total, page.revision, page.partial)
         }
         data.value = LoadState.Ready(
@@ -316,9 +315,10 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            // Offline past the cached first page: the rest of a downloaded playlist is on disk. Only
-            // when actually offline: a transient error online keeps the server list (Retry footer).
-            if (offline.value && appendDownloadedRows()) return false
+            // The session can't reach the server past the cached first page: the rest of a downloaded
+            // playlist is on disk. Not while the session is ONLINE: a transient error then keeps the
+            // server list (Retry footer).
+            if (downloadFallbackAllowed(e) && appendDownloadedRows()) return false
             paging.update { it.copy(failed = true) }
             return false
         } finally {
