@@ -33,6 +33,9 @@ internal object DownloadRules {
     /** Rate-limit pauses one run waits out before it hands the queue back to the system. */
     const val MAX_THROTTLED_PER_RUN_MS = 5 * 60_000L
 
+    /** First queue pause after the Keystore could not seal a finished download's key (doubles). */
+    const val KEYSTORE_PAUSE_MS = 30_000L
+
     /** Stop downloading when less than this is free on the data partition. */
     const val MIN_FREE_BYTES = 200L * 1024 * 1024
 
@@ -231,6 +234,19 @@ internal object DownloadRules {
     }
 
     /**
+     * Members queued by a sync ([queued]) that must also leave a failed row: the ones that became
+     * playable again ([revived]); inserting skips existing rows, so without this a revived member
+     * whose download failed (or was failed by re-validation) would stay failed.
+     */
+    fun requeueOnSync(queued: List<String>, revived: Set<String>): List<String> = queued.filter { it in revived }
+
+    /**
+     * Whether scheduled download work is cancelled after removals: when nothing is pending any more
+     * and no run or job is active (a later enqueue schedules again).
+     */
+    fun cancelIdleWork(pending: Int, running: Boolean, jobExecuting: Boolean): Boolean = pending == 0 && !running && !jobExecuting
+
+    /**
      * Earliest time a downloaded collection is synced again when the session comes online:
      * [SYNC_STALE_MS] after its last complete sync, and after [failures] consecutive failed or
      * incomplete attempts no sooner than [SYNC_RETRY_BASE_MS] (doubling, ≤ [SYNC_RETRY_MAX_MS]) after
@@ -369,11 +385,26 @@ internal class QueueBreaker {
     private var rateLimits = 0
     private var connectivityFailures = 0
     private var connectivityTrips = 0
+    private var keystoreBusy = 0
 
     fun onSuccess() {
         rateLimits = 0
         connectivityFailures = 0
         connectivityTrips = 0
+        keystoreBusy = 0
+    }
+
+    /**
+     * Queue pause after the Keystore could not seal the key of a finished download: device-wide and
+     * not the item's fault, so it is not counted as an attempt; 30 s, 1, 2, 4 min …, at most
+     * [DownloadRules.MAX_QUEUE_PAUSE_MS], so a Keystore that does not recover hands the queue back to
+     * the system instead of cycling.
+     */
+    fun onKeystoreBusy(): Long {
+        keystoreBusy++
+        var pause = DownloadRules.KEYSTORE_PAUSE_MS
+        repeat((keystoreBusy - 1).coerceIn(0, 10)) { pause = (pause * 2).coerceAtMost(DownloadRules.MAX_QUEUE_PAUSE_MS) }
+        return pause
     }
 
     /** How long to pause the whole queue after an item failed with [code]; null = go on. */

@@ -804,7 +804,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   attempt and pauses the whole queue for the server's `retryAfterMs` (else 1 min, doubling);
   three consecutive connectivity failures while the session is online (CDN unreachable) pause
   it for 1, 4, 16 min …; at most 30 min. Every pending row is held back (`retryAt`), so the run
-  waits inline (≤ 2 min) or reschedules; a completed download resets the breaker.
+  waits inline (≤ 2 min) or reschedules; a completed download resets the breaker. A Keystore that
+  cannot seal a finished download's key (after ~15 s of retries) requeues it without an attempt
+  (the file stays) and pauses the queue 30 s, doubling. A job or worker that starts for an empty
+  queue finishes at once, and removals that empty the queue cancel the scheduled work.
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
   of another downloaded collection). Liked Songs are listed with `library.tracks
@@ -815,7 +818,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   doubling up to 24 h (`lastAttemptAt`, `syncFailures`), instead of at every reconnect.
   Members the catalog resolves as not playable here (`playable:false` with a name) stay members
   but are not queued and do not count in the collection status (`unavailableUrisJson`); they
-  are queued once they become playable.
+  are queued once they become playable (also from a failed row). Each sync also queues failed
+  downloads that still own their file (failed by re-validation or the key check) and are playable
+  again; `download.track` reuses the file.
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
   `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks start at 2 MiB and adapt between 1 and
   4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all";
