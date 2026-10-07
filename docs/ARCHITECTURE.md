@@ -643,12 +643,18 @@ Native catalog strategy (Rust `catalog/`):
   they are discovered at runtime: fetch `https://open.spotify.com/` once, extract the web
   player bundle URLs, regex out `"<operationName>","query","<sha256>"` pairs, cache them on
   disk (`filesDir/pathfinder.json`, refreshed weekly or on `PersistedQueryNotFound`); shipped
-  defaults are only a starting point. Token: login5 first; on 401/403 the OAuth access token
-  from login (if still valid); otherwise the call fails over to the fallbacks below.
+  defaults are only a starting point. A refresh runs detached from the RPC that triggered it
+  (a superseded search cannot abort it; the query waits ≤ 20 s, then uses its fallbacks), at
+  most once an hour across restarts (5 min after a network failure), with bundle parsing on
+  the blocking pool. Token: login5 first; on 401/403 the OAuth access token from login (if
+  still valid); otherwise the call fails over to the fallbacks below. The optional
+  `client-token` header gets 5 s.
 * **Fallbacks**: search → spclient `searchview/km/v4/search/<q>` (JSON) → context-resolve
-  `spotify:search:<q>` (tracks only). Home → assembled locally from recently played,
+  `spotify:search:<q>` (tracks only); a NETWORK/RATE_LIMITED searchview failure ends the chain
+  (same spclient). Home → assembled locally from recently played,
   rootlist playlists (incl. followed Made-For-You mixes), followed artists and radio
-  stations seeded from recent tracks.
+  stations seeded from recent tracks. Liked Songs → context-resolve when `collection/v2/paging`
+  fails (not when offline or rate limited); the resolved list is reused for 60 s.
 * The public Web API is never used by default.
 
 
@@ -656,8 +662,12 @@ Native catalog strategy (Rust `catalog/`):
 Repositories call the native catalog RPCs and expose `suspend` functions / `Flow`s.
 `ResponseCache` (Room table `response_cache`: key, json, fetchedAt) stores the last
 successful response of browse calls (home, library lists, album/artist/playlist pages) so
-the app opens instantly and works offline; stale-while-revalidate. Library mutations are
-optimistic (local state flips immediately, rolled back on error). Liked-state of the
+the app opens instantly and works offline; stale-while-revalidate. A `partial` response
+(§6.3) is shown but never stored as fresh: it only fills a missing row (stored stale) and is
+refetched twice while on screen (after 15 s and 30 s). Paged lists advance by whole windows
+until `total`; an empty page before `total` is an error, not the end. Library mutations are
+optimistic (local state flips immediately, rolled back on error); playlist edits run in the
+app scope, so they complete even if their screen closes. Liked-state of the
 current track is cached in memory (LRU) and refreshed via `library.contains`.
 
 ### 9.9 UI
