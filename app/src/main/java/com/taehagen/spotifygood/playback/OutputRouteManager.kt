@@ -42,9 +42,9 @@ data class AudioOutput(
 
 /**
  * Local output routing (docs/ARCHITECTURE.md §9.5): lists outputs, tracks the routed device,
- * lets the user pick one (AudioTrack preferred device), opens the system output switcher and
- * reports the current output to Spotify Connect. Listeners are registered only between
- * [start] and [stop] (the engine calls these while it runs).
+ * lets the user pick one (AudioTrack preferred device; temporary, see [OutputPick]), opens the
+ * system output switcher and reports the current output to Spotify Connect. Listeners are
+ * registered only between [start] and [stop] (the engine calls these while it runs).
  */
 class OutputRouteManager(
     context: Context,
@@ -63,19 +63,23 @@ class OutputRouteManager(
     val current: StateFlow<AudioOutput?> = _current.asStateFlow()
 
     @Volatile private var started = false
-    @Volatile private var preferredId: Int? = null
+    private val pick = OutputPick()
     @Volatile private var routedDevice: AudioDeviceInfo? = null
     private var lastReported: AudioOutputInfo? = null
 
     private val deviceCallback = object : AudioDeviceCallback() {
-        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) = refresh()
-
-        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
-            if (removedDevices.any { it.id == preferredId }) {
-                // The chosen output went away: follow the system route again.
-                preferredId = null
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+            // A new external output (headphones, a car kit) takes over from a pick, like the
+            // system switcher. The initial event lists every current device: not new.
+            if (pick.onAdded(addedDevices.filter { it.isSink }.map { it.id to kindOf(it.type) })) {
                 audioSink.setPreferredDevice(null)
             }
+            refresh()
+        }
+
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+            // The chosen output went away: follow the system route again.
+            if (pick.onRemoved(removedDevices.mapTo(HashSet()) { it.id })) audioSink.setPreferredDevice(null)
             refresh()
         }
     }
@@ -97,6 +101,12 @@ class OutputRouteManager(
     }
 
     fun stop() {
+        // A pick does not outlive the session (engine stop, logout): the next one follows the
+        // system route, whatever was connected meanwhile.
+        if (pick.clear()) {
+            audioSink.setPreferredDevice(null)
+            refresh()
+        }
         if (!started) return
         started = false
         audioManager.unregisterAudioDeviceCallback(deviceCallback)
@@ -107,7 +117,12 @@ class OutputRouteManager(
     /** null = follow the system default route. */
     fun select(output: AudioOutput?) {
         val info = output?.info?.takeIf { it.type != AudioDeviceInfo.TYPE_UNKNOWN }
-        preferredId = info?.id
+        val present = if (info == null) {
+            emptySet()
+        } else {
+            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { it.isSink }.mapTo(HashSet()) { it.id }
+        }
+        pick.pick(info?.id, present)
         audioSink.setPreferredDevice(info)
         // The route change listener confirms the actual result; reflect the choice meanwhile.
         refresh()
@@ -143,7 +158,7 @@ class OutputRouteManager(
         val unique = dedupe(devices)
         val routed = routedDevice?.takeIf { r -> unique.any { matches(it, r) } }
             ?: fallbackRoute(unique)
-        val preferred = preferredId
+        val preferred = pick.preferredId
         val list = unique
             .map { info ->
                 AudioOutput(
@@ -173,7 +188,7 @@ class OutputRouteManager(
                 ?.firstOrNull { r -> devices.any { matches(it, r) } }
                 ?.let { return it }
         }
-        preferredId?.let { id -> devices.firstOrNull { it.id == id }?.let { return it } }
+        pick.preferredId?.let { id -> devices.firstOrNull { it.id == id }?.let { return it } }
         return devices.minByOrNull { routePriority(it.type) }
     }
 

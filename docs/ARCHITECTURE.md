@@ -905,7 +905,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `OnRoutingChangedListener`, and listens with `AudioDeviceCallback` (registered only
   while the engine runs).
 * User selection → `AudioSinkBridge.setPreferredDevice(AudioDeviceInfo?)` (`null` =
-  system default; best effort — verify with `routedDevice()`). "More devices…" opens the
+  system default; best effort — verify with `routedDevice()`). A pick is temporary, like the
+  system switcher's (`OutputPick`): it lasts until that device goes away, a new external output
+  connects (Bluetooth, wired, USB, hearing aid, car, HDMI not present at the pick: it takes
+  over), the engine stops or logs out, or the user picks "Automatic". "More devices…" opens the
   system output switcher via `androidx.mediarouter.app.SystemOutputSwitcherDialogController
   .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — lists Bluetooth and
   other system audio outputs not yet connected (the app does not cast). Never use `setCommunicationDevice` for media.
