@@ -1324,6 +1324,72 @@ fn shuffled_transfer_keeps_a_queued_or_unknown_current_track() {
     }
 }
 
+#[test]
+fn pages_appended_after_a_wrap_play_before_it() {
+    use crate::context_resolver::{ContextAction, ContextResolver, ResolveContext};
+
+    // repeat is on while only the first page (10 tracks) is there: the next tracks wrap it
+    let (rt, mut state) = state(10);
+    state.set_repeat_context(true);
+    state.reset_playback_to_position(Some(0)).unwrap();
+    assert_eq!(state.next_tracks().len(), 80);
+    assert!(next_uids(&state)[9].starts_with(IDENTIFIER_DELIMITER));
+
+    state
+        .fill_context_from_page(default_page(10..30), ContextType::Default)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    let next = next_uids(&state);
+    assert_eq!(next[..29], uids(1..30));
+    let wrap = &state.next_tracks()[29];
+    assert!(wrap.uid.starts_with(IDENTIFIER_DELIMITER));
+    assert_eq!(wrap.get_iteration().map(String::as_str), Some("0"));
+    assert_eq!(next[30], "uid0");
+    assert_unique_uids(&state);
+
+    // the further pages through the resolver, and the setup after the last one
+    let session = {
+        let _guard = rt.enter();
+        Session::new(SessionConfig::default(), None)
+    };
+    let (_rt, mut state) = self::state(10);
+    state.set_repeat_context(true);
+    state.reset_playback_to_position(Some(0)).unwrap();
+    let mut resolver = ContextResolver::new(session);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Default,
+        ContextAction::Append,
+    ));
+    let pages = Context {
+        uri: Some(CONTEXT_URI.to_string()),
+        pages: vec![default_page(10..20), default_page(20..30)],
+        ..Default::default()
+    };
+    resolver.apply_next_context(&mut state, pages).unwrap();
+    assert!(resolver.try_finish(&mut state, &mut None));
+    let next = next_uids(&state);
+    assert_eq!(next[..29], uids(1..30));
+    assert!(next[29].starts_with(IDENTIFIER_DELIMITER));
+
+    // without repeat, the transition to autoplay
+    let (_rt, mut state) = self::state(10);
+    state
+        .update_context(autoplay_context(100), ContextType::Autoplay)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    assert!(next_uids(&state)[9].starts_with(IDENTIFIER_DELIMITER));
+    state
+        .fill_context_from_page(default_page(10..15), ContextType::Default)
+        .unwrap();
+    state.fill_up_next_tracks().unwrap();
+    let next = next_uids(&state);
+    assert_eq!(next[..14], uids(1..15));
+    assert!(next[14].starts_with(IDENTIFIER_DELIMITER));
+    assert_eq!(next[15..18], ["a0", "a1", "a2"]);
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(

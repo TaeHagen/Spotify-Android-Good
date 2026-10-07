@@ -311,7 +311,7 @@ impl ConnectState {
             .flat_map(|page| {
                 if !page.tracks.is_empty() {
                     // SPOTIFYGOOD: into the context that is updated
-                    self.fill_context_from_page(page, ty).ok()?;
+                    self.append_page(page, ty).ok()?;
                     None
                 } else if matches!(page.page_url, Some(ref url) if !url.is_empty()) {
                     Some(page_url_to_uri(
@@ -550,12 +550,36 @@ impl ConnectState {
     // default context, also the further pages of an autoplay resolve: the autoplay context never
     // grew, so autoplay stopped after its first batch, and the playlist got the autoplay tracks
     // as its own tracks.
-    /// Appends the tracks of a further page to the context of the given type
+    /// Appends the tracks of a further page (resolved after the first one) to the context of the
+    /// given type
     pub fn fill_context_from_page(
         &mut self,
         page: ContextPage,
         ty: ContextType,
     ) -> Result<(), Error> {
+        // SPOTIFYGOOD: the next tracks may already go past the end of the default context so
+        // far: wrapped (repeat), about 7 times for the 10 top tracks of an artist before the
+        // album pages arrived, or into autoplay. The new tracks were only reached after all of
+        // that. Drop it (the fill up rewinds to the end of the context so far, in the same pass)
+        // so that the next fill up continues with the new tracks.
+        if matches!(ty, ContextType::Default)
+            && matches!(self.active_context, ContextType::Default)
+        {
+            if let Some(end) = self
+                .next_tracks()
+                .iter()
+                .position(|t| t.uid.starts_with(IDENTIFIER_DELIMITER))
+            {
+                self.truncate_next_tracks(end);
+            }
+        }
+
+        self.append_page(page, ty)
+    }
+
+    // SPOTIFYGOOD: see fill_context_from_page, update_context appends its further pages with it
+    // (the next tracks are still those of the previous context then)
+    fn append_page(&mut self, page: ContextPage, ty: ContextType) -> Result<(), Error> {
         match ty {
             ContextType::Default => {
                 let ctx_len = self.context.as_ref().map(|c| c.tracks.len());
