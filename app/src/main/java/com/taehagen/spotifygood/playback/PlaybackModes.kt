@@ -48,4 +48,11 @@ internal object PlaybackModes {
         RepeatMode.CONTEXT -> "context"
         RepeatMode.TRACK -> "track"
     }
+
+    /** Inverse of [wire]; anything else (missing, unknown) is [RepeatMode.OFF]. */
+    fun parseRepeat(wire: String?): RepeatMode = when (wire) {
+        "context" -> RepeatMode.CONTEXT
+        "track" -> RepeatMode.TRACK
+        else -> RepeatMode.OFF
+    }
 }

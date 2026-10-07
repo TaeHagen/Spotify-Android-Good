@@ -342,7 +342,10 @@ internal class SpotifyPlayer(
             // Media3 semantics: setMediaItems keeps playWhenReady; controllers call play() next.
             play = playWhenReady,
         )
-        return track(controller.playAsync(request), settleMs = LOAD_SETTLE_MS)
+        // The stored session (playback resumption, "Tap to resume", "play something") comes back
+        // with its shuffle / repeat: its item carries them (LibraryTree.resumeItem).
+        val withModes = ResumeModes.applyTo(request, mediaItems.singleOrNull()?.requestMetadata?.extras)
+        return track(controller.playAsync(withModes), settleMs = LOAD_SETTLE_MS)
     }
 
     override fun handleAddMediaItems(index: Int, mediaItems: List<MediaItem>): ListenableFuture<*> {
