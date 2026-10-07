@@ -350,7 +350,7 @@ restore (§8).
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
-| `connect.transfer` | `{"deviceId":"…","play":true?}` (self = pull, other = push) |
+| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs"}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE`. Pushing offline playback hands over its tracks and current position |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>"}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…"}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |

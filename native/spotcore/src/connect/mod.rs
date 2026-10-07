@@ -23,7 +23,7 @@ mod route;
 mod snapshot;
 mod uri;
 
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::RepeatMode;
 use crate::rpc::{ok, parse_args, to_value};
 use crate::engine;
@@ -322,18 +322,26 @@ fn set_audio_output(args: AudioOutputArgs) -> AppResult<Value> {
     ok()
 }
 
+fn nothing_active() -> AppError {
+    AppError::new(ErrorCode::NotActiveDevice, "Nothing is playing on any device")
+}
+
 async fn transfer(args: TransferArgs) -> AppResult<Value> {
+    await_online_if_connecting(CommandKind::Load).await;
     if !engine::is_online() {
         return Err(AppError::not_connected());
     }
+    // An explicit choice of the device: a pending reconnect restore doesn't run anymore.
+    restore::cancel();
     let me = hub::me();
+    let other_active = hub::active_device_id().is_some_and(|id| id != me);
     if args.device_id == me {
         let spirc = spirc()?;
         if hub::local_active() {
             if args.play {
                 local::sent(spirc.play())?;
             }
-        } else if hub::active_device_id().is_some_and(|id| id != me) {
+        } else if other_active {
             let request = TransferRequest {
                 transfer_options: TransferOptions {
                     restore_paused: Some(if args.play { "restore" } else { "pause" }.to_string()),
@@ -341,8 +349,15 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
                 },
             };
             local::sent(spirc.transfer(Some(request)))?;
+        } else if offline::is_active() {
+            // Already playing here (downloads).
+            if args.play {
+                offline::control(&Ctl::Play)?;
+            }
         } else {
-            local::sent(spirc.activate())?;
+            // Nothing is active anywhere: start the given session here.
+            let resume = args.resume.as_ref().and_then(|r| r.load_args(args.play)).ok_or_else(nothing_active)?;
+            return load(resume).await;
         }
         return ok();
     }
@@ -365,6 +380,15 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
                 return ok();
             }
         }
+    }
+    if !hub::local_active() && !other_active {
+        // Nothing to transfer: start the given session on the target.
+        let resume = args.resume.as_ref().and_then(|r| r.load_args(args.play)).ok_or_else(nothing_active)?;
+        player_events::on_user_load();
+        remote::send(&args.device_id, remote::play(&resume, &uri::random_command_id()))
+            .await
+            .map_err(remote::remote_error)?;
+        return ok();
     }
     remote::transfer(&args.device_id, args.play).await.map_err(remote::remote_error)?;
     ok()

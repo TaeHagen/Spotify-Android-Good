@@ -74,7 +74,7 @@ class AppGraph(val app: Application) {
     /** Last local session (playback resumption, cold-start play); one DataStore per process. */
     val resumeStore: ResumeStore by lazy { ResumeStore(app) }
     val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore) }
-    val devices: DevicesRepository by lazy { DevicesRepository(appScope, rpc, events) }
+    val devices: DevicesRepository by lazy { DevicesRepository(appScope, rpc, events, resumeStore::read) }
     /** Spotify Connect local-network discovery (the "send" side); runs only while the sheet is up. */
     val localDiscovery: LocalDeviceDiscovery by lazy {
         LocalDeviceDiscovery(app, rpc) { devices.devices.value.devices.map { it.id }.toSet() }
