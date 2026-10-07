@@ -11,6 +11,7 @@ import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.Resource
 import com.taehagen.spotifygood.data.dataOrNull
+import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.SpotifyLinks
 import kotlinx.coroutines.CancellationException
@@ -56,20 +57,15 @@ internal class MediaActionRunner(
         }
 
     /**
-     * Adds [uris] in order, one player command each, and reports what really happened: the engine
-     * refuses adds once this phone's queue is full, so a batch can stop part-way. The batch stops
-     * at the first failed add (the player reports that failure itself).
+     * Adds [uris] in order, one player command each, and reports what really happened in one
+     * message: the batch stops at the first failed add (e.g. the engine's "The queue is full" once
+     * this phone's queue is full), whose reason is shown here (the player does not report it).
      */
     fun addToQueue(uris: List<String>) {
         if (uris.isEmpty()) return
         graph.appScope.launch {
-            val queuedBefore = localQueuedCount(graph.playback.snapshot.value)
-            var added = 0
-            for (uri in uris) {
-                if (!graph.player.addToQueueAsync(listOf(uri)).await()) break
-                added++
-            }
-            when (val outcome = queueAddOutcome(uris.size, added, queuedBefore)) {
+            val result = graph.player.addToQueueCounted(uris).await()
+            when (val outcome = queueAddOutcome(uris.size, result.added, result.error)) {
                 is QueueAddOutcome.Added ->
                     if (outcome.added == 1) message(R.string.shell_msg_added_to_queue) else message(R.string.shell_msg_added_n_to_queue, outcome.added)
                 is QueueAddOutcome.QueueFull ->
@@ -78,9 +74,17 @@ internal class MediaActionRunner(
                     } else {
                         message(R.string.shell_msg_queue_full_added, outcome.added, outcome.requested)
                     }
-                // The player's own error message already explains why; say how far it got.
-                is QueueAddOutcome.Stopped ->
-                    if (outcome.added > 0) message(R.string.shell_msg_added_some_to_queue, outcome.added, outcome.requested)
+                is QueueAddOutcome.Stopped -> {
+                    if (outcome.error.code == NativeErrorCode.CANCELLED) return@launch
+                    val reason = friendlyErrorMessage(appContext, outcome.error)
+                    navigator?.showMessage(
+                        if (outcome.added == 0) {
+                            reason
+                        } else {
+                            "$reason ${appContext.getString(R.string.shell_msg_added_some_to_queue, outcome.added, outcome.requested)}"
+                        },
+                    )
+                }
             }
         }
     }

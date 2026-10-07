@@ -197,6 +197,20 @@ class PlayerControllerTest {
     }
 
     @Test
+    fun countedQueueAddsStopAtTheFirstFailureAndLeaveTheMessageToTheCaller() = runTest {
+        val h = Harness(this, null)
+        var adds = 0
+        val full = NativeException(NativeErrorInfo(NativeErrorCode.UNAVAILABLE, "The queue is full"))
+        h.fail = { if (it == "queue.add" && ++adds > 2) full else null }
+        val result = h.controller.addToQueueCounted(listOf(t(1), t(2), t(3), t(4))).await()
+        runCurrent()
+        assertEquals(QueueAddResult(2, full.info), result)
+        assertEquals(listOf("queue.add", "queue.add", "queue.add"), h.methods())
+        assertTrue("no generic player error", h.errors.isEmpty())
+        assertEquals(QueueAddResult(0, null), h.controller.addToQueueCounted(emptyList()).await())
+    }
+
+    @Test
     fun controlCommandsDoNotWaitForTheSession() = runTest {
         val env = Env(EngineReach.CONNECTING).apply { gate = CompletableDeferred() }
         val h = Harness(this, env)

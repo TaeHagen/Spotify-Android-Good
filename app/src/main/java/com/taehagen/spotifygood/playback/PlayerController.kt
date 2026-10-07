@@ -53,6 +53,9 @@ data class PlayRequest(
     val play: Boolean = true,
 )
 
+/** Outcome of [PlayerController.addToQueueCounted]: [added] items, then the first failure ([error]; null: none). */
+data class QueueAddResult(val added: Int, val error: NativeErrorInfo?)
+
 /** A failed attempt to start playback while nothing was playing (Media3's player error). */
 data class PlaybackFailure(val kind: PlaybackErrorKind, val message: String)
 
@@ -386,6 +389,37 @@ class PlayerController internal constructor(
         return enqueue("queue.add") {
             uris.forEach { call("queue.add", buildJsonObject { put("uri", it) }) }
         }
+    }
+
+    /**
+     * Adds [uris] in order (one `queue.add` each) and stops at the first failure, which is returned
+     * instead of reported on [errors]: the caller says what happened (e.g. the engine's "The queue is
+     * full" after part of an album).
+     */
+    internal fun addToQueueCounted(uris: List<String>): Deferred<QueueAddResult> {
+        val result = CompletableDeferred<QueueAddResult>()
+        if (uris.isEmpty()) return result.apply { complete(QueueAddResult(0, null)) }
+        var added = 0
+        var error: NativeErrorInfo? = null
+        val done = enqueue("queue.add", timeoutMs = COMMAND_TIMEOUT_MS * (uris.size + 1)) {
+            for (uri in uris) {
+                try {
+                    withTimeout(COMMAND_TIMEOUT_MS) { call("queue.add", buildJsonObject { put("uri", uri) }) }
+                    added++
+                } catch (e: TimeoutCancellationException) {
+                    error = NativeErrorInfo(NativeErrorCode.NETWORK, "The device didn't respond")
+                    break
+                } catch (e: NativeException) {
+                    error = e.info
+                    break
+                }
+            }
+        }
+        done.invokeOnCompletion {
+            val ran = runCatching { done.getCompleted() }.getOrDefault(false)
+            result.complete(QueueAddResult(added, error ?: if (ran) null else NativeErrorInfo(NativeErrorCode.CANCELLED, "Not sent")))
+        }
+        return result
     }
 
     internal fun removeFromQueueAsync(uid: String): Deferred<Boolean> =
