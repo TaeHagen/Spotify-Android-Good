@@ -42,23 +42,53 @@ interface SleepWakeups {
     fun release()
 }
 
-/** When to wake the device for a sleep timer, and for how long (pure, see [SleepWakeups]). */
+/**
+ * When to wake the device for a sleep timer, and for how long (pure, see [SleepWakeups]).
+ *
+ * Without an exact-alarm grant (Android 12+) the wake-up is an inexact allow-while-idle alarm.
+ * AlarmManager gives it the heuristic window [trigger, trigger + 0.75 × (trigger − now)] (at most
+ * an hour; none under 10 s) and, on Android 12+, delivers it at the window's end unless something
+ * else wakes the device first — also in Doze, where windowed alarms wait for a maintenance window.
+ * So the trigger is placed where that window ends exactly at the timer's end ([stageTrigger]); an
+ * earlier delivery re-arms the next stage the same way until less than 10 s remain.
+ */
 internal object SleepSchedule {
+    /** Inexact alarms closer than this get no window (AlarmManager's MIN_FUZZABLE_INTERVAL). */
+    const val MIN_FUZZ_MS = 10_000L
+
+    /** AlarmManager caps a heuristic window at an hour. */
+    const val MAX_WINDOW_MS = 60 * 60_000L
+
     /**
-     * The wake-up alarm is a window ending at the timer's end (inexact alarms need no special
-     * permission; Android 12+ makes windows at least 10 minutes long anyway). Once it fires the CPU
-     * is kept awake until the end, so the pause is on time.
+     * Longest time the CPU is held awake (from the last stage or, for remote playback, from arming
+     * a timer that ends soon). Partial wake locks are honoured outside Doze only.
      */
     const val LEAD_MS = 10 * 60_000L
 
     /** Extra awake time after the end, for the pause request to reach the device. */
     const val PAUSE_SLACK_MS = 30_000L
 
-    /** Start of the alarm window for [endsAt]: [LEAD_MS] before it, never in the past. */
-    fun windowStart(endsAt: Long, now: Long): Long = max(now, endsAt - LEAD_MS)
+    /**
+     * Trigger of an inexact alarm whose heuristic window ends at [endsAt]: trigger + 0.75 ×
+     * (trigger − now) = endsAt, i.e. now + (endsAt − now) / 1.75 (or an hour before the end when the
+     * window would be longer than its cap); exact below [MIN_FUZZ_MS].
+     */
+    fun stageTrigger(endsAt: Long, now: Long): Long {
+        val remaining = endsAt - now
+        if (remaining <= MIN_FUZZ_MS) return max(now, endsAt)
+        val trigger = now + remaining * 4 / 7
+        return if (endsAt - trigger > MAX_WINDOW_MS) endsAt - MAX_WINDOW_MS else trigger
+    }
 
-    /** Length of the alarm window (ending at [endsAt]; at least 1 ms). */
-    fun windowLength(endsAt: Long, now: Long): Long = max(1L, endsAt - windowStart(endsAt, now))
+    /** End of the heuristic window of an inexact alarm at [trigger] armed at [now] (AlarmManager's rule). */
+    fun windowEnd(trigger: Long, now: Long): Long {
+        val futurity = trigger - now
+        if (futurity < MIN_FUZZ_MS) return trigger
+        return trigger + min((0.75 * futurity).toLong(), MAX_WINDOW_MS)
+    }
+
+    /** A wake-up at [now] needs another stage: more than [MIN_FUZZ_MS] are left. */
+    fun needsAnotherStage(endsAt: Long, now: Long): Boolean = endsAt - now > MIN_FUZZ_MS
 
     /** How long to keep the CPU awake when the alarm fires at [now]: until the end plus slack. */
     fun awakeMs(endsAt: Long, now: Long): Long = (endsAt - now).coerceIn(0L, LEAD_MS) + PAUSE_SLACK_MS
@@ -73,8 +103,9 @@ internal object SleepSchedule {
  *
  * The timer sleeps (no polling) until the fade starts and re-checks the elapsed-realtime clock
  * whenever it wakes. A sleeping coroutine does not count time while the CPU is suspended, so a
- * wake-up alarm ([wakeups], `ELAPSED_REALTIME_WAKEUP`) pokes it ([onWakeupAlarm]) and keeps the CPU
- * awake until the end; for local playback the playback wake lock keeps the CPU up anyway. The fade
+ * wake-up alarm ([wakeups], `ELAPSED_REALTIME_WAKEUP`, delivered by the end: see [SleepSchedule])
+ * pokes it ([onWakeupAlarm]) and keeps the CPU awake until the end; for local playback the
+ * playback wake lock keeps the CPU up anyway. The fade
  * only touches the local AudioTrack gain ([fader]); remote devices are simply paused. Manual pauses
  * do not cancel the timer.
  */
@@ -154,10 +185,16 @@ class SleepTimer(
         setFade(1f)
     }
 
-    /** The wake-up alarm fired: keep the CPU up until the end and let the wait re-check the clock. */
+    /**
+     * The wake-up alarm fired: keep the CPU up until the end, arm the next stage while the end is
+     * still more than a few seconds away (an inexact alarm may come early), and let the wait
+     * re-check the clock.
+     */
     fun onWakeupAlarm() {
         val target = wakeTarget ?: return
-        wakeups?.holdAwake(SleepSchedule.awakeMs(target, clock()))
+        val now = clock()
+        wakeups?.holdAwake(SleepSchedule.awakeMs(target, now))
+        if (SleepSchedule.needsAnotherStage(target, now)) wakeups?.schedule(target)
         pokes.trySend(Unit)
     }
 
@@ -188,7 +225,14 @@ class SleepTimer(
 
     private fun arm(endsAt: Long) {
         wakeTarget = endsAt
-        wakeups?.schedule(endsAt)
+        val wakeups = wakeups ?: return
+        wakeups.schedule(endsAt)
+        // Remote playback holds no wake lock: when the end is near anyway (short timer, end of
+        // track), keep the CPU up from now on instead of relying on the alarm alone.
+        val now = clock()
+        if (playback.snapshot.value.source == PlaybackSource.REMOTE && endsAt - now <= SleepSchedule.LEAD_MS) {
+            wakeups.holdAwake(SleepSchedule.awakeMs(endsAt, now))
+        }
     }
 
     private fun disarm() {
@@ -222,7 +266,7 @@ class SleepTimer(
 
     private suspend fun pauseAndRestore() {
         // A remote device's pause is a network request: keep the CPU up until it went out.
-        if (playback.snapshot.value.source != PlaybackSource.LOCAL) wakeups?.holdAwake(PAUSE_AWAKE_MS)
+        if (playback.snapshot.value.source == PlaybackSource.REMOTE) wakeups?.holdAwake(PAUSE_AWAKE_MS)
         withTimeoutOrNull(PAUSE_AWAKE_MS) { player.pauseAsync().await() }
         // Keep the output silent until the pause has taken effect, then restore the gain.
         withTimeoutOrNull(RESTORE_TIMEOUT_MS) { playback.snapshot.first { !it.isPlaying } }

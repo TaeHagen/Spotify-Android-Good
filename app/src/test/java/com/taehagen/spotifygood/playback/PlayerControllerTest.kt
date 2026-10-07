@@ -257,6 +257,45 @@ class PlayerControllerTest {
     }
 
     @Test
+    fun clearingTheQueueStopsBulkAddsQueuedBeforeIt() = runTest {
+        val h = Harness(this, null)
+        val slow = CompletableDeferred<Unit>()
+        var adds = 0
+        h.hold = { method -> if (method == "queue.add" && ++adds == 1) slow.await() }
+        val running = h.controller.addToQueueCounted(listOf(t(1), t(2), t(3)))
+        val waiting = h.controller.addToQueueCounted(listOf(t(4), t(5)))
+        runCurrent()
+        h.controller.clearQueue()
+        slow.complete(Unit)
+        val r = running.await()
+        val w = waiting.await()
+        runCurrent()
+        assertEquals(listOf("queue.add", "queue.clear"), h.methods())
+        assertEquals(1, r.added)
+        assertEquals(NativeErrorCode.CANCELLED, r.error?.code)
+        assertEquals(QueueAddResult(0, w.error), w)
+        assertEquals(NativeErrorCode.CANCELLED, w.error?.code)
+        // A bulk add started after the clear runs normally.
+        assertEquals(QueueAddResult(1, null), h.controller.addToQueueCounted(listOf(t(6))).await())
+        assertEquals(listOf("queue.add", "queue.clear", "queue.add"), h.methods())
+        assertTrue("silent", h.errors.isEmpty())
+    }
+
+    @Test
+    fun aLoadStopsARunningBulkAdd() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE))
+        val slow = CompletableDeferred<Unit>()
+        h.hold = { method -> if (method == "queue.add") slow.await() }
+        val bulk = h.controller.addToQueueCounted(listOf(t(1), t(2), t(3)))
+        runCurrent()
+        val load = h.controller.playAsync(PlayRequest(contextUri = playlist))
+        slow.complete(Unit)
+        assertEquals(NativeErrorCode.CANCELLED, bulk.await().error?.code)
+        assertTrue(load.await())
+        assertEquals(listOf("queue.add", "player.load"), h.methods())
+    }
+
+    @Test
     fun mediaSessionQueueAddsReportTheirFailure() = runTest {
         val h = Harness(this, null)
         h.fail = { if (it == "queue.add") NativeException(NativeErrorInfo(NativeErrorCode.UNAVAILABLE, "The queue is full")) else null }

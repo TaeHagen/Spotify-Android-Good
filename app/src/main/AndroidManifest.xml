@@ -17,6 +17,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Sleep timer: exact wake-up only where already granted (Android 12-13 by default; never
+         requested). Without it a staged inexact alarm is used. Not USE_EXACT_ALARM. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
     <!-- Downloads -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />

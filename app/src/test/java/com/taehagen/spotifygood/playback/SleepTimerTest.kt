@@ -100,6 +100,33 @@ class SleepTimerTest {
         runCurrent()
         assertEquals(listOf(6 * 60_000L + SleepSchedule.PAUSE_SLACK_MS), h.wakeups.holds)
         assertTrue("not paused yet", h.calls.isEmpty())
+        // The next stage is armed (in Doze the wake lock alone would not be honoured).
+        val endsAt = h.now + 6 * 60_000L
+        assertEquals(listOf(endsAt, endsAt), h.wakeups.scheduled)
+        // Within the last seconds no further stage.
+        h.now = endsAt - 5_000
+        h.timer.onWakeupAlarm()
+        assertEquals(2, h.wakeups.scheduled.size)
+    }
+
+    @Test
+    fun aShortTimerOnARemoteDeviceKeepsTheCpuUpFromTheStart() = runTest {
+        val h = Harness(this)
+        h.snapshot(remotePlaying)
+        runCurrent()
+        h.timer.start(5)
+        runCurrent()
+        assertEquals(listOf(5 * 60_000L + SleepSchedule.PAUSE_SLACK_MS), h.wakeups.holds)
+        // A long one relies on the alarm.
+        h.timer.start(30)
+        runCurrent()
+        assertEquals(1, h.wakeups.holds.size)
+        // Local playback has the playback wake lock already.
+        h.snapshot(remotePlaying.copy(source = PlaybackSource.LOCAL))
+        runCurrent()
+        h.timer.start(5)
+        runCurrent()
+        assertEquals(1, h.wakeups.holds.size)
     }
 
     @Test

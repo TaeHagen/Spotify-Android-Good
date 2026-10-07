@@ -776,11 +776,17 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Wake locks: Media3 `WakeLockManager` + `WifiLockManager` `setStayAwake(true)` only while
   local status is playing/loading; false otherwise.
 * Sleep timer (`SleepTimer`): coroutine delays stop while the CPU sleeps (remote playback holds
-  no wake lock), so an inexact `ELAPSED_REALTIME_WAKEUP` alarm window ending at the timer's end
-  (≤ 10 min earlier; plus an allow-while-idle alarm at the end for Doze) reaches the non-exported
-  `SleepTimerAlarmReceiver`, which pokes the timer and holds a timed partial wake lock until the
-  end + 30 s. "End of track" arms it for the snapshot's track end and re-arms on every snapshot.
-  Disarmed on cancel, replace, finish and manual pause (end of track).
+  no wake lock), so an `ELAPSED_REALTIME_WAKEUP` allow-while-idle alarm (also delivered, with
+  network, in Doze) reaches the non-exported `SleepTimerAlarmReceiver`, which pokes the timer and
+  holds a timed partial wake lock until the end + 30 s (≤ 10 min). Exact at the end where no
+  runtime grant is needed (API < 31, or SCHEDULE_EXACT_ALARM already allowed; never requested;
+  not USE_EXACT_ALARM). Otherwise inexact and staged: its heuristic window
+  [t, t + 0.75 × (t − now)] (≤ 1 h) is placed to end at the timer's end
+  (t = now + (end − now) / 1.75), Android 12+ delivers at the window end unless woken earlier, and
+  an early delivery arms the next stage until < 10 s remain (a handful of stages, within the
+  allow-while-idle quota). A remote timer ending within 10 min also holds the wake lock from the
+  start (honoured outside Doze). "End of track" arms the snapshot's track end and re-arms on every
+  snapshot. Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
 
