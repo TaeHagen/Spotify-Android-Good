@@ -5,6 +5,7 @@ import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.PlaybackSnapshot
+import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.ui.components.SessionMessenger
@@ -154,22 +155,35 @@ internal suspend fun planTrackStart(
 }
 
 /**
- * Whether playback changed since [start] in a way that means the user started (or paused)
- * something else: another context, playing ↔ not playing, or another track that isn't simply the
- * next one of [start] (the current song ending).
+ * Whether playback changed since [start] in a way that means the user started something else on
+ * this phone meanwhile: another local track (not just the next song of [start]).
+ *
+ * Changes the session makes by itself while coming online are not that, and are ignored: the
+ * first cluster after a reconnect (another device's REMOTE playback replacing the empty snapshot),
+ * the restore of the reconnect placeholder (same track, playing again), anything from an empty
+ * snapshot. So is the load a previous single-track start already sent landing ([ownTargets]):
+ * this newer tap replaces it anyway. Pausing or resuming doesn't drop the tap either.
  */
-internal fun startSuperseded(start: PlaybackSnapshot, now: PlaybackSnapshot): Boolean {
-    if (start.context?.uri != now.context?.uri) return true
-    if (start.isPlaying != now.isPlaying) return true
-    val before = start.track?.uri
+internal fun startSuperseded(start: PlaybackSnapshot, now: PlaybackSnapshot, ownTargets: Set<String> = emptySet()): Boolean {
+    // Nothing (or only a placeholder without a track) to compare with: can't tell who changed it.
+    if (start.track == null || start.source == PlaybackSource.NONE) return false
+    // Only a load on this phone; what other devices play is the cluster, not this user's taps here.
+    if (now.source != PlaybackSource.LOCAL) return false
+    // Another track, not the next one (the song ending). The same track in another context is a
+    // hand-back or restore of the session (e.g. offline queue to Spirc), not a new start.
     val after = now.track?.uri
-    return before != after && after != start.nextTracks.firstOrNull()?.uri
+    val trackChanged = start.track.uri != after && after != start.nextTracks.firstOrNull()?.uri
+    if (!trackChanged) return false
+    return now.context?.uri !in ownTargets && after !in ownTargets
 }
 
 /** The single-track start in flight: a newer one replaces it (it would otherwise land later). */
 private object TrackStarts {
     private val lock = Any()
     private var job: Job? = null
+
+    /** Album and track of the last load a single-track start sent (see [startSuperseded]). */
+    @Volatile var lastSent: Set<String> = emptySet()
 
     fun launch(scope: CoroutineScope, block: suspend () -> Unit) {
         synchronized(lock) {
@@ -215,7 +229,7 @@ private suspend fun AppGraph.startTrack(trackUri: String, track: Track?) {
                 }
             }
         },
-        superseded = { startSuperseded(start, playback.snapshot.value) },
+        superseded = { startSuperseded(start, playback.snapshot.value, TrackStarts.lastSent) },
     )
     when (plan) {
         is TrackStartPlan.Blocked -> messenger.post(
@@ -224,10 +238,13 @@ private suspend fun AppGraph.startTrack(trackUri: String, track: Track?) {
                 TrackStartBlock.NOT_DOWNLOADED -> R.string.playback_error_not_available_offline
             },
         )
-        is TrackStartPlan.Play -> if (plan.albumUri != null) {
-            player.playContext(plan.albumUri, startUri = plan.trackUri)
-        } else {
-            player.playTracks(listOf(plan.trackUri))
+        is TrackStartPlan.Play -> {
+            TrackStarts.lastSent = setOfNotNull(plan.albumUri, plan.trackUri)
+            if (plan.albumUri != null) {
+                player.playContext(plan.albumUri, startUri = plan.trackUri)
+            } else {
+                player.playTracks(listOf(plan.trackUri))
+            }
         }
         TrackStartPlan.Superseded -> Unit
     }
