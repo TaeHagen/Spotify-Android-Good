@@ -225,12 +225,12 @@ pub(crate) async fn rpc(args: Value) -> AppResult<Value> {
     let session = engine::session()?;
     let tz = a.time_zone.filter(|t| !t.is_empty()).unwrap_or_else(|| "UTC".to_string());
     let pathfinder_error = match pathfinder::query(&session, "home", variables(&tz)).await {
-        Ok(data) => {
-            let sections = parse_home(&data);
+        Ok(answer) => {
+            let sections = parse_home(&answer.data);
             if !sections.is_empty() {
                 return to_value(&feed_value(sections, false));
             }
-            log::info!("pathfinder home returned no sections; using the local feed");
+            log::info!("pathfinder home returned no sections ({:?}); using the local feed", answer.errors.first());
             None
         }
         Err(e) => {
