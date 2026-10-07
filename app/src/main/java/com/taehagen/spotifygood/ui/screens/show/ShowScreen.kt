@@ -214,7 +214,7 @@ private fun ShowList(
         }
         items(state.list.episodes, key = { it.uri }, contentType = { "episode" }) { episode ->
             val downloadState = state.rowDownloads[episode.uri]
-            val playable = canStartNow(episode.playable, state.online, downloadState)
+            val playable = canStartNow(episode.playable, state.online, downloadState, episode.explicit, state.filterExplicit)
             val showActions = { navigator.showActions(MediaActionTarget.EpisodeTarget(episode)) }
             EpisodeRow(
                 episode = episode,

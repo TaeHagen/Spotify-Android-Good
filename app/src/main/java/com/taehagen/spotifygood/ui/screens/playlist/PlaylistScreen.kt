@@ -488,7 +488,13 @@ private fun PlaylistItemRow(
     val itemUri = item.uri ?: return
     val downloadState = state.rowDownloads[itemUri]
     // Unplayable (or not downloaded while the session isn't online): dimmed, actions still in the overflow.
-    val playable = canStartNow(track?.playable ?: episode?.playable ?: false, state.online, downloadState)
+    val playable = canStartNow(
+        playable = track?.playable ?: episode?.playable ?: false,
+        online = state.online,
+        downloadState = downloadState,
+        explicit = track?.explicit ?: episode?.explicit ?: false,
+        filterExplicit = state.filterExplicit,
+    )
     val onClick = { onPlay(visible) }
     val editable = playlist.meta.canEdit && !playlist.downloadedCopy
     when {

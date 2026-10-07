@@ -182,7 +182,7 @@ private fun ArtistList(
             }
             itemsIndexed(popular, key = { index, track -> "pop-$index-${track.uri}" }, contentType = { _, _ -> "track" }) { index, track ->
                 val downloadState = state.rowDownloads[track.uri]
-                val playable = canStartNow(track.playable, state.online, downloadState)
+                val playable = canStartNow(track.playable, state.online, downloadState, track.explicit, state.filterExplicit)
                 val showActions = { navigator.showActions(MediaActionTarget.TrackTarget(track, contextUri = uri)) }
                 TrackRow(
                     track = track,

@@ -122,7 +122,7 @@ private fun AlbumList(
             items(disc.tracks, key = { "t-${it.index}" }, contentType = { "track" }) { indexed ->
                 val track = indexed.track
                 val downloadState = state.rowDownloads[track.uri]
-                val playable = canStartNow(track.playable, state.online, downloadState)
+                val playable = canStartNow(track.playable, state.online, downloadState, track.explicit, state.filterExplicit)
                 val showActions = { navigator.showActions(MediaActionTarget.TrackTarget(track, contextUri = uri)) }
                 TrackRow(
                     track = track,

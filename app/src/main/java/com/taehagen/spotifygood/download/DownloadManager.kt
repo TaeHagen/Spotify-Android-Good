@@ -25,6 +25,7 @@ import androidx.work.WorkManager
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.db.RetryRow
 import com.taehagen.spotifygood.auth.CredentialStore
+import com.taehagen.spotifygood.data.LibraryEdit
 import com.taehagen.spotifygood.data.SpotifyUris
 import com.taehagen.spotifygood.data.db.AppDatabase
 import com.taehagen.spotifygood.data.db.DownloadCollectionEntity
@@ -53,6 +54,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.shareIn
@@ -62,6 +64,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
 import java.io.File
@@ -136,6 +139,8 @@ data class DownloadActivity(
  * * Removal deletes files, rows and the native offline index entries.
  * * The native offline index follows the database through numbered changes ([OfflineIndexSync]):
  *   every commit and removal takes its number under [mutex] with its database write.
+ * * Likes and playlist edits made in the app ([onLibraryEdit]) re-sync the affected downloaded
+ *   collection a few seconds later (coalesced), instead of at the next scheduled sync.
  * * Writes (download, remove, remove all, retry, sync; settings changes are observed on [scope])
  *   run on [scope], not in the caller ([detached]): a caller that goes away (a page popped) only
  *   stops waiting, so a write never stops between its database commit and the file deletion,
@@ -188,11 +193,27 @@ class DownloadManager(
         .flowOn(Dispatchers.Default)
         .shareIn(scope, SharingStarted.WhileSubscribed(STATES_STOP_TIMEOUT_MS, replayExpirationMillis = 0), replay = 1)
 
-    val items: Flow<List<DownloadItem>> = dao.observeListRows()
-        .map { rows ->
+    /**
+     * Every row for the Downloads screens, with the live progress of the item being downloaded
+     * (the database gets it only every few seconds). One shared database observer.
+     */
+    val items: Flow<List<DownloadItem>> = combine(
+        dao.observeListRows().map { rows ->
             rows.map { DownloadItem(it.uri, it.state, it.bytesDone, it.sizeBytes, it.metadataJson, it.imagePath, it.error) }
-        }
+        },
+        runner.activity.map { Triple(it.currentUri, it.bytes, it.totalBytes) }.distinctUntilChanged(),
+    ) { items, (uri, bytes, total) -> DownloadRules.withLiveProgress(items, uri, bytes, total) }
         .flowOn(Dispatchers.Default)
+        .shareIn(scope, SharingStarted.WhileSubscribed(STATES_STOP_TIMEOUT_MS, replayExpirationMillis = 0), replay = 1)
+
+    /**
+     * uri → cover path of completed downloads, for long-lived observers (the playback service): it
+     * changes only when the set of completed downloads does, never on progress writes.
+     */
+    val downloadedImages: Flow<Map<String, String>> = downloadedUris
+        .map { dao.completedImages().associate { it.uri to it.imagePath } }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.IO)
     val usedBytes: Flow<Long> = dao.observeUsedBytes()
     val pendingCount: Flow<Int> = dao.observePendingCount()
 
@@ -299,7 +320,11 @@ class DownloadManager(
     suspend fun downloadCollection(ref: CollectionRef): Unit = scope.detached { downloadCollectionNow(ref) }
 
     private suspend fun downloadCollectionNow(ref: CollectionRef) {
-        val found = requireNotNull(resolver.resolve(ref.type, ref.uri))
+        val countryKnown = awaitCountry()
+        val listed = requireNotNull(resolver.resolve(ref.type, ref.uri))
+        // Without the country the catalog's `playable` is not trustworthy: queue everything and let
+        // download.track (which waits for the country itself) decide.
+        val found = if (countryKnown) listed else listed.copy(items = listed.items.map { it.copy(unavailable = false) })
         if (found.items.isEmpty() && !found.complete) {
             // Nothing listed and the lookup is not trustworthy: report it instead of storing an empty
             // collection that would show as downloaded.
@@ -563,10 +588,15 @@ class DownloadManager(
      * [syncCollections]; false when it could not run because the session did not come online. With
      * [onlyDue], collections whose next sync ([DownloadRules.nextSyncAt]) is still ahead are skipped.
      */
-    internal suspend fun sync(onlyDue: Boolean = false): Boolean = scope.detached { syncNow(onlyDue) }
+    internal suspend fun sync(onlyDue: Boolean = false, only: Set<String>? = null, wait: Boolean = false): Boolean =
+        scope.detached { syncNow(onlyDue, only, wait) }
 
-    private suspend fun syncNow(onlyDue: Boolean): Boolean {
-        if (!syncMutex.tryLock()) return true // another sync is running
+    /**
+     * With [only], just those collections (no re-validation); with [wait], after a sync that is
+     * running instead of skipping (it may have listed them before the edit).
+     */
+    private suspend fun syncNow(onlyDue: Boolean, only: Set<String>? = null, wait: Boolean = false): Boolean {
+        if (wait) syncMutex.lock() else if (!syncMutex.tryLock()) return true // another sync is running
         try {
             if (settings.awaitLoaded().offlineMode) return true
             val startedAt = System.currentTimeMillis()
@@ -578,9 +608,16 @@ class DownloadManager(
             val holder = engine.acquire(HolderType.DOWNLOAD)
             try {
                 if (!engine.awaitOnline(SYNC_ONLINE_TIMEOUT_MS)) return false
+                if (!awaitCountry()) {
+                    // The catalog judges `playable` per country: before it is known, re-validation and
+                    // the availability bookkeeping would fail good downloads. Retried later.
+                    Log.i(TAG, "Sync postponed: the session has not reported its country yet")
+                    return false
+                }
                 var added = 0
                 val removed = ArrayList<Removal>()
                 for (collection in all) {
+                    if (only != null && collection.uri !in only) continue
                     val type = CollectionType.fromWire(collection.type) ?: continue
                     if (onlyDue && DownloadRules.nextSyncAt(collection.lastSyncedAt, collection.lastAttemptAt, collection.syncFailures) > startedAt) continue
                     val resolved = try {
@@ -608,7 +645,7 @@ class DownloadManager(
                     added += result.added
                     removed += result.removal
                 }
-                added += revalidate()
+                if (only == null) added += revalidate()
                 afterRemoval(removed)
                 if (added > 0) scheduleExecution()
                 return true
@@ -617,6 +654,46 @@ class DownloadManager(
             }
         } finally {
             syncMutex.unlock()
+        }
+    }
+
+    // ---- app-side library edits -------------------------------------------------------------------
+
+    private val editSyncs = EditCoalescer(scope, EDIT_SYNC_DELAY_MS) { uris -> syncEdited(uris) }
+
+    /**
+     * A like / unlike or a playlist edit made in the app (wired in AppGraph from
+     * [com.taehagen.spotifygood.data.LibraryRepository.edits]): the downloaded collection it affects
+     * is synced [EDIT_SYNC_DELAY_MS] after the last such edit, so the download follows within
+     * seconds instead of at the next scheduled sync.
+     */
+    internal suspend fun onLibraryEdit(edit: LibraryEdit) {
+        try {
+            val downloaded = collectionDao.syncStates()
+            val targets = when (edit) {
+                is LibraryEdit.LikedTracks -> downloaded.filter { it.type == CollectionType.LIKED_SONGS.wire }.map { it.uri }
+                is LibraryEdit.PlaylistEdited -> downloaded.filter { it.uri == edit.uri }.map { it.uri }
+            }
+            targets.forEach(editSyncs::offer)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not follow a library edit", e)
+        }
+    }
+
+    private suspend fun syncEdited(uris: Set<String>) {
+        try {
+            if (settings.awaitLoaded().offlineMode || !engine.isOnline.value) {
+                // Not now: due at the next sync (when the session comes online).
+                mutex.withLock { collectionDao.markSyncDue(uris.toList()) }
+                return
+            }
+            sync(only = uris, wait = true)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Sync after a library edit failed", e)
         }
     }
 
@@ -881,6 +958,10 @@ class DownloadManager(
         return requeued
     }
 
+    /** Waits (≤ [COUNTRY_TIMEOUT_MS]) until the session reported its country; false if it did not. */
+    private suspend fun awaitCountry(): Boolean =
+        withTimeoutOrNull(COUNTRY_TIMEOUT_MS) { engine.user.first { !it?.country.isNullOrEmpty() } } != null
+
     /** Must hold [mutex]. Applies [DownloadRules.adjustUnavailable] to every downloaded collection. */
     private suspend fun adjustUnavailableLocked(gone: Set<String>, playableAgain: Set<String>) {
         if (gone.isEmpty() && playableAgain.isEmpty()) return
@@ -1118,6 +1199,8 @@ class DownloadManager(
         private const val LATE_KEY_RETRY_MS = 5_000L
         private const val LATE_KEY_ATTEMPTS = 5
         private const val SYNC_ONLINE_TIMEOUT_MS = 60_000L
+        private const val COUNTRY_TIMEOUT_MS = 10_000L
+        private const val EDIT_SYNC_DELAY_MS = 5_000L
         private const val JOB_BACKOFF_MS = 30_000L
         private const val WORK_BACKOFF_S = 30L
         private const val SYNC_BACKOFF_MIN = 15L

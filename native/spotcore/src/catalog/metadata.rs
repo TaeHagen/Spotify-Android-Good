@@ -274,7 +274,7 @@ pub(crate) async fn show_episode_uris(session: &Session, show_uri: &str) -> AppR
 
 fn fetch_show_episodes(session: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<Vec<String>>>> {
     async move {
-        let mut out = Partial::default();
+        let mut out = Partial { provisional: session_country(&session).is_empty(), ..Partial::default() };
         for uri in uris {
             match resolve_show_episodes(&session, &uri).await {
                 Ok(list) if !list.is_empty() => {
@@ -338,11 +338,57 @@ pub(crate) struct Ctx {
 impl Ctx {
     pub(crate) fn new(session: &Session) -> Self {
         Self {
-            country: session.country(),
+            country: session_country(session),
             catalogue: session.get_user_attribute("catalogue").unwrap_or_else(|| "premium".into()),
             filter_explicit: session.filter_explicit_content(),
             now_ms: super::util::now_ms(),
         }
+    }
+}
+
+/// The session's country: the access point's country code, or the account's `country`
+/// attribute while that has not arrived yet (as the engine reports the user); "" when neither
+/// is known.
+pub(crate) fn session_country(session: &Session) -> String {
+    effective_country(session.country(), || session.get_user_attribute("country"))
+}
+
+fn effective_country(reported: String, attribute: impl FnOnce() -> Option<String>) -> String {
+    if !reported.is_empty() {
+        return reported;
+    }
+    attribute().filter(|c| !c.is_empty()).unwrap_or_default()
+}
+
+/// Entities fetched without a country (availability unknown: `playable` is a guess) are cached
+/// this long instead of [`MAX_AGE`].
+const PROVISIONAL_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// The country the cached entities were computed for (None before the first lookup).
+static CACHE_COUNTRY: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
+/// Whether the cache must be dropped before computing entities for `now`: a country has
+/// arrived that differs from the one (or the lack of one) the cache was filled with. A country
+/// that goes missing again does not clear (those results are provisional anyway).
+fn country_changed(last: Option<&str>, now: &str) -> bool {
+    !now.is_empty() && last.is_some_and(|l| l != now)
+}
+
+/// Clears the entity caches when the session's country arrived (or changed) since they were
+/// filled: `playable` and market-specific data computed without it are wrong.
+fn note_country(session: &Session) {
+    let now = session_country(session);
+    let changed = {
+        let mut last = CACHE_COUNTRY.lock();
+        let changed = country_changed(last.as_deref(), &now);
+        if !now.is_empty() || last.is_none() {
+            *last = Some(now.clone());
+        }
+        changed
+    };
+    if changed {
+        log::info!("catalog: country now {now}; dropping metadata computed before");
+        clear_cache();
     }
 }
 
@@ -357,17 +403,19 @@ pub(crate) struct Partial<T> {
     pub failed: Vec<String>,
     /// First error; set whenever `failed` is non-empty.
     pub error: Option<AppError>,
+    /// Fetched without a country: cached only briefly ([`PROVISIONAL_MAX_AGE`]).
+    pub provisional: bool,
 }
 
 impl<T> Default for Partial<T> {
     fn default() -> Self {
-        Self { found: HashMap::new(), failed: Vec::new(), error: None }
+        Self { found: HashMap::new(), failed: Vec::new(), error: None, provisional: false }
     }
 }
 
 impl<T> Partial<T> {
     fn map_found<U>(self, f: impl FnOnce(HashMap<String, T>) -> HashMap<String, U>) -> Partial<U> {
-        Partial { found: f(self.found), failed: self.failed, error: self.error }
+        Partial { found: f(self.found), failed: self.failed, error: self.error, provisional: self.provisional }
     }
 }
 
@@ -394,7 +442,8 @@ pub(crate) async fn fetch_extended(session: &Session, kind: ExtensionKind, uris:
         .buffer_unordered(CONCURRENCY)
         .collect()
         .await;
-    let mut out = Partial::default();
+    // No country: the server answered for no market and `playable` cannot be judged.
+    let mut out = Partial { provisional: ctx.country.is_empty(), ..Partial::default() };
     let mut any_ok = false;
     for (batch, r) in results {
         match r {
@@ -473,6 +522,8 @@ type Fetcher<T> = fn(Session, Vec<String>) -> BoxFuture<'static, AppResult<Parti
 struct Entry<T> {
     at: Instant,
     value: Arc<T>,
+    /// How long the entry is fresh: the store's age, or [`PROVISIONAL_MAX_AGE`].
+    ttl: Duration,
 }
 
 struct Inflight<T> {
@@ -517,7 +568,7 @@ impl<T: Send + Sync + 'static> Store<T> {
     fn fresh(&self, uri: &str) -> Option<Arc<T>> {
         let mut lru = self.lru.lock();
         let e = lru.get(uri)?;
-        (e.at.elapsed() < self.max_age).then(|| e.value.clone())
+        (e.at.elapsed() < e.ttl).then(|| e.value.clone())
     }
 
     /// Looks `uris` up (fresh cache entries, joined in-flight fetches, one new fetch for the
@@ -606,13 +657,14 @@ impl<T: Send + Sync + 'static> Store<T> {
                     let now = Instant::now();
                     let mut lru = self.lru.lock();
                     let current = self.epoch.load(Ordering::SeqCst) == epoch;
+                    let ttl = if partial.provisional { PROVISIONAL_MAX_AGE.min(self.max_age) } else { self.max_age };
                     let map = partial
                         .found
                         .into_iter()
                         .map(|(k, v)| {
                             let a = Arc::new(v);
                             if current {
-                                lru.put(k.clone(), Entry { at: now, value: a.clone() });
+                                lru.put(k.clone(), Entry { at: now, value: a.clone(), ttl });
                             }
                             (k, a)
                         })
@@ -675,6 +727,8 @@ async fn lookup<T: Send + Sync + 'static>(
     if uniq.is_empty() {
         return Ok((order, Fetched::default()));
     }
+    // Before any cache read: entities computed without the (now known) country are dropped.
+    note_country(session);
     let store: &'static Store<T> = store;
     let fetched = store.get_many(session, &uniq, fetch).await?;
     Ok((order, fetched))
@@ -1465,6 +1519,44 @@ pub(crate) mod tests {
         assert!(none.map.is_empty() && none.failed.is_empty() && none.error.is_none());
         // Failures are not cached: the next lookup retries.
         assert!(store.peek("fail1").is_none());
+    }
+
+    #[test]
+    fn the_country_falls_back_to_the_account_attribute() {
+        assert_eq!(effective_country("SE".into(), || Some("DE".into())), "SE", "the access point's country first");
+        assert_eq!(effective_country(String::new(), || Some("DE".into())), "DE", "not reported yet: the attribute");
+        assert_eq!(effective_country(String::new(), || Some(String::new())), "");
+        assert_eq!(effective_country(String::new(), || None), "");
+    }
+
+    #[test]
+    fn the_cache_is_dropped_when_the_country_arrives_or_changes() {
+        assert!(!country_changed(None, "DE"), "first lookup: nothing cached yet");
+        assert!(country_changed(Some(""), "DE"), "computed without a country, now known");
+        assert!(country_changed(Some("SE"), "DE"), "another market");
+        assert!(!country_changed(Some("DE"), "DE"));
+        assert!(!country_changed(Some("DE"), ""), "a country going missing does not clear");
+    }
+
+    #[tokio::test]
+    async fn results_without_a_country_are_cached_briefly() {
+        static STORE: LazyLock<Store<String>> = LazyLock::new(|| Store::new(16, MAX_AGE));
+        fn fetch(_s: Session, uris: Vec<String>) -> BoxFuture<'static, AppResult<Partial<String>>> {
+            async move {
+                // "p*" are fetched without a country, the rest with one.
+                let provisional = uris.iter().all(|u| u.starts_with('p'));
+                Ok(Partial { found: uris.into_iter().map(|u| (u.clone(), u)).collect(), provisional, ..Default::default() })
+            }
+            .boxed()
+        }
+        let session = Session::new(Default::default(), None);
+        let store: &'static Store<String> = &STORE;
+        store.get_many(&session, &["p1".to_string()], fetch).await.unwrap();
+        store.get_many(&session, &["c1".to_string()], fetch).await.unwrap();
+        let ttl = |k: &str| store.lru.lock().peek(k).map(|e| e.ttl);
+        assert_eq!(ttl("p1"), Some(PROVISIONAL_MAX_AGE));
+        assert_eq!(ttl("c1"), Some(MAX_AGE));
+        assert!(store.fresh("p1").is_some(), "still served right away");
     }
 
     #[tokio::test]

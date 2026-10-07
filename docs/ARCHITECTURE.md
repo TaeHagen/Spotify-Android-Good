@@ -489,7 +489,7 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.artist` | `{"uri"}` | `Artist` |
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
-| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. A pathfinder answer whose `searchV2` failed (`null` with a GraphQL field error, or every requested section nulled) counts as a failed source; an error inside one item only drops that item. Then searchview is asked, and context-resolve only when tracks were requested (it finds nothing else); if they fail (or do not apply) the call fails instead of returning "no results". "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
+| `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. `"partial": true` marks a degraded answer: a requested pathfinder section failed while others answered, or the tracks-only context-resolve answer to a request for other types too; clients show it but must not keep it as the query's answer. A pathfinder answer whose `searchV2` failed (`null` with a GraphQL field error, or every requested section nulled) counts as a failed source; an error inside one item only drops that item. Then searchview is asked, and context-resolve only when tracks were requested (it finds nothing else); if they fail (or do not apply) the call fails instead of returning "no results". "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
 | `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
 | `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
@@ -582,7 +582,7 @@ partial      present (true) only when some item metadata could not be fetched ri
              are placeholders with just `uri` (and `playable:false`). Artist: some top tracks,
              releases or related artists are missing. Do not cache as fresh; retry (§6.3).
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
-              "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n}}
+              "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
 HomeSection  {"id","title","items":[MediaRef]}
 RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit"}
@@ -643,7 +643,9 @@ For a remote active device, smart shuffle is not supported (the command reports
   `DevicesRepository.pendingTarget`, and the next in-app play or radio start carries it as
   `player.load {deviceId}` (a connect-state `play` command there). Media-session loads (Auto,
   Assistant, watches, resumption), the stored session and offline plays never take it: they
-  play on this phone. It is used once and expires 10 minutes after the pick (also checked when
+  play on this phone, and media-session loads and the stored session are sent with
+  `"local": true`, so they also take playback over from an active remote device instead of
+  being routed onto it. It is used once and expires 10 minutes after the pick (also checked when
   taken, so a timer delayed by Doze cannot let an old pick through); it is cleared too when any
   device becomes active, when this phone is picked, and on logout.
 * **Remote playback in the app**: `PlaybackSnapshot.source == "remote"` is built from the
@@ -784,6 +786,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
   set-media-items (Auto/Assistant/resumption), device volume only when remote (relative
   steps accumulate from the last sent target for 2 s), seek back/forward 15 s for episodes.
+  Handlers complete once the next snapshot arrives (≤ 2 s); set-media-items only once a snapshot
+  shows a track or remote playback, or the start failed (≤ 15 s after the load went through), so
+  Media3's BUFFERING placeholder, and with it the notification and the foreground, lasts over a
+  cold session's trackless snapshots (engine start, Spirc activation before the context resolved).
+  With an empty timeline Media3 drops the notification and the foreground, so the service does
+  not count itself media-foreground then.
   Media button preferences: like/unlike, shuffle (3-state), repeat (3-state); for episodes
   −15 s / +15 s next to play/pause instead of shuffle/repeat. `onSetRating` (HeartRating)
   toggles like. Remote playback: the current item's artist reads "<artists> • Playing on
@@ -807,7 +815,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   active. Media-session loads (`SpotifyPlayer.handleSetMediaItems`: Auto, Assistant, watches,
   Media3 resumption, Tap to resume, "play something"), the Play fallback to the stored session
   and offline plans (offline reach, or rewritten for the offline queue) never take it: they play
-  through this phone (in a car, a speaker picked earlier at home would be wrong).
+  through this phone (in a car, a speaker picked earlier at home would be wrong). Media-session
+  loads and the Play fallback to the stored session carry `"local": true`: they play here even
+  while another Connect device is active (the stored session must not overwrite what that device
+  plays now); in-app plays and radio are routed as usual.
 * `onConnectAsync` grants full commands to Media3-trusted controllers (MEDIA_CONTENT_CONTROL /
   notification listener: SysUI, Bluetooth, watch apps), the media notification, Auto/AAOS, our
   own uid and known system packages (package name verified by Media3); connection hints are not
@@ -826,11 +837,18 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
-  on a mode change and every 15 s while playing. Every resume of it (resumption, Tap to
+  on a mode change and every 15 s while playing, from local snapshots only (`ResumeSaver`):
+  when playback leaves the phone (transfer, takeover, the engine's reset) it is saved once more
+  at that moment and then stays frozen; logging out clears it, through the same writer, so a
+  save in progress never lands after the clear. Every resume of it (resumption, Tap to
   resume, "play something", the Play fallback) loads with its modes, since a load without
   them resets both to off (the Media3 resume item carries them as request extras). Offline the
   load asks for a plain shuffle instead of smart shuffle. States from older versions read with
-  the modes off.
+  the modes off. Only a track of its context is stored with the context; a queued, autoplay or
+  suggested track (or a context that cannot be loaded again) is stored as a track list instead:
+  that track plus the visible next context / autoplay tracks in play order (≤ 50), resumed as a
+  `trackUris` load in that order (shuffle off), because loading the context would start its
+  first track at the saved position. The Media3 resume item carries the list in its extras.
 * Foreground: Media3 default (10 min after pause, then notification becomes dismissable).
   Local audio never plays without it: local audio starting in the background with no service
   (remote "play on this phone" during the idle grace or a download) starts the service with
@@ -840,7 +858,13 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   player so Media3 goes foreground at once). `onForegroundServiceStartNotAllowedException`
   → for local playback pause + "Tap to resume"; while mirroring a remote device the notification
   is posted without the foreground (the remote device is never paused).
-  `onTaskRemoved` default behaviour. Engine holder released when the service is destroyed.
+  `onTaskRemoved` default behaviour. The `PLAYBACK` engine holder is taken on the first
+  playback command (play, load, seek, queue, modes, volume; a pause or stop does not count),
+  a playback resumption for playback, voice "play", Tap to resume, our LOCAL_PLAYBACK start,
+  the media foreground, or a local / mirrored snapshot, and released when the service is
+  destroyed. A browse-only bind (SysUI's resumption card at boot: root + recent; Bluetooth
+  player discovery) never starts the engine; catalog browsing and search (Auto) hold a second
+  `PLAYBACK` holder until 60 s after the browser's last such request.
 * **Opt-in Connect presence** (setting "Stay available for Spotify Connect", default off):
   when enabled and the app goes to background while idle, the service keeps itself in the
   foreground as `connectedDevice` with a low-importance "Available on Spotify Connect"
@@ -916,7 +940,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `nativeCancel`), stores records (encrypted key), updates `offline.add`, retries failures
   with backoff (max 3), stops gracefully on `onStopped`/timeout (Android 15 6 h limit),
   re-enqueues itself if work remains. "Not enough storage" reschedules (the hosts require
-  storage not low) instead of stopping for good.
+  storage not low) instead of stopping for good. Progress is persisted on a state change and every
+  5 s (resume / crash recovery); live bytes reach the Downloads screens through the runner's
+  activity, so long-lived observers (the playback service observes `downloadedImages`, which
+  changes only with the completed set) are not woken twice a second. "N downloads complete" is
+  posted only when the queue is empty; a run that ends with items still queued after doing work
+  posts "Downloads paused" (x of y downloaded).
 * Scheduling: turning "Download using mobile data" off or on stops a running run (its item
   resumes from the `.part`) and re-creates the job / worker with the new network constraint;
   pending work whose constraint does not match the setting is re-created too, and the runner
@@ -933,7 +962,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   queue finishes at once, and removals that empty the queue cancel the scheduled work.
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
-  of another downloaded collection). Liked Songs are listed with `library.tracks
+  of another downloaded collection). Likes and playlist edits made in the app
+  (`LibraryRepository.edits`) re-sync the affected downloaded collection 5 s after the last edit
+  (coalesced; after a sync that is running; marked due when offline). A sync waits ≤ 10 s for the
+  session's country and is postponed without it: the catalog's `playable` is per country, and
+  re-validation must not fail good downloads. Liked Songs are listed with `library.tracks
   {urisOnly:true}`; members without a row and members whose row failed get metadata and their
   playability from `catalog.tracks` (batched, ≤ 60 s; completed and pending rows are not looked up
   again; placeholders are stored without metadata). Re-validation adds a member found not playable
@@ -994,6 +1027,10 @@ Native catalog strategy (Rust `catalog/`):
   read for and never served to another account (a load that finishes after a logout included).
   `session.logout` drops them (`catalog::clear_user_state`, next to `metadata::clear_cache`),
   and a login as another account without a logout drops them on first use.
+* **Country of the metadata cache**: entity metadata (`playable`, market-specific data) uses the
+  access point's country, or the account's `country` attribute until that arrives. Entities
+  fetched with no country at all are cached for 60 s instead of 12 h, and the whole metadata
+  cache is dropped when a country arrives (or changes) after entries were computed without it.
 * The public Web API is never used by default.
 
 

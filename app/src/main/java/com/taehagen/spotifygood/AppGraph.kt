@@ -118,7 +118,10 @@ class AppGraph(val app: Application) {
     val playlists: PlaylistEditor by lazy { PlaylistEditor(appScope, rpc, library, catalog) }
 
     val downloads: DownloadManager by lazy {
-        DownloadManager(app, appScope, database, rpc, events, engine, settings, credentialStore)
+        DownloadManager(app, appScope, database, rpc, events, engine, settings, credentialStore).also { manager ->
+            // Likes and playlist edits made in the app re-sync the downloaded collection they affect.
+            appScope.launch { library.edits.collect(manager::onLibraryEdit) }
+        }
     }
 
     /**

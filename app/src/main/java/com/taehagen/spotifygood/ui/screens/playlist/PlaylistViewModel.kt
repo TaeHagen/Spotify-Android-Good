@@ -16,6 +16,7 @@ import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
+import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadUi
@@ -28,8 +29,10 @@ import com.taehagen.spotifygood.ui.screens.album.LoadState
 import com.taehagen.spotifygood.ui.screens.album.PlaybackInfo
 import com.taehagen.spotifygood.ui.screens.album.RichText
 import com.taehagen.spotifygood.ui.screens.album.assignRowKeys
+import com.taehagen.spotifygood.ui.screens.album.cachedPageMatchesDownload
 import com.taehagen.spotifygood.ui.screens.album.collectionUi
 import com.taehagen.spotifygood.ui.screens.album.dataOrNull
+import com.taehagen.spotifygood.ui.screens.album.engineReach
 import com.taehagen.spotifygood.ui.screens.album.failureReason
 import com.taehagen.spotifygood.ui.screens.album.insertBeforeIndex
 import com.taehagen.spotifygood.ui.screens.album.matchesTokens
@@ -39,6 +42,7 @@ import com.taehagen.spotifygood.ui.screens.album.savedFlow
 import com.taehagen.spotifygood.ui.screens.album.searchText
 import com.taehagen.spotifygood.ui.screens.album.searchTokens
 import com.taehagen.spotifygood.ui.screens.album.statesFor
+import com.taehagen.spotifygood.ui.screens.library.explicitFilterChanges
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
@@ -56,8 +60,10 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -130,6 +136,7 @@ internal data class PlaylistUiState(
     val offline: Boolean = false,
     /** The session is ONLINE: rows that aren't downloaded can start ([canStartNow]). */
     val online: Boolean = true,
+    val filterExplicit: Boolean = false,
 )
 
 @Immutable
@@ -206,7 +213,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     ) { core, playback, following, download, (rows, connectivity) ->
         PlaylistUiState(
             core.load, core.list, core.paging, core.editMode, playback, following, download, rows,
-            connectivity.offline, connectivity.online,
+            connectivity.offline, connectivity.online, connectivity.filterExplicit,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlaylistUiState())
 
@@ -227,6 +234,19 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         }
         // Session back ONLINE while showing the download: fetch the server's rows (they replace it).
         refetchWhenOnline(showingDownload = { data.value.dataOrNull()?.downloadedCopy == true })
+        // Loaded rows carry the playable flags of the old explicit filter; the revision doesn't
+        // change, so the live page alone wouldn't replace them.
+        graph.explicitFilterChanges()
+            .onEach {
+                mutationMutex.withLock {
+                    val current = data.value.dataOrNull()
+                    if (current != null && !current.downloadedCopy && canApplyServerRows() && graph.engineReach() == EngineReach.ONLINE) {
+                        refreshLoaded(force = false)
+                    }
+                }
+            }
+            .catch { }
+            .launchIn(viewModelScope)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -259,16 +279,27 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         // The catalog flow is live (re-emits after edits). Local edits win until the mutation queue
         // drains; the queue refreshes the loaded range itself afterwards.
         if (pendingMutations > 0 || dragging) return
+        // A stale cached page while the server can't be reached: the daily sync may have changed
+        // the downloaded playlist since it was cached. Then the download is what can play: list it.
+        if (resource is Resource.Error && !editMode.value && downloadFallbackAllowed(resource.error)) {
+            val copy = downloadedCopy()
+            if (copy != null && !cachedPageMatchesDownload(page.items.map { it.uri }, page.total, copy.itemUris)) {
+                data.value = LoadState.Ready(downloadedData(copy), stale = true)
+                return
+            }
+        }
         val description = withContext(Dispatchers.Default) { parseHtml(page.description.orEmpty()) }
         val current = data.value.dataOrNull()
         val sameRevision = current != null && page.revision != null && current.revision == page.revision
         // Loaded rows are kept for the same revision, unless they hold placeholders or come from the
         // download: then a refetch (this one, or the data layer's retries) replaces them.
         val replaceable = current != null && (current.partial || current.downloadedCopy)
-        val keepRows = current != null && sameRevision && !replaceable && current.rows.size >= page.items.size
-        // A new revision (or replaceable rows) while more than the first page is loaded: keep showing
-        // the loaded rows (no scroll jump) and reload the whole loaded range in the background.
-        val reloadRange = current != null && (!sameRevision || replaceable) && current.rows.size > page.items.size
+        // Same revision but other rows or playable flags (e.g. Hide explicit content changed).
+        val rowsDiffer = current != null && !current.startsWith(page.items)
+        val keepRows = current != null && sameRevision && !replaceable && !rowsDiffer
+        // A new revision (or replaceable / changed rows) while more than the first page is loaded:
+        // keep showing the loaded rows (no scroll jump) and reload the whole loaded range.
+        val reloadRange = current != null && (!sameRevision || replaceable || rowsDiffer) && current.rows.size > page.items.size
         val playlist = when {
             keepRows -> PlaylistData(page.copy(items = emptyList()), description, current.rows, maxOf(page.total, current.rows.size), page.revision)
             // Rows still from the download stay read-only until the reload replaces them.
@@ -287,7 +318,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             viewModelScope.launch {
                 mutationMutex.withLock {
                     val latest = data.value.dataOrNull()
-                    val replace = latest?.revision != page.revision || latest?.partial == true || latest?.downloadedCopy == true
+                    val replace = latest?.revision != page.revision || latest?.partial == true || latest?.downloadedCopy == true || rowsDiffer
                     if (canApplyServerRows() && replace) refreshLoaded(force = false)
                 }
             }
@@ -688,3 +719,15 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         const val CONFLICT_CODE = "CONFLICT"
     }
 }
+
+/** The loaded rows begin with [items] (same items, same playable flags). */
+private fun PlaylistData.startsWith(items: List<PlaylistItem>): Boolean {
+    if (rows.size < items.size) return false
+    return items.indices.all { i ->
+        val row = rows[i].item
+        val item = items[i]
+        row.uri == item.uri && row.playableFlag == item.playableFlag
+    }
+}
+
+private val PlaylistItem.playableFlag: Boolean? get() = track?.playable ?: episode?.playable

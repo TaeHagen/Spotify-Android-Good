@@ -325,6 +325,10 @@ pub struct SearchResults {
     /// (docs §6.3): the lists may be shorter than `limit` while more results exist.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub totals: HashMap<String, u32>,
+    /// Some requested types are missing because their source failed (a failed pathfinder
+    /// section, or the tracks-only fallback): not to be cached as the full answer (docs §6.3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

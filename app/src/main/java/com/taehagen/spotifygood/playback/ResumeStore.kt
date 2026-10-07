@@ -12,6 +12,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.RepeatMode
+import com.taehagen.spotifygood.model.TrackProvider
 import kotlinx.coroutines.flow.first
 import java.io.IOException
 
@@ -21,6 +22,11 @@ private val Context.resumeDataStore: DataStore<Preferences> by preferencesDataSt
  * What was last played locally, for Media3 playback resumption (BT button, SysUI card, Auto), the
  * "Tap to resume" alert, Assistant's "play something" and the in-app Play fallback. The modes
  * ([shuffle], [smartShuffle], [repeat]) default to off for states stored by older versions.
+ *
+ * Two forms: a track of its context resumes in [contextUri] (Spotify context semantics); any
+ * other track (queued, autoplay, a smart-shuffle suggestion, or a context that cannot be loaded
+ * again) resumes as the track list [trackUris], since loading the context would start the
+ * context's first track at the saved position (the track is not part of it).
  */
 data class ResumeState(
     val contextUri: String?,
@@ -36,14 +42,24 @@ data class ResumeState(
     val shuffle: Boolean = false,
     val smartShuffle: Boolean = false,
     val repeat: RepeatMode = RepeatMode.OFF,
-) {
     /**
-     * The context to resume in; null when there is none, it is just the track itself, or it cannot
-     * be loaded again (a plain track list reports `spotify:web-api`). Applied when reading, so
-     * states stored by older versions are repaired too.
+     * The track-list form: [trackUri] followed by the visible next tracks of the context and
+     * autoplay, in play order (≤ [RESUME_TRACKS]); null for the context form (and for states
+     * stored by older versions, which did not record it).
+     */
+    val trackUris: List<String>? = null,
+) {
+    /** [trackUris] when usable (it starts with [trackUri]). */
+    private val trackList: List<String>?
+        get() = trackUris?.takeIf { it.isNotEmpty() && it.first() == trackUri }
+
+    /**
+     * The context to resume in; null for the track-list form, when there is none, it is just the
+     * track itself, or it cannot be loaded again (a plain track list reports `spotify:web-api`).
+     * Applied when reading, so states stored by older versions are repaired too.
      */
     private val resumeContext: String?
-        get() = contextUri?.takeIf { it != trackUri && MediaIds.isResolvableContext(it) }
+        get() = if (trackList != null) null else contextUri?.takeIf { it != trackUri && MediaIds.isResolvableContext(it) }
 
     /** Media id understood by the session player (see [MediaIds]). */
     val mediaId: String
@@ -51,32 +67,49 @@ data class ResumeState(
 
     /**
      * `player.load` request that starts this session again (e.g. when no Connect device is active).
-     * It always names the modes: a load without them resets shuffle and repeat to off. Offline,
-     * [PlayerController] turns smart shuffle into a plain shuffle ([OfflineLoads.withoutSmartShuffle]).
+     * It always names the modes: a load without them resets shuffle and repeat to off. The
+     * track-list form plays its list in the saved order (shuffle and smart shuffle off, like the
+     * engine's own hand-over of such a window). Offline, [PlayerController] turns smart shuffle
+     * into a plain shuffle ([OfflineLoads.withoutSmartShuffle]).
      */
     fun toPlayRequest(): PlayRequest {
+        val list = trackList
         val context = resumeContext
-        return withModes(
-            PlayRequest(
-                contextUri = context,
-                trackUris = if (context == null) listOf(trackUri) else null,
-                startUri = trackUri,
-                positionMs = positionMs,
-                play = true,
-            ),
+        val request = PlayRequest(
+            contextUri = context,
+            trackUris = list ?: if (context == null) listOf(trackUri) else null,
+            startUri = trackUri,
+            startIndex = if (list != null) 0 else null,
+            positionMs = positionMs,
+            play = true,
         )
+        return resumeLoad.applyModes(request)
     }
 
-    /** [request] with the modes of this session. */
-    private fun withModes(request: PlayRequest): PlayRequest =
-        request.copy(shuffle = shuffle || smartShuffle, smartShuffle = smartShuffle, repeat = repeat)
+    /** What the Media3 resume item carries for its load ([ResumeModes], [ResumeLoad.applyTo]). */
+    internal val resumeLoad: ResumeLoad
+        get() {
+            val list = trackList
+            return ResumeLoad(
+                trackUris = list,
+                shuffle = list == null && (shuffle || smartShuffle),
+                smartShuffle = list == null && smartShuffle,
+                repeat = repeat,
+            )
+        }
 
     companion object {
+        /** Longest stored track list (like the engine's hand-over window). */
+        const val RESUME_TRACKS = 50
+
         /** Resume state of a local snapshot at [positionMs]; null if nothing is loaded. */
         fun from(snapshot: PlaybackSnapshot, positionMs: Long = snapshot.positionAt()): ResumeState? {
             val track = snapshot.track ?: return null
+            val context = snapshot.context?.uri?.takeIf { it.isNotBlank() }
+            val inContext = track.provider == TrackProvider.CONTEXT && context != null &&
+                context != track.uri && MediaIds.isResolvableContext(context)
             return ResumeState(
-                contextUri = snapshot.context?.uri?.takeIf { it.isNotBlank() },
+                contextUri = context.takeIf { inContext },
                 trackUri = track.uri,
                 positionMs = positionMs.coerceAtLeast(0),
                 title = track.name,
@@ -88,8 +121,51 @@ data class ResumeState(
                 shuffle = snapshot.shuffle || snapshot.smartShuffle,
                 smartShuffle = snapshot.smartShuffle,
                 repeat = snapshot.repeat,
+                trackUris = if (inContext) null else trackList(track.uri, snapshot),
             )
         }
+
+        /**
+         * [current] and the visible next tracks that belong to the context or autoplay (not the
+         * user queue, smart-shuffle suggestions or unavailable entries), in play order.
+         */
+        private fun trackList(current: String, snapshot: PlaybackSnapshot): List<String> {
+            val next = snapshot.nextTracks.asSequence()
+                .filter { it.provider == TrackProvider.CONTEXT || it.provider == TrackProvider.AUTOPLAY }
+                .map { it.uri }
+                .filter(::isPlayableItem)
+                .take(RESUME_TRACKS - 1)
+            return listOf(current) + next
+        }
+
+        private fun isPlayableItem(uri: String): Boolean =
+            uri.startsWith("spotify:track:") || uri.startsWith("spotify:episode:")
+    }
+}
+
+/**
+ * The load form of a resume item ([ResumeState.resumeLoad]): the modes, and the track list of the
+ * track-list form (null: the item's own media id says what to load).
+ */
+internal data class ResumeLoad(
+    val trackUris: List<String>?,
+    val shuffle: Boolean,
+    val smartShuffle: Boolean,
+    val repeat: RepeatMode,
+) {
+    fun applyModes(request: PlayRequest): PlayRequest =
+        request.copy(shuffle = shuffle || smartShuffle, smartShuffle = smartShuffle, repeat = repeat)
+
+    /**
+     * [request] (the session player's load of the resume item's media id) as the stored session's
+     * load: its modes, and its track list when the request starts at the list's first track.
+     */
+    fun applyTo(request: PlayRequest): PlayRequest {
+        val withModes = applyModes(request)
+        val list = trackUris?.takeIf { it.isNotEmpty() } ?: return withModes
+        val start = request.trackUris?.getOrNull(request.startIndex ?: 0) ?: request.startUri
+        if (request.contextUri != null || start != list.first()) return withModes
+        return withModes.copy(trackUris = list, startIndex = 0, startUri = list.first(), startUid = null)
     }
 }
 
@@ -103,23 +179,29 @@ internal object ResumeModes {
     private const val SHUFFLE = "com.taehagen.spotifygood.resume.SHUFFLE"
     private const val SMART_SHUFFLE = "com.taehagen.spotifygood.resume.SMART_SHUFFLE"
     private const val REPEAT = "com.taehagen.spotifygood.resume.REPEAT"
+    private const val TRACK_URIS = "com.taehagen.spotifygood.resume.TRACK_URIS"
 
     fun extras(state: ResumeState): Bundle = Bundle().apply {
-        putBoolean(SHUFFLE, state.shuffle)
-        putBoolean(SMART_SHUFFLE, state.smartShuffle)
-        putString(REPEAT, PlaybackModes.wire(state.repeat))
+        val load = state.resumeLoad
+        putBoolean(SHUFFLE, load.shuffle)
+        putBoolean(SMART_SHUFFLE, load.smartShuffle)
+        putString(REPEAT, PlaybackModes.wire(load.repeat))
+        load.trackUris?.let { putStringArrayList(TRACK_URIS, ArrayList(it)) }
     }
 
-    /** [request] with the modes in [extras]; unchanged when they carry none (any other item). */
-    fun applyTo(request: PlayRequest, extras: Bundle?): PlayRequest {
-        val repeat = extras?.getString(REPEAT) ?: return request
-        val smartShuffle = extras.getBoolean(SMART_SHUFFLE)
-        return request.copy(
-            shuffle = extras.getBoolean(SHUFFLE) || smartShuffle,
-            smartShuffle = smartShuffle,
+    /** The resume load in [extras]; null when they carry none (any other item). */
+    fun read(extras: Bundle?): ResumeLoad? {
+        val repeat = extras?.getString(REPEAT) ?: return null
+        return ResumeLoad(
+            trackUris = extras.getStringArrayList(TRACK_URIS)?.toList(),
+            shuffle = extras.getBoolean(SHUFFLE),
+            smartShuffle = extras.getBoolean(SMART_SHUFFLE),
             repeat = PlaybackModes.parseRepeat(repeat),
         )
     }
+
+    /** [request] as the stored session's load when [extras] are a resume item's. */
+    fun applyTo(request: PlayRequest, extras: Bundle?): PlayRequest = read(extras)?.applyTo(request) ?: request
 }
 
 /**
@@ -146,6 +228,7 @@ class ResumeStore internal constructor(private val store: DataStore<Preferences>
                 shuffle = p[SHUFFLE] ?: false,
                 smartShuffle = p[SMART_SHUFFLE] ?: false,
                 repeat = PlaybackModes.parseRepeat(p[REPEAT]),
+                trackUris = p[TRACK_URIS]?.split(LIST_SEPARATOR)?.filter { it.isNotBlank() }?.takeIf { it.isNotEmpty() },
             )
         }
     } catch (e: IOException) {
@@ -168,6 +251,7 @@ class ResumeStore internal constructor(private val store: DataStore<Preferences>
                 p[SHUFFLE] = state.shuffle
                 p[SMART_SHUFFLE] = state.smartShuffle
                 p[REPEAT] = PlaybackModes.wire(state.repeat)
+                p.setOrRemove(TRACK_URIS, state.trackUris?.takeIf { it.isNotEmpty() }?.joinToString(LIST_SEPARATOR))
             }
         } catch (e: IOException) {
             Log.w(TAG, "Cannot save resume state", e)
@@ -204,5 +288,8 @@ class ResumeStore internal constructor(private val store: DataStore<Preferences>
         val SHUFFLE = booleanPreferencesKey("shuffle")
         val SMART_SHUFFLE = booleanPreferencesKey("smart_shuffle")
         val REPEAT = stringPreferencesKey("repeat")
+        /** The track-list form, newline-separated (uris never contain one). */
+        val TRACK_URIS = stringPreferencesKey("track_uris")
+        const val LIST_SEPARATOR = "\n"
     }
 }
