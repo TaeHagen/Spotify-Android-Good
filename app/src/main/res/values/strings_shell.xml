@@ -38,6 +38,7 @@
     <string name="shell_cd_download_failed">Download failed</string>
     <string name="shell_state_now_playing">Now playing</string>
     <string name="shell_state_unavailable">Unavailable</string>
+    <string name="shell_partial_content">Some items couldn\'t be loaded.</string>
 
     <!-- Rows / formatting -->
     <string name="shell_duration_hr_min">%1$d hr %2$d min</string>

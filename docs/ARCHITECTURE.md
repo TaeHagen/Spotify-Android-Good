@@ -376,10 +376,10 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.lyrics` | `{"uri"}` | `Lyrics` or `NOT_FOUND` |
 | `catalog.radio` | `{"uri"}` | `{"contextUri"?:"spotify:playlist:…","trackUris"?:[…]}` (inspiredby-mix; radio-apollo fallback may return only `trackUris`) |
 | `catalog.recentlyPlayed` | `{"limit":50}` | `{"items":[MediaRef]}` |
-| `catalog.user` | `{"username"?}` | `User` (me when omitted) |
-| `library.playlists` | `{}` | `{"items":[RootlistEntry]}` (rootlist, folders preserved) |
-| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}]}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` |
-| `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"}` | paged `{"total","items":[…]}` |
+| `catalog.user` | `{"username"?}` | `User` (me when omitted; other users include their `publicPlaylists`) |
+| `library.playlists` | `{}` | `{"items":[RootlistEntry],"partial"?:true}` (rootlist, folders preserved; entries without decorations are named through cached header lookups, ≤100 requests per call; deleted/inaccessible playlists are remembered for 30 min; `partial` when some names could not be looked up yet and those playlists are missing) |
+| `library.tracks` | `{"offset":0,"limit":100,"urisOnly"?:false}` | `{"total","items":[{"addedAt","track":Track}],"partial"?}` (Liked Songs); with `urisOnly`: `{"total","items":[],"uris":[…]}` (no metadata involved: the membership source for downloads) |
+| `library.albums` / `library.artists` / `library.shows` / `library.episodes` | `{"offset","limit"≤500}` | paged `{"total","items":[…],"partial"?}` |
 | `library.contains` | `{"uris":[…]}` | `{"contains":[bool]}` |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
 | — | | Playlist revision conflicts (stale `revision`) fail with `INVALID_ARGUMENT` and a message containing "revision"; clients reload and retry. |
@@ -390,6 +390,23 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `playlist.updateDetails` | `{"uri","name"?,"description"?}` | `{}` |
 | `playlist.delete` | `{"uri"}` | `{}` (removes from rootlist; unfollow) |
 | `playlist.follow` / `playlist.unfollow` | `{"uri"}` | `{}` |
+
+**Item metadata failures** (pages that list tracks/episodes/albums/artists/shows: `catalog.album`,
+`catalog.artist`, `catalog.playlist`, `catalog.show`, `library.*`). A metadata failure is never
+returned as an authoritative but shorter list:
+* If no item metadata of the page could be fetched (and some was requested), the call fails with a
+  retryable `NETWORK`, `RATE_LIMITED` or `UNAVAILABLE` (never `NOT_FOUND`: the page exists).
+* If only some requests failed, the affected items keep their slot as a placeholder that carries
+  only `uri` (`playable:false`, empty `name`) and the result has `"partial": true`. Clients must not
+  cache a partial result as fresh, nor treat its item list as authoritative (e.g. to delete
+  downloads); retry later instead.
+* Items the server has no data for (taken down, undecodable) are not failures: they never set
+  `partial`. `library.*` and `catalog.playlist` keep them as placeholders too, so a page always has
+  exactly one item per slot (`library.*`: `items.length == min(limit, total - offset)`; page by
+  `offset += limit` until `offset >= total`). `catalog.album` and `catalog.show` drop them.
+* `catalog.show` episode lists that do not come with `SHOW_V4` (`SHOW_V4_EPISODES_ASSOC`, else
+  context-resolve) are cached for 30 min and shared by all pages; if neither source answers, the
+  call fails instead of returning an empty show.
 
 ### 6.4 Downloads / offline
 
@@ -424,24 +441,29 @@ Track        {"uri","name","artists":[ArtistRef],"album":AlbumRef,"durationMs","
               "trackNumber"?,"discNumber"?,"popularity"?,"hasLyrics"?}
 Episode      {"uri","name","show":{"uri","name","images"},"description","durationMs","releaseDate","images",
               "explicit","playable","resumePositionMs"?,"fullyPlayed"?}
-Album        AlbumRef + {"label"?,"copyrights":[String],"tracks":[Track],"releaseDatePrecision"?}
+Album        AlbumRef + {"label"?,"copyrights":[String],"tracks":[Track],"releaseDatePrecision"?,"partial"?:true}
 Artist       {"uri","name","images","headerImages"?,"biography"?,"topTracks":[Track],"albums":[AlbumRef],
-              "singles":[AlbumRef],"compilations":[AlbumRef],"appearsOn":[AlbumRef],"related":[ArtistRef],"following"?:bool}
+              "singles":[AlbumRef],"compilations":[AlbumRef],"appearsOn":[AlbumRef],"related":[ArtistRef],"following"?:bool,
+              "partial"?:true}
 PlaylistRef  {"uri","name","description"?,"images","owner":{"username","displayName"?},"totalTracks"?}
 Playlist     PlaylistRef + {"collaborative","isOwnedByMe","canEdit","revision","offset","total",
-              "items":[{"uid"?,"addedAt"?,"addedBy"?,"track"?:Track,"episode"?:Episode}],"following"?:bool}
+              "items":[{"uid"?,"addedAt"?,"addedBy"?,"track"?:Track,"episode"?:Episode}],"following"?:bool,"partial"?:true}
              (items never drop out, so indexes stay aligned for edits: local files and unresolved
               items keep their slot as a `track`/`episode` with `playable:false`; local files have
               empty `artists`)
 ShowRef      {"uri","name","publisher"?,"images"}
-Show         ShowRef + {"description","episodes":[Episode],"total","offset","following"?}
+Show         ShowRef + {"description","episodes":[Episode],"total","offset","following"?,"partial"?:true}
+partial      present (true) only when some item metadata could not be fetched right now; those items
+             are placeholders with just `uri` (and `playable:false`). Artist: some top tracks,
+             releases or related artists are missing. Do not cache as fresh; retry (§6.3).
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
 HomeSection  {"id","title","items":[MediaRef]}
 RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit"}
 Lyrics       {"syncType":"LINE_SYNCED|UNSYNCED|SYLLABLE_SYNCED","lines":[{"startTimeMs","words"}],
               "provider"?,"colors"?:{"background","text","highlightText"}}
-User         {"username","displayName","images","product","country","explicitFilter"}
+User         {"username","displayName","images","product","country","explicitFilter",
+              "publicPlaylists"?:[PlaylistRef]}   (publicPlaylists: other users only, up to 50; mine come from the rootlist)
 ```
 
 ## 7. Smart shuffle
@@ -664,9 +686,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
   of another downloaded collection). Liked Songs are listed with `library.tracks
-  {urisOnly:true}`; new rows get metadata from `catalog.tracks`. Only a *complete* resolution
-  removes items (item count matches the source's total, not empty): an empty or short one only
-  adds, and is retried. A collection whose sync fails or is incomplete is retried after 1 h,
+  {urisOnly:true}`; new rows get metadata from `catalog.tracks` (also placeholders: they are stored
+  without metadata). Only a *complete* resolution removes items (not `partial`, not empty, and for
+  playlists / Liked Songs every slot listed): an empty, short or partial one only adds, and is
+  retried. A collection whose sync fails or is incomplete is retried after 1 h,
   doubling up to 24 h (`lastAttemptAt`, `syncFailures`), instead of at every reconnect.
   Members the catalog resolves as not playable here (`playable:false` with a name) stay members
   but are not queued and do not count in the collection status (`unavailableUrisJson`); they
@@ -699,12 +722,18 @@ Native catalog strategy (Rust `catalog/`):
   they are discovered at runtime: fetch `https://open.spotify.com/` once, extract the web
   player bundle URLs, regex out `"<operationName>","query","<sha256>"` pairs, cache them on
   disk (`filesDir/pathfinder.json`, refreshed weekly or on `PersistedQueryNotFound`); shipped
-  defaults are only a starting point. Token: login5 first; on 401/403 the OAuth access token
-  from login (if still valid); otherwise the call fails over to the fallbacks below.
+  defaults are only a starting point. A refresh runs detached from the RPC that triggered it
+  (a superseded search cannot abort it; the query waits ≤ 20 s, then uses its fallbacks), at
+  most once an hour across restarts (5 min after a network failure), with bundle parsing on
+  the blocking pool. Token: login5 first; on 401/403 the OAuth access token from login (if
+  still valid); otherwise the call fails over to the fallbacks below. The optional
+  `client-token` header gets 5 s.
 * **Fallbacks**: search → spclient `searchview/km/v4/search/<q>` (JSON) → context-resolve
-  `spotify:search:<q>` (tracks only). Home → assembled locally from recently played,
+  `spotify:search:<q>` (tracks only); a NETWORK/RATE_LIMITED searchview failure ends the chain
+  (same spclient). Home → assembled locally from recently played,
   rootlist playlists (incl. followed Made-For-You mixes), followed artists and radio
-  stations seeded from recent tracks.
+  stations seeded from recent tracks. Liked Songs → context-resolve when `collection/v2/paging`
+  fails (not when offline or rate limited); the resolved list is reused for 60 s.
 * The public Web API is never used by default.
 
 
@@ -712,8 +741,12 @@ Native catalog strategy (Rust `catalog/`):
 Repositories call the native catalog RPCs and expose `suspend` functions / `Flow`s.
 `ResponseCache` (Room table `response_cache`: key, json, fetchedAt) stores the last
 successful response of browse calls (home, library lists, album/artist/playlist pages) so
-the app opens instantly and works offline; stale-while-revalidate. Library mutations are
-optimistic (local state flips immediately, rolled back on error). Liked-state of the
+the app opens instantly and works offline; stale-while-revalidate. A `partial` response
+(§6.3) is shown but never stored as fresh: it only fills a missing row (stored stale) and is
+refetched twice while on screen (after 15 s and 30 s). Paged lists advance by whole windows
+until `total`; an empty page before `total` is an error, not the end. Library mutations are
+optimistic (local state flips immediately, rolled back on error); playlist edits run in the
+app scope, so they complete even if their screen closes. Liked-state of the
 current track is cached in memory (LRU) and refreshed via `library.contains`.
 
 ### 9.9 UI

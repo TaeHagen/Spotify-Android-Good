@@ -14,6 +14,7 @@ import com.taehagen.spotifygood.model.MediaType
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.playback.PlayRequest
+import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.DetailViewModel
 import com.taehagen.spotifygood.ui.screens.album.LoadState
 import com.taehagen.spotifygood.ui.screens.album.PlaybackInfo
@@ -104,6 +105,7 @@ internal class ArtistViewModel(graph: AppGraph, private val uri: String) : Detai
 
     /** Plays the artist context starting at [track] (top tracks come first in an artist context). */
     fun playTrack(track: Track) {
+        if (track.isPlaceholder || !track.playable) return
         graph.player.play(PlayRequest(contextUri = uri, startUri = track.uri))
     }
 

@@ -18,10 +18,32 @@ import com.taehagen.spotifygood.model.SavedShow
 import com.taehagen.spotifygood.model.ShowRef
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.text.Collator
 import java.util.Locale
 
 // Pure Your Library shaping: items, folders, filters and sort orders (JVM-testable).
+
+/**
+ * Which loaded pages of a [PagedLoader] list came back `partial` (some items are uri-only
+ * placeholders, docs §6.3), by offset. A page fetched at offset 0 starts the list over. Thread-safe.
+ */
+class PartialPages {
+    private val offsets = HashSet<Int>()
+    private val _partial = MutableStateFlow(false)
+
+    /** True while any loaded page is partial: the list offers a retry. */
+    val partial: StateFlow<Boolean> = _partial.asStateFlow()
+
+    @Synchronized
+    fun record(offset: Int, partial: Boolean) {
+        if (offset == 0) offsets.clear()
+        if (partial) offsets += offset else offsets -= offset
+        _partial.value = offsets.isNotEmpty()
+    }
+}
 
 enum class LibraryFilter { PLAYLISTS, ALBUMS, ARTISTS, PODCASTS, DOWNLOADED }
 

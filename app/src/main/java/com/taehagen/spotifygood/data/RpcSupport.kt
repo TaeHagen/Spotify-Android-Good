@@ -36,25 +36,42 @@ internal fun JsonObjectBuilder.putStrings(key: String, values: Collection<String
     put(key, JsonArray(values.map(::JsonPrimitive)))
 }
 
-/**
- * Collects every item of an offset/limit paged endpoint. Stops at `total`, on an empty page (guards
- * against a server that over-reports `total`) or at [maxItems].
- */
+/** Every item of a paged list, and whether any page was `partial` (docs §6.3). */
+internal data class PagedItems<T>(val items: List<T>, val partial: Boolean)
+
+/** [pageAllChecked] without the partial flag. */
 internal suspend fun <T> pageAll(
     pageSize: Int,
     maxItems: Int = MAX_PAGED_ITEMS,
     fetch: suspend (offset: Int, limit: Int) -> Page<T>,
-): List<T> {
+): List<T> = pageAllChecked(pageSize, maxItems, fetch).items
+
+/**
+ * Collects every item of an offset/limit paged `library.*` endpoint until `total` or [maxItems].
+ * Pages are whole windows (one item per slot, docs §6.3), so the offset advances by the window size.
+ * An empty page before `total` means the list changed or broke mid-way: that fails instead of
+ * returning a silently truncated list.
+ */
+internal suspend fun <T> pageAllChecked(
+    pageSize: Int,
+    maxItems: Int = MAX_PAGED_ITEMS,
+    fetch: suspend (offset: Int, limit: Int) -> Page<T>,
+): PagedItems<T> {
     val out = ArrayList<T>()
+    var partial = false
     var offset = 0
     while (out.size < maxItems) {
         val page = fetch(offset, pageSize)
-        if (page.items.isEmpty()) break
+        partial = partial || page.partial
+        if (page.items.isEmpty()) {
+            check(offset >= page.total) { "Empty page at offset $offset of ${page.total}" }
+            break
+        }
         out += page.items
-        offset += page.items.size
+        offset += maxOf(page.items.size, pageSize)
         if (offset >= page.total) break
     }
-    return if (out.size > maxItems) out.subList(0, maxItems).toList() else out
+    return PagedItems(if (out.size > maxItems) out.subList(0, maxItems).toList() else out, partial)
 }
 
 /** Upper bound for internally paged lists (Spotify caps playlists at 10k items). */

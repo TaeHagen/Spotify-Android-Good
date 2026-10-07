@@ -87,6 +87,39 @@ class BrowseLogicTest {
     }
 
     @Test
+    fun pagerKeepsGoingAfterAShortPageWhenTotalSaysThereIsMore() = runTest {
+        // An older engine dropped items without metadata: 99 of a 100-item window.
+        val requests = mutableListOf<Int>()
+        val loader = PagedLoader(this, pageSize = 100, keyOf = { it }) { offset, limit ->
+            requests += offset
+            val window = (offset until minOf(offset + limit, 250)).map { "t$it" }
+            PageResult(if (offset == 0) window - "t57" else window, total = 250)
+        }
+        loader.loadMore()
+        advanceUntilIdle()
+        assertEquals(99, loader.state.value.items.size)
+        assertFalse(loader.state.value.endReached)
+        loader.loadMore()
+        advanceUntilIdle()
+        loader.loadMore()
+        advanceUntilIdle()
+        assertEquals("windows advance by the page size, without overlap", listOf(0, 100, 200), requests)
+        assertEquals(249, loader.state.value.items.size)
+        assertTrue(loader.state.value.endReached)
+    }
+
+    @Test
+    fun pageSteps() {
+        assertEquals(100 to false, pageStep(offset = 0, pageSize = 100, received = 99, total = 250))
+        assertEquals(300 to true, pageStep(offset = 200, pageSize = 100, received = 50, total = 250))
+        assertEquals(100 to true, pageStep(offset = 0, pageSize = 100, received = 100, total = 100))
+        assertTrue("an empty page ends the list", pageStep(offset = 0, pageSize = 100, received = 0, total = 250).second)
+        // Unknown total (search): a short page is the end.
+        assertEquals(30 to false, pageStep(offset = 0, pageSize = 30, received = 30, total = null))
+        assertEquals(42 to true, pageStep(offset = 30, pageSize = 30, received = 12, total = null))
+    }
+
+    @Test
     fun pagerIgnoresConcurrentLoadsAndRecoversFromErrors() = runTest {
         var fail = true
         var calls = 0

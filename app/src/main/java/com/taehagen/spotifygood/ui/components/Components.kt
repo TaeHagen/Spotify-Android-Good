@@ -190,7 +190,50 @@ fun Artwork(
     }
 }
 
-/** A track list row: artwork (optional) or index, title, artists, explicit/download badges, overflow. */
+/**
+ * A slot whose metadata could not be loaded right now (docs §6.5): only the uri, an empty name,
+ * not playable. Shown as "Unavailable", it cannot be played and offers no actions (retry the page
+ * instead, see [PartialContentNotice]).
+ */
+val Track.isPlaceholder: Boolean get() = name.isBlank()
+
+/** See [Track.isPlaceholder]. */
+val Episode.isPlaceholder: Boolean get() = name.isBlank()
+
+/**
+ * Unobtrusive notice for a page that came back `partial` (some items are placeholders), with a
+ * retry that refreshes the page.
+ */
+@Composable
+fun PartialContentNotice(onRetry: () -> Unit, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .padding(start = 16.dp, end = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.Rounded.ErrorOutline,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = stringResource(R.string.shell_partial_content),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onRetry) { Text(stringResource(R.string.shell_retry)) }
+    }
+}
+
+/**
+ * A track list row: artwork (optional) or index, title, artists, explicit/download badges, overflow.
+ * A [placeholder][Track.isPlaceholder] shows "Unavailable", dimmed, without click or actions.
+ */
 @Composable
 fun TrackRow(
     track: Track,
@@ -214,23 +257,28 @@ fun TrackRow(
 ) {
     val colors = MaterialTheme.colorScheme
     val titleColor = if (isCurrent) colors.primary else colors.onSurface
-    val dimmed = !enabled || !track.playable
+    val placeholder = track.isPlaceholder
+    val dimmed = !enabled || !track.playable || placeholder
     val subtitle = subtitleOverride ?: remember(track.artists) { track.artists.joinToString { it.name } }
     val nowPlayingLabel = stringResource(R.string.shell_state_now_playing)
     val unavailableLabel = stringResource(R.string.shell_state_unavailable)
-    val moreLabel = stringResource(R.string.shell_cd_more_options_for, track.name)
+    val title = if (placeholder) unavailableLabel else track.name
+    val moreLabel = stringResource(R.string.shell_cd_more_options_for, title)
+    // A placeholder has nothing to act on (no metadata): no long press and no overflow.
+    val onMoreClick = onMoreClick.takeUnless { placeholder }
+    val onLongClick = onLongClick.takeUnless { placeholder }
     Row(
         modifier = modifier
             .fillMaxWidth()
             .combinedClickable(
-                enabled = enabled,
-                onClick = { if (track.playable) onClick() },
+                enabled = enabled && !placeholder,
+                onClick = { if (track.playable && !placeholder) onClick() },
                 onLongClick = onLongClick ?: onMoreClick,
                 onLongClickLabel = if (onLongClick != null || onMoreClick != null) moreLabel else null,
             )
             .semantics {
                 when {
-                    !track.playable -> stateDescription = unavailableLabel
+                    !track.playable || placeholder -> stateDescription = unavailableLabel
                     isCurrent -> stateDescription = nowPlayingLabel
                 }
             }
@@ -284,7 +332,7 @@ fun TrackRow(
                         Spacer(Modifier.width(6.dp))
                     }
                     Text(
-                        text = track.name,
+                        text = title,
                         style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.Medium,
                         color = titleColor,
@@ -328,7 +376,10 @@ fun TrackRow(
     }
 }
 
-/** A podcast episode row with date, duration, progress and description excerpt. */
+/**
+ * A podcast episode row with date, duration, progress and description excerpt. A
+ * [placeholder][Episode.isPlaceholder] shows "Unavailable", dimmed, without click or actions.
+ */
 @Composable
 fun EpisodeRow(
     episode: Episode,
@@ -361,22 +412,33 @@ fun EpisodeRow(
             }
         }.joinToString(" • ")
     }
-    val moreLabel = stringResource(R.string.shell_cd_more_options_for, episode.name)
+    val placeholder = episode.isPlaceholder
+    val unavailableLabel = stringResource(R.string.shell_state_unavailable)
+    val title = if (placeholder) unavailableLabel else episode.name
+    val moreLabel = stringResource(R.string.shell_cd_more_options_for, title)
     val nowPlayingLabel = stringResource(R.string.shell_state_now_playing)
+    // A placeholder has nothing to act on (no metadata): no long press and no overflow.
+    val onMoreClick = onMoreClick.takeUnless { placeholder }
+    val onLongClick = onLongClick.takeUnless { placeholder }
     Row(
         modifier = modifier
             .fillMaxWidth()
             .combinedClickable(
-                enabled = enabled,
-                onClick = { if (episode.playable) onClick() },
+                enabled = enabled && !placeholder,
+                onClick = { if (episode.playable && !placeholder) onClick() },
                 onLongClick = onLongClick ?: onMoreClick,
                 onLongClickLabel = if (onLongClick != null || onMoreClick != null) moreLabel else null,
             )
-            .semantics { if (isCurrent) stateDescription = nowPlayingLabel }
+            .semantics {
+                when {
+                    placeholder -> stateDescription = unavailableLabel
+                    isCurrent -> stateDescription = nowPlayingLabel
+                }
+            }
             .padding(start = 16.dp, end = if (onMoreClick != null) 4.dp else 16.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.Top,
     ) {
-        Row(Modifier.weight(1f).alpha(if (enabled && episode.playable) 1f else DISABLED_ALPHA)) {
+        Row(Modifier.weight(1f).alpha(if (enabled && episode.playable && !placeholder) 1f else DISABLED_ALPHA)) {
             Artwork(
                 url = episode.images.best(160) ?: episode.show?.images?.best(160),
                 contentDescription = null,
@@ -387,7 +449,7 @@ fun EpisodeRow(
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
-                    text = episode.name,
+                    text = title,
                     style = MaterialTheme.typography.titleSmall,
                     color = if (isCurrent) colors.primary else colors.onSurface,
                     maxLines = 2,

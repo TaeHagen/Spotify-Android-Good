@@ -97,6 +97,8 @@ data class Album(
     val label: String? = null,
     val copyrights: List<String> = emptyList(),
     val tracks: List<Track> = emptyList(),
+    /** Some track metadata failed to load; those tracks are uri-only placeholders (docs §6.5). */
+    val partial: Boolean = false,
 ) {
     fun toRef() = AlbumRef(uri, name, images, artists, releaseDate, albumType, totalTracks)
 }
@@ -115,6 +117,8 @@ data class Artist(
     val appearsOn: List<AlbumRef> = emptyList(),
     val related: List<ArtistRef> = emptyList(),
     val following: Boolean? = null,
+    /** Some top tracks, releases or related artists failed to load (docs §6.5). */
+    val partial: Boolean = false,
 )
 
 @Serializable
@@ -157,6 +161,8 @@ data class Playlist(
     val total: Int = 0,
     val items: List<PlaylistItem> = emptyList(),
     val following: Boolean? = null,
+    /** Some item metadata failed to load; those items are uri-only placeholders (docs §6.5). */
+    val partial: Boolean = false,
 ) {
     fun toRef() = PlaylistRef(uri, name, description, images, owner, total)
 }
@@ -172,6 +178,8 @@ data class Show(
     val total: Int = 0,
     val offset: Int = 0,
     val following: Boolean? = null,
+    /** Some episode metadata failed to load; those episodes are uri-only placeholders (docs §6.5). */
+    val partial: Boolean = false,
 ) {
     fun toRef() = ShowRef(uri, name, publisher, images)
 }
@@ -237,8 +245,9 @@ data class RootlistEntry(
     val canEdit: Boolean = false,
 )
 
+/** `library.playlists`; [partial]: some playlist names could not be looked up right now and are missing. */
 @Serializable
-data class Rootlist(val items: List<RootlistEntry> = emptyList()) {
+data class Rootlist(val items: List<RootlistEntry> = emptyList(), val partial: Boolean = false) {
     /** All playlists, folders flattened (depth first). */
     fun flatPlaylists(): List<RootlistEntry> = buildList {
         fun walk(entries: List<RootlistEntry>) {
@@ -248,8 +257,12 @@ data class Rootlist(val items: List<RootlistEntry> = emptyList()) {
     }
 }
 
+/**
+ * A `library.*` page: one item per slot of the window (`items.size == min(limit, total - offset)`).
+ * [partial]: some item metadata failed to load; those items are uri-only placeholders (docs §6.3).
+ */
 @Serializable
-data class Page<T>(val total: Int = 0, val items: List<T> = emptyList())
+data class Page<T>(val total: Int = 0, val items: List<T> = emptyList(), val partial: Boolean = false)
 
 @Serializable
 data class SavedTrack(val addedAt: Long? = null, val track: Track)
@@ -295,6 +308,8 @@ data class User(
     val product: String? = null,
     val country: String? = null,
     val explicitFilter: Boolean = false,
+    /** Another user's public playlists (`catalog.user {username}`); empty for me (use the rootlist). */
+    val publicPlaylists: List<PlaylistRef> = emptyList(),
 ) {
     val isPremium: Boolean get() = product == null || product == "premium"
 }

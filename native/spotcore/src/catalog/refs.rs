@@ -105,14 +105,14 @@ pub(crate) async fn resolve(session: &Session, uris: &[String]) -> Vec<MediaRef>
         metadata::shows(session, &show_uris),
         metadata::track_map(session, &track_uris),
         metadata::episode_map(session, &episode_uris),
-        playlist::headers(session, &playlist_uris),
+        playlist::headers(session, &playlist_uris, usize::MAX),
     );
     let albums = albums.unwrap_or_default();
     let artists = artists.unwrap_or_default();
     let shows = shows.unwrap_or_default();
     let tracks = tracks.unwrap_or_default();
     let episodes = episodes.unwrap_or_default();
-    let playlists: HashMap<String, PlaylistRef> = playlists;
+    let playlists: HashMap<String, PlaylistRef> = playlists.refs;
     ordered
         .iter()
         .filter_map(|(uri, kind)| match kind {

@@ -6,6 +6,7 @@ import com.taehagen.spotifygood.data.db.ResponseCacheEntity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.filter
@@ -25,8 +26,16 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Rows hold the last successful response of a call keyed by method + arguments ([CacheKeys]).
  * Invalidation never drops data: it only marks rows stale ([invalidate]/[invalidatePrefix]) so screens
  * still open instantly and work offline, but revalidate on their next collection.
+ *
+ * Degraded responses (`partial`, docs §6.3: some item metadata failed to load) are shown but never
+ * stored as fresh: they only fill an empty row, stored stale, and the flow refetches them a few
+ * times while collected ([resourceOf]).
  */
-class ResponseCache(private val dao: ResponseCacheDao, private val json: Json) {
+class ResponseCache(
+    private val dao: ResponseCacheDao,
+    private val json: Json,
+    private val partialRetryDelayMs: Long = PARTIAL_RETRY_DELAY_MS,
+) {
     private val pruned = AtomicBoolean(false)
     private val clearListeners = CopyOnWriteArrayList<() -> Unit>()
 
@@ -60,7 +69,8 @@ class ResponseCache(private val dao: ResponseCacheDao, private val json: Json) {
         }
     }
 
-    suspend fun <T> put(key: String, serializer: KSerializer<T>, value: T): Unit = withContext(Dispatchers.Default) {
+    /** Stores [value]; a [stale] row is kept for offline display but revalidated on its next read. */
+    suspend fun <T> put(key: String, serializer: KSerializer<T>, value: T, stale: Boolean = false): Unit = withContext(Dispatchers.Default) {
         val encoded = json.encodeToString(serializer, value)
         if (encoded.length > MAX_ENTRY_CHARS) {
             // Rows above ~2 MB cannot be read back through a CursorWindow; skip instead of failing later.
@@ -69,7 +79,8 @@ class ResponseCache(private val dao: ResponseCacheDao, private val json: Json) {
             return@withContext
         }
         val now = System.currentTimeMillis()
-        dao.put(ResponseCacheEntity(key, encoded, now))
+        // Stale rows store the negated fetch time (see ResponseCacheDao.markStale).
+        dao.put(ResponseCacheEntity(key, encoded, if (stale) -now else now))
         if (pruned.compareAndSet(false, true)) {
             // Once per process: drop rows nobody has refreshed for a month.
             dao.pruneFetchedBefore(now - PRUNE_AGE_MS)
@@ -83,14 +94,24 @@ class ResponseCache(private val dao: ResponseCacheDao, private val json: Json) {
      * A fresh cache hit emits a single `Success(cached, fromCache = true)`. `maxAgeMs <= 0` forces a
      * network fetch. Failures to write the cache never fail the flow.
      */
-    fun <T> resource(key: String, serializer: KSerializer<T>, maxAgeMs: Long, fetch: suspend () -> T): Flow<Resource<T>> = flow {
+    fun <T> resource(key: String, serializer: KSerializer<T>, maxAgeMs: Long, fetch: suspend () -> T): Flow<Resource<T>> =
+        resourceOf(key, serializer, maxAgeMs) { CacheFill(fetch()) }
+
+    /**
+     * [resource] for responses that can come back degraded ([CacheFill.partial]). A partial value is
+     * emitted as `Success` but not stored as fresh: it only fills a missing row (stored stale, for
+     * offline display) and an existing row is kept for offline use. While collected, the call is
+     * then retried up to [PARTIAL_RETRIES] times (after [partialRetryDelayMs], growing); each retry
+     * emits its result, a failed retry keeps the partial value on screen.
+     */
+    fun <T> resourceOf(key: String, serializer: KSerializer<T>, maxAgeMs: Long, fetch: suspend () -> CacheFill<T>): Flow<Resource<T>> = flow {
         val cached = get(key, serializer)
         if (cached != null && isFresh(cached.second, maxAgeMs, System.currentTimeMillis())) {
             emit(Resource.Success(cached.first, fromCache = true))
             return@flow
         }
         emit(Resource.Loading(cached?.first))
-        val fresh = try {
+        var fresh = try {
             fetch()
         } catch (e: CancellationException) {
             throw e
@@ -98,25 +119,53 @@ class ResponseCache(private val dao: ResponseCacheDao, private val json: Json) {
             emit(Resource.Error(e, cached?.first))
             return@flow
         }
+        // A row from an earlier complete response is worth more offline than a partial one.
+        val keepRow = cached != null
+        store(key, serializer, fresh, keepRow)
+        emit(Resource.Success(fresh.value))
+        var attempt = 0
+        while (fresh.partial && attempt < PARTIAL_RETRIES) {
+            attempt++
+            delay(partialRetryDelayMs * attempt)
+            fresh = try {
+                fetch()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                continue // keep showing the partial value
+            }
+            store(key, serializer, fresh, keepRow)
+            emit(Resource.Success(fresh.value))
+        }
+    }.flowOn(Dispatchers.Default)
+
+    private suspend fun <T> store(key: String, serializer: KSerializer<T>, fill: CacheFill<T>, keepRow: Boolean) {
         try {
-            put(key, serializer, fresh)
+            when {
+                !fill.partial -> put(key, serializer, fill.value)
+                !keepRow -> put(key, serializer, fill.value, stale = true)
+                else -> Unit
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "Cache write failed for $key", e)
         }
-        emit(Resource.Success(fresh))
-    }.flowOn(Dispatchers.Default)
+    }
 
     /**
      * [resource] that stays subscribed: whenever [key] is invalidated while collected, it reloads
      * (Loading(cached) → Success / Error). Never completes; listens only while collected.
      */
     fun <T> live(key: String, serializer: KSerializer<T>, maxAgeMs: Long, fetch: suspend () -> T): Flow<Resource<T>> =
+        liveOf(key, serializer, maxAgeMs) { CacheFill(fetch()) }
+
+    /** [live] for responses that can come back degraded (see [resourceOf]). */
+    fun <T> liveOf(key: String, serializer: KSerializer<T>, maxAgeMs: Long, fetch: suspend () -> CacheFill<T>): Flow<Resource<T>> =
         invalidations
             .onSubscription { emit(Invalidation(key, prefix = false)) } // initial load, no missed invalidation
             .filter { it.matches(key) }
-            .flatMapLatest { resource(key, serializer, maxAgeMs, fetch) }
+            .flatMapLatest { resourceOf(key, serializer, maxAgeMs, fetch) }
 
     /** Marks [key] stale (kept for offline display, refetched on next collection) and reloads [live] flows. */
     suspend fun invalidate(key: String) {
@@ -156,12 +205,18 @@ class ResponseCache(private val dao: ResponseCacheDao, private val json: Json) {
         private const val TAG = "ResponseCache"
         private const val MAX_ENTRY_CHARS = 1_000_000
         private const val PRUNE_AGE_MS = 30L * 24 * 60 * 60 * 1000
+        /** Refetches of a partial response while it is on screen (after 15 s, then 30 s). */
+        const val PARTIAL_RETRIES = 2
+        const val PARTIAL_RETRY_DELAY_MS = 15_000L
 
         /** True when a row fetched at [fetchedAt] (`<= 0` = invalidated) is younger than [maxAgeMs] at [now]. */
         internal fun isFresh(fetchedAt: Long, maxAgeMs: Long, now: Long): Boolean =
             maxAgeMs > 0 && fetchedAt > 0 && now - fetchedAt in 0 until maxAgeMs
     }
 }
+
+/** A fetched response; [partial] when the engine marked it degraded (docs §6.3), see [ResponseCache.resourceOf]. */
+class CacheFill<out T>(val value: T, val partial: Boolean = false)
 
 /** Cache keys (method + arguments) and TTLs shared by the repositories. */
 internal object CacheKeys {

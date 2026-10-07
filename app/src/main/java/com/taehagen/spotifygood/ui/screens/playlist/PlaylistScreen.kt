@@ -58,6 +58,7 @@ import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.ui.appViewModel
 import com.taehagen.spotifygood.ui.components.DetailHeader
 import com.taehagen.spotifygood.ui.components.EmptyState
+import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.components.EpisodeRow
 import com.taehagen.spotifygood.ui.components.PlayFab
 import com.taehagen.spotifygood.ui.components.TrackRow
@@ -122,6 +123,7 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
             onPlay = viewModel::playContext,
             onShuffle = viewModel::shuffleContext,
             onSmartShuffle = viewModel::smartShuffleContext,
+            onRetryPartial = viewModel::retryPartial,
             onToggleFollow = viewModel::toggleFollow,
             onDownload = viewModel::download,
             onRemoveDownload = { viewModel.removeCollectionDownload() },
@@ -222,6 +224,7 @@ private class PlaylistActions(
     val onPlay: () -> Unit,
     val onShuffle: () -> Unit,
     val onSmartShuffle: () -> Unit,
+    val onRetryPartial: () -> Unit,
     val onToggleFollow: () -> Unit,
     val onDownload: () -> Unit,
     val onRemoveDownload: () -> Unit,
@@ -266,6 +269,10 @@ private fun PlaylistList(
     LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
         item(key = "header", contentType = "header") {
             PlaylistHeader(playlist, state, navigator, actions)
+        }
+        if (playlist.partial && !state.editMode) {
+            // Some rows are placeholders (their metadata failed right now).
+            item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = actions.onRetryPartial) }
         }
         if (!state.editMode && playlist.total > 0) {
             item(key = "filter", contentType = "filter") {
