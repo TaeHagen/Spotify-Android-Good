@@ -65,6 +65,11 @@ interface EngineHolder : AutoCloseable {
 data class EngineState(
     val session: SessionState = SessionState.STOPPED,
     val loggedIn: Boolean = false,
+    /**
+     * The logged-in user. Until a session was online in this process (a cold start without a
+     * network) only the username from the stored credentials ([knownUser]): product, country and
+     * the account's explicit filter are unknown then. Never a sign of being online ([session]).
+     */
     val user: User? = null,
     val error: NativeErrorInfo? = null,
     val nextRetryMs: Long? = null,
@@ -108,6 +113,7 @@ class SpotifyEngine(
 
     val state: StateFlow<EngineState> = _state.asStateFlow()
     val isLoggedIn: StateFlow<Boolean> = _loggedIn.asStateFlow()
+    /** [EngineState.user]: possibly only the username (offline cold start); not an online signal. */
     val user: StateFlow<User?> = _user.asStateFlow()
     /** True while the native session is ONLINE. */
     val isOnline: StateFlow<Boolean> = _online.asStateFlow()
@@ -182,7 +188,9 @@ class SpotifyEngine(
                         credentialsLoaded = true
                     }
                     val loggedIn = credentials != null
-                    updateState { it.copy(loggedIn = it.loggedIn || loggedIn) }
+                    // Known without a session: Liked Songs (Android Auto, the library row) and
+                    // the profile need the username also on a cold start without a network.
+                    updateState { it.copy(loggedIn = it.loggedIn || loggedIn, user = knownUser(it.user, credentials)) }
                     Log.i(TAG, "Credentials loaded (loggedIn=$loggedIn)")
                     reconcileLocked(acquired = false)
                 }
@@ -364,7 +372,7 @@ class SpotifyEngine(
                 credentials = result.credentials
                 credentialsLoaded = true
                 credentialsVersion.update { it + 1 }
-                updateState { it.copy(loggedIn = true) }
+                updateState { it.copy(loggedIn = true, user = knownUser(it.user, result.credentials)) }
                 if (running) stopLocked()
                 startLocked(credentials = result.credentials, accessToken = null)
             }
@@ -730,6 +738,7 @@ class SpotifyEngine(
             credentials = stored
             credentialsLoaded = true
             credentialsVersion.update { it + 1 }
+            updateState { it.copy(user = knownUser(it.user, stored)) }
             Log.i(TAG, "Reusable credentials stored")
         }
     }
@@ -776,7 +785,7 @@ class SpotifyEngine(
                 }
                 stopLocked()
                 if (credentials == null) {
-                    updateState { it.copy(loggedIn = false) }
+                    updateState { it.copy(loggedIn = false, user = null) }
                 } else {
                     reconcileLocked(acquired = false)
                 }
@@ -903,6 +912,17 @@ class SpotifyEngine(
         private fun nativeUnavailableInfo() =
             NativeErrorInfo(NativeErrorCode.INTERNAL, "The playback engine could not be loaded", context = "session")
     }
+}
+
+/**
+ * The user to show for [credentials]: [current] while it is that account (the full user once a
+ * session was online), else a username-only [User] (product, country and the account's explicit
+ * filter unknown: `isPremium` stays true, no country for downloads). Without credentials,
+ * [current] as it is.
+ */
+internal fun knownUser(current: User?, credentials: StoredCredentials?): User? {
+    val username = credentials?.username?.takeIf { it.isNotBlank() } ?: return current
+    return current?.takeIf { it.username == username } ?: User(username = username)
 }
 
 /** `session.setNetworkAvailable` args (docs/ARCHITECTURE.md §6.1); `network` only when known. */

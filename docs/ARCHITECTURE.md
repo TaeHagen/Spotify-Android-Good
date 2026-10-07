@@ -734,7 +734,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   the engine is running) → `session.setNetworkAvailable` `{available, metered, network}`, where
   `network` is the default network's handle (`Network.getNetworkHandle`, absent without one),
   so a switch of the default network without an outage reaches the engine (§4.2).
-* `state: StateFlow<EngineState>` mirrors `session` events; `user: StateFlow<User?>`.
+* `state: StateFlow<EngineState>` mirrors `session` events; `user: StateFlow<User?>`. As soon
+  as the stored credentials are loaded (also on a cold start without a network), `user` holds a
+  username-only `User` from them (Liked Songs `spotify:user:<name>:collection`, the library row,
+  Android Auto); the session's full user replaces it once online (product, country, the account's
+  explicit filter), logout and rejected credentials clear it. It is no online signal (`isOnline`).
 * Writes reusable credentials from `credentials` events to `CredentialStore`.
 
 ### 9.3 Auth
