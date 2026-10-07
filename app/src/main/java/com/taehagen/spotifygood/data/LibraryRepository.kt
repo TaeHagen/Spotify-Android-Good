@@ -51,7 +51,9 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
     }
 
     fun playlists(): Flow<Resource<Rootlist>> =
-        cache.live(CacheKeys.LIBRARY_PLAYLISTS, Rootlist.serializer(), CacheKeys.TTL_LIBRARY) { fetchRootlist() }
+        cache.liveOf(CacheKeys.LIBRARY_PLAYLISTS, Rootlist.serializer(), CacheKeys.TTL_LIBRARY) {
+            fetchRootlist().let { CacheFill(it, it.partial) }
+        }
 
     suspend fun likedTracks(offset: Int, limit: Int = 100): Page<SavedTrack> {
         val seq = saved.currentSeq()
@@ -238,7 +240,7 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
         val rootlist = if (cached != null && ResponseCache.isFresh(cached.second, CacheKeys.TTL_LIBRARY, System.currentTimeMillis())) {
             cached.first
         } else {
-            fetchRootlist().also { runCatching { cache.put(CacheKeys.LIBRARY_PLAYLISTS, Rootlist.serializer(), it) } }
+            fetchRootlist().also { if (!it.partial) runCatching { cache.put(CacheKeys.LIBRARY_PLAYLISTS, Rootlist.serializer(), it) } }
         }
         return rootlist.flatPlaylists().mapNotNullTo(HashSet()) { it.uri }
     }

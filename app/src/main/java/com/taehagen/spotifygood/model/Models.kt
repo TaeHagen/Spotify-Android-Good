@@ -245,8 +245,9 @@ data class RootlistEntry(
     val canEdit: Boolean = false,
 )
 
+/** `library.playlists`; [partial]: some playlist names could not be looked up right now and are missing. */
 @Serializable
-data class Rootlist(val items: List<RootlistEntry> = emptyList()) {
+data class Rootlist(val items: List<RootlistEntry> = emptyList(), val partial: Boolean = false) {
     /** All playlists, folders flattened (depth first). */
     fun flatPlaylists(): List<RootlistEntry> = buildList {
         fun walk(entries: List<RootlistEntry>) {
