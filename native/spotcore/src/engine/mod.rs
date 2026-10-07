@@ -98,27 +98,36 @@ pub(crate) fn offline_index_received() {
 }
 
 /// Holds a `player.load` until it can be routed knowing the downloads: the offline index of
-/// this process arrived, or the session is online (then Spirc plays everything). At most
-/// `bound`. Right after a cold start (a Bluetooth resume of a downloaded track with no network)
-/// the load can otherwise overtake Kotlin's first index push and fail as "not available offline".
+/// this process arrived, or streaming is possible (a session online and Android reporting a
+/// network: then Spirc plays everything). Returns at once in either case, else after at most
+/// `bound`. A load without a session or without a network is routed to the downloads
+/// (`connect::load`, also while the session still reads Online): right after a cold start (a
+/// Bluetooth resume of a downloaded track with no network, or the network lost before Kotlin's
+/// first index push finished) it could otherwise overtake that push and fail as "not available
+/// offline".
 pub(crate) async fn await_offline_index(bound: Duration) {
-    wait_for_offline_index(OFFLINE_INDEX_READY.subscribe(), online_watch(), is_online, bound).await;
+    let (online, network) = (online_watch(), shared().network_changes.subscribe());
+    wait_for_offline_index(OFFLINE_INDEX_READY.subscribe(), online, network, is_online, state::network_available, bound)
+        .await;
 }
 
 async fn wait_for_offline_index(
     mut ready: watch::Receiver<bool>,
     mut online: watch::Receiver<bool>,
+    mut network: watch::Receiver<()>,
     is_online: impl Fn() -> bool,
+    has_network: impl Fn() -> bool,
     bound: Duration,
 ) -> bool {
     let wait = async {
         loop {
-            if *ready.borrow_and_update() || is_online() {
+            if *ready.borrow_and_update() || (is_online() && has_network()) {
                 return;
             }
             tokio::select! {
                 r = ready.changed() => if r.is_err() { return },
                 r = online.changed() => if r.is_err() { return },
+                r = network.changed() => if r.is_err() { return },
             }
         }
     };
@@ -508,29 +517,24 @@ struct NetworkArgs {
     available: bool,
     #[serde(default)]
     metered: bool,
+    /// The default network's handle (`Network.getNetworkHandle`, NetworkMonitor).
+    #[serde(default)]
+    network: Option<i64>,
 }
 
 fn set_network_available(args: NetworkArgs) -> AppResult<Value> {
-    let outage = {
-        let mut net = shared().network.lock();
-        net.metered = args.metered;
-        let outage = if args.available {
-            if net.available { None } else { Some(net.lost_at.take().map(|t| t.elapsed()).unwrap_or(Duration::MAX)) }
-        } else {
-            if net.available {
-                net.lost_at = Some(std::time::Instant::now());
-            }
-            None
-        };
-        let changed = net.available != args.available;
-        net.available = args.available;
-        if !changed {
-            return ok();
-        }
-        outage
+    let report = shared().network.lock().report(args.available, args.metered, args.network, std::time::Instant::now());
+    let Some(msg) = report else {
+        return ok();
     };
-    log::info!("network {}", if args.available { "available" } else { "unavailable" });
-    state::send_to_supervisor(Msg::Network { available: args.available, outage });
+    match &msg {
+        Msg::Network { available, .. } => {
+            log::info!("network {}", if *available { "available" } else { "unavailable" });
+            shared().network_changes.send_replace(());
+        }
+        _ => log::info!("the default network changed"),
+    }
+    state::send_to_supervisor(msg);
     ok()
 }
 
@@ -720,29 +724,68 @@ mod tests {
 
     #[tokio::test]
     async fn a_load_waits_for_the_offline_index() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         let bound = Duration::from_millis(500);
         // Already there: no wait.
         let (ready, _) = watch::channel(true);
         let (_online_tx, online) = watch::channel(false);
-        assert!(wait_for_offline_index(ready.subscribe(), online.clone(), || false, bound).await);
+        let (network_tx, network) = watch::channel(());
+        assert!(wait_for_offline_index(ready.subscribe(), online.clone(), network.clone(), || false, || false, bound).await);
 
         // Cold start without network: the load waits until Kotlin's first push applied.
         let (ready, _) = watch::channel(false);
-        let waiter = tokio::spawn(wait_for_offline_index(ready.subscribe(), online.clone(), || false, bound));
+        let waiter = tokio::spawn(wait_for_offline_index(ready.subscribe(), online.clone(), network.clone(), || false, || false, bound));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiter.is_finished());
         ready.send_replace(true);
         assert!(waiter.await.expect("join"));
 
-        // Online: Spirc plays everything, no wait for the index.
+        // Online with a network: Spirc plays everything, no wait for the index.
         let (ready, _) = watch::channel(false);
-        assert!(wait_for_offline_index(ready.subscribe(), online.clone(), || true, bound).await);
+        assert!(wait_for_offline_index(ready.subscribe(), online.clone(), network.clone(), || true, || true, bound).await);
 
-        // Never pushed: bounded.
+        // Still online without a network (the loss grace): routed to the downloads, so it waits.
         let (ready, _) = watch::channel(false);
-        let started = std::time::Instant::now();
-        assert!(!wait_for_offline_index(ready.subscribe(), online, || false, Duration::from_millis(100)).await);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let waiter = tokio::spawn(wait_for_offline_index(ready.subscribe(), online.clone(), network.clone(), || true, || false, bound));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+        ready.send_replace(true);
+        assert!(waiter.await.expect("join"));
+
+        // ... until the network comes back (woken at once, not after the bound).
+        let (ready, _) = watch::channel(false);
+        let up = Arc::new(AtomicBool::new(false));
+        let flag = up.clone();
+        let waiter = tokio::spawn(wait_for_offline_index(
+            ready.subscribe(),
+            online.clone(),
+            network.clone(),
+            || true,
+            move || flag.load(Ordering::SeqCst),
+            Duration::from_secs(30),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+        up.store(true, Ordering::SeqCst);
+        network_tx.send_replace(());
+        assert!(tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("woken").expect("join"));
+
+        // Never pushed: bounded (also online without a network).
+        for online_now in [false, true] {
+            let (ready, _) = watch::channel(false);
+            let started = std::time::Instant::now();
+            let waited = wait_for_offline_index(
+                ready.subscribe(),
+                online.clone(),
+                network.clone(),
+                move || online_now,
+                || false,
+                Duration::from_millis(100),
+            );
+            assert!(!waited.await);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
     }
 
     #[test]

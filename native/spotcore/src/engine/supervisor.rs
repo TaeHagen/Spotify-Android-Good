@@ -4,8 +4,9 @@
 //! `Online` (watch the Spirc task, `session.is_invalid()` and the Player every 5 s) → on loss
 //! `Wait` (exponential backoff 1→60 s + jitter) → `Connect` … Terminal errors (BAD_CREDENTIALS,
 //! PREMIUM_REQUIRED) park in `Halted`; more than 10 reconnects in 10 minutes park in `Throttled`
-//! until the network changes. Every phase reacts to messages (stop, network, settings, player
-//! death) without waiting for timers; the connect attempt itself is cancellable.
+//! until the network changes (it comes back, or another network becomes the default). Every
+//! phase reacts to messages (stop, network, settings, player death) without waiting for timers;
+//! the connect attempt itself is cancellable.
 //!
 //! The backoff is reset only once a connection stayed up for `backoff::STABLE_AFTER` (or the
 //! network changes): a connection that fails right after connecting keeps backing off. The
@@ -46,6 +47,11 @@ const NETWORK_LOSS_RECHECK: Duration = Duration::from_secs(5);
 /// ... but for at most this long after the loss: the session then goes offline anyway (a Spirc
 /// whose loop hangs on the dead network keeps reporting "playing").
 const NETWORK_LOSS_MAX: Duration = Duration::from_secs(60);
+/// Another default network while Online: the connection to the AP (opened on the previous one)
+/// must answer a request within this long, else the session reconnects. Android keeps the
+/// sockets of a network that is still connected (Wi-Fi without internet), so librespot alone
+/// would notice only after its 80 s keep-alive.
+const AP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECTS_PER_WINDOW: usize = 10;
 const RECONNECT_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// How long a stopping supervisor may take for its graceful teardown before it is aborted.
@@ -59,6 +65,8 @@ const _: () = assert!(connector::TEARDOWN_BOUND.as_millis() < STOP_TIMEOUT.as_mi
 
 pub(crate) enum Msg {
     Network { available: bool, outage: Option<Duration> },
+    /// Another network became the default while one stayed available (no outage reported).
+    NetworkChanged,
     /// Retry now (a repeated `session.start`).
     Reconnect,
     Settings { old: EngineSettings },
@@ -240,6 +248,33 @@ fn no_network() -> AppError {
     AppError::new(ErrorCode::Network, "No network connection")
 }
 
+type Probe = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+
+/// Whether the AP connection of `session` still answers: a Mercury request (a keymaster token,
+/// what librespot's `TokenProvider` asks for) goes over the AP socket, and any answer, also an
+/// error status, proves the path works. No answer within [`AP_PROBE_TIMEOUT`], or a session
+/// that can't send any more, means it is dead.
+fn probe_ap(session: &Session) -> Probe {
+    let uri = format!(
+        "hm://keymaster/token/authenticated?scope=playlist-read&client_id={}&device_id={}",
+        session.client_id(),
+        session.device_id(),
+    );
+    let request = session.mercury().get(uri);
+    let session = session.clone();
+    Box::pin(async move {
+        let Ok(response) = request else { return false };
+        tokio::time::timeout(AP_PROBE_TIMEOUT, response).await.is_ok() && !session.is_invalid()
+    })
+}
+
+async fn probe_done(probe: &mut Option<Probe>) -> bool {
+    match probe {
+        Some(probe) => probe.await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The user, once the ProductInfo attributes arrived.
 fn user_of(session: &Session) -> Option<User> {
     let product = session.get_user_attribute("type")?;
@@ -304,7 +339,7 @@ impl Supervisor {
             let msg = self.rx.recv().await;
             match self.stop_requested(msg) {
                 None => return Phase::Exit,
-                Some(Msg::Network { available: true, .. }) => self.backoff.reset(),
+                Some(Msg::Network { available: true, .. } | Msg::NetworkChanged) => self.backoff.reset(),
                 Some(_) => {}
             }
         }
@@ -388,6 +423,8 @@ impl Supervisor {
                     msg = self.rx.recv() => match self.stop_requested(msg) {
                         None => break AttemptEnd::Abort(Phase::Exit),
                         Some(Msg::Network { available: false, .. }) => break AttemptEnd::Abort(Phase::Gate),
+                        // The attempt may hang on the previous network (30 s per step): start over.
+                        Some(Msg::NetworkChanged) => break AttemptEnd::Abort(Phase::Connect),
                         Some(Msg::GoOffline) if !state::network_available() => break AttemptEnd::Abort(Phase::Gate),
                         Some(Msg::Settings { .. }) if super::settings().offline => break AttemptEnd::Abort(Phase::Gate),
                         Some(_) => {}
@@ -432,7 +469,7 @@ impl Supervisor {
                 msg = self.rx.recv() => match self.stop_requested(msg) {
                     None => return Phase::Exit,
                     Some(Msg::Network { available: false, .. }) => return Phase::Gate,
-                    Some(Msg::Network { available: true, .. }) => {
+                    Some(Msg::Network { available: true, .. } | Msg::NetworkChanged) => {
                         self.backoff.reset();
                         return Phase::Connect;
                     }
@@ -534,6 +571,8 @@ impl Supervisor {
             // Lost while the attempt finished.
             network_loss.lost(Instant::now());
         }
+        // Checks the AP connection after a change of the default network.
+        let mut probe: Option<Probe> = None;
         loop {
             let loss_deadline = network_loss.deadline();
             tokio::select! {
@@ -548,6 +587,15 @@ impl Supervisor {
                         return Phase::Gate;
                     }
                     log::debug!("network lost, but this device is playing: staying online for now");
+                }
+                alive = probe_done(&mut probe) => {
+                    probe = None;
+                    if !alive {
+                        log::info!("the connection to Spotify doesn't answer after the network change: reconnecting");
+                        self.backoff.reset();
+                        return self.reconnect(live).await;
+                    }
+                    log::info!("the connection to Spotify still answers after the network change");
                 }
                 _ = spirc_ended(&mut live.device) => {
                     self.backoff.note_uptime(connected_at, std::time::Instant::now());
@@ -620,6 +668,19 @@ impl Supervisor {
                         }
                     }
                     Some(Msg::Network { available: false, .. }) => network_loss.lost(Instant::now()),
+                    Some(Msg::NetworkChanged) => {
+                        if live.session.is_invalid() {
+                            self.backoff.reset();
+                            return self.reconnect(live).await;
+                        }
+                        // Not torn down blindly: the previous network may still work (LTE stays
+                        // up for a while after Wi-Fi took over), and playback would be frozen
+                        // and restored for nothing.
+                        if probe.is_none() {
+                            log::info!("the default network changed: checking the connection to Spotify");
+                            probe = Some(probe_ap(&live.session));
+                        }
+                    }
                     Some(Msg::Reconnect) => {
                         if live.session.is_invalid() {
                             return self.reconnect(live).await;
@@ -674,27 +735,93 @@ impl Supervisor {
         });
         loop {
             let msg = self.rx.recv().await;
-            match self.stop_requested(msg) {
-                None => return Phase::Exit,
-                Some(Msg::Network { available: true, .. }) if throttled => {
-                    shared().reconnects.lock().reset();
-                    self.backoff.reset();
-                    return Phase::Connect;
-                }
-                Some(Msg::Reconnect) => {
-                    shared().reconnects.lock().reset();
-                    self.backoff.reset();
-                    return Phase::Connect;
-                }
-                Some(_) => {}
+            if let Some(next) = self.halted_next(msg, throttled) {
+                return next;
             }
         }
+    }
+
+    /// What a message does to a halted supervisor: `None` stays halted. A throttled one resumes
+    /// once the network changed (back, or another default network); `Reconnect` resumes both.
+    fn halted_next(&mut self, msg: Option<Msg>, throttled: bool) -> Option<Phase> {
+        let Some(msg) = self.stop_requested(msg) else {
+            return Some(Phase::Exit);
+        };
+        let resume = match msg {
+            Msg::Network { available: true, .. } | Msg::NetworkChanged => throttled,
+            Msg::Reconnect => true,
+            _ => false,
+        };
+        if !resume {
+            return None;
+        }
+        shared().reconnects.lock().reset();
+        self.backoff.reset();
+        Some(Phase::Connect)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn supervisor() -> Supervisor {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        Supervisor {
+            rx,
+            backoff: Backoff::default(),
+            first: false,
+            intentional: false,
+            prefer_token: false,
+            login_generation: 0,
+        }
+    }
+
+    #[test]
+    fn a_throttled_supervisor_resumes_on_another_network() {
+        let now = std::time::Instant::now();
+        let mut supervisor = supervisor();
+        for _ in 0..6 {
+            supervisor.backoff.next_delay(0.0);
+        }
+        {
+            let mut limiter = shared().reconnects.lock();
+            for _ in 0..RECONNECTS_PER_WINDOW {
+                limiter.record(now);
+            }
+            assert!(!limiter.try_acquire(now), "throttled");
+        }
+        // A captive-portal Wi-Fi stays connected while LTE becomes the default: no outage, only
+        // another network handle from NetworkMonitor.
+        let mut net = state::NetworkState { available: true, metered: false, lost_at: None, handle: Some(100) };
+        assert!(net.report(true, true, Some(100), now).is_none(), "only metered: nothing to tell");
+        let changed = net.report(true, true, Some(200), now);
+        assert!(matches!(changed, Some(Msg::NetworkChanged)));
+        assert!(matches!(supervisor.halted_next(changed, true), Some(Phase::Connect)));
+        assert!(shared().reconnects.lock().try_acquire(now), "the limit starts over");
+        assert_eq!(supervisor.backoff.next_delay(0.0), Duration::from_secs(1), "so does the backoff");
+        shared().reconnects.lock().reset();
+
+        // The network coming back resumes it too.
+        assert!(matches!(
+            supervisor.halted_next(Some(Msg::Network { available: true, outage: Some(Duration::MAX) }), true),
+            Some(Phase::Connect)
+        ));
+        shared().reconnects.lock().reset();
+    }
+
+    #[test]
+    fn a_halted_supervisor_waits_for_a_retry() {
+        let mut supervisor = supervisor();
+        // Bad credentials or no Premium: another network changes nothing.
+        assert!(supervisor.halted_next(Some(Msg::NetworkChanged), false).is_none());
+        assert!(supervisor.halted_next(Some(Msg::Network { available: true, outage: None }), false).is_none());
+        assert!(supervisor.halted_next(Some(Msg::Network { available: false, outage: None }), true).is_none());
+        assert!(matches!(supervisor.halted_next(Some(Msg::Reconnect), false), Some(Phase::Connect)));
+        assert!(matches!(supervisor.halted_next(Some(Msg::Stop), true), Some(Phase::Exit)));
+        assert!(matches!(supervisor.halted_next(None, false), Some(Phase::Exit)));
+        shared().reconnects.lock().reset();
+    }
 
     #[test]
     fn a_network_loss_goes_offline_after_the_grace() {
