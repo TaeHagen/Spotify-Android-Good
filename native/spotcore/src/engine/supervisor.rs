@@ -290,6 +290,33 @@ fn user_of(session: &Session) -> Option<User> {
     })
 }
 
+/// What this connection reported of the user (the account's own explicit filter it carried).
+#[derive(Debug, Default)]
+struct ReportedUser {
+    filter: Option<bool>,
+}
+
+impl ReportedUser {
+    fn reported(&mut self, user: Option<&User>) {
+        if let Some(user) = user {
+            self.filter = Some(user.explicit_filter);
+        }
+    }
+
+    /// The user to report now: the first one this connection knows, or a new one when the
+    /// account's own explicit filter changed since (a Family manager flips "Allow explicit
+    /// content" while connected: Spirc applies the mutation, and Kotlin persists the new value
+    /// for the offline session and the downloads).
+    fn update(&mut self, session: &Session) -> Option<User> {
+        if self.filter == Some(super::explicit::account_filter(session)) {
+            return None;
+        }
+        let user = user_of(session)?;
+        self.reported(Some(&user));
+        Some(user)
+    }
+}
+
 impl Supervisor {
     async fn run(mut self) {
         let mut phase = Phase::Gate;
@@ -560,7 +587,7 @@ impl Supervisor {
         let mut stable = false;
         let mut rename_pending = false;
         let mut declared = false;
-        let mut user_known = false;
+        let mut reported = ReportedUser::default();
         let mut verify_ticks = 0u32;
         let mut verify = interval(VERIFY_INTERVAL);
         verify.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -616,7 +643,7 @@ impl Supervisor {
                     let user = user_of(&live.session);
                     if user.is_some() || verify_ticks >= VERIFY_TICKS {
                         declared = true;
-                        user_known = user.is_some();
+                        reported.reported(user.as_ref());
                         self.declare_online(&live, user);
                         // The visibility may have changed while connecting.
                         if self.sync_device(&mut live, &mut rename_pending).await {
@@ -643,16 +670,15 @@ impl Supervisor {
                         connector::teardown(live, true).await;
                         return self.retry_after(AppError::new(ErrorCode::Network, "Connection to Spotify lost"));
                     }
-                    // Spirc may have overwritten the forced filter (a server attribute push).
+                    // A server attribute push may have changed the account's filter: the cached
+                    // catalog metadata follows the effective value.
                     super::sync_explicit_filter();
                     if self.sync_device(&mut live, &mut rename_pending).await {
                         return self.reconnect(live).await;
                     }
-                    if !user_known {
-                        if let Some(user) = user_of(&live.session) {
-                            user_known = true;
-                            update_status(|s| s.user = Some(user));
-                        }
+                    // The user once ProductInfo is in, again when the account's filter changed.
+                    if let Some(user) = reported.update(&live.session) {
+                        update_status(|s| s.user = Some(user));
                     }
                 }
                 msg = self.rx.recv() => match self.stop_requested(msg) {
@@ -783,6 +809,28 @@ mod tests {
             prefer_token: false,
             login_generation: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn a_changed_account_filter_is_reported_again() {
+        let session = Session::new(librespot_core::SessionConfig::default(), None);
+        let mut reported = ReportedUser::default();
+        assert!(reported.update(&session).is_none(), "no ProductInfo yet: nothing to report");
+        let mut attributes = std::collections::HashMap::new();
+        attributes.insert("type".to_owned(), "premium".to_owned());
+        attributes.insert("filter-explicit-content".to_owned(), "0".to_owned());
+        session.set_user_attributes(attributes);
+        let first = reported.update(&session).expect("first report");
+        assert!(!first.explicit_filter);
+        assert!(reported.update(&session).is_none(), "unchanged: once");
+        // "Hide explicit content" is the app's, not the account's: nothing new to report.
+        super::super::explicit::apply(&session, true);
+        assert!(reported.update(&session).is_none());
+        // The account's filter turns on mid-connection (Spirc flips the attribute).
+        session.set_user_attribute("filter-explicit-content", "1");
+        let again = reported.update(&session).expect("re-reported");
+        assert!(again.explicit_filter);
+        assert!(reported.update(&session).is_none());
     }
 
     #[test]

@@ -253,20 +253,26 @@ through the patched runtime setters, without recreating it: bitrate and gapless 
 load (track change), normalisation from the next audio packet.
 
 Explicit filter: `EngineSettings.filterExplicit` is OR-ed into the session's own
-`filter-explicit-content` user attribute (the account's value is kept in a private attribute
-and restored when the setting goes off). librespot reads that attribute everywhere: the Player
-refuses explicit tracks (Spirc skips them) and skips a loaded one when the filter turns on,
-the catalog returns them with `playable:false` (its cached metadata is dropped when the
-effective filter changes). Downloads ignore the app setting (they are filtered when shown and
-played) but not the account's own filter: `download.track` refuses explicit items for such an
-account (§9.7). It is applied to the live session (when it is declared online and on every health
-tick, since Spirc can overwrite it) and to the offline session the Player uses while not online.
-`User.explicitFilter` stays the account's. The offline session is never connected, so no server
-tells it the account's filter: Kotlin persists the value an online session last reported
+`filter-explicit-content` user attribute, the account's value: the setting is a separate flag
+of the session (the vendored `Session::set_filter_explicit_forced`), so the attribute stays the
+account's whatever ProductInfo, Spirc's attribute updates and its mutations (which flip the local
+value) do, and none of them can lift the setting. librespot reads the effective value
+everywhere: the Player refuses explicit tracks (Spirc skips them) and skips a loaded one when the
+filter turns on, the catalog returns them with `playable:false` (its cached metadata is dropped
+when the effective filter changes). Downloads ignore the app setting (they are filtered when
+shown and played) but not the account's own filter: `download.track` refuses explicit items for
+such an account (§9.7). It is applied to the live session, to the offline session the Player uses
+while not online, and to the session of a connect attempt, which the Player is bound to before
+the session is online (from its creation, so a download the offline queue loads or preloads
+during the attempt is filtered too). `User.explicitFilter` stays the account's, and is reported
+again when it changes while connected (a Family manager flips "Allow explicit content": checked
+on every 5 s health tick). The offline session is never connected, so no server tells it the
+account's filter: Kotlin persists the value an online session last reported
 (`Settings.accountExplicitFilter`, cleared on logout and when another account's data is removed)
-and sends it as `EngineSettings.accountFilterExplicit`, which the offline session takes as the
-account's value. Until a session reports the user again (a cold start without a network: only the
-username is known), the app's lists use the persisted value too (`explicitFilterFlow`).
+and sends it as `EngineSettings.accountFilterExplicit`, which the offline session (and a connect
+attempt's until its ProductInfo) takes as the account's value. Until a session reports the user
+again (a cold start without a network: only the username is known), the app's lists use the
+persisted value too (`explicitFilterFlow`).
 
 ### 4.4 Audio output
 
@@ -660,8 +666,9 @@ For a remote active device, smart shuffle is not supported (the command reports
 * **Visibility**: the phone is listed only while it can play. Kotlin sets `connectVisible`
   while a UI (app in the foreground), PLAYBACK or PRESENCE holder is held; a DOWNLOAD holder
   alone and the idle grace keep it hidden. Becoming visible applies at once; becoming hidden only
-  after 20 s without such a holder (`ConnectVisibility`), because becoming visible again costs a
-  re-login, so a quick switch to another app and back changes nothing. A fresh start uses the
+  after 20 s of wall time (`elapsedRealtime`, see §9.2) without such a holder
+  (`ConnectVisibility`), because becoming visible again costs a re-login, so a quick switch to
+  another app and back changes nothing. A fresh start uses the
   holders as they are (a start for downloads alone is hidden from the beginning). Hidden, the supervisor connects the Session without
   Spirc (catalog, downloads and tokens keep working). `connect` then never starts offline
   playback: `player.load`, control, queue and `connect.transfer` fail with `NOT_CONNECTED`
@@ -781,6 +788,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `DOWNLOAD` (DownloadWorker while running), `PRESENCE` (opt-in Connect presence).
 * When the first holder is acquired and credentials exist → `session.start`.
   When the last holder is released → after `IDLE_GRACE` (60 s) `session.stop`.
+* Both idle graces (the 60 s stop and the 20 s Connect hide, §8) are wall time
+  (`elapsedRealtime`): they usually start right before the phone sleeps (the app was left, the
+  paused service let go, a download job ended) and coroutine delays only count awake time. The
+  waits look at the clock at least every second of awake time, an inexact non-wakeup
+  allow-while-idle alarm at the earliest deadline (`EngineIdleAlarm`) applies them at the first
+  wake-up after it, and so does any session event. When the playback service lets go after its
+  paused lifetime (§9.4) it releases with `releaseNow()`: that lifetime was the grace, so without
+  other holders the phone is hidden and the session stopped at once.
 * With every start, the offline index (`offline.setIndex`, §6.4) is pushed right away,
   independent of the session state, and retried until it went through.
 * `NetworkMonitor` (ConnectivityManager default-network callback, registered only while
@@ -832,6 +847,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   package so the official Spotify app cannot intercept. Exchange at
   `https://accounts.spotify.com/api/token` with OkHttp. The access token goes to
   `session.start {accessToken}`; the refresh token is stored encrypted as a fallback.
+* The login Custom Tabs open in the app's own task, above `MainActivity`, which is `singleTop`:
+  leaving to read an emailed code or a 2FA app and coming back through the launcher icon
+  brings the task to the front with the login page still on top (a `singleTask` relaunch
+  cleared it, and the half-done login was lost). Every request from outside (the
+  `spotifygood://auth` redirect, `spotify:` / open.spotify.com links, shares, voice search)
+  arrives through `LinkActivity` (no UI, no history), which forwards it as a launcher intent
+  carrying the request with `CLEAR_TOP | SINGLE_TOP` to the existing `MainActivity`: the
+  redirect closes the tab, and a task a link created still has the launcher's root intent.
 * Alternative login: "Use another device" → `session.zeroconfLogin` (mDNS, MulticastLock
   only while that screen is visible: hiding the screen cancels it).
 * A finished login (`LoginState.Success`) goes back to the options as soon as the engine
@@ -1143,8 +1166,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   keeps a `.part` while an unfinished row (pending, failed, cancelled) names it, so "Retry
   failed" resumes it, and deletes files and `.part`s no row names.
 * Explicit filter: downloads are the user's content, so a filter applies when they are shown and
-  played (the Downloads screens dim explicit entries, the Player refuses them, offline too: the
-  offline session takes the account's filter as last reported, §4.3), never to download rows.
+  played (the Downloads screens dim explicit entries, the Player refuses them, offline and during
+  reconnect attempts too: those sessions take the account's filter as last reported, §4.3),
+  never to download rows.
   "Hide explicit content" never keeps an item from being downloaded; the account's own filter
   (Spotify's parental setting) does: `download.track` refuses explicit items for such an account
   and explicit members are not queued (recorded as not playable here, re-checked when the filter
@@ -1260,7 +1284,7 @@ error while ONLINE: after the next reconnect).
 | App visible | Online | yes | none unless playing | none |
 | Playing locally | Online (or offline mode) | yes | mediaPlayback | wake + Wi-Fi |
 | Paused < 10 min (wall time, `PausedIdle`) | Online | yes | mediaPlayback (Media3 timeout, bounded by an elapsed-realtime alarm) | none |
-| Paused ≥ 10 min, app background | hidden 20 s after release, stopped after 60 s | no | none | none |
+| Paused ≥ 10 min, app background | hidden and stopped when the service lets go (other releases: hidden after 20 s, stopped after 60 s, both wall time) | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
 | Presence opt-in, idle | Online | yes | connectedDevice (low-importance) | none |
