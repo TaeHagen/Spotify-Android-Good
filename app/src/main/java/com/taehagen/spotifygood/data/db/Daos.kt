@@ -34,10 +34,14 @@ data class CollectionSyncRow(
     val syncFailures: Int,
 )
 
+/** A download's files, by absolute path (any location, see `download.DownloadLocations`). */
+data class LocatedRow(val uri: String, val path: String?, val imagePath: String?)
+
 /** What the offline index needs of a completed download (no metadata JSON). */
 data class IndexRow(
     val uri: String,
     val path: String?,
+    val imagePath: String?,
     val recordJson: String?,
     val encryptedKey: ByteArray?,
     val keyVersion: Int,
@@ -148,8 +152,9 @@ interface DownloadDao {
     @Query("UPDATE downloads SET state = 'queued' WHERE state IN ('preparing','downloading')")
     suspend fun resetInterrupted()
 
+    /** Returns the rows updated: 0 when the item was removed since it was picked. */
     @Query("UPDATE downloads SET state = 'preparing', quality = :quality, error = NULL WHERE uri = :uri")
-    suspend fun markPreparing(uri: String, quality: Int)
+    suspend fun markPreparing(uri: String, quality: Int): Int
 
     /** Progress update that never overrides a final state written concurrently. */
     @Query(
@@ -244,11 +249,39 @@ interface DownloadDao {
     @Query("SELECT uri, state FROM downloads WHERE uri IN (:uris)")
     suspend fun statesOf(uris: List<String>): List<DownloadStateRow>
 
-    @Query("SELECT uri, path, recordJson, encryptedKey, keyVersion, completedAt FROM downloads WHERE state = 'completed' ORDER BY addedAt")
+    @Query("SELECT uri, path, imagePath, recordJson, encryptedKey, keyVersion, completedAt FROM downloads WHERE state = 'completed' ORDER BY addedAt")
     suspend fun completedIndexRows(): List<IndexRow>
 
-    @Query("SELECT uri, path, recordJson, encryptedKey, keyVersion, completedAt FROM downloads WHERE uri IN (:uris) AND state = 'completed'")
+    @Query("SELECT uri, path, imagePath, recordJson, encryptedKey, keyVersion, completedAt FROM downloads WHERE uri IN (:uris) AND state = 'completed'")
     suspend fun completedIndexRows(uris: List<String>): List<IndexRow>
+
+    // ---- download locations ------------------------------------------------------------------------
+
+    /** Every row's files (moving downloads to another location). */
+    @Query("SELECT uri, path, imagePath FROM downloads WHERE path IS NOT NULL OR imagePath IS NOT NULL")
+    suspend fun locatedRows(): List<LocatedRow>
+
+    /** Completed downloads' files (which ones are on a location that is not mounted). */
+    @Query("SELECT uri, path, imagePath FROM downloads WHERE state = 'completed'")
+    fun observeCompletedLocated(): Flow<List<LocatedRow>>
+
+    @Query("SELECT uri, path, imagePath FROM downloads WHERE state = 'completed'")
+    suspend fun completedLocated(): List<LocatedRow>
+
+    /** Points every row whose audio is [from] at its copy [to]; returns their URIs' count. */
+    @Query("UPDATE downloads SET path = :to WHERE path = :from")
+    suspend fun relocatePath(from: String, to: String): Int
+
+    /** Points every row whose cover is [from] at its copy [to]. */
+    @Query("UPDATE downloads SET imagePath = :to WHERE imagePath = :from")
+    suspend fun relocateImage(from: String, to: String): Int
+
+    @Query("SELECT uri FROM downloads WHERE (path = :path OR imagePath = :path) AND state = 'completed'")
+    suspend fun completedUrisUsing(path: String): List<String>
+
+    /** Rows naming [path] as their audio or cover. */
+    @Query("SELECT COUNT(*) FROM downloads WHERE path = :path OR imagePath = :path")
+    suspend fun countPathUsers(path: String): Int
 
     /**
      * Moves a Keystore-sealed key (version 0) to the data key, only while the row is still the
