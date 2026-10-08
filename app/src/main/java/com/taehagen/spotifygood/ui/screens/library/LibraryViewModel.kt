@@ -220,7 +220,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
 
     /** Saved episodes with this phone's podcast progress where it is newer than Spotify's (docs §6.5). */
     private val episodes: Flow<PagedState<Episode>> = combine(episodesLoader.state, graph.episodeProgress.version) { page, _ ->
-        page.copy(items = page.items.map(graph.episodeProgress::merge))
+        page.copy(items = page.items.map(graph.episodeProgress::overlay))
     }
 
     val state: StateFlow<LibraryUiState> = combine(
