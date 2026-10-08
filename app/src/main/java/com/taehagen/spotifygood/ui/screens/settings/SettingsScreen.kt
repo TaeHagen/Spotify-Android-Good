@@ -56,6 +56,7 @@ import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.SdCard
 import androidx.compose.material.icons.rounded.SdStorage
 import androidx.compose.material.icons.rounded.SignalCellularAlt
 import androidx.compose.material.icons.rounded.SpatialAudioOff
@@ -120,6 +121,8 @@ import com.taehagen.spotifygood.data.settings.Settings
 import com.taehagen.spotifygood.data.settings.ThemeMode
 import com.taehagen.spotifygood.engine.defaultDeviceName
 import com.taehagen.spotifygood.model.Bitrate
+import com.taehagen.spotifygood.download.DownloadLocation
+import com.taehagen.spotifygood.download.DownloadRelocation
 import com.taehagen.spotifygood.download.FailedCounts
 import com.taehagen.spotifygood.model.NormalizePregain
 import com.taehagen.spotifygood.model.User
@@ -136,6 +139,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -167,6 +171,19 @@ class SettingsViewModel(private val graph: AppGraph) : ViewModel() {
     /** Failed downloads: the retryable ones (offered by "Retry") and those not playable here. */
     val failedCounts: StateFlow<FailedCounts> = graph.downloads.failedCounts
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), FailedCounts())
+
+    /** Where downloads can go now (internal storage, mounted SD cards), with their free space. */
+    val downloadLocations: StateFlow<List<DownloadLocation>> = graph.downloads.volumeChanges
+        .map { graph.downloads.locations() }
+        .catch { emit(emptyList()) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Moving downloads to a newly chosen location. */
+    val relocation: StateFlow<DownloadRelocation> = graph.downloads.relocation
+
+    fun setDownloadLocation(id: String) {
+        graph.appScope.launch { graph.downloads.setDownloadLocation(id) }
+    }
 
     /** Audio session of the local player, for the system equalizer. */
     val audioSessionId: Int get() = graph.audioSink.audioSessionId
@@ -256,6 +273,8 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
     val usedBytes by vm.usedBytes.collectAsStateWithLifecycle()
     val downloadedCount by vm.downloadedCount.collectAsStateWithLifecycle()
     val failedCounts by vm.failedCounts.collectAsStateWithLifecycle()
+    val downloadLocations by vm.downloadLocations.collectAsStateWithLifecycle()
+    val relocation by vm.relocation.collectAsStateWithLifecycle()
     val sleepTimer by vm.sleepTimer.collectAsStateWithLifecycle()
     var dialog by remember { mutableStateOf<SettingsDialog?>(null) }
 
@@ -510,6 +529,36 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
 
             // ---- Storage
             item(key = "h_storage") { PrefHeader(stringResource(R.string.shell_settings_storage)) }
+            // Only with a choice: an SD card is mounted, or downloads are set to go to one.
+            if (downloadLocations.size > 1 || settings.downloadLocation.isNotEmpty()) {
+                item(key = "download_location") {
+                    val options = downloadLocations.map { location ->
+                        location.id to stringResource(R.string.shell_settings_download_location_option, location.label, formatBytes(context, location.freeBytes))
+                    }
+                    val chosenMissing = downloadLocations.isNotEmpty() && downloadLocations.none { it.id == settings.downloadLocation }
+                    ChoicePref(
+                        title = stringResource(R.string.shell_settings_download_location),
+                        icon = Icons.Rounded.SdCard,
+                        options = if (chosenMissing) {
+                            options + (settings.downloadLocation to stringResource(R.string.shell_settings_download_location_missing, stringResource(R.string.data_dl_location_card)))
+                        } else {
+                            options
+                        },
+                        selected = settings.downloadLocation,
+                        onSelect = { id -> vm.setDownloadLocation(id) },
+                    )
+                }
+            }
+            if (relocation.moving || relocation.error != null) {
+                item(key = "download_moving") {
+                    PrefItem(
+                        title = stringResource(if (relocation.moving) R.string.shell_settings_download_moving else R.string.shell_settings_download_move_stopped),
+                        summary = relocation.error ?: stringResource(R.string.shell_settings_download_moving_summary, relocation.moved, relocation.total),
+                        icon = Icons.Rounded.SdCard,
+                        onClick = { navigator.navigate(Route.Downloads) },
+                    )
+                }
+            }
             item(key = "cache_size") {
                 CacheSizePref(
                     valueMb = settings.streamingCacheMb,

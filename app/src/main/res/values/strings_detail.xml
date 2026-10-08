@@ -75,6 +75,10 @@
     <string name="detail_edit_playlist">Edit playlist</string>
     <string name="detail_done">Done</string>
     <string name="detail_edit_details">Edit details</string>
+    <string name="detail_playlist_public">Public playlist</string>
+    <string name="detail_playlist_private">Private playlist</string>
+    <string name="detail_playlist_collaborative">Collaborative playlist</string>
+    <string name="detail_playlist_privacy_failed">Couldn\'t change the playlist. Try again.</string>
     <string name="detail_name">Name</string>
     <string name="detail_description">Description</string>
     <string name="detail_save">Save</string>

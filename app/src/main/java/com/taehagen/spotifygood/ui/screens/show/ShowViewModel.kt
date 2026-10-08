@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.Resource
+import com.taehagen.spotifygood.data.withoutPlayedState
 import com.taehagen.spotifygood.data.dataOrNull
 import com.taehagen.spotifygood.download.CollectionRef
 import com.taehagen.spotifygood.download.CollectionType
@@ -428,7 +429,8 @@ internal class EpisodeViewModel(graph: AppGraph, private val uri: String) : Deta
         graph.downloads.items.first()
             .firstOrNull { it.uri == uri }
             ?.metadataJson
-            ?.let { graph.json.decodeFromString(Episode.serializer(), it) }
+            // Its played state is frozen at download time (docs §6.5): not Spotify's current one.
+            ?.let { graph.json.decodeFromString(Episode.serializer(), it).withoutPlayedState() }
     } catch (e: CancellationException) {
         throw e
     } catch (_: Exception) {

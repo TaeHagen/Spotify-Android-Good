@@ -52,13 +52,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.model.Playlist
 import com.taehagen.spotifygood.model.PlaylistOwner
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.ui.appViewModel
 import com.taehagen.spotifygood.ui.components.DetailHeader
 import com.taehagen.spotifygood.ui.components.EmptyState
-import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.components.EpisodeRow
+import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.components.PlayFab
 import com.taehagen.spotifygood.ui.components.TrackRow
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
@@ -66,12 +67,11 @@ import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MainNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
-import com.taehagen.spotifygood.ui.screens.album.canStartNow
 import com.taehagen.spotifygood.ui.screens.album.AddedButton
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadButton
 import com.taehagen.spotifygood.ui.screens.album.DetailActionRow
-import com.taehagen.spotifygood.ui.screens.album.DownloadedCopyNotice
 import com.taehagen.spotifygood.ui.screens.album.DetailScaffold
+import com.taehagen.spotifygood.ui.screens.album.DownloadedCopyNotice
 import com.taehagen.spotifygood.ui.screens.album.ExpandableText
 import com.taehagen.spotifygood.ui.screens.album.HeaderMetaText
 import com.taehagen.spotifygood.ui.screens.album.LoadMoreEffect
@@ -81,6 +81,7 @@ import com.taehagen.spotifygood.ui.screens.album.MoreButton
 import com.taehagen.spotifygood.ui.screens.album.PagingFooter
 import com.taehagen.spotifygood.ui.screens.album.ShuffleButton
 import com.taehagen.spotifygood.ui.screens.album.SmartShuffleButton
+import com.taehagen.spotifygood.ui.screens.album.canStartNow
 import com.taehagen.spotifygood.ui.screens.album.dataOrNull
 import com.taehagen.spotifygood.ui.screens.album.detailTopInset
 import com.taehagen.spotifygood.ui.screens.album.isRefreshing
@@ -134,6 +135,8 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
             onAddSongs = { showAddSongs = true },
             onEditDetails = { showEditDetails = true },
             onDelete = { confirmDelete = true },
+            onSetPublic = viewModel::setPublic,
+            onSetCollaborative = viewModel::setCollaborative,
             onRemoveItem = viewModel::removeItem,
             onMoveItem = viewModel::moveItem,
             onDragStart = viewModel::beginDrag,
@@ -238,6 +241,8 @@ private class PlaylistActions(
     val onAddSongs: () -> Unit,
     val onEditDetails: () -> Unit,
     val onDelete: () -> Unit,
+    val onSetPublic: (Boolean) -> Unit,
+    val onSetCollaborative: (Boolean) -> Unit,
     val onRemoveItem: (String) -> Unit,
     val onMoveItem: (Int, Int) -> Unit,
     val onDragStart: () -> Unit,
@@ -398,13 +403,19 @@ private fun PlaylistHeader(
                         onClick = { navigator.navigate(Route.Profile(owner.username)) },
                     )
                 }
-                HeaderMetaText(songsAndDuration(playlist.total, state.list.totalDurationMs))
+                val privacy = privacyLabel(meta)
+                val songs = songsAndDuration(playlist.total, state.list.totalDurationMs)
+                HeaderMetaText(if (privacy != null) "$privacy • $songs" else songs)
                 if (state.editMode) {
                     EditToolbar(
                         isOwned = meta.isOwnedByMe,
                         onAddSongs = actions.onAddSongs,
                         onEditDetails = actions.onEditDetails,
                         onDelete = actions.onDelete,
+                        isPublic = meta.isPublic,
+                        collaborative = meta.collaborative,
+                        onSetPublic = actions.onSetPublic,
+                        onSetCollaborative = actions.onSetCollaborative,
                     )
                 } else {
                     DetailActionRow(
@@ -445,6 +456,16 @@ private fun PlaylistHeader(
             }
         },
     )
+}
+
+/** "Public / Private / Collaborative playlist" for an owned playlist whose state is known. */
+@Composable
+private fun privacyLabel(meta: Playlist): String? = when {
+    !meta.isOwnedByMe -> null
+    meta.collaborative -> stringResource(R.string.detail_playlist_collaborative)
+    meta.isPublic == true -> stringResource(R.string.detail_playlist_public)
+    meta.isPublic == false -> stringResource(R.string.detail_playlist_private)
+    else -> null
 }
 
 @Composable
