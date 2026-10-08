@@ -32,6 +32,10 @@ below. `Cargo.lock`, `Cargo.toml.orig` and `.cargo_vcs_info.json` were removed, 
    the audio by speed x stall. After a fast part a slower speed kept the corrections away for
    long, and below 1x one came every second or two. A seek's wait for its data wasn't reported
    at any speed.
+7. **Stalls of streamed files.** A read that waits longer than librespot-audio's
+   `download_timeout` (8 s) for its data fails with `TimedOut`, and stock took that as a broken
+   track: it sent `EndOfTrack`, so a tunnel or a cell handover a few seconds past the buffer
+   ended the episode and Spirc went on with the next one.
 
 ## Public API added
 
@@ -75,6 +79,15 @@ impl Player {
     pub fn set_gapless(&self, gapless: bool);
     pub fn set_playback_speed(&self, speed: f64);   // the sink's speed; not finite or <= 0 => 1
 }
+// src/decoder/mod.rs
+pub enum DecoderError {
+    // ...
+    Stalled(String),                    // a read timed out waiting for the data of a streamed file
+}
+impl DecoderError {
+    pub fn is_stall(&self) -> bool;
+}
+
 pub enum PlayerEvent {
     // ...
     Unavailable { play_request_id: u64, track_id: SpotifyUri, reason: UnavailableReason }, // `reason` added
@@ -124,6 +137,10 @@ arm), which needed no change.
 | `PlayerInternal::load_track` | Named thread `lrs-loader`. Sends the full `Result`. Holds `load_handles` while spawning and inserting (stock could leak a finished thread's handle until Player drop). A failed spawn is logged instead of panicking while the guard is held (that poisoned the mutex, and the unwind's `Drop` panicked again, aborting the process); the load ends as `Unavailable(Other)`. A dropped result sender maps to `Other`. |
 | `PlayerCommand::SetPlaybackSpeed`, `Player::set_playback_speed`, `PlayerInternal::playback_speed`, `handle_set_playback_speed`, `nominal_start_time`, `lags_behind`, `valid_playback_speed` | The playback's line (`reported_nominal_start_time`) is in media time at the playback speed: `now - position / speed` at load-and-play, resume (`paused_to_playing(speed)`) and after a correction, and the playing track's line is re-based at its position when the speed changes. The packet loop reports a correction when the stream lags 1 s of media behind that line (`lags_behind`); being ahead (the sink's buffer) still isn't reported, and the skipped-packet check is unchanged. At 1x both are the stock computations. |
 | `handle_command_seek` | After the wait for the data (`preload_data_before_playback`) the line is `None`, so the first packet reports its position (`PositionCorrection`) and starts the line there. Stock started the line after the wait, so the `Seeked` position (sent before it) stayed ahead of the audio by the wait. |
+| `src/decoder/mod.rs`, `src/decoder/symphonia_decoder.rs` | `DecoderError::Stalled`, `is_stall`, `from_io`: an `io::ErrorKind::TimedOut` from symphonia (`next_packet`, and `seek` through `From<symphonia::Error>`) is a stall; every other error is the stock `SymphoniaDecoder(String)`. |
+| `STREAM_STALL_MAX`, `StreamStall`, `StallAction`, `stall_action`, `PlayerInternal::stream_stall`, packet loop, `handle_play`, `handle_pause` | A stalled read of the playing track keeps it Playing: the line is cleared (the first packet after the stall reports its position), and the next read re-seeks the decoder to the position played first (its reader may have stopped in the middle of a page). A seek that times out is another attempt. Each attempt waits in the read again, which asks again for a range whose request failed, and commands are handled between attempts. After `STREAM_STALL_MAX` (60 s, as long as the engine keeps the session up for a device that streams from its buffer) it pauses at the position played (a `Paused` event). A pause stops the waiting; a resume waits anew, still re-seeked. A session that is gone and every other decoder error send `EndOfTrack` as stock. |
+| `handle_command_seek` (stall) | The line is cleared also when the wait for the data times out (the seek's error is returned after it), and the seek starts any stall afresh. |
+| `mod spotifygood_tests` (stall) | `stall_action` (retry, pause after the bound, skip a broken track or without a session) and the mapping of a timed-out read to `Stalled`. |
 | `mod spotifygood_tests` (speed) | A simulated packet loop: a stall at 2x is corrected at the first packet once it is 1 s of media behind (stock: never), a speed change from 2x to 0.5x (and back) keeps corrections working, the 1x line is the stock one. |
 | `lock_load_handles`, `LOAD_HANDLES_POISON_MSG` | Every `load_handles` lock (loader thread, `load_track`, `Drop`) ignores poisoning (`PoisonError::into_inner`) instead of `expect`, so no panic can become a double panic in `PlayerInternal::drop`. The constant is removed. |
 
@@ -158,6 +175,11 @@ arm), which needed no change.
   (`player_host::set_playback_speed`). Corrections then come after a stall or a seek, not
   periodically; Spirc absorbs the ones on the line of the speed (see the vendored connect
   crate's item S).
+* **Stalls.** A streamed track whose data doesn't come stays Playing (the sink starves) for up
+  to `STREAM_STALL_MAX`, then pauses at the position played; the engine's restore covers a
+  session that went away. Each attempt is one blocking read of at most `download_timeout`, so
+  without a network it makes one range request about every 8 s for a minute, and a paused
+  track makes none. Downloaded and cached files never time out.
 * **`set_normalisation`** applies from the next packet: the config and knee factor are updated,
   and the current track's gain is recomputed from its normalisation data. `normalisation_type:
   Auto` still follows `set_auto_normalise_as_album`.
