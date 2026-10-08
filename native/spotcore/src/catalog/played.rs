@@ -8,11 +8,13 @@
 //! `partial`, and it never delays a page by more than [`OVERLAY_TIMEOUT`].
 //!
 //! The operation names and variables follow the web player (`queryPodcastEpisodes` for a show's
-//! episode page, `getEpisodeOrChapter` for one episode); the answer is read by walking it for
-//! Episode objects (`uri` + `playedState`), so the exact nesting does not matter.
+//! episode page, `getEpisodeOrChapter` for one episode, also a few at a time for Your Episodes);
+//! the answer is read by walking it for Episode objects (`uri` + `playedState`), so the exact
+//! nesting does not matter.
 
 use super::pathfinder;
 use crate::models::Episode;
+use futures_util::stream::{self, StreamExt};
 use librespot_core::Session;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -26,6 +28,9 @@ const EPISODE_OP: &str = "getEpisodeOrChapter";
 const OVERLAY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Single-episode lookups for at most this many episodes (an episode page, not a download batch).
 const MAX_SINGLE_LOOKUPS: usize = 2;
+/// A list of episodes (Your Episodes): at most this many looked up, this many at a time.
+const MAX_LIST_LOOKUPS: usize = 50;
+const LIST_CONCURRENCY: usize = 4;
 
 /// Spotify's resume point of one episode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +120,25 @@ pub(crate) async fn overlay_episodes(session: &Session, episodes: &mut [Episode]
     if let Ok(played) = tokio::time::timeout(OVERLAY_TIMEOUT, lookups).await {
         apply(episodes, &played);
     }
+}
+
+/// Overlays Spotify's resume points on a list of episodes from different shows (Your Episodes),
+/// one lookup per episode, a few at a time (best effort; whatever answered within
+/// [`OVERLAY_TIMEOUT`] is applied).
+pub(crate) async fn overlay_list(session: &Session, episodes: &mut [Episode]) {
+    if episodes.is_empty() || !pathfinder::has_operation(EPISODE_OP).await {
+        return;
+    }
+    let uris: Vec<String> = episodes.iter().take(MAX_LIST_LOOKUPS).map(|e| e.uri.clone()).collect();
+    let mut answers = stream::iter(uris)
+        .map(|uri| async move { query_played(session, EPISODE_OP, json!({ "uri": uri })).await })
+        .buffer_unordered(LIST_CONCURRENCY);
+    let deadline = tokio::time::Instant::now() + OVERLAY_TIMEOUT;
+    let mut played = HashMap::new();
+    while let Ok(Some(found)) = tokio::time::timeout_at(deadline, answers.next()).await {
+        played.extend(found);
+    }
+    apply(episodes, &played);
 }
 
 #[cfg(test)]

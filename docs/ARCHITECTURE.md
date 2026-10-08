@@ -619,36 +619,47 @@ partial      present (true) only when some item metadata could not be fetched ri
 resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the account's
              `playedState`). Extended metadata has none; `catalog.show` pages and `catalog.episodes`
              for one or two episodes (an episode page) overlay it from Pathfinder
-             (`queryPodcastEpisodes`, `getEpisodeOrChapter`, `catalog/played.rs`): best effort, only
+             (`queryPodcastEpisodes`, `getEpisodeOrChapter`, `catalog/played.rs`; `library.episodes`
+             pages too, a few `getEpisodeOrChapter` lookups at a time): best effort, only
              when the operation's hash is known (never triggers a hash discovery), at most 3 s, a
              failure leaves the fields out and never makes a page `partial`. Search results carry it
              when Pathfinder sends it. Kotlin keeps one resume point per episode
              (`EpisodeProgressStore`) with the time it was learned: the wall time of this phone's
              last save, or the request time of the fresh answer that brought Spotify's; the newest
              wins.
-             * Local playback of an episode is saved on pause, on a change of item, when playback
-               leaves the phone and every 15 s while playing; within 30 s of the end it is played.
+             * Playback of an episode is saved on pause, on a change of item, when it leaves the
+               device and every 15 s while playing; within 30 s of the end it is played. That is
+               this phone's playback and a remote device's this phone follows (it is its remote, or
+               handed it over): the phone's view of the account's progress. A remote position near
+               the start doesn't replace a point further on.
              * Only a fresh answer carries Spotify's state: cached show pages (fresh hits, copies
                shown while revalidating or offline) and download metadata are stripped (when
                emitted / stored / decoded). Fresh answers are observed once, where they arrive
-               (`CatalogRepository.showPage` / `episodes`, `SearchRepository.search`); an answer
+               (`CatalogRepository.showPage` / `episodes`, `SearchRepository.search`,
+               `LibraryRepository.episodes`); an answer
                requested before the last one seen is ignored, so an older page can't undo a newer
                one. Everything that shows an episode only overlays the point (no side effects).
              * A fresh state is news only when it differs from the last one seen (nothing is
                reported to Spotify, so otherwise its state lags this phone's progress); then it
-               replaces an older point (a not-started one keeps none). The first state seen after
-               an offline play only becomes the reference. A partly played state is kept when
-               nothing is.
-             * Connect: while another device plays an episode (this phone is its remote, or handed
-               it over), Spotify's next state for it is news; when this phone takes an episode over
-               (seen remote just before, or arriving far from the kept point), the next state (the
-               other device's, older than this phone's progress) only becomes the reference.
+               replaces an older point (a not-started one keeps none). With no reference yet (the
+               phone played it, nothing fresh seen since) the furthest point wins. A partly played
+               state is kept when nothing is.
+             * Connect: after a remote device's position is saved, Spotify's next state is news
+               when partly or fully played (that device may have played on after the phone stopped
+               following); a not-started one (a device that reports nothing, e.g. librespot)
+               changes nothing. When this phone takes an episode over (seen remote just before, or
+               arriving far from the kept point), the next state (the other device's, older than
+               this phone's progress) only becomes the reference.
              * Every play path resumes from the point: the app's pages (rows and the show's Play),
-               Downloads, search, Android Auto / Assistant / media browsers (their rows also carry
-               the completion status) via `PlayerController.episodeResume` for a play with no
-               position; auto-advance and next (Spirc, the offline queue) by one seek when local
-               playback arrives near the start of a partly played episode (the point isn't
-               overwritten before it lands).
+               Your Episodes, Downloads, search, Android Auto / Assistant / media browsers (their
+               rows also carry the completion status) via `PlayerController.episodeResume` for a
+               play with no position. With no point known and the session online (and no fresh
+               answer about it in the last 10 min), the load first looks Spotify's up
+               (`episodeResumeLookup`: `catalog.episodes`, at most 3.5 s). Auto-advance, next and
+               context loads (Spirc, the offline queue) seek once when local playback arrives near
+               the start of a partly played episode, after the same lookup when nothing is known
+               (nothing is saved below the point until the seek lands or the lookup answers).
+               Tapping the episode that is playing (here or on a Connect device) toggles it.
              Nothing is reported back to Spotify: progress made on this phone, offline above all,
              is not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,

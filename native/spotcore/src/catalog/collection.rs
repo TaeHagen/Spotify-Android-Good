@@ -12,6 +12,7 @@
 use super::context;
 use super::http::{self, HttpError, JSON};
 use super::metadata::{self, Fetched};
+use super::played;
 use super::playlist;
 use super::proto::collection2v2 as c2;
 use super::util::{now_ms, parse_kind, parse_uri, ParsedUri, UriKind};
@@ -700,8 +701,16 @@ pub(crate) async fn episodes(args: Value) -> AppResult<Value> {
     let snap = snapshot(&session, Set::ListenLater, LIST_MAX_AGE).await?;
     let (total, page) = window(&snap, UriKind::Episode, a.offset, a.limit.clamp(1, MAX_LIMIT));
     let fetched = metadata::episode_lookup(&session, &window_uris(&page)).await.map_err(metadata::page_error)?;
+    // Spotify's resume points (best effort, bounded; never makes the page partial).
+    let mut found: Vec<Episode> = fetched.map.values().map(|e| (**e).clone()).collect();
+    played::overlay_list(&session, &mut found).await;
+    let played: HashMap<String, Episode> = found.into_iter().map(|e| (e.uri.clone(), e)).collect();
     saved_page(total, &page, UriKind::Episode, &fetched, false, |uri, e| EpisodeItem {
-        episode: e.cloned().unwrap_or_else(|| metadata::placeholder_episode(uri)),
+        episode: played
+            .get(uri)
+            .cloned()
+            .or_else(|| e.cloned())
+            .unwrap_or_else(|| metadata::placeholder_episode(uri)),
     })
 }
 
