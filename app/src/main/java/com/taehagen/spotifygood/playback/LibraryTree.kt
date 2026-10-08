@@ -17,9 +17,12 @@ import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.RecentSearch
 import com.taehagen.spotifygood.data.Resource
 import com.taehagen.spotifygood.data.dataOrNull
+import com.taehagen.spotifygood.data.db.DownloadEntity
+import com.taehagen.spotifygood.download.CollectionType
+import com.taehagen.spotifygood.download.DownloadedCollection
+import com.taehagen.spotifygood.engine.accountExplicitFilter
 import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.ArtistRef
-import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.Image
 import com.taehagen.spotifygood.model.MediaRef
@@ -40,7 +43,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  * at most four tabs — Home (recently played + home feed), Library (Liked Songs, playlists, albums,
  * artists, podcasts), Downloads (playable offline; the only tab for offline requests) and Browse
  * (recent searches, followed artists). Spotify contexts are browsable by their uri; playable
- * children carry `ctx|<context>|<track>` ids so Spotify context semantics are kept.
+ * children carry `ctx|<context>|<track>` ids so Spotify context semantics are kept. The downloads
+ * ([OfflineTree]) are listed from the download database, a page at a time ([pagedChildren]).
  *
  * All data comes from the repositories (cached, stale-while-revalidate); every lookup is bounded
  * by a timeout so a browser never waits forever.
@@ -104,7 +108,7 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
             ALBUMS -> graph.library.albums().settle().orEmpty().mapNotNull { albumItem(it.album) }
             ARTISTS -> graph.library.artists().settle().orEmpty().mapNotNull { artistItem(it.artist) }
             PODCASTS -> graph.library.shows().settle().orEmpty().mapNotNull { showItem(it.show) }
-            DOWNLOADS -> downloads()
+            DOWNLOADS -> downloadsTab().page(0, MAX_ITEMS)
             BROWSE -> browse()
             else -> contextChildren(parentId)
         }?.take(MAX_ITEMS)
@@ -131,28 +135,191 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         return graph.library.likedTracks(0, MAX_ITEMS).items.mapNotNull { saved -> trackItem(saved.track, likedUri) }
     }
 
-    /** Newest download first, the order [com.taehagen.spotifygood.download.DownloadManager.downloadedUris] plays them in. */
-    private suspend fun downloads(): List<MediaItem> {
-        val items = withTimeoutOrNull(LOOKUP_TIMEOUT_MS) { graph.downloads.items.first() }.orEmpty()
-        return items.asReversed().filter { it.state == DownloadState.COMPLETED }.mapNotNull { item ->
-            val json = item.metadataJson ?: return@mapNotNull null
-            val image = item.imagePath?.let { artworkUri(context, it) }
-            val extras = Bundle().apply { putLong(MediaConstants.EXTRAS_KEY_DOWNLOAD_STATUS, MediaConstants.EXTRAS_VALUE_STATUS_DOWNLOADED) }
-            if (item.uri.startsWith("spotify:episode:")) {
-                val episode = runCatching { graph.json.decodeFromString<Episode>(json) }.getOrNull() ?: return@mapNotNull null
-                playable(
-                    MediaIds.downloaded(item.uri), episode.name, episode.show?.name,
-                    image ?: artwork(episode.images.ifEmpty { episode.show?.images.orEmpty() }),
-                    MediaMetadata.MEDIA_TYPE_PODCAST_EPISODE, episode.explicit, extras = extras,
-                )
-            } else {
-                val track = runCatching { graph.json.decodeFromString<Track>(json) }.getOrNull() ?: return@mapNotNull null
-                playable(
-                    MediaIds.downloaded(item.uri), track.name, track.artists.joinToString { it.name },
-                    image ?: artwork(track.album?.images.orEmpty()),
-                    MediaMetadata.MEDIA_TYPE_MUSIC, track.explicit, extras = extras,
-                )
+    // ---- offline tree: the downloads ------------------------------------------------------------
+
+    /**
+     * Children of [parentId] as page [page] of [pageSize] (Media3 paging, [OfflineTree.range]).
+     * The Downloads tab, and a downloaded collection browsed offline (or one the catalog has
+     * nothing for), come from the download database a page at a time: only the rows of the page
+     * are read. Everything else is [children], paged.
+     */
+    suspend fun pagedChildren(parentId: String, page: Int, pageSize: Int, params: LibraryParams?): List<MediaItem>? {
+        val downloads = try {
+            downloadsList(parentId, params)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Downloads of $parentId failed", e)
+            null
+        }
+        downloads ?: return children(parentId, params)?.let { OfflineTree.page(it, page, pageSize) }
+        return try {
+            downloads.page(page, pageSize)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Downloads page of $parentId failed", e)
+            null
+        }
+    }
+
+    /**
+     * Whether [parentId] is browsed from the downloads alone now: offline, a downloaded
+     * collection (the Downloads tab always is, [needsSession]). No session to wait for or start.
+     */
+    suspend fun browsesDownloads(parentId: String): Boolean =
+        isOffline() && OfflineTree.mayBeCollection(parentId) && OfflineTree.collectionOf(parentId, downloadedCollections()) != null
+
+    /** The download-backed list of [parentId]; null when it is none (not the tab, not downloaded). */
+    private suspend fun downloadsList(parentId: String, params: LibraryParams?): PagedList? {
+        if (parentId == DOWNLOADS) return downloadsTab()
+        if (!OfflineTree.mayBeCollection(parentId)) return null
+        val collection = OfflineTree.collectionOf(parentId, downloadedCollections()) ?: return null
+        if (!isOffline()) {
+            // Online the catalog's copy comes first (all of it, in its current order); the
+            // downloads when it has nothing (no session, a failed or empty answer, a cleared cache).
+            children(parentId, params)?.takeIf { it.isNotEmpty() }?.let { return PagedList.of(it) }
+        }
+        return collectionList(collection)
+    }
+
+    /** The Downloads tab, grouped as the app's Downloads screen ([OfflineTree.tab]). */
+    private suspend fun downloadsTab(): PagedList {
+        val rows = OfflineTree.tab(downloadedCollections(), downloadedUris())
+        return PagedList(rows.size) { range ->
+            val page = rows.subList(range.first, range.last + 1)
+            val stored = storedDownloads(page.mapNotNull { (it as? OfflineTree.Row.Item)?.uri })
+            val filter = explicitFilter()
+            page.mapNotNull { row ->
+                val group = context.getString(sectionTitle(row.section))
+                when (row) {
+                    is OfflineTree.Row.Collection -> downloadedCollectionItem(row.collection, group)
+                    is OfflineTree.Row.Item -> stored[row.uri]?.let { downloadedItem(it, contextUri = null, group = group, filter = filter) }
+                }
             }
+        }
+    }
+
+    /** The downloads of [collection] in collection order, as `ctx|` items (an offline load plays them in it). */
+    private suspend fun collectionList(collection: DownloadedCollection): PagedList {
+        val uris = OfflineTree.playableItems(collection, downloadedUris())
+        val ref = collection.ref
+        val contextUri = if (ref.type == CollectionType.LIKED_SONGS) likedContextUri() ?: ref.uri else ref.uri
+        return PagedList(uris.size) { range ->
+            val page = uris.subList(range.first, range.last + 1)
+            val stored = storedDownloads(page)
+            val filter = explicitFilter()
+            page.mapNotNull { uri -> stored[uri]?.let { downloadedItem(it, contextUri, group = null, filter = filter) } }
+        }
+    }
+
+    private suspend fun downloadedCollections(): List<DownloadedCollection> =
+        withTimeoutOrNull(LOOKUP_TIMEOUT_MS) { graph.downloads.collections.first() }.orEmpty()
+
+    /**
+     * The completed downloads that play, newest first ([com.taehagen.spotifygood.download.DownloadManager.downloadedUris]).
+     * Right after a cold start (Auto binds the service first) that set may not be read yet: when
+     * the database has completed downloads, wait for it.
+     */
+    private suspend fun downloadedUris(): Set<String> {
+        val hot = graph.downloads.downloadedUris
+        if (hot.value.isNotEmpty()) return hot.value
+        if (graph.database.downloads().observeCompletedUris().first().isEmpty()) return emptySet()
+        return withTimeoutOrNull(FIRST_READ_TIMEOUT_MS) { hot.first { it.isNotEmpty() } } ?: hot.value
+    }
+
+    /** The download rows of [uris] (metadata and cover stored at download time). */
+    private suspend fun storedDownloads(uris: List<String>): Map<String, DownloadEntity> {
+        if (uris.isEmpty()) return emptyMap()
+        val dao = graph.database.downloads()
+        return uris.chunked(SQL_CHUNK).flatMap { dao.getAll(it) }.associateBy { it.uri }
+    }
+
+    /**
+     * A downloaded song / episode from its stored metadata (always marked playable: [filter]
+     * (Hide explicit content) makes an explicit one unplayable, as the player refuses it), with its
+     * downloaded cover and the downloaded status; `ctx|` in [contextUri], otherwise `dl|`.
+     */
+    private fun downloadedItem(row: DownloadEntity, contextUri: String?, group: String?, filter: Boolean): MediaItem? {
+        val json = row.metadataJson ?: return null
+        val item = if (row.uri.startsWith("spotify:episode:")) {
+            val episode = runCatching { graph.json.decodeFromString<Episode>(json) }.getOrNull() ?: return null
+            episodeItem(episode.copy(playable = !(filter && episode.explicit)), contextUri, group)
+        } else {
+            val track = runCatching { graph.json.decodeFromString<Track>(json) }.getOrNull() ?: return null
+            trackItem(track.copy(playable = !(filter && track.explicit)), contextUri, group)
+        } ?: return null
+        val extras = Bundle(item.mediaMetadata.extras ?: Bundle()).apply {
+            putLong(MediaConstants.EXTRAS_KEY_DOWNLOAD_STATUS, MediaConstants.EXTRAS_VALUE_STATUS_DOWNLOADED)
+        }
+        val metadata = item.mediaMetadata.buildUpon().setExtras(extras)
+        artworkUri(context, row.imagePath)?.let(metadata::setArtworkUri)
+        return item.buildUpon()
+            .setMediaId(contextUri?.let { MediaIds.inContext(it, row.uri) } ?: MediaIds.downloaded(row.uri))
+            .setMediaMetadata(metadata.build())
+            .build()
+    }
+
+    /** A downloaded collection of the Downloads tab: browsable (its downloads) and playable (its context). */
+    private fun downloadedCollectionItem(collection: DownloadedCollection, group: String): MediaItem? {
+        val ref = collection.ref
+        val liked = ref.type == CollectionType.LIKED_SONGS
+        val title = if (liked) context.getString(R.string.playback_liked_songs) else ref.name
+        if (isPlaceholder(title)) return null
+        val extras = groupExtras(group).apply {
+            putLong(MediaConstants.EXTRAS_KEY_DOWNLOAD_STATUS, MediaConstants.EXTRAS_VALUE_STATUS_DOWNLOADED)
+        }
+        return MediaItem.Builder()
+            .setMediaId(if (liked) likedContextUri() ?: ref.uri else ref.uri)
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(title)
+                    .setArtworkUri(if (liked) resourceUri(R.drawable.pb_ic_auto_liked) else artworkUri(context, ref.imageUrl))
+                    .setIsBrowsable(true)
+                    .setIsPlayable(true)
+                    .setMediaType(
+                        when (ref.type) {
+                            CollectionType.ALBUM -> MediaMetadata.MEDIA_TYPE_ALBUM
+                            CollectionType.SHOW -> MediaMetadata.MEDIA_TYPE_PODCAST
+                            CollectionType.PLAYLIST, CollectionType.LIKED_SONGS -> MediaMetadata.MEDIA_TYPE_PLAYLIST
+                        },
+                    )
+                    .setExtras(extras)
+                    .build(),
+            )
+            .build()
+    }
+
+    @StringRes
+    private fun sectionTitle(section: OfflineTree.Section): Int = when (section) {
+        OfflineTree.Section.PLAYLISTS -> R.string.playback_playlists
+        OfflineTree.Section.ALBUMS -> R.string.playback_albums
+        OfflineTree.Section.PODCASTS -> R.string.playback_podcasts
+        OfflineTree.Section.SONGS -> R.string.playback_songs
+        OfflineTree.Section.EPISODES -> R.string.playback_episodes
+    }
+
+    private fun isOffline(): Boolean = graph.settings.settings.value.offlineMode || !graph.engine.isNetworkAvailable.value
+
+    private fun explicitFilter(): Boolean {
+        val settings = graph.settings.settings.value
+        return settings.hideExplicit || accountExplicitFilter(graph.engine.user.value, settings.accountExplicitFilter)
+    }
+
+    /** A list built a page at a time: [build] gets the indices of the page ([OfflineTree.range]). */
+    private class PagedList(
+        private val size: Int,
+        private val unpagedMax: Int = OfflineTree.UNPAGED_MAX,
+        private val build: suspend (IntRange) -> List<MediaItem>,
+    ) {
+        suspend fun page(page: Int, pageSize: Int): List<MediaItem> {
+            val range = OfflineTree.range(page, pageSize, size, unpagedMax)
+            return if (range.isEmpty()) emptyList() else build(range)
+        }
+
+        companion object {
+            /** A list already built (a catalog answer: its size is bounded). */
+            fun of(items: List<MediaItem>) = PagedList(items.size, Int.MAX_VALUE) { items.subList(it.first, it.last + 1) }
         }
     }
 
@@ -433,19 +600,40 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
             isPlayable = track.playable,
         )
 
-    private fun episodeItem(episode: Episode, contextUri: String?, group: String? = null, fallbackImages: List<Image> = emptyList()): MediaItem? =
-        playable(
-            mediaId = contextUri?.let { MediaIds.inContext(it, episode.uri) } ?: episode.uri,
-            title = episode.name,
-            subtitle = episode.show?.name,
-            artwork = artwork(episode.images.ifEmpty { episode.show?.images.orEmpty() }.ifEmpty { fallbackImages }),
+    /**
+     * An episode row, with its resume point as the car's completion status (docs §6.5). Playing it
+     * resumes there: the catalog / search answer that brought the episode already taught the store
+     * Spotify's point, and every play of an episode starts at the store's point.
+     */
+    private fun episodeItem(episode: Episode, contextUri: String?, group: String? = null, fallbackImages: List<Image> = emptyList()): MediaItem? {
+        val shown = graph.episodeProgress.overlay(episode)
+        return playable(
+            mediaId = contextUri?.let { MediaIds.inContext(it, shown.uri) } ?: shown.uri,
+            title = shown.name,
+            subtitle = shown.show?.name,
+            artwork = artwork(shown.images.ifEmpty { shown.show?.images.orEmpty() }.ifEmpty { fallbackImages }),
             mediaType = MediaMetadata.MEDIA_TYPE_PODCAST_EPISODE,
-            explicit = episode.explicit,
+            explicit = shown.explicit,
             group = group,
-            album = episode.show?.name,
-            durationMs = episode.durationMs.takeIf { it > 0 },
-            isPlayable = episode.playable,
+            album = shown.show?.name,
+            durationMs = shown.durationMs.takeIf { it > 0 },
+            extras = completionExtras(shown),
+            isPlayable = shown.playable,
         )
+    }
+
+    private fun completionExtras(episode: Episode): Bundle = Bundle().apply {
+        val position = episode.resumePositionMs ?: 0
+        when {
+            episode.fullyPlayed == true ->
+                putInt(MediaConstants.EXTRAS_KEY_COMPLETION_STATUS, MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_FULLY_PLAYED)
+            position > 0 && episode.durationMs > 0 -> {
+                putInt(MediaConstants.EXTRAS_KEY_COMPLETION_STATUS, MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_PARTIALLY_PLAYED)
+                putDouble(MediaConstants.EXTRAS_KEY_COMPLETION_PERCENTAGE, (position.toDouble() / episode.durationMs).coerceIn(0.0, 1.0))
+            }
+            else -> putInt(MediaConstants.EXTRAS_KEY_COMPLETION_STATUS, MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_NOT_PLAYED)
+        }
+    }
 
     /**
      * A track / episode row. Null for a uri-only placeholder (partial catalog page: its metadata
@@ -558,6 +746,10 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         private const val VOICE_LIMIT = 5
         private const val ARTWORK_PX = 300
         private const val LOOKUP_TIMEOUT_MS = 8_000L
+        /** Longest wait for the first read of the completed downloads (all on a card not mounted: none). */
+        private const val FIRST_READ_TIMEOUT_MS = 2_000L
+        /** Uris per download-row query (SQLite's variable limit is 999 on older devices). */
+        private const val SQL_CHUNK = 400
         /** `MediaStore.Audio.Playlists.ENTRY_CONTENT_TYPE` (the constant is deprecated). */
         private const val PLAYLIST_FOCUS = "vnd.android.cursor.item/playlist"
     }

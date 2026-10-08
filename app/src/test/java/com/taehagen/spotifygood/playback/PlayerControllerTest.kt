@@ -637,6 +637,88 @@ class PlayerControllerTest {
     }
 
     @Test
+    fun podcastLoadsPlayInOrderWithRepeatOff() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE))
+        h.snapshot.value = playingIn(playlist, shuffle = true, repeat = RepeatMode.TRACK)
+        val episode = "spotify:episode:y"
+        val loads = listOf(
+            PlayRequest(contextUri = "spotify:show:x", startUri = episode, positionMs = 5_000), // a show page row
+            PlayRequest(trackUris = listOf(episode)), // search, Auto
+            PlayRequest(contextUri = episode), // an episode page
+            PlayRequest(trackUris = listOf(t(9), episode, t(8)), startIndex = 1), // a list starting at an episode
+            PlayRequest(contextUri = "spotify:user:u:collection:your-episodes"), // Your Episodes
+        )
+        for ((i, load) in loads.withIndex()) {
+            assertTrue(h.controller.playAsync(load).await())
+            val args = h.calls[i].second
+            assertEquals("load $i", "false", args.mode("shuffle"))
+            assertEquals("load $i", "false", args.mode("smartShuffle"))
+            assertEquals("load $i", "off", args.mode("repeat"))
+        }
+        // Also with nothing loaded (explicit: a remote target turns its own modes off too).
+        val idle = Harness(this, Env(EngineReach.ONLINE))
+        assertTrue(idle.controller.playAsync(PlayRequest(contextUri = "spotify:show:x")).await())
+        assertEquals("false", idle.calls.single().second.mode("shuffle"))
+        assertEquals("off", idle.calls.single().second.mode("repeat"))
+        // Modes a podcast load names stay.
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = "spotify:show:x", shuffle = true)).await())
+        assertEquals("true", h.calls.last().second.mode("shuffle"))
+        assertEquals("off", h.calls.last().second.mode("repeat"))
+        // A playlist row of a track still keeps the music's modes.
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = "spotify:album:a", startUri = t(3))).await())
+        assertEquals("true", h.calls.last().second.mode("shuffle"))
+        assertEquals("track", h.calls.last().second.mode("repeat"))
+    }
+
+    @Test
+    fun aMusicLoadAfterAnEpisodeKeepsTheLastMusicModes() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE))
+        h.snapshot.value = playingIn(playlist, smart = true, repeat = RepeatMode.CONTEXT)
+        runCurrent()
+        // The episode now plays with its modes off.
+        h.snapshot.value = PlaybackSnapshot(
+            source = PlaybackSource.LOCAL,
+            status = PlaybackStatus.PLAYING,
+            context = com.taehagen.spotifygood.model.PlaybackContext("spotify:show:x"),
+            track = PlaybackTrack(uri = "spotify:episode:y", isEpisode = true),
+        )
+        runCurrent()
+        // A playlist row: the music's modes, not the episode's (smart shuffle in its own context).
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = playlist, startUri = t(3))).await())
+        assertEquals("true", h.calls[0].second.mode("shuffle"))
+        assertEquals("true", h.calls[0].second.mode("smartShuffle"))
+        assertEquals("context", h.calls[0].second.mode("repeat"))
+        assertTrue(h.controller.playAsync(PlayRequest(contextUri = "spotify:album:a")).await())
+        assertEquals("true", h.calls[1].second.mode("shuffle"))
+        assertEquals("false", h.calls[1].second.mode("smartShuffle"))
+        // No music seen in this process: the episode's modes are not passed on (off on this phone).
+        val fresh = Harness(this, Env(EngineReach.ONLINE))
+        fresh.snapshot.value = h.snapshot.value.copy(shuffle = true, repeat = RepeatMode.TRACK)
+        assertTrue(fresh.controller.playAsync(PlayRequest(contextUri = playlist)).await())
+        assertNull(fresh.calls.single().second["shuffle"])
+        assertNull(fresh.calls.single().second["repeat"])
+    }
+
+    @Test
+    fun radioDoesNotRepeatItsFirstTrack() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE))
+        h.snapshot.value = playingIn(playlist, shuffle = true, repeat = RepeatMode.TRACK)
+        h.respond = { method ->
+            if (method == "catalog.radio") JsonObject(mapOf("contextUri" to JsonPrimitive("spotify:playlist:radio"))) else JsonObject(emptyMap())
+        }
+        h.controller.startRadio(t(1))
+        runCurrent()
+        val load = h.calls[1].second
+        assertEquals("off", load.mode("repeat"))
+        assertEquals("true", load.mode("shuffle"))
+        // Repeat-all is kept.
+        h.snapshot.value = playingIn(playlist, repeat = RepeatMode.CONTEXT)
+        h.controller.startRadio(t(1))
+        runCurrent()
+        assertEquals("context", h.calls[3].second.mode("repeat"))
+    }
+
+    @Test
     fun aModeJustToggledIsTheOneKeptAndNothingLoadedKeepsNothing() = runTest {
         val h = Harness(this, Env(EngineReach.ONLINE))
         h.snapshot.value = playingIn(playlist)

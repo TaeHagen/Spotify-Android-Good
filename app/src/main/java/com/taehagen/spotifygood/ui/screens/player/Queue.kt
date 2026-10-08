@@ -492,6 +492,8 @@ private fun QueueBottomBar(
     onRepeat: () -> Unit,
 ) {
     val restrictions = snapshot.restrictions
+    // Podcasts have no shuffle or repeat (as on Now Playing); empty slots keep play/pause centred.
+    val episode = snapshot.track?.isEpisode == true
     Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
         Row(
             Modifier
@@ -501,12 +503,16 @@ private fun QueueBottomBar(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            ShuffleButton(
-                shuffle = snapshot.shuffle,
-                smart = snapshot.smartShuffle,
-                enabled = restrictions.canToggleShuffle,
-                onClick = onShuffle,
-            )
+            if (episode) {
+                Spacer(Modifier.size(48.dp))
+            } else {
+                ShuffleButton(
+                    shuffle = snapshot.shuffle,
+                    smart = snapshot.smartShuffle,
+                    enabled = restrictions.canToggleShuffle,
+                    onClick = onShuffle,
+                )
+            }
             PlayPauseButton(
                 status = snapshot.status,
                 onClick = onPlayPause,
@@ -515,7 +521,11 @@ private fun QueueBottomBar(
                 containerColor = MaterialTheme.colorScheme.onSurface,
                 iconColor = MaterialTheme.colorScheme.surface,
             )
-            RepeatButton(mode = snapshot.repeat, enabled = restrictions.canToggleRepeat, onClick = onRepeat)
+            if (episode) {
+                Spacer(Modifier.size(48.dp))
+            } else {
+                RepeatButton(mode = snapshot.repeat, enabled = restrictions.canToggleRepeat, onClick = onRepeat)
+            }
         }
     }
 }

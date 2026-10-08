@@ -108,9 +108,16 @@ internal object SleepSchedule {
     /** How long to keep the CPU awake when the alarm fires at [now]: until the end plus slack. */
     fun awakeMs(endsAt: Long, now: Long): Long = (endsAt - now).coerceIn(0L, LEAD_MS) + PAUSE_SLACK_MS
 
-    /** End (elapsed clock) of the current track for "end of track", slightly before its last sample. */
-    fun trackEndsAt(now: Long, durationMs: Long, positionMs: Long, marginMs: Long = SleepTimer.END_MARGIN_MS): Long =
-        now + (durationMs - positionMs - marginMs).coerceAtLeast(0)
+    /**
+     * End (elapsed clock) of the current track for "end of track", [marginMs] of wall time before
+     * its last sample: the media time left takes `left / speed` at [speed] (a podcast speed; one
+     * that is not positive and finite counts as 1x).
+     */
+    fun trackEndsAt(now: Long, durationMs: Long, positionMs: Long, speed: Double = 1.0, marginMs: Long = SleepTimer.END_MARGIN_MS): Long {
+        val rate = speed.takeIf { it > 0 && it.isFinite() } ?: 1.0
+        val left = ((durationMs - positionMs).coerceAtLeast(0) / rate).toLong()
+        return now + (left - marginMs).coerceAtLeast(0)
+    }
 }
 
 /**
@@ -179,8 +186,9 @@ class SleepTimer(
                     return@transformLatest
                 }
                 val durationMs = s.durationMs.takeIf { it > 0 } ?: track.durationMs ?: return@transformLatest
-                // Re-armed on every snapshot (seek, resume, remote position updates).
-                val endsAt = SleepSchedule.trackEndsAt(clock(), durationMs, s.positionAt())
+                // Re-armed on every snapshot (seek, resume, remote position updates, a change of
+                // the podcast speed): the media time left plays at the snapshot's speed.
+                val endsAt = SleepSchedule.trackEndsAt(clock(), durationMs, s.positionAt(), s.playbackSpeed)
                 arm(endsAt)
                 fadeUntil(endsAt)
                 emit(Unit)

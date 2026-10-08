@@ -45,6 +45,7 @@ import com.taehagen.spotifygood.App
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.Notifications
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.download.DownloadedCollection
 import com.taehagen.spotifygood.engine.EngineHolder
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.model.PlaybackSource
@@ -134,6 +135,8 @@ class PlaybackService : MediaLibraryService() {
     private val searchCache = ConcurrentHashMap<String, List<MediaItem>>()
     /** uri → downloaded cover path of completed downloads (offline artwork). */
     @Volatile private var downloadedImages: Map<String, String> = emptyMap()
+    /** The downloaded collections ([downloadedQueue]: what is downloaded on its own). */
+    @Volatile private var downloadedCollections: List<DownloadedCollection> = emptyList()
     /** The stored credentials were read: "logged out" is real from then on. */
     @Volatile private var engineReady = false
     /** Last published player error (the same instance while unchanged, so controllers see it once). */
@@ -155,12 +158,12 @@ class PlaybackService : MediaLibraryService() {
             devices = graph.devices,
             volume = coordinator.volumeSync,
             audioSessionId = graph.audioSink.audioSessionId,
-            downloadedUris = { graph.downloads.downloadedUris.value.toList() },
+            downloadedQueue = ::downloadedQueue,
             downloadedImage = { uri -> downloadedImages[uri] },
             playerError = ::currentPlayerError,
             onRetry = ::retryAfterError,
             onCommand = ::ensurePlaybackHolder,
-            podcastSpeed = { graph.podcastSpeed.speed.value },
+            podcastSpeed = { graph.podcastSpeed.inEffect.value },
             onSpeed = graph.podcastSpeed::set,
         )
 
@@ -399,7 +402,7 @@ class PlaybackService : MediaLibraryService() {
                 // Inputs of the player error.
                 graph.engine.state.map { },
                 graph.player.failure.map { },
-                graph.podcastSpeed.speed.map { },
+                graph.podcastSpeed.inEffect.map { },
             ).collect {
                 player.refresh()
                 // Runs on most wake-ups (engine and snapshot events): a cheap check of the
@@ -438,6 +441,11 @@ class PlaybackService : MediaLibraryService() {
                     triggerNotificationUpdate()
                 }
             }
+        }
+        lifecycleScope.launch {
+            graph.downloads.collections
+                .catch { Log.w(TAG, "Downloaded collections unavailable", it) }
+                .collect { downloadedCollections = it }
         }
         lifecycleScope.launch {
             // Changes only with the set of completed downloads (not on download progress).
@@ -822,14 +830,15 @@ class PlaybackService : MediaLibraryService() {
             accountLibraryError()?.let { return@future LibraryResult.ofError(it) }
             // Auto browses right after connecting, often on a cold engine: let the session come up
             // first instead of answering from an empty cache. The local parents (root, recent,
-            // downloads) never start the engine.
-            if (LibraryTree.needsSession(parentId)) {
+            // downloads) never start the engine, nor does a downloaded collection browsed offline.
+            if (LibraryTree.needsSession(parentId) && !tree.browsesDownloads(parentId)) {
                 holdForBrowsing()
                 coordinator.environment.awaitSessionStart()
             }
-            val children = tree.children(parentId, params)
+            // Paged by the tree: the downloads are read a page at a time.
+            val children = tree.pagedChildren(parentId, page, pageSize, params)
                 ?: return@future LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
-            LibraryResult.ofItemList(children.page(page, pageSize), params)
+            LibraryResult.ofItemList(ImmutableList.copyOf(children), params)
         }
 
         override fun onSearch(
@@ -941,6 +950,13 @@ class PlaybackService : MediaLibraryService() {
         if (searchCache.size >= MAX_CACHED_SEARCHES) searchCache.clear()
         searchCache[query] = results
     }
+
+    /**
+     * The downloads a `dl|` item (a song or episode the Downloads tab lists on its own) plays
+     * with: its section of the tab, newest first, as the app's Downloads screen plays it.
+     */
+    private fun downloadedQueue(startUri: String): List<String> =
+        OfflineTree.singles(graph.downloads.downloadedUris.value, downloadedCollections).sectionOf(startUri)
 
     private fun List<MediaItem>.page(page: Int, pageSize: Int): ImmutableList<MediaItem> {
         if (pageSize <= 0 || pageSize == Int.MAX_VALUE || (page <= 0 && pageSize >= size)) return ImmutableList.copyOf(this)

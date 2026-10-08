@@ -13,9 +13,14 @@ import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
 import com.taehagen.spotifygood.playback.PlaybackCoordinator
+import com.taehagen.spotifygood.playback.PodcastSpeeds
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.CopyOnWriteArraySet
+import kotlin.math.ceil
 
 /**
  * PCM output for the native librespot player (docs/ARCHITECTURE.md §3.2, §4.4).
@@ -56,8 +61,20 @@ class AudioSinkBridge(context: Context) {
     @Volatile private var track: AudioTrack? = null
     @Volatile private var started = false
     @Volatile private var preferredDevice: AudioDeviceInfo? = null
-    /** Playback speed (podcasts), pitch kept; also applied to tracks created later. */
-    @Volatile private var speed = 1f
+    /** The playback speed asked for (podcasts, pitch kept); every new track and route tries it again. */
+    @Volatile private var requestedSpeed = 1f
+    private val _speedInEffect = MutableStateFlow(1f)
+
+    /**
+     * The playback speed in effect: the speed asked for ([setPlaybackSpeed]), or the highest the
+     * output takes below it ([PodcastSpeeds.fallbacks]). It also changes by itself when a new
+     * track or a route change checks the speed asked for again (a Bluetooth output needs more
+     * buffer for a speed than the phone's speaker, and may refuse it).
+     */
+    val speedInEffect: StateFlow<Float> = _speedInEffect.asStateFlow()
+
+    /** The 1x fill level of [track] in frames (~250 ms); the fill follows the speed. Under [lock]. */
+    private var baseFrames = 0
     @Volatile private var trackVolume = 1f
     @Volatile private var duckVolume = 1f
     @Volatile private var fadeVolume = 1f
@@ -69,6 +86,7 @@ class AudioSinkBridge(context: Context) {
 
     private val routingListener = AudioRouting.OnRoutingChangedListener { router ->
         val device = router.routedDevice
+        recheckSpeed(router)
         listener?.onRoutedDeviceChanged(device)
         routingListeners.forEach { it(device) }
     }
@@ -175,21 +193,58 @@ class AudioSinkBridge(context: Context) {
      * Playback speed (podcasts, 0.5..3.5) with the pitch kept: the track consumes PCM faster or
      * slower, and the blocking [write] throttles the decoder to it, so librespot's position stays
      * media time. Applied immediately (also to the audio already buffered) and to future tracks
-     * (a track recreated after a dead object or a route change keeps it). Any thread.
+     * (a track recreated after a dead object or a route change tries it again). Returns the speed
+     * in effect ([speedInEffect]): a speed the output refuses falls back to the highest it takes
+     * below it. Without a track yet, the speed asked for (the next track checks it). Any thread.
      */
-    fun setPlaybackSpeed(value: Float) {
-        if (value == speed) return
-        speed = value
-        synchronized(lock) { track?.let(::applySpeed) }
+    fun setPlaybackSpeed(value: Float): Float = synchronized(lock) {
+        requestedSpeed = value
+        val applied = track?.let(::applySpeed) ?: value
+        _speedInEffect.value = applied
+        applied
     }
 
-    private fun applySpeed(t: AudioTrack) {
-        try {
-            t.playbackParams = PlaybackParams().setSpeed(speed).setPitch(1f)
-        } catch (e: IllegalArgumentException) {
-            Log.w(TAG, "Playback speed $speed not supported", e)
-        } catch (e: IllegalStateException) {
-            Log.w(TAG, "Playback speed not applied", e)
+    /**
+     * Applies [requestedSpeed] to [t], or the first of its [PodcastSpeeds.fallbacks] the track
+     * takes (AudioTrack refuses a speed it cannot time-stretch in its buffer), and sets the fill
+     * level for it; returns the speed in effect. Under [lock].
+     */
+    private fun applySpeed(t: AudioTrack): Float {
+        val requested = requestedSpeed
+        for (candidate in PodcastSpeeds.fallbacks(requested)) {
+            try {
+                t.playbackParams = PlaybackParams().setSpeed(candidate).setPitch(1f)
+            } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "Playback speed $candidate not supported by this output")
+                continue
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "Playback speed not applied", e)
+                break
+            }
+            setFill(t, candidate)
+            if (candidate != requested) Log.i(TAG, "Playback speed $requested refused, playing at $candidate")
+            return candidate
+        }
+        return runCatching { t.playbackParams.speed }.getOrDefault(1f)
+    }
+
+    /**
+     * The fill level of [t] for [speed]: the 1x level ([baseFrames], ~250 ms) times the speed,
+     * so the track holds ~250 ms of wall-clock audio at any speed (enough to ride out scheduling
+     * hiccups at speed, and a pause or seek still drops only that much). Under [lock].
+     */
+    private fun setFill(t: AudioTrack, speed: Float) {
+        if (baseFrames <= 0) return
+        val frames = ceil(baseFrames * maxOf(1f, speed)).toInt()
+        runCatching { t.setBufferSizeInFrames(frames) }.onFailure { Log.w(TAG, "Buffer size not set", it) }
+    }
+
+    /** A route change of [router] (the current track): the new output checks the speed asked for again. Main thread. */
+    private fun recheckSpeed(router: AudioRouting) {
+        synchronized(lock) {
+            val t = track?.takeIf { it === router } ?: return
+            if (requestedSpeed == 1f && _speedInEffect.value == 1f) return
+            _speedInEffect.value = applySpeed(t)
         }
     }
 
@@ -267,9 +322,13 @@ class AudioSinkBridge(context: Context) {
             .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
             .build()
         val minBytes = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_FLOAT)
-        // ~250 ms: enough to ride out scheduling hiccups, small enough for responsive pause/seek.
+        // Fill level ~250 ms: enough to ride out scheduling hiccups, small enough for responsive
+        // pause/seek. The capacity is sized for the fastest podcast speed, as ExoPlayer sizes its
+        // track: AudioTrack refuses a speed whose time-stretch needs more frames than the track
+        // holds (about the speed times the 1x minimum). The fill follows the speed ([setFill]).
         val targetBytes = SAMPLE_RATE / 4 * BYTES_PER_FRAME
-        val bufferBytes = maxOf(minBytes * 2, targetBytes)
+        val fillBytes = maxOf(minBytes * 2, targetBytes)
+        val bufferBytes = fillBytes * ceil(PodcastSpeeds.MAX).toInt()
         val t = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -285,7 +344,9 @@ class AudioSinkBridge(context: Context) {
             .build()
         t.preferredDevice = preferredDevice
         t.setVolume(effectiveGain())
-        if (speed != 1f) applySpeed(t)
+        baseFrames = fillBytes / BYTES_PER_FRAME
+        setFill(t, 1f)
+        _speedInEffect.value = if (requestedSpeed != 1f) applySpeed(t) else 1f
         t.addOnRoutingChangedListener(routingListener, android.os.Handler(android.os.Looper.getMainLooper()))
         return t
     }

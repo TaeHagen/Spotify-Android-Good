@@ -479,11 +479,38 @@ impl ConnectState {
     }
 
     // SPOTIFYGOOD: the position at `timestamp` as the state extrapolates it (its speed is 0 while
-    // paused)
+    // paused), as other clients see it. Spirc goes by playing_position (the state's speed may be
+    // outdated), the tests check the line of a put with it.
+    #[cfg(test)]
     pub fn extrapolated_position(&self, timestamp: i64) -> i64 {
         let player = self.player();
-        let elapsed = (timestamp - player.timestamp).max(0) as f64;
-        player.position_as_of_timestamp + (elapsed * player.playback_speed) as i64
+        let elapsed = (timestamp - player.timestamp).max(0);
+        Self::advanced(
+            player.position_as_of_timestamp,
+            elapsed,
+            player.playback_speed,
+        )
+    }
+
+    // SPOTIFYGOOD: Spirc's position while it plays (handle_pause, handle_prev, a speed change):
+    // the anchor advanced at the playing speed. The state's `playback_speed` is only brought up
+    // to date by set_status (with the next put): right after a resume it is still 0. Spirc's 1x
+    // nominal start time ran ahead of a slower playback and behind a faster one (the player only
+    // corrects a playback that lags, below 1x).
+    /// The position at `timestamp` of a playback that plays (at the playing speed)
+    pub fn playing_position(&self, timestamp: i64) -> i64 {
+        let player = self.player();
+        let elapsed = (timestamp - player.timestamp).max(0);
+        Self::advanced(
+            player.position_as_of_timestamp,
+            elapsed,
+            self.playing_speed(),
+        )
+    }
+
+    // SPOTIFYGOOD: see extrapolated_position, playing_position and update_position_in_relation
+    fn advanced(position: i64, elapsed_ms: i64, speed: f64) -> i64 {
+        (position + (elapsed_ms as f64 * speed).round() as i64).max(0)
     }
 
     pub fn update_position(&mut self, position_ms: u32, timestamp: i64) {
@@ -595,11 +622,28 @@ impl ConnectState {
         }
     }
 
+    // SPOTIFYGOOD: factored out of Spirc's send_state_put and notify
+    /// Brings the state up to date for a put: the status, the position re-anchored at `now` while
+    /// playing (on the line of its speed, see update_position_in_relation), and the time
+    pub(crate) fn prepare_put(&mut self, status: &SpircPlayStatus, now: i64) {
+        self.set_status(status);
+        if self.is_playing() {
+            self.update_position_in_relation(now);
+        }
+        self.set_now(now as u64);
+    }
+
     pub fn update_position_in_relation(&mut self, timestamp: i64) {
         let player = self.player_mut();
 
+        // SPOTIFYGOOD: at the state's speed (the playing speed, 0 while paused), like every other
+        // client extrapolates it. It added the time at 1x: above 1x (podcasts) every put moved the
+        // position back by (speed - 1) x the time since the anchor, and nothing corrected it (the
+        // player only corrects a playback that lags, below 1x). A paused position went on too.
+        // A timestamp before the anchor (a clock correction) stays on the same line.
         let diff = timestamp - player.timestamp;
-        player.position_as_of_timestamp += diff;
+        player.position_as_of_timestamp =
+            Self::advanced(player.position_as_of_timestamp, diff, player.playback_speed);
 
         if log::max_level() >= LevelFilter::Debug {
             let pos = Duration::from_millis(player.position_as_of_timestamp as u64);

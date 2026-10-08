@@ -26,32 +26,50 @@ import kotlinx.serialization.builtins.MapSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import java.io.File
+import kotlin.math.abs
 
-/** Spotify's played state of an episode, as a fresh answer reported it (its resume point). */
+// Podcast resume points (docs §6.5). One point per episode, with the time it was learned: the
+// wall time of this phone's last save, or the request time of the fresh answer that brought
+// Spotify's. The newest wins. A fresh answer counts as news only when Spotify's state differs from
+// the last one seen (nothing here is reported to Spotify, so its state otherwise lags this phone's
+// progress), and an answer requested before the last one seen is ignored. Connect handoffs mark
+// what the next fresh state means. Every play path resumes from the point.
+
+/** Spotify's played state of an episode, as a fresh answer reported it. */
 @Serializable
 data class PlayedPoint(val positionMs: Long? = null, val fullyPlayed: Boolean? = null) {
     /** Partly played: a point worth resuming from. */
     val inProgress: Boolean get() = fullyPlayed != true && (positionMs ?: 0) > 0
 }
 
-/**
- * The best known resume point of an episode: where this phone left it, or Spotify's newer one
- * ([mergeProgress]). [positionMs] (0 once [fullyPlayed]) at [updatedAt]. [server]: Spotify's
- * played state last seen live for it when this was written (null: never seen); a different live
- * one later means it was played elsewhere afterwards.
- */
+/** Where to resume an episode ([positionMs]; 0 once [fullyPlayed]) and when that was learned ([at]). */
 @Serializable
-data class EpisodeProgress(
-    val positionMs: Long,
-    val fullyPlayed: Boolean,
-    val updatedAt: Long,
-    val server: PlayedPoint? = null,
-)
+data class ResumePoint(val positionMs: Long, val fullyPlayed: Boolean, val at: Long)
+
+/** What the next fresh Spotify state means ([observeSpotify]). */
+@Serializable
+enum class SpotifyRef {
+    /** [SpotifySeen.state] is the last fresh state seen: a different one is news. */
+    STATE,
+
+    /** Playback was handed to this phone, which continues the other device's position: the next fresh state (that device's, older than this phone's progress) only becomes the reference. */
+    ADOPT_NEXT,
+
+    /** Another device played the episode: the next fresh state is news, whatever it is. */
+    NEWER_NEXT,
+}
+
+/** The last fresh Spotify state seen for an episode (requested at [at]), or a Connect handoff mark. */
+@Serializable
+data class SpotifySeen(val state: PlayedPoint? = null, val at: Long, val ref: SpotifyRef = SpotifyRef.STATE)
+
+/** What is kept for one episode: its resume [point] and what [seen] of Spotify's state. */
+@Serializable
+data class EpisodeResume(val point: ResumePoint? = null, val seen: SpotifySeen? = null)
 
 /**
  * Spotify's played state carried by this episode (null when it carries none). Only a fresh answer
- * carries one (docs §6.5): cached pages and download metadata are stripped
- * ([withoutPlayedState]), so a frozen copy can never stand for Spotify's current state.
+ * carries one: cached pages and download metadata are stripped ([withoutPlayedState]).
  */
 internal fun Episode.playedPoint(): PlayedPoint? =
     if (resumePositionMs == null && fullyPlayed == null) null else PlayedPoint(resumePositionMs, fullyPlayed)
@@ -66,44 +84,49 @@ fun Show.withoutPlayedState(): Show =
     else copy(episodes = episodes.map { it.withoutPlayedState() })
 
 /**
- * The resume point to keep for an episode after a page showed [server] (Spotify's state from a
- * fresh answer, null: none) while [local] was kept; null keeps nothing. The episode then shows
- * what is kept, or its own (Spotify's) state.
- *
- * Neither side carries a time the other could be compared with, so the live state seen when the
- * point was written ([EpisodeProgress.server]) is the reference:
- * * unchanged since: this phone's progress is newer (made here, possibly offline, never reported
- *   to Spotify) and stays;
- * * changed since: the episode was played elsewhere afterwards, and Spotify's point becomes this
- *   phone's resume point (a not-started one keeps nothing), so the downloads, Android Auto and
- *   offline plays follow it too;
- * * no reference yet (played offline before any live state was seen): this phone's stays and
- *   adopts the one seen now as its reference;
- * * nothing kept: Spotify's point is kept when the episode is partly played, so the same paths can
- *   resume it later (not-started and finished ones are not, they would only crowd out progress).
+ * What is kept for an episode after a fresh answer, requested at [fetchedAt], reported Spotify's
+ * [state] while [current] was kept (null: nothing kept, nor worth keeping).
+ * * An answer requested before (or with) the last one seen is ignored: an older page that finishes
+ *   later can't undo a newer one.
+ * * News (the state differs from the last one seen; or another device played it since; or nothing
+ *   was ever known): Spotify's point, learned at [fetchedAt], replaces an older point — unless this
+ *   phone saved progress after the request started. A not-started state keeps no point.
+ * * No news (unchanged; or the first state seen after this phone played it offline or took it
+ *   over from another device): the point stays and the state becomes the reference.
+ * Episodes never played anywhere (not started, or finished, with nothing kept) keep nothing, so
+ * browsing doesn't crowd out real points.
  */
-internal fun mergeProgress(server: PlayedPoint?, local: EpisodeProgress?, now: Long): EpisodeProgress? = when {
-    server == null -> local
-    local == null -> if (server.inProgress) spotifyPoint(server, now) else null
-    local.server == null -> local.copy(server = server)
-    local.server == server -> local
-    else -> if (server.inProgress || server.fullyPlayed == true) spotifyPoint(server, now) else null
-}
-
-private fun spotifyPoint(server: PlayedPoint, now: Long): EpisodeProgress {
-    val played = server.fullyPlayed == true
-    return EpisodeProgress(positionMs = if (played) 0 else server.positionMs ?: 0, fullyPlayed = played, updatedAt = now, server = server)
+internal fun observeSpotify(current: EpisodeResume?, state: PlayedPoint, fetchedAt: Long): EpisodeResume? {
+    val seen = current?.seen
+    if (seen != null && fetchedAt <= seen.at) return current
+    val point = current?.point
+    val news = when {
+        seen == null -> point == null
+        seen.ref == SpotifyRef.ADOPT_NEXT -> false
+        seen.ref == SpotifyRef.NEWER_NEXT -> true
+        else -> seen.state != state
+    }
+    val next = when {
+        !news -> point
+        point != null && point.at > fetchedAt -> point
+        state.fullyPlayed == true -> ResumePoint(0, fullyPlayed = true, at = fetchedAt)
+        state.inProgress -> ResumePoint(state.positionMs ?: 0, fullyPlayed = false, at = fetchedAt)
+        else -> null
+    }
+    if (current == null && (next == null || next.fullyPlayed)) return null
+    return EpisodeResume(next, SpotifySeen(state, fetchedAt))
 }
 
 /**
- * Podcast resume points (docs §6.5), per episode: progress made on this phone, or Spotify's when
- * a fresh page showed a newer one; a small JSON file in the app's files, LRU-bounded, wiped with
- * the account's data (§9.3). Nothing here is reported back to Spotify, so progress made on this
- * phone (offline above all) stays on this phone.
+ * Podcast resume points (docs §6.5), per episode ([EpisodeResume]): a small JSON file in the app's
+ * files, LRU-bounded, wiped with the account's data (§9.3). Nothing here is reported back to
+ * Spotify, so progress made on this phone (offline above all) stays on this phone.
  *
- * [record] is fed by [recordFrom] (local playback of an episode); [merge] overlays the progress on
- * an [Episode] (pages, downloads); [resumeMs] gives where a play of an episode starts. [version]
- * is bumped on every change, for live overlays. Thread-safe.
+ * Fresh answers are [observe]d once, where they arrive (the catalog and search repositories);
+ * everything that shows an episode only [overlay]s the point (no side effects); [resumeMs] is where a
+ * play of an episode starts ([com.taehagen.spotifygood.playback.PlayerController.episodeResume]);
+ * [recordFrom] records local playback, marks Connect handoffs and resumes an episode playback
+ * moved to by itself (auto-advance, next). [version] is bumped on every change. Thread-safe.
  */
 class EpisodeProgressStore internal constructor(
     private val file: File?,
@@ -115,18 +138,15 @@ class EpisodeProgressStore internal constructor(
     constructor(file: File, scope: CoroutineScope) : this(file, scope, System::currentTimeMillis)
 
     private val lock = Any()
-    /** Least recently updated first. */
-    private val entries = LinkedHashMap<String, EpisodeProgress>()
-    private val lastServer = object : LinkedHashMap<String, PlayedPoint>(64, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PlayedPoint>?) = size > MAX_SERVER_STATES
-    }
+    /** Least recently changed first. */
+    private val entries = LinkedHashMap<String, EpisodeResume>()
     /** Bumped by [clear]: a load or write that started before it must not bring the data back. */
     private var generation = 0L
     private val fileMutex = Mutex()
     private val writes = Channel<Unit>(Channel.CONFLATED)
     private val _version = MutableStateFlow(0L)
 
-    /** Bumped after every change of what [merge] / [resumeMs] give. */
+    /** Bumped after every change of what [overlay] / [resumeMs] give. */
     val version: StateFlow<Long> = _version.asStateFlow()
 
     init {
@@ -136,8 +156,31 @@ class EpisodeProgressStore internal constructor(
         }
     }
 
+    /** Learns Spotify's played state from a fresh answer requested at [fetchedAt] ([observeSpotify]). */
+    fun observe(episodes: List<Episode>, fetchedAt: Long) {
+        var changed = false
+        synchronized(lock) {
+            for (episode in episodes) {
+                val state = episode.playedPoint() ?: continue
+                val current = entries[episode.uri]
+                val next = observeSpotify(current, state, fetchedAt)
+                if (next != current) {
+                    put(episode.uri, next)
+                    changed = true
+                }
+            }
+        }
+        if (changed) changed()
+    }
+
+    /** [episode] showing its resume point, if one is kept (no side effects: safe in any combine). */
+    fun overlay(episode: Episode): Episode {
+        val point = synchronized(lock) { entries[episode.uri]?.point } ?: return episode
+        return episode.copy(resumePositionMs = point.positionMs, fullyPlayed = point.fullyPlayed)
+    }
+
     /**
-     * Records that local playback of [uri] got to [positionMs] of [durationMs]. Within
+     * Records that local playback of [uri] got to [positionMs] of [durationMs] now. Within
      * [COMPLETE_MARGIN_MS] of the end it is fully played (resumes from the start). A position of 0
      * that is not the end records nothing (a load before its seek to the resume point).
      */
@@ -145,45 +188,30 @@ class EpisodeProgressStore internal constructor(
         val finished = durationMs > 0 && positionMs >= durationMs - COMPLETE_MARGIN_MS
         if (!finished && positionMs <= 0) return
         synchronized(lock) {
-            val previous = entries.remove(uri)
-            entries[uri] = EpisodeProgress(
-                positionMs = if (finished) 0 else positionMs,
-                fullyPlayed = finished,
-                updatedAt = clock(),
-                server = lastServer[uri] ?: previous?.server,
-            )
-            while (entries.size > maxEntries) entries.remove(entries.keys.first())
+            val current = entries[uri]
+            val point = ResumePoint(if (finished) 0 else positionMs, finished, clock())
+            put(uri, EpisodeResume(point, current?.seen), touch = true)
         }
         changed()
     }
 
-    /**
-     * [episode] with the best known resume point ([mergeProgress]). Its played state, if any, must
-     * be Spotify's from a fresh answer ([playedPoint]); one without (a cached page, a download)
-     * only shows what is kept and changes nothing.
-     */
-    fun merge(episode: Episode): Episode {
-        val server = episode.playedPoint()
-        val (kept, changed) = synchronized(lock) {
-            if (server != null) lastServer[episode.uri] = server
-            val local = entries[episode.uri]
-            val next = mergeProgress(server, local, clock())
-            if (next != local) {
-                if (next == null) {
-                    entries.remove(episode.uri)
-                } else {
-                    entries[episode.uri] = next
-                    while (entries.size > maxEntries) entries.remove(entries.keys.first())
-                }
-            }
-            next to (next != local)
+    /** Another device plays [uri] (this phone is its remote, or handed it over): Spotify's next state is news. */
+    fun playedElsewhere(uri: String) = mark(uri, SpotifyRef.NEWER_NEXT)
+
+    /** This phone took [uri] over from another device: Spotify's next state is that device's, older than this phone's progress. */
+    fun continuedHere(uri: String) = mark(uri, SpotifyRef.ADOPT_NEXT)
+
+    private fun mark(uri: String, ref: SpotifyRef) {
+        synchronized(lock) {
+            val current = entries[uri]
+            if (current == null && ref == SpotifyRef.NEWER_NEXT) return // nothing kept: any state is news anyway
+            put(uri, EpisodeResume(current?.point, SpotifySeen(null, clock(), ref)))
         }
-        if (changed) changed()
-        return kept?.let { episode.copy(resumePositionMs = it.positionMs, fullyPlayed = it.fullyPlayed) } ?: episode
+        writes.trySend(Unit) // nothing shown changes
     }
 
-    /** Where a play of [uri] resumes: the best known point ([merge]); null: none, or fully played. */
-    fun resumeMs(uri: String): Long? = synchronized(lock) { entries[uri] }
+    /** Where a play of [uri] resumes; null: no point, or fully played. */
+    fun resumeMs(uri: String): Long? = synchronized(lock) { entries[uri]?.point }
         ?.takeIf { !it.fullyPlayed && it.positionMs > 0 }
         ?.positionMs
 
@@ -191,7 +219,6 @@ class EpisodeProgressStore internal constructor(
     suspend fun clear() {
         synchronized(lock) {
             entries.clear()
-            lastServer.clear()
             generation++
         }
         _version.update { it + 1 }
@@ -205,12 +232,24 @@ class EpisodeProgressStore internal constructor(
     }
 
     /**
-     * Records local playback of episodes from [snapshots] until cancelled: on pause, on a change of
-     * item (where the outgoing episode got to: the end when it finished), when playback leaves the
-     * phone, and every [SAVE_INTERVAL_MS] while one plays.
+     * Follows local playback from [snapshots] until cancelled ([EpisodeProgressTracker]): records
+     * episodes (on pause, on a change of item, when playback leaves the phone, every
+     * [SAVE_INTERVAL_MS] while one plays), marks Connect handoffs, and [seek]s an episode that
+     * playback moved to by itself (auto-advance, next) to its resume point.
      */
-    suspend fun recordFrom(snapshots: Flow<PlaybackSnapshot>, now: () -> Long = System::currentTimeMillis) {
-        val tracker = EpisodeProgressTracker(::record)
+    suspend fun recordFrom(
+        snapshots: Flow<PlaybackSnapshot>,
+        seek: (Long) -> Unit = {},
+        now: () -> Long = System::currentTimeMillis,
+    ) {
+        val tracker = EpisodeProgressTracker(object : ResumeSink {
+            override fun record(uri: String, positionMs: Long, durationMs: Long) = this@EpisodeProgressStore.record(uri, positionMs, durationMs)
+            override fun playedElsewhere(uri: String) = this@EpisodeProgressStore.playedElsewhere(uri)
+            override fun continuedHere(uri: String) = this@EpisodeProgressStore.continuedHere(uri)
+            override fun resumeMs(uri: String): Long? = this@EpisodeProgressStore.resumeMs(uri)
+            override fun pointMs(uri: String): Long? = synchronized(lock) { entries[uri]?.point }?.positionMs
+            override fun seek(positionMs: Long) = seek(positionMs)
+        })
         snapshots
             .transformLatest { s ->
                 emit(s)
@@ -222,6 +261,17 @@ class EpisodeProgressStore internal constructor(
                 }
             }
             .collect { tracker.onSnapshot(it, now()) }
+    }
+
+    /** Caller holds [lock]. [touch]: moves it to the most recent end (a play), not for marks / observations. */
+    private fun put(uri: String, value: EpisodeResume?, touch: Boolean = false) {
+        if (value == null) {
+            entries.remove(uri)
+            return
+        }
+        if (touch || uri !in entries) entries.remove(uri)
+        entries[uri] = value
+        while (entries.size > maxEntries) entries.remove(entries.keys.first())
     }
 
     private fun changed() {
@@ -239,18 +289,18 @@ class EpisodeProgressStore internal constructor(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                return // unreadable: start over
+                return // unreadable (or an older format): start over
             }
         }
         synchronized(lock) {
             if (generation != started) return
-            // Recorded before the file was read: newer.
-            val recorded = LinkedHashMap(entries)
+            // Changed before the file was read: newer.
+            val changedMeanwhile = LinkedHashMap(entries)
             entries.clear()
-            stored.entries.sortedBy { it.value.updatedAt }.forEach { (uri, progress) -> entries[uri] = progress }
-            recorded.forEach { (uri, progress) ->
+            stored.forEach { (uri, value) -> entries[uri] = value }
+            changedMeanwhile.forEach { (uri, value) ->
                 entries.remove(uri)
-                entries[uri] = progress
+                entries[uri] = value
             }
             while (entries.size > maxEntries) entries.remove(entries.keys.first())
         }
@@ -278,43 +328,131 @@ class EpisodeProgressStore internal constructor(
     private fun tmpOf(target: File) = File(target.path + ".tmp")
 
     companion object {
-        /** Episodes remembered (least recently played ones go first). */
-        const val MAX_ENTRIES = 500
-        private const val MAX_SERVER_STATES = 2_000
+        /** Episodes remembered (least recently changed ones go first). */
+        const val MAX_ENTRIES = 1_000
         /** This close to the end an episode counts as played. */
         const val COMPLETE_MARGIN_MS = 30_000L
         /** While an episode plays, its position is saved this often (as the resume state is). */
         const val SAVE_INTERVAL_MS = 15_000L
-        private val SERIALIZER = MapSerializer(String.serializer(), EpisodeProgress.serializer())
+        private val SERIALIZER = MapSerializer(String.serializer(), EpisodeResume.serializer())
         private val json = Json { ignoreUnknownKeys = true }
     }
 }
 
+/** What [EpisodeProgressTracker] drives ([EpisodeProgressStore.recordFrom]). */
+internal interface ResumeSink {
+    fun record(uri: String, positionMs: Long, durationMs: Long)
+    fun playedElsewhere(uri: String)
+    fun continuedHere(uri: String)
+    /** Where a play resumes (null: none, or fully played). */
+    fun resumeMs(uri: String): Long?
+    /** The kept point's position, also when fully played (0). */
+    fun pointMs(uri: String): Long?
+    /** Seeks the local playback. */
+    fun seek(positionMs: Long)
+}
+
 /**
- * Turns local playback snapshots into [record] calls (see [EpisodeProgressStore.recordFrom]).
- * Only episodes played on this phone count (a remote device reports its own progress); only a
- * playing or paused state has a position worth keeping (a load reports 0 before its seek).
+ * Turns playback snapshots into resume points ([ResumeSink]).
+ * * Only a playing or paused local episode has a position worth keeping (a load reports 0 before
+ *   its seek); it is recorded on every snapshot, and where the outgoing one got to when it is left
+ *   (its end when it finished or stopped there).
+ * * A remote device playing an episode (this phone is its remote, or handed it over) marks it
+ *   [ResumeSink.playedElsewhere]; local playback arriving at an episode another device was playing
+ *   (a transfer to this phone: seen remote just before, or its position is far from the kept point)
+ *   marks it [ResumeSink.continuedHere].
+ * * Local playback arriving at a partly played episode near its start by itself (auto-advance,
+ *   next: the app's own loads already start at the point) seeks to the point once; until it lands
+ *   (at most [RESUME_GRACE_MS]) nothing records the episode below it.
  */
-internal class EpisodeProgressTracker(private val record: (uri: String, positionMs: Long, durationMs: Long) -> Unit) {
+internal class EpisodeProgressTracker(private val sink: ResumeSink) {
     private var current: PlaybackSnapshot? = null
+    /** The local episode the arrival decision was made for. */
+    private var arrived: String? = null
+    /** The episode a remote device was playing, until local playback takes over. */
+    private var remoteEpisode: String? = null
+    private var pending: Pending? = null
+
+    private class Pending(val uri: String, val target: Long, val until: Long)
 
     fun onSnapshot(s: PlaybackSnapshot, nowMs: Long) {
-        val episode = s.track?.takeIf { s.source == PlaybackSource.LOCAL && it.isEpisode }
+        val local = s.source == PlaybackSource.LOCAL
+        val episodeUri = s.track?.takeIf { it.isEpisode }?.uri
         val previous = current
         if (previous != null && previous.hasPosition()) {
             val previousUri = previous.track?.uri
-            val left = previousUri != episode?.uri
+            val left = !local || previousUri != episodeUri
             // Stopped at the end (the last item): where the playing episode got to, i.e. the end.
             val stopped = !left && previous.isPlaying && s.status == PlaybackStatus.STOPPED
             if ((left || stopped) && previousUri != null) {
-                record(previousUri, previous.positionAt(nowMs), previous.durationOrTrack())
+                record(previousUri, previous.positionAt(nowMs), previous.durationOrTrack(), nowMs)
             }
         }
-        current = if (episode != null) s else null
-        if (episode != null && s.hasPosition()) record(episode.uri, s.positionAt(nowMs), s.durationOrTrack())
+        if (!local) {
+            current = null
+            arrived = null
+            pending = null
+            if (s.source == PlaybackSource.REMOTE) {
+                if (episodeUri != null && episodeUri != remoteEpisode) sink.playedElsewhere(episodeUri)
+                remoteEpisode = episodeUri
+            }
+            return
+        }
+        if (episodeUri == null) {
+            current = null
+            arrived = null
+            pending = null
+            remoteEpisode = null
+            return
+        }
+        current = s
+        if (!s.hasPosition()) return
+        val position = s.positionAt(nowMs)
+        if (arrived != episodeUri) {
+            arrived = episodeUri
+            arrive(episodeUri, position, nowMs)
+        }
+        record(episodeUri, position, s.durationOrTrack(), nowMs)
+    }
+
+    private fun arrive(uri: String, position: Long, nowMs: Long) {
+        val point = sink.pointMs(uri)
+        val handedOver = remoteEpisode == uri ||
+            (position > ARRIVAL_START_MS && abs(position - (point ?: 0)) > HANDOFF_MARGIN_MS)
+        remoteEpisode = null
+        pending = null
+        if (handedOver) {
+            sink.continuedHere(uri)
+            return
+        }
+        val resume = sink.resumeMs(uri) ?: return
+        if (position < ARRIVAL_START_MS && resume > ARRIVAL_START_MS) {
+            pending = Pending(uri, resume, nowMs + RESUME_GRACE_MS)
+            sink.seek(resume)
+        }
+    }
+
+    /** Records unless a resume seek of [uri] is pending and [position] is still below it. */
+    private fun record(uri: String, position: Long, duration: Long, nowMs: Long) {
+        val p = pending
+        if (p != null && p.uri == uri) {
+            if (position < p.target - SEEK_TOLERANCE_MS && nowMs < p.until) return
+            pending = null
+        }
+        sink.record(uri, position, duration)
     }
 
     private fun PlaybackSnapshot.hasPosition(): Boolean = status == PlaybackStatus.PLAYING || status == PlaybackStatus.PAUSED
 
     private fun PlaybackSnapshot.durationOrTrack(): Long = durationMs.takeIf { it > 0 } ?: track?.durationMs ?: 0
+
+    companion object {
+        /** An episode this close to its start was started from the beginning. */
+        const val ARRIVAL_START_MS = 5_000L
+        /** Arriving this far from the kept point means another device's position was taken over. */
+        const val HANDOFF_MARGIN_MS = 30_000L
+        /** How long a resume seek may take to land before recording resumes. */
+        const val RESUME_GRACE_MS = 10_000L
+        private const val SEEK_TOLERANCE_MS = 2_000L
+    }
 }

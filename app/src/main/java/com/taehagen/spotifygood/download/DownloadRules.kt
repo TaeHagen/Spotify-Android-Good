@@ -374,6 +374,22 @@ internal object DownloadRules {
     }
 
     /**
+     * Brings the memoised cover sources [known] (uri → source) in line with the completed downloads'
+     * current cover files [paths] (uri → path), without the ones on storage that is not mounted
+     * ([gone]): drops downloads that are gone, follows a cover that moved to another location (its
+     * URLs come from the metadata, which a move does not touch) and returns the URIs to read.
+     */
+    fun refreshCoverSources(known: MutableMap<String, CoverSource>, paths: Map<String, String?>, gone: Set<String>): List<String> {
+        known.keys.retainAll { it in paths && it !in gone }
+        known.replaceAll { uri, source -> paths[uri].let { if (it != source.imagePath) source.copy(imagePath = it) else source } }
+        return paths.keys.filter { it !in known && it !in gone }
+    }
+
+    /** uri → cover file of the completed downloads that can be shown (not on a card that went). */
+    fun downloadedImagesOf(paths: Map<String, String?>, gone: Set<String>): Map<String, String> =
+        paths.mapNotNull { (uri, path) -> path?.takeIf { uri !in gone }?.let { uri to it } }.toMap()
+
+    /**
      * [CoverMaps] for completed [downloads] and downloaded [collections] (their image URL and
      * members in order): each URL of a download maps to its cover file; a collection image URL no
      * download shows falls back to the cover of its first downloaded member (for an album exactly its
@@ -638,6 +654,32 @@ internal object DownloadRules {
 
     /** Of [paths], those under location root [root]. */
     fun pathsUnder(root: String, paths: Collection<String>): List<String> = paths.filter { rootOf(it) == root }
+
+    /** Where a download run stands with its location ([storageCheck]). */
+    enum class StorageCheck { OK, LOCATION_MISSING, CARD_FULL, INTERNAL_FULL }
+
+    /**
+     * Whether downloads can go to the location at [root] (null: the chosen card is not mounted)
+     * with [freeBytes] there; [internalRoot] tells internal storage from a card.
+     */
+    fun storageCheck(root: String?, internalRoot: String, freeBytes: () -> Long): StorageCheck = when {
+        root == null -> StorageCheck.LOCATION_MISSING
+        freeBytes() >= MIN_FREE_BYTES -> StorageCheck.OK
+        normalizeRoot(root) == normalizeRoot(internalRoot) -> StorageCheck.INTERNAL_FULL
+        else -> StorageCheck.CARD_FULL
+    }
+
+    /**
+     * How a run ends for [check] (null: it goes on). A card that is missing or full stops it: the
+     * hosts have no constraint that would wait for a card, and a mount, a change of location, the
+     * app coming back or "Retry" schedule the queue again. Full internal storage reschedules: the
+     * hosts wait until storage is not low.
+     */
+    fun storageOutcome(check: StorageCheck): RunOutcome? = when (check) {
+        StorageCheck.OK -> null
+        StorageCheck.LOCATION_MISSING, StorageCheck.CARD_FULL -> RunOutcome.STOPPED
+        StorageCheck.INTERNAL_FULL -> RunOutcome.RESCHEDULE
+    }
 
     /** A file to move to the download location. */
     data class FileMove(val from: String, val to: String, val image: Boolean)

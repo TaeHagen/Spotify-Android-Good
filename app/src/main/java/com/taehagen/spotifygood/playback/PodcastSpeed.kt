@@ -67,6 +67,33 @@ internal object PodcastSpeeds {
     }
 
     fun same(a: Float, b: Float): Boolean = abs(a - b) < 0.001f
+
+    /**
+     * The speeds to try for [speed] on an output that may refuse it: [speed], then the steps
+     * between it and normal speed from the closest on, then normal speed. The first one the
+     * output takes is the highest it supports up to [speed] (an AudioTrack needs more buffer the
+     * faster it plays).
+     */
+    fun fallbacks(speed: Float): List<Float> = buildList {
+        add(speed)
+        when {
+            speed > NORMAL -> STEPS.filter { it < speed && !same(it, speed) && it > NORMAL && !same(it, NORMAL) }.sortedDescending()
+            speed < NORMAL -> STEPS.filter { it > speed && !same(it, speed) && it < NORMAL && !same(it, NORMAL) }.sorted()
+            else -> emptyList()
+        }.let(::addAll)
+        if (!same(speed, NORMAL)) add(NORMAL)
+    }
+
+    /**
+     * Whether the output is known to refuse [step]: [inEffect] fell back from [chosen], so every
+     * speed from it toward [chosen] was refused ([fallbacks]), and one beyond [chosen] needs even
+     * more. Nothing is known while the chosen speed plays.
+     */
+    fun refused(step: Float, chosen: Float, inEffect: Float): Boolean = when {
+        same(chosen, inEffect) || same(step, inEffect) -> false
+        chosen > inEffect -> step > inEffect
+        else -> step < inEffect
+    }
 }
 
 /**
@@ -77,13 +104,21 @@ internal object PodcastSpeeds {
  * episode and music or between this phone and another device. The engine's position stays media
  * time (the decoder is throttled by the sink), and its snapshots and Spotify Connect state carry
  * the speed, so positions extrapolate at the real rate here and on the other clients.
+ *
+ * The sink decides: an output may refuse a speed (AudioTrack needs more buffer the faster it
+ * plays, a Bluetooth output more than the speaker), and then plays the highest it takes below
+ * it. The engine is told only the speed the sink plays at, also when it changes by itself (a new
+ * track or output), and [inEffect] shows it; the chosen speed stays, and is tried again on every
+ * new track and output.
  */
 class PodcastSpeed internal constructor(
     private val scope: CoroutineScope,
     snapshots: Flow<PlaybackSnapshot>,
     private val store: DataStore<Preferences>,
-    /** Applies a speed to the sink. */
-    private val applyToSink: (Float) -> Unit,
+    /** Applies a speed to the sink; returns the speed in effect (published on [sinkSpeed] too). */
+    private val applyToSink: (Float) -> Float,
+    /** The speed the sink plays at; it may change by itself (a new track or output checks it again). */
+    private val sinkSpeed: StateFlow<Float>,
     /** Reports a speed to the engine (`player.setSpeed`); it starts at normal speed. */
     private val report: (Float) -> Unit,
 ) {
@@ -92,6 +127,7 @@ class PodcastSpeed internal constructor(
         playback.snapshot,
         context.applicationContext.speedDataStore,
         sink::setPlaybackSpeed,
+        sink.speedInEffect,
         { speed -> rpc.fire("player.setSpeed", buildJsonObject { put("speed", speed.toDouble()) }) },
     )
 
@@ -104,6 +140,14 @@ class PodcastSpeed internal constructor(
     /** The chosen podcast speed. */
     val speed: StateFlow<Float> = _speed.asStateFlow()
 
+    private val _inEffect = MutableStateFlow(PodcastSpeeds.NORMAL)
+
+    /**
+     * The speed an episode plays at here: while one plays, the speed the sink took (the chosen
+     * one, or the highest the output takes below it); otherwise the chosen speed.
+     */
+    val inEffect: StateFlow<Float> = _inEffect.asStateFlow()
+
     init {
         scope.launch {
             try {
@@ -114,13 +158,23 @@ class PodcastSpeed internal constructor(
             }
         }
         scope.launch {
-            combine(snapshots.map(PodcastSpeeds::appliesTo).distinctUntilChanged(), _speed) { episode, chosen ->
-                if (episode) chosen else PodcastSpeeds.NORMAL
-            }.distinctUntilChanged().collect { speed ->
-                applyToSink(speed)
-                if (!PodcastSpeeds.same(speed, reported)) {
-                    reported = speed
-                    report(speed)
+            // The target speed last applied to the sink.
+            var applied: Float? = null
+            combine(snapshots.map(PodcastSpeeds::appliesTo).distinctUntilChanged(), _speed, sinkSpeed) { episode, chosen, _ ->
+                episode to chosen
+            }.collect { (episode, chosen) ->
+                val target = if (episode) chosen else PodcastSpeeds.NORMAL
+                val playing = if (applied?.let { PodcastSpeeds.same(it, target) } != true) {
+                    applied = target
+                    applyToSink(target)
+                } else {
+                    // The sink changed by itself: what it plays at now (never an older value).
+                    sinkSpeed.value
+                }
+                _inEffect.value = if (episode) playing else chosen
+                if (!PodcastSpeeds.same(playing, reported)) {
+                    reported = playing
+                    report(playing)
                 }
             }
         }
