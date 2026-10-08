@@ -87,6 +87,9 @@ internal class AudioFocusController(context: Context, callbacks: Callbacks) {
     /** True while a transient loss is pending a resume (keep focus requested meanwhile). */
     val isWaitingForGain: Boolean get() = state.isWaitingForGain
 
+    /** The output went away (becoming noisy): a later GAIN must not resume on another one. */
+    fun cancelPendingResume() = state.cancelPendingResume()
+
     companion object {
         private const val TAG = "AudioFocus"
         const val DUCK_VOLUME = 0.2f
@@ -153,6 +156,11 @@ internal class AudioFocusState(
                 false
             }
         }
+    }
+
+    /** Drops the auto-resume of a transient loss (the output went away meanwhile). */
+    fun cancelPendingResume() {
+        resumeOnGainUntil = 0L
     }
 
     fun abandon() {

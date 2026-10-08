@@ -82,6 +82,9 @@ pub(crate) struct LocalLoad {
     pub generation: u64,
     pub at: Instant,
     pub args: LoadArgs,
+    /// Loads sent before it that hadn't played or failed (an earlier user load, the restore's, a
+    /// hand-back's): their failures come first (the Spirc handles loads in order).
+    pub ahead: u32,
 }
 
 /// See [`HubState::handing_back`].
@@ -225,11 +228,30 @@ pub(crate) fn forget_hand_back() {
     HUB.lock().handing_back = None;
 }
 
-/// A user load (`args`) was sent to the attached Spirc (see [`HubState::loading`]).
+/// A user load (`args`) is sent to the attached Spirc (see [`HubState::loading`]). Called before
+/// the load replaces the restore or a hand-back: their loads, already sent, count as ahead of it.
 pub(crate) fn set_loading(args: &LoadArgs) {
     let mut hub = HUB.lock();
-    if let Some(generation) = hub.link.as_ref().map(|l| l.generation) {
-        hub.loading = Some(LocalLoad { generation, at: Instant::now(), args: args.clone() });
+    let link = hub.link.as_ref().map(|l| l.generation);
+    let now = Instant::now();
+    let ahead = loads_ahead(&hub, link, now);
+    hub.loading = link.map(|generation| LocalLoad { generation, at: now, args: args.clone(), ahead });
+}
+
+/// The loads sent to the attached Spirc (`link`) that haven't played or failed yet: the Spirc
+/// handles them before a new one.
+fn loads_ahead(hub: &HubState, link: Option<u64>, now: Instant) -> u32 {
+    let user = hub.loading.as_ref().filter(|l| link == Some(l.generation) && now.saturating_duration_since(l.at) < restore::RESTORING_MAX);
+    user.map_or(0, |l| l.ahead + 1)
+        + u32::from(restore_applying(hub.restoring.as_ref(), link, now))
+        + u32::from(handing_back_view(hub, link, now).is_some())
+}
+
+/// A local load failed on the attached Spirc: one ahead of the user load on its way, or that one.
+fn load_failed(hub: &mut HubState) {
+    match hub.loading.as_mut() {
+        Some(l) if l.ahead > 0 => l.ahead -= 1,
+        _ => hub.loading = None,
     }
 }
 
@@ -607,7 +629,7 @@ fn on_spirc_error(err: SpircCommandError) {
         return;
     }
     if !err.remote && err.command == "load" {
-        HUB.lock().loading = None;
+        load_failed(&mut HUB.lock());
         on_local_load_failed();
     }
     use librespot_core::error::ErrorKind;
@@ -726,7 +748,8 @@ fn local_view(hub: &HubState, link: Option<u64>, now: Instant, now_ms: i64) -> L
     LocalView {
         active,
         hand_back: handing_back_view(hub, link, now).cloned(),
-        placeholder: frozen.filter(|f| f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned(),
+        // (a load that was on its way has no playback to show)
+        placeholder: frozen.filter(|f| f.load.is_none() && f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned(),
         activating: activating(hub, link, now),
     }
 }
@@ -1035,7 +1058,7 @@ mod hub_tests {
     #[test]
     fn a_load_fetching_its_context_isnt_nothing_loaded() {
         let now = Instant::now();
-        let loading = || Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default() });
+        let loading = || Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default(), ahead: 0 });
         // the activation's empty snapshot while the load fetches its context (past the grace)
         let mut hub = HubState { snapshot: Some(empty_active()), loading: loading(), ..Default::default() };
         assert!(local_load_in(&hub, Some(3), now + ACTIVATION_GRACE).is_some());
@@ -1050,6 +1073,34 @@ mod hub_tests {
         let mut hub = HubState { snapshot: Some(empty_active()), loading: loading(), ..Default::default() };
         apply_snapshot(&mut hub, ConnectSnapshot::default(), false, 0);
         assert!(hub.loading.is_none());
+    }
+
+    #[test]
+    fn a_failed_load_ahead_keeps_the_newer_loads_marker() {
+        let now = Instant::now();
+        let load = |ahead| Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default(), ahead });
+        // A on its way, B sent after it
+        let hub = HubState { loading: load(0), ..Default::default() };
+        assert_eq!(loads_ahead(&hub, Some(3), now), 1);
+        let mut hub = HubState { snapshot: Some(empty_active()), loading: load(1), ..Default::default() };
+        // A failed: B is still on its way
+        load_failed(&mut hub);
+        assert!(local_load_in(&hub, Some(3), now).is_some());
+        assert!(!local_active_empty_in(&hub, Some(3), now + ACTIVATION_GRACE));
+        // B failed
+        load_failed(&mut hub);
+        assert!(hub.loading.is_none());
+        assert!(local_active_empty_in(&hub, Some(3), now + ACTIVATION_GRACE));
+        // a restore being applied, or a hand-back, that a user load replaces: their loads are ahead
+        let frozen = restore::freeze(playing_track(), 0, now);
+        let view = PlaybackSnapshot::default();
+        let hub = HubState {
+            restoring: Some(restore::Restoring { generation: 3, frozen, at: now }),
+            handing_back: Some(HandingBack { generation: 3, at: now, view }),
+            ..Default::default()
+        };
+        assert_eq!(loads_ahead(&hub, Some(3), now), 2);
+        assert_eq!(loads_ahead(&hub, Some(4), now), 0, "another Spirc's");
     }
 
     #[test]
