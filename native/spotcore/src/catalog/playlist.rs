@@ -45,6 +45,8 @@ const HEADER_TTL: Duration = Duration::from_secs(30 * 60);
 const HEADER_NEGATIVE_TTL: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) const CONFLICT_MESSAGE: &str = "playlist revision changed, reload and retry";
+/// How old a rootlist a playlist page may use for `following` / `isPublic`.
+const PAGE_ROOTLIST_AGE: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------------------------
 // Shared conversion helpers
@@ -379,7 +381,14 @@ pub(crate) async fn playlist(args: Value) -> AppResult<Value> {
     let owned = !owner_name.is_empty() && owner_name.eq_ignore_ascii_case(&me);
     let collaborative = list.attributes.collaborative();
     let can_edit = list.capabilities.can_edit_items.unwrap_or(owned || collaborative);
-    let following = cached_rootlist(&me, Duration::from_secs(300)).map(|r| r.contains(&p.id));
+    // An owned playlist's page offers "Make public / private": its state lives in the rootlist.
+    let library = match cached_rootlist(&me, PAGE_ROOTLIST_AGE) {
+        Some(r) => Some(r),
+        None if owned => rootlist(&session, PAGE_ROOTLIST_AGE).await.ok(),
+        None => None,
+    };
+    let following = library.as_ref().map(|r| r.contains(&p.id));
+    let is_public = library.as_ref().and_then(|r| r.public_of(&p.id));
     to_value(&Playlist {
         uri,
         name: header.name,
@@ -395,6 +404,7 @@ pub(crate) async fn playlist(args: Value) -> AppResult<Value> {
         total,
         items: build_items(&page, &tracks.map, &episodes.map),
         following,
+        is_public,
         partial,
     })
 }
@@ -435,6 +445,8 @@ pub(crate) struct RootItem {
     pub can_edit_items: Option<bool>,
     /// `status_code` decoration (e.g. 404 for a playlist its owner deleted), when present.
     pub status_code: Option<i32>,
+    /// The item's `public` attribute: the playlist is shown on the user's profile.
+    pub public: Option<bool>,
 }
 
 impl RootItem {
@@ -467,6 +479,11 @@ impl Rootlist {
 
     pub(crate) fn contains(&self, id: &str) -> bool {
         self.find(id).is_some()
+    }
+
+    /// Whether the playlist with base62 `id` is public (on the profile); None when not listed.
+    pub(crate) fn public_of(&self, id: &str) -> Option<bool> {
+        self.find(id).map(|(i, _)| self.items[i].public == Some(true))
     }
 
     /// Playlist items (folders flattened) in rootlist order.
@@ -510,6 +527,7 @@ pub(crate) fn parse_rootlist_page(list: &p4::SelectedListContent) -> Vec<RootIte
                 length: meta.and_then(|m| m.length),
                 can_edit_items: meta.and_then(|m| m.capabilities.as_ref()).and_then(|c| c.can_edit_items),
                 status_code: meta.and_then(|m| m.status_code),
+                public: item.attributes.as_ref().and_then(|a| a.public),
             }
         })
         .collect()
@@ -579,6 +597,7 @@ pub(crate) fn build_tree(items: &[RootItem], username: &str, extra: &HashMap<Str
                     children: Vec::new(),
                     collaborative: false,
                     can_edit: false,
+                    is_public: None,
                 },
             });
         } else if let Some(id) = item.uri.strip_prefix("spotify:end-group:") {
@@ -604,6 +623,7 @@ pub(crate) fn build_tree(items: &[RootItem], username: &str, extra: &HashMap<Str
                         children: Vec::new(),
                         collaborative,
                         can_edit: item.can_edit_items.unwrap_or(owned_by(&item.owner) || collaborative),
+                        is_public: Some(item.public == Some(true)),
                     })
                 }
                 (_, Some(r)) => {
@@ -618,6 +638,7 @@ pub(crate) fn build_tree(items: &[RootItem], username: &str, extra: &HashMap<Str
                         children: Vec::new(),
                         collaborative: false,
                         can_edit: item.can_edit_items.unwrap_or(owned),
+                        is_public: Some(item.public == Some(true)),
                     })
                 }
                 _ => None,
@@ -775,11 +796,21 @@ pub(crate) fn mov_op(from: u32, length: u32, to: u32) -> p4::Op {
 }
 
 pub(crate) fn update_attributes_op(name: Option<&str>, desc: Option<&str>) -> p4::Op {
+    list_attributes_op(name, desc, None)
+}
+
+/// `UPDATE_LIST_ATTRIBUTES` that makes the playlist collaborative (or not).
+pub(crate) fn collaborative_op(collaborative: bool) -> p4::Op {
+    list_attributes_op(None, None, Some(collaborative))
+}
+
+fn list_attributes_op(name: Option<&str>, desc: Option<&str>, collaborative: Option<bool>) -> p4::Op {
     let mut values = p4::ListAttributes::new();
     let mut no_value = Vec::new();
     if let Some(n) = name {
         values.set_name(n.to_string());
     }
+    values.collaborative = collaborative;
     match desc {
         Some("") => no_value.push(EnumOrUnknown::new(p4::ListAttributeKind::LIST_DESCRIPTION)),
         Some(d) => values.set_description(d.to_string()),
@@ -792,6 +823,21 @@ pub(crate) fn update_attributes_op(name: Option<&str>, desc: Option<&str>) -> p4
     upd.new_attributes = MessageField::some(state);
     let mut o = op(p4::op::Kind::UPDATE_LIST_ATTRIBUTES);
     o.update_list_attributes = MessageField::some(upd);
+    o
+}
+
+/// `UPDATE_ITEM_ATTRIBUTES` on the rootlist item at `index` (the playlist [`Rootlist::find`]
+/// reports): `public` shows it on the user's profile, or not.
+pub(crate) fn public_op(index: usize, public: bool) -> p4::Op {
+    let mut values = p4::ItemAttributes::new();
+    values.public = Some(public);
+    let mut state = p4::ItemAttributesPartialState::new();
+    state.values = MessageField::some(values);
+    let mut upd = p4::UpdateItemAttributes::new();
+    upd.set_index(index as i32);
+    upd.new_attributes = MessageField::some(state);
+    let mut o = op(p4::op::Kind::UPDATE_ITEM_ATTRIBUTES);
+    o.update_item_attributes = MessageField::some(upd);
     o
 }
 
@@ -1067,6 +1113,65 @@ pub(crate) async fn unfollow_uri(session: &Session, uri: &str) -> AppResult<()> 
     Ok(())
 }
 
+/// Shows the playlist on the user's profile, or not: the rootlist item's `public` attribute (as
+/// the web player's "Make public / private"). The playlist must be in the user's library. Retries
+/// once on a revision conflict.
+pub(crate) async fn set_public_uri(session: &Session, uri: &str, public: bool) -> AppResult<()> {
+    let id = playlist_id(uri)?;
+    for attempt in 0..2 {
+        let r = rootlist(session, Duration::ZERO).await?;
+        let Some((index, _)) = r.find(&id) else {
+            return Err(AppError::new(ErrorCode::NotFound, "the playlist is not in your library"));
+        };
+        if r.public_of(&id) == Some(public) {
+            return Ok(());
+        }
+        let changes = list_changes(Some(r.revision.clone()), vec![public_op(index, public)]);
+        match apply_rootlist_changes(session, &changes).await {
+            Err(e) if attempt == 0 && e.message == CONFLICT_MESSAGE => continue,
+            other => return other,
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct PublicArgs {
+    uri: String,
+    public: bool,
+}
+
+pub(crate) async fn set_public(args: Value) -> AppResult<Value> {
+    let a: PublicArgs = parse_args(args)?;
+    let session = engine::session()?;
+    set_public_uri(&session, &a.uri, a.public).await?;
+    Ok(json!({}))
+}
+
+#[derive(Deserialize)]
+struct CollaborativeArgs {
+    uri: String,
+    collaborative: bool,
+}
+
+/// Makes the playlist collaborative (anyone it is shared with may add items) or not. As in
+/// Spotify, a collaborative playlist is not public: making it collaborative also takes it off the
+/// profile.
+pub(crate) async fn set_collaborative(args: Value) -> AppResult<Value> {
+    let a: CollaborativeArgs = parse_args(args)?;
+    let id = playlist_id(&a.uri)?;
+    let session = engine::session()?;
+    let rev = apply_changes(&session, &id, &list_changes(None, vec![collaborative_op(a.collaborative)])).await?;
+    invalidate_rootlist();
+    if a.collaborative {
+        set_public_uri(&session, &a.uri, false).await.or_else(|e| match e.code {
+            ErrorCode::NotFound => Ok(()),
+            _ => Err(e),
+        })?;
+    }
+    Ok(revision_result(rev))
+}
+
 pub(crate) async fn follow(args: Value) -> AppResult<Value> {
     let a: super::pages::UriArgs = parse_args(args)?;
     let session = engine::session()?;
@@ -1126,6 +1231,12 @@ mod tests {
         for (i, uri) in uris.iter().enumerate() {
             let mut item = p4::Item::new();
             item.set_uri(uri.to_string());
+            if i == 4 {
+                // On the profile: the rootlist item's `public` attribute.
+                let mut ia = p4::ItemAttributes::new();
+                ia.public = Some(true);
+                item.attributes = MessageField::some(ia);
+            }
             contents.items.push(item);
             let mut meta = p4::MetaItem::new();
             match i {
@@ -1197,6 +1308,13 @@ mod tests {
 
         let mut r = Rootlist { revision: list.revision().to_vec(), items, fetched: Instant::now(), owner: "alice".into() };
         assert_eq!(r.find("5ihSl7a56tjMkVSzwQpSnl").map(|(i, _)| i), Some(2));
+        // Public (on the profile) only where the item says so; unknown for playlists not listed.
+        assert_eq!(r.public_of("1yQ6yj6Gyd1kkMqk4YaRRd"), Some(true));
+        assert_eq!(r.public_of("5ihSl7a56tjMkVSzwQpSnl"), Some(false));
+        assert_eq!(r.public_of("0000000000000000000000"), None);
+        assert_eq!(v[1]["children"][1]["children"][0]["isPublic"], true);
+        assert_eq!(v[1]["children"][0]["isPublic"], false);
+        assert!(v[1].get("isPublic").is_none(), "folders have no public state");
         assert_eq!(r.playlists().count(), 4);
         // Only the undecorated playlist needs a header lookup, unless the rootlist reports it gone.
         assert_eq!(undecorated(&r), ["spotify:playlist:2UZk7JjJnbTut1w8fqs3JL"]);
@@ -1278,6 +1396,7 @@ mod tests {
                 length: None,
                 can_edit_items: None,
                 status_code: None,
+                public: None,
             })
             .collect();
         let tree = build_tree(&items, "u", &HashMap::new());
@@ -1392,6 +1511,27 @@ mod tests {
         assert_eq!(v["kind"], "UPDATE_LIST_ATTRIBUTES");
         assert_eq!(v["updateListAttributes"]["newAttributes"]["values"]["name"], "New");
         assert_eq!(v["updateListAttributes"]["newAttributes"]["noValue"][0], "LIST_DESCRIPTION");
+        assert!(v["updateListAttributes"]["newAttributes"]["values"].get("collaborative").is_none());
+
+        for collaborative in [true, false] {
+            let collab = collaborative_op(collaborative);
+            let v: Value = serde_json::from_str(&protobuf_json_mapping::print_to_string(&collab).unwrap()).unwrap();
+            assert_eq!(v["kind"], "UPDATE_LIST_ATTRIBUTES");
+            assert_eq!(v["updateListAttributes"]["newAttributes"]["values"]["collaborative"], collaborative);
+            assert!(v["updateListAttributes"]["newAttributes"]["values"].get("name").is_none());
+        }
+
+        let public = list_changes(Some(vec![7]), vec![public_op(3, true)]);
+        let v: Value = serde_json::from_str(&protobuf_json_mapping::print_to_string(&public).unwrap()).unwrap();
+        let op = &v["deltas"][0]["ops"][0];
+        assert_eq!(op["kind"], "UPDATE_ITEM_ATTRIBUTES");
+        assert_eq!(op["updateItemAttributes"]["index"], 3);
+        assert_eq!(op["updateItemAttributes"]["newAttributes"]["values"]["public"], true);
+        assert_eq!(v["baseRevision"], "Bw==");
+        let private = public_op(0, false);
+        let v: Value = serde_json::from_str(&protobuf_json_mapping::print_to_string(&private).unwrap()).unwrap();
+        assert_eq!(v["updateItemAttributes"]["newAttributes"]["values"]["public"], false);
+        assert!(public.write_to_bytes().is_ok());
         // Protobuf fallback encodes without required-field errors.
         assert!(changes.write_to_bytes().is_ok());
     }

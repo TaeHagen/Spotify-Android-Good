@@ -5,6 +5,7 @@ import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.PlaybackTrack
+import com.taehagen.spotifygood.model.Show
 import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.playback.PlayerController
 import kotlinx.coroutines.CoroutineScope
@@ -29,34 +30,46 @@ private const val HOUR = 3_600_000L
 
 class MergeProgressTest {
     private val local = EpisodeProgress(positionMs = 50 * 60_000L, fullyPlayed = false, updatedAt = 1)
+    private val now = 99L
 
     @Test
-    fun noLocalProgressShowsTheServers() {
-        assertEquals(ProgressMerge.Server(dropLocal = false), mergeProgress(PlayedPoint(10, false), null))
-        assertEquals(ProgressMerge.Server(dropLocal = false), mergeProgress(null, null))
+    fun withoutALiveStateWhatIsKeptStays() {
+        assertNull(mergeProgress(null, null, now))
+        assertEquals(local, mergeProgress(null, local, now))
     }
 
     @Test
-    fun localProgressWinsWithoutAServerState() {
-        assertEquals(ProgressMerge.Local(local), mergeProgress(null, local))
+    fun aPartlyPlayedLiveStateIsKeptWhenNothingIs() {
+        assertEquals(
+            EpisodeProgress(10 * 60_000L, fullyPlayed = false, updatedAt = now, server = PlayedPoint(10 * 60_000L, false)),
+            mergeProgress(PlayedPoint(10 * 60_000L, false), null, now),
+        )
+        // Not started and finished ones would only crowd out this phone's progress.
+        assertNull(mergeProgress(PlayedPoint(0, false), null, now))
+        assertNull(mergeProgress(PlayedPoint(0, true), null, now))
     }
 
     @Test
-    fun playedOfflineBeforeAnyServerStateWasSeenWinsAndAdoptsIt() {
+    fun playedOfflineBeforeAnyLiveStateWasSeenWinsAndAdoptsIt() {
         val server = PlayedPoint(0, false)
-        assertEquals(ProgressMerge.Local(local, baseline = server), mergeProgress(server, local))
+        assertEquals(local.copy(server = server), mergeProgress(server, local, now))
     }
 
     @Test
-    fun unchangedServerStateMeansThisPhoneIsNewer() {
+    fun anUnchangedLiveStateMeansThisPhoneIsNewer() {
         val server = PlayedPoint(10 * 60_000L, false)
-        assertEquals(ProgressMerge.Local(local.copy(server = server)), mergeProgress(server, local.copy(server = server)))
+        assertEquals(local.copy(server = server), mergeProgress(server, local.copy(server = server), now))
     }
 
     @Test
-    fun aServerStateThatChangedSinceMeansItWasPlayedElsewhere() {
+    fun aLiveStateThatChangedSinceBecomesThisPhonesResumePoint() {
         val seen = PlayedPoint(10 * 60_000L, false)
-        assertEquals(ProgressMerge.Server(dropLocal = true), mergeProgress(PlayedPoint(70 * 60_000L, false), local.copy(server = seen)))
+        val newer = PlayedPoint(70 * 60_000L, false)
+        assertEquals(EpisodeProgress(70 * 60_000L, false, now, newer), mergeProgress(newer, local.copy(server = seen), now))
+        val finished = PlayedPoint(0, true)
+        assertEquals(EpisodeProgress(0, true, now, finished), mergeProgress(finished, local.copy(server = seen), now))
+        // Marked unplayed elsewhere: nothing to resume.
+        assertNull(mergeProgress(PlayedPoint(0, false), local.copy(server = seen), now))
     }
 }
 
@@ -114,11 +127,71 @@ class EpisodeProgressStoreTest {
         store.merge(episode(resume = 10 * 60_000L, played = false))
         store.record(EP, 50 * 60_000L, 2 * HOUR)
         assertEquals(50 * 60_000L, store.merge(episode(resume = 10 * 60_000L, played = false)).resumePositionMs)
-        // Later the desktop got to 70 min: Spotify's state changed since, it wins.
+        // Later the desktop got to 70 min: Spotify's state changed since, it wins and becomes the
+        // phone's resume point.
         val versionBefore = store.version.value
         assertEquals(70 * 60_000L, store.merge(episode(resume = 70 * 60_000L, played = false)).resumePositionMs)
-        assertNull(store.resumeMs(EP))
+        assertEquals(70 * 60_000L, store.resumeMs(EP))
         assertTrue(store.version.value > versionBefore)
+        scope.cancel()
+    }
+
+    @Test
+    fun spotifysNewerPointIsUsedByTheDownloadsOffline() = runTest {
+        val (store, scope) = store()
+        store.merge(episode(resume = 0, played = false)) // the show page: not started
+        store.record(EP, 20 * 60_000L, 2 * HOUR) // played here to 20 min
+        store.merge(episode(resume = 50 * 60_000L, played = false)) // later the desktop got to 50 min
+        // The download (no played state, offline) resumes Spotify's point.
+        assertEquals(50 * 60_000L, store.merge(episode()).resumePositionMs)
+        assertEquals(50 * 60_000L, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun copiesWithoutALiveStateNeitherDropNorRebaseProgress() = runTest {
+        val (store, scope) = store()
+        val live = 10 * 60_000L
+        store.merge(episode(resume = live, played = false)) // a fresh page
+        store.record(EP, 40 * 60_000L, 2 * HOUR)
+        // Downloads and cached pages carry no played state: they show the phone's 40 min.
+        val download = episode(resume = 0, played = false).withoutPlayedState()
+        assertEquals(40 * 60_000L, store.merge(download).resumePositionMs)
+        // The next fresh page with the same live state keeps the phone's progress.
+        assertEquals(40 * 60_000L, store.merge(episode(resume = live, played = false)).resumePositionMs)
+        assertEquals(40 * 60_000L, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun aCachedShowPageThenTheFreshOneKeepsTheProgress() = runTest {
+        val (store, scope) = store()
+        val s1 = 20 * 60_000L
+        store.merge(episode(resume = s1, played = false)) // the episode page, live
+        store.record(EP, 55 * 60_000L, 2 * HOUR)
+        // Monday's cached show page (E not started) is emitted first, then the fresh one.
+        val monday = Show(uri = "spotify:show:s", name = "Show", episodes = listOf(episode(resume = 0, played = false)))
+        for (resource in listOf<Resource<Show>>(Resource.Loading(monday), Resource.Success(monday, fromCache = true), Resource.Error(Exception(), monday))) {
+            val shown = resource.withoutCachedPlayedState().dataOrNull!!.episodes.map(store::merge)
+            assertEquals(55 * 60_000L, shown.single().resumePositionMs)
+        }
+        val fresh: Resource<Show> = Resource.Success(monday.copy(episodes = listOf(episode(resume = s1, played = false))))
+        assertEquals(55 * 60_000L, fresh.withoutCachedPlayedState().dataOrNull!!.episodes.map(store::merge).single().resumePositionMs)
+        assertEquals(55 * 60_000L, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun anOfflineCachedPageBeforeAnOfflinePlayDoesNotLetTheFirstLivePageDropIt() = runTest {
+        val (store, scope) = store()
+        // Offline: the cached page (stripped) and a play from the downloads.
+        val cached = Show(uri = "spotify:show:s", name = "Show", episodes = listOf(episode(resume = 0, played = false)))
+        Resource.Error<Show>(Exception(), cached).withoutCachedPlayedState().dataOrNull!!.episodes.forEach { store.merge(it) }
+        store.record(EP, 30 * 60_000L, 2 * HOUR)
+        // Online again: the first live page (Spotify still at 20 min from the desktop) adopts it as
+        // the reference and keeps this phone's newer progress.
+        assertEquals(30 * 60_000L, store.merge(episode(resume = 20 * 60_000L, played = false)).resumePositionMs)
+        assertEquals(30 * 60_000L, store.resumeMs(EP))
         scope.cancel()
     }
 
@@ -242,5 +315,18 @@ class EpisodeProgressTrackerTest {
         tracker.onSnapshot(snapshot(status = PlaybackStatus.LOADING), nowMs = 0)
         tracker.onSnapshot(snapshot(uri = "spotify:track:t", isEpisode = false, positionMs = 30_000), nowMs = 0)
         assertTrue(recorded.isEmpty())
+    }
+}
+
+class DownloadPlayedStateTest {
+    @Test
+    fun downloadMetadataNeverCarriesAFrozenPlayedState() {
+        // Rows written before played state was stripped at download time still hold one.
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val stored = """{"uri":"$EP","name":"E","durationMs":7200000,"resumePositionMs":0,"fullyPlayed":false}"""
+        val decoded = com.taehagen.spotifygood.ui.screens.library.decodeDownloadMetadata(json, EP, stored)
+            as com.taehagen.spotifygood.ui.screens.library.DownloadMetadata.OfEpisode
+        assertNull(decoded.episode.resumePositionMs)
+        assertNull(decoded.episode.fullyPlayed)
     }
 }

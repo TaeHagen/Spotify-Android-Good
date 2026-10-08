@@ -525,11 +525,13 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `library.invalidate` | `{}` | `{}` — forgets the engine's cached library lists (set snapshots ≤ 60 s, Liked Songs fallback, rootlist ≤ 30–300 s), so the next `library.*` reads come from the server; called on pull-to-refresh |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
 | — | | Playlist revision conflicts (stale `revision`) fail with `INVALID_ARGUMENT` and a message containing "revision"; clients reload and retry. |
-| `playlist.create` | `{"name","description"?,"public":false,"uris"?:[…]}` | `{"uri","revision"}` (also added to the top of the rootlist) |
+| `playlist.create` | `{"name","description"?,"public":false,"uris"?:[…]}` | `{"uri","revision"}` (also added to the top of the rootlist; `public`: shown on the profile, the app's create dialog defaults it on as Spotify does) |
 | `playlist.addItems` | `{"uri","uris":[…],"position":null}` | `{"revision"}` |
 | `playlist.removeItems` | `{"uri","items":[{"uri","index"}],"revision"}` | `{"revision"}` |
 | `playlist.moveItems` | `{"uri","fromIndex","length","toIndex","revision"}` | `{"revision"}` — `toIndex` uses playlist4 MOV semantics: the insert-before position in the list *before* the move (moving item 2 to the end of a 5-item list: from 2, to 5) |
 | `playlist.updateDetails` | `{"uri","name"?,"description"?}` | `{}` |
+| `playlist.setPublic` | `{"uri","public":bool}` | `{}`: shows the playlist on the profile or not — the rootlist item's `public` attribute (`UPDATE_ITEM_ATTRIBUTES` at its index, rootlist base revision, one retry on a conflict); `NOT_FOUND` when it is not in the library. The app offers it for owned, non-collaborative playlists |
+| `playlist.setCollaborative` | `{"uri","collaborative":bool}` | `{"revision"?}`: `UPDATE_LIST_ATTRIBUTES` `collaborative` on the playlist; making it collaborative also makes it private (as in Spotify) |
 | `playlist.delete` | `{"uri"}` | `{}` (removes from rootlist; unfollow) |
 | `playlist.follow` / `playlist.unfollow` | `{"uri"}` | `{}` |
 
@@ -554,7 +556,7 @@ returned as an authoritative but shorter list:
 
 | method | args | result |
 |---|---|---|
-| `download.track` | `{"uri","bitrate":160,"dir":"…/offline/audio","imageDir":"…/offline/images"}` | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`; waits ≤ 10 s for the session country, else `NOT_CONNECTED`; a CDN `429` asking for more than 30 s, or a second `429`, fails at once with `RATE_LIMITED` and the server's `retryAfterMs`) |
+| `download.track` | `{"uri","bitrate":160,"dir":"<location>/audio","imageDir":"<location>/images"}` (the chosen download location, §9.7) | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`; waits ≤ 10 s for the session country, else `NOT_CONNECTED`; a CDN `429` asking for more than 30 s, or a second `429`, fails at once with `RATE_LIMITED` and the server's `retryAfterMs`) |
 | `download.fileId` | `{"uri"}` | `{"fileId"}` (omitted when unknown): the file the last `download.track` of `uri` in this process chose, also after it failed or was cancelled |
 | `offline.setIndex` | `{"tracks":[OfflineTrackRecord],"seq"?}` | `{}` or `{"rejected":["uri",…]}` (replaces the in-memory resolver index, except URIs changed after `seq`; malformed records are skipped) |
 | `offline.add` / `offline.remove` | `{"tracks":[…],"seq"?}` / `{"uris":[…],"seq"?}` | `{}` (`add` may also return `"rejected"`; `remove` matches a record's `uri` only, never its `playedUri`, and never deletes files — Kotlin owns deletion) |
@@ -596,7 +598,9 @@ Artist       {"uri","name","images","headerImages"?,"biography"?,"topTracks":[Tr
               "partial"?:true}
 PlaylistRef  {"uri","name","description"?,"images","owner":{"username","displayName"?},"totalTracks"?}
 Playlist     PlaylistRef + {"collaborative","isOwnedByMe","canEdit","revision","offset","total",
-              "items":[{"uid"?,"addedAt"?,"addedBy"?,"track"?:Track,"episode"?:Episode}],"following"?:bool,"partial"?:true}
+              "items":[{"uid"?,"addedAt"?,"addedBy"?,"track"?:Track,"episode"?:Episode}],"following"?:bool,"isPublic"?:bool,"partial"?:true}
+             (`isPublic`: on the user's profile, known when it is in the user's rootlist; an owned
+              playlist's page reads the rootlist for it)
              (items never drop out, so indexes stay aligned for edits: local files and unresolved
               items keep their slot as a `track`/`episode` with `playable:false`; local files have
               empty `artists`)
@@ -616,14 +620,20 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
              of item, when playback leaves the phone, every 15 s while playing; within 30 s of the
              end it is played), shown on show / episode pages, saved episodes and downloads, and a
              play of an episode with no position resumes there (`PlayerController.episodeResume`).
-             The phone's progress wins unless Spotify's state changed since it was recorded (the
-             episode was played elsewhere afterwards). Nothing is reported back to Spotify: progress
-             made on this phone, offline above all, is not synced to other devices.
+             Only a fresh answer counts as Spotify's current state: cached show pages (fresh hits,
+             copies shown while revalidating or offline) and download metadata carry no played state
+             (stripped when emitted / stored / decoded). The phone's progress wins unless a fresh
+             state differs from the one seen when it was recorded (the episode was played elsewhere
+             afterwards); then Spotify's point becomes the phone's resume point, so the downloads,
+             Android Auto and offline plays resume it too. A partly played fresh state is also kept
+             when the phone has none. Nothing is reported back to Spotify: progress made on this
+             phone, offline above all, is not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
               "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
 HomeSection  {"id","title","items":[MediaRef]}
-RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit"}
+RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit",
+              "isPublic"?:bool (playlists: the item's `public` attribute)}
 Lyrics       {"syncType":"LINE_SYNCED|UNSYNCED|SYLLABLE_SYNCED","lines":[{"startTimeMs","words"}],
               "provider"?,"colors"?:{"background","text","highlightText"}}
 User         {"username","displayName","images","product","country","explicitFilter",
@@ -1054,8 +1064,13 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   queued items one at a time with `download.track` (cancellation propagates to
   `nativeCancel`), stores records (encrypted key), updates `offline.add`, retries failures
   with backoff (max 3), stops gracefully on `onStopped`/timeout (Android 15 6 h limit),
-  re-enqueues itself if work remains. "Not enough storage" reschedules (the hosts require
-  storage not low) instead of stopping for good. Progress is persisted on a state change and every
+  re-enqueues itself if work remains. "Not enough storage" (under 200 MiB free at the download
+  location) reschedules instead of stopping for good; the hosts require storage not low only while
+  downloads go to internal storage (the constraint tracks internal storage). A chosen SD card that
+  is not mounted stops the run ("location not available") until it is back or another location is
+  chosen. Removing the item being downloaded stops it for good: the run waits for the removal to
+  delete its row before it picks the next item (the cancelled item puts its row back into the queue
+  first), and an item whose row is gone when it starts is skipped. Progress is persisted on a state change and every
   5 s (resume / crash recovery); live bytes reach the Downloads screens through the runner's
   activity, so long-lived observers (the playback service observes `downloadedImages`, which
   changes only with the completed set) are not woken twice a second. "N downloads complete" is
@@ -1104,8 +1119,26 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   the foreground while online (coming to the foreground, coming online) Liked Songs and playlists
   synced over 30 min ago are re-listed (albums and shows keep the 12 h / daily cadence). A sync after
   an edit that cannot come online marks the collection due instead.
-* Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
-  `noBackupFilesDir/offline/images/<imageIdHex>.jpg`.
+* Storage: under the root of the download location, `audio/<fileIdHex>` (+ `.part`) and
+  `images/<imageIdHex>.jpg`. Locations (`DownloadLocations`): internal storage
+  (`noBackupFilesDir/offline`) or a mounted removable volume (an SD card: `<getExternalFilesDirs
+  entry>/offline`, no storage permission; other apps cannot read it on API 30+ and the audio is
+  encrypted). Settings > Storage offers "Download location" (each with its free space) when a card
+  is mounted (`Settings.downloadLocation`: the volume UUID, empty = internal). Rows name their
+  files by absolute path, so every download plays from wherever it is.
+* Changing the location moves the downloads (stops a running download first; its item resumes in
+  the new location): `.part` files of unfinished downloads while no download runs, then every
+  completed file and cover, each copied to `<file>.tmp`, synced, read back and compared (SHA-256),
+  renamed, then the rows and the offline index (`offline.add`, numbered) switched to the copy, then
+  the original deleted. Every step is resumable: an interrupted move leaves the original in use or
+  both copies with the rows on one of them, and the next pass (start, mount, change) carries on.
+  Garbage collection waits while a move runs; it covers every mounted location (by location and
+  name), never a card that is not mounted.
+* A card that is removed or unmounted (the system's media broadcasts): its downloads stay COMPLETED
+  (nothing is failed or deleted, files removed meanwhile are collected when it is back) but are
+  shown as not available (FAILED with "On an SD card that isn't available", left out of the
+  playable downloads and the "Retry" count) and taken out of the offline index; the index snapshot
+  leaves them out. On remount they are registered again, and whatever waited for the card moves.
 * Covers (`OfflineCovers`, a Coil interceptor): lists built from downloads and the online pages
   of downloaded items name the CDN image URLs of the stored metadata. Every size of a completed
   download's album images (an episode's own images, else its show's) is served from the download's
@@ -1113,7 +1146,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   URL (a playlist mosaic) is loaded from the network and falls back to its first downloaded
   member's cover. The maps follow the completed downloads (metadata read once per download).
 * Audio keys (`KeyVault`, envelope encryption): one random AES-256 data key in
-  `noBackupFilesDir/offline/datakey.bin`, sealed with the `CredentialStore` Keystore key, unsealed
+  `noBackupFilesDir/offline/datakey.bin` (always internal: only the encrypted audio moves to a card),
+  sealed with the `CredentialStore` Keystore key, unsealed
   once per process and kept in memory; each download's key is sealed with it in software (AES-GCM,
   the row's URI as associated data; `keyVersion` 1). A cold start's index snapshot therefore costs
   one TEE operation instead of one per download, so the first `offline.setIndex` lands well within
@@ -1128,7 +1162,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   shared file once.
 * Files are shared: the downloader reuses a verified `<fileId>`, so several rows (relinking, the
   same recording in two releases) can use one file. Removal deletes a completed file only when no
-  remaining row has it as its `path` or `fileId`. Unfinished rows record the file their download
+  remaining row has it as its `path` (in the same location) and no unfinished download writes it
+  (`fileId`). Unfinished rows record the file their download
   writes (`download.fileId`, stored in `fileId`); garbage collection (when the queue is idle)
   keeps a `.part` while an unfinished row (pending, failed, cancelled) names it, so "Retry
   failed" resumes it, and deletes files and `.part`s no row names.

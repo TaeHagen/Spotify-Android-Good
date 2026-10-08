@@ -46,6 +46,14 @@ import com.taehagen.spotifygood.nativebridge.NativeEvents
 import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.nativebridge.NativeRpc
 import kotlinx.coroutines.CancellationException
+import java.io.IOException
+import java.io.FileNotFoundException
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -107,6 +115,15 @@ data class DownloadItem(
     val imagePath: String?,
     val error: String?,
 )
+
+/** A place downloads can be stored (Settings > Storage): internal storage or a mounted SD card. */
+data class DownloadLocation(val id: String, val label: String, val freeBytes: Long, val removable: Boolean)
+
+/**
+ * Moving downloads to the chosen location: [moved] of [total] files while [moving]; [error] when a
+ * pass stopped early (it resumes at the next start, mount or change of the location).
+ */
+data class DownloadRelocation(val moving: Boolean = false, val moved: Int = 0, val total: Int = 0, val error: String? = null)
 
 /** What the downloader is doing right now (Downloads screen header, banners). */
 data class DownloadActivity(
@@ -209,15 +226,37 @@ class DownloadManager(
     /** Registers downloads an index push left out because the Keystore was busy ([registerLate]). */
     @Volatile private var lateKeys: Job? = null
 
-    /** URIs of completed downloads (hot), iterating newest download first (Android Auto queue order). */
-    val downloadedUris: StateFlow<Set<String>> = dao.observeCompletedUris()
-        .map<List<String>, Set<String>> { LinkedHashSet(it) }
+    /** Bumped when a volume is mounted or goes ([onVolumesChanged]). */
+    private val volumes = MutableStateFlow(0)
+
+    /**
+     * Completed downloads on a location that is not available (an SD card removed or unmounted):
+     * they stay COMPLETED (nothing is failed or deleted) and come back with the card, but are shown
+     * as not available and are left out of the offline index meanwhile.
+     */
+    private val unavailable: StateFlow<Set<String>> = combine(dao.observeCompletedLocated(), volumes) { rows, _ -> rows }
+        .map { rows -> DownloadRules.unavailableUris(rows, storage.availability()) }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.IO)
+        .stateIn(scope, SharingStarted.Eagerly, emptySet())
+
+    /**
+     * URIs of completed downloads that can play (hot), iterating newest download first (Android Auto
+     * queue order). Not the ones on a card that is not mounted.
+     */
+    val downloadedUris: StateFlow<Set<String>> = combine(dao.observeCompletedUris(), unavailable) { uris, gone ->
+        if (gone.isEmpty()) LinkedHashSet(uris) else uris.filterTo(LinkedHashSet()) { it !in gone }
+    }
         .flowOn(Dispatchers.Default)
         .stateIn(scope, SharingStarted.Eagerly, emptySet())
 
-    /** uri → state of every row; one shared database observer for all per-item / collection flows. */
-    private val states: Flow<Map<String, DownloadState>> = dao.observeStates()
-        .map { rows -> rows.associate { it.uri to it.state } }
+    /**
+     * uri → state of every row; one shared database observer for all per-item / collection flows.
+     * A download on a card that is not mounted reads as FAILED (not available) meanwhile.
+     */
+    private val states: Flow<Map<String, DownloadState>> = combine(dao.observeStates(), unavailable) { rows, gone ->
+        rows.associate { it.uri to if (it.state == DownloadState.COMPLETED && it.uri in gone) DownloadState.FAILED else it.state }
+    }
         .flowOn(Dispatchers.Default)
         .shareIn(scope, SharingStarted.WhileSubscribed(STATES_STOP_TIMEOUT_MS, replayExpirationMillis = 0), replay = 1)
 
@@ -229,8 +268,12 @@ class DownloadManager(
         dao.observeListRows().map { rows ->
             rows.map { DownloadItem(it.uri, it.state, it.bytesDone, it.sizeBytes, it.metadataJson, it.imagePath, it.error) }
         },
+        unavailable,
         runner.activity.map { Triple(it.currentUri, it.bytes, it.totalBytes) }.distinctUntilChanged(),
-    ) { items, (uri, bytes, total) -> DownloadRules.withLiveProgress(items, uri, bytes, total) }
+    ) { items, gone, (uri, bytes, total) ->
+        val shown = DownloadRules.withUnavailable(items, gone, appContext.getString(R.string.data_dl_error_volume))
+        DownloadRules.withLiveProgress(shown, uri, bytes, total)
+    }
         .flowOn(Dispatchers.Default)
         .shareIn(scope, SharingStarted.WhileSubscribed(STATES_STOP_TIMEOUT_MS, replayExpirationMillis = 0), replay = 1)
 
@@ -252,10 +295,12 @@ class DownloadManager(
     val failedCounts: Flow<FailedCounts> = combine(
         items,
         collectionDao.observeAll().map { list -> list.flatMapTo(HashSet()) { decodeItems(it.unavailableUrisJson) } },
-    ) { rows, unavailable ->
+        unavailable,
+    ) { rows, unavailable, onMissingCard ->
         DownloadRules.failedCounts(
             rows.map { RetryRow(it.uri, it.state, it.error) },
-            unavailable,
+            // Downloads on a card that is not mounted are not retried: they come back with it.
+            unavailable + onMissingCard,
             appContext.getString(R.string.data_dl_error_unplayable),
         )
     }.distinctUntilChanged().flowOn(Dispatchers.Default)
@@ -317,6 +362,7 @@ class DownloadManager(
                 if (!runner.isRunning && dao.pendingCount() > 0) scheduleExecution(kick = true)
             }
         }
+        scope.launch { followLocation() }
         scope.launch { followCovers() }
         scope.launch { watchExplicitFilter() }
         scope.launch { repairExplicitFailures() }
@@ -525,15 +571,19 @@ class DownloadManager(
         val missing = ArrayList<String>()
         val keystoreBusy = ArrayList<String>()
         val legacy = ArrayList<Pair<IndexRow, String>>()
+        val available = storage.availability()
+        var unmounted = 0
         var keystoreDown = false
         for (row in rows) {
-            when (val result = offlineRecord(row, skipKeystore = keystoreDown)) {
+            when (val result = offlineRecord(row, skipKeystore = keystoreDown, available)) {
                 is RecordResult.Ready -> {
                     records += result.record
                     if (result.legacyKey) legacy += row to result.record.keyHex
                 }
                 RecordResult.Unreadable -> undecryptable += row.uri
                 RecordResult.Missing -> missing += row.uri
+                // Not failed: registered when the card is back (onVolumesChanged).
+                RecordResult.Unmounted -> unmounted++
                 RecordResult.KeystoreBusy -> {
                     keystoreBusy += row.uri
                     // One retry cycle per pass, not one per row: the rest wait for registerLate.
@@ -544,11 +594,11 @@ class DownloadManager(
         val now = System.currentTimeMillis()
         undecryptable.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, appContext.getString(R.string.data_dl_error_key), now) }
         missing.chunked(SQL_CHUNK).forEach { dao.markMissing(it, appContext.getString(R.string.data_dl_error_missing_file), now) }
-        if (undecryptable.isNotEmpty() || missing.isNotEmpty() || keystoreBusy.isNotEmpty()) {
+        if (undecryptable.isNotEmpty() || missing.isNotEmpty() || keystoreBusy.isNotEmpty() || unmounted > 0) {
             Log.w(
                 TAG,
-                "Skipped ${undecryptable.size} undecryptable, ${missing.size} missing and " +
-                    "${keystoreBusy.size} downloads whose key the Keystore could not decrypt right now",
+                "Skipped ${undecryptable.size} undecryptable, ${missing.size} missing, $unmounted on storage that " +
+                    "is not mounted and ${keystoreBusy.size} downloads whose key the Keystore could not decrypt right now",
             )
         }
         index.beginSnapshot(seq)
@@ -589,24 +639,31 @@ class DownloadManager(
         data class Ready(val record: OfflineTrackRecord, val legacyKey: Boolean = false) : RecordResult
         data object Unreadable : RecordResult
         data object Missing : RecordResult
+
+        /** On a location (SD card) that is not mounted: left out, not failed. */
+        data object Unmounted : RecordResult
         data object KeystoreBusy : RecordResult
     }
 
     /**
-     * The decrypted index record of a COMPLETED [row]. Blocking (file check, Keystore). With
-     * [skipKeystore] (it was busy for an earlier row of this pass) only a cached key is used.
+     * The decrypted index record of a COMPLETED [row], with its files where the row has them now
+     * (moved between locations). Blocking (file check, Keystore). With [skipKeystore] (it was busy
+     * for an earlier row of this pass) only a cached key is used. [available]: whether a location
+     * root can be read ([DownloadStorage.availability]).
      */
-    private fun offlineRecord(row: IndexRow, skipKeystore: Boolean): RecordResult {
-        val record = row.recordJson?.let { runCatching { json.decodeFromString(OfflineTrackRecord.serializer(), it) }.getOrNull() }
+    private fun offlineRecord(row: IndexRow, skipKeystore: Boolean, available: (String) -> Boolean): RecordResult {
+        val stored = row.recordJson?.let { runCatching { json.decodeFromString(OfflineTrackRecord.serializer(), it) }.getOrNull() }
             ?: return RecordResult.Unreadable
-        val path = row.path ?: record.path
+        val path = row.path ?: stored.path
+        if (DownloadRules.rootOf(path)?.let(available) == false) return RecordResult.Unmounted
         if (!File(path).isFile) return RecordResult.Missing
-        keys[row.uri]?.let { return RecordResult.Ready(record.copy(keyHex = it, path = path), legacyKey = row.keyVersion == 0) }
+        val record = stored.copy(path = path, imagePath = row.imagePath ?: stored.imagePath)
+        keys[row.uri]?.let { return RecordResult.Ready(record.copy(keyHex = it), legacyKey = row.keyVersion == 0) }
         if (skipKeystore) return RecordResult.KeystoreBusy
         return when (val key = decryptKey(row)) {
             // Not overwriting a key a newer commit of this URI cached meanwhile; this row's record
             // still gets this row's key.
-            is KeyResult.Key -> RecordResult.Ready(record.copy(keyHex = key.hex.also { keys.remember(row.uri, it) }, path = path), key.legacy)
+            is KeyResult.Key -> RecordResult.Ready(record.copy(keyHex = key.hex.also { keys.remember(row.uri, it) }), key.legacy)
             KeyResult.Unreadable -> RecordResult.Unreadable
             KeyResult.KeystoreBusy -> RecordResult.KeystoreBusy
         }
@@ -643,13 +700,15 @@ class DownloadManager(
         val stillBusy = ArrayList<String>()
         val records = ArrayList<OfflineTrackRecord>()
         val unreadable = ArrayList<IndexRow>()
+        val available = storage.availability()
         var keystoreDown = false
         for (row in rows) {
             ensureActive() // registerLate: a newer push supersedes this one
-            when (val result = offlineRecord(row, skipKeystore = keystoreDown)) {
+            when (val result = offlineRecord(row, skipKeystore = keystoreDown, available)) {
                 is RecordResult.Ready -> records += result.record
                 RecordResult.Unreadable -> unreadable += row
                 RecordResult.Missing -> Unit // the next push marks it
+                RecordResult.Unmounted -> Unit // registered when the card is back
                 RecordResult.KeystoreBusy -> {
                     stillBusy += row.uri
                     keystoreDown = true
@@ -662,6 +721,230 @@ class DownloadManager(
         // Only the download that was read (not one removed and downloaded again meanwhile).
         unreadable.forEach { row -> row.completedAt?.let { dao.markUnavailableIfUnchanged(row.uri, it, error, now) } }
         stillBusy
+    }
+
+    // ---- download location -----------------------------------------------------------------------------
+
+    /** The locations downloads can go to now, with their free space (Settings > Storage). */
+    suspend fun locations(): List<DownloadLocation> = withContext(Dispatchers.IO) {
+        storage.locations.list().map { DownloadLocation(it.id, it.label, it.freeBytes, it.removable) }
+    }
+
+    /** Emits when a volume is mounted or goes (the [locations] changed). */
+    val volumeChanges: Flow<Int> = volumes
+
+    private val _relocation = MutableStateFlow(DownloadRelocation())
+
+    /** Moving the downloads to a newly chosen location ([setDownloadLocation]). */
+    val relocation: StateFlow<DownloadRelocation> = _relocation.asStateFlow()
+
+    /**
+     * New downloads go to location [id] ([DownloadLocation.id]); the existing ones move there
+     * ([relocate]: copied, verified, switched in the index, then deleted where they were).
+     */
+    suspend fun setDownloadLocation(id: String) {
+        settings.update { it.copy(downloadLocation = id) }
+    }
+
+    /**
+     * Follows the chosen location and the volumes: resolves where new downloads go, keeps the
+     * offline index in step with what is mounted ([onVolumesChanged]) and moves downloads to the
+     * chosen location ([relocate]). A mount comes as several broadcasts: handled once they settle.
+     */
+    private suspend fun followLocation() {
+        combine(
+            settings.persisted.map { it.downloadLocation }.distinctUntilChanged(),
+            storage.locations.changes().onStart { emit(Unit) },
+        ) { id, _ -> id }
+            .collectLatest { id ->
+                delay(MOUNT_SETTLE_MS)
+                withContext(NonCancellable) { applyLocation(id) }
+            }
+    }
+
+    private suspend fun applyLocation(id: String) {
+        try {
+            val root = withContext(Dispatchers.IO) { runCatching { storage.locations.rootFor(id) }.getOrNull() }
+            val before = storage.target.value
+            val next = if (root != null) DownloadStorage.Target.Ready(id, root) else DownloadStorage.Target.Missing(id)
+            storage.setTarget(next)
+            onVolumesChanged()
+            if (before != next && before is DownloadStorage.Target.Ready && runner.isRunning) {
+                // The run downloads into the old location: stopped; its item resumes in the new one.
+                runner.stopAndAwaitIdle()
+            }
+            relocate()
+            // Re-created: whether it waits for internal storage to be not low depends on the location.
+            if (before != next && next is DownloadStorage.Target.Ready && dao.pendingCount() > 0) {
+                scheduleExecution(replace = before is DownloadStorage.Target.Ready, kick = true)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Applying the download location failed", e)
+        }
+    }
+
+    /** Availability of each location root holding completed downloads, as the index last saw it. */
+    private var indexedRoots: Map<String, Boolean> = emptyMap()
+
+    /**
+     * A volume was mounted or went: downloads on a card that went leave the offline index (they
+     * would not play), the ones on a card that is back are registered again; the lists follow
+     * ([unavailable]). Nothing is failed or deleted.
+     */
+    private suspend fun onVolumesChanged() {
+        val rows = dao.completedLocated()
+        val available = storage.availability()
+        val roots = withContext(Dispatchers.IO) { rows.mapNotNullTo(HashSet()) { row -> row.path?.let(DownloadRules::rootOf) }.associateWith(available) }
+        val back = roots.filter { (root, now) -> now && indexedRoots[root] == false }.keys
+        val gone = roots.filter { (root, now) -> !now && indexedRoots[root] != false }.keys
+        indexedRoots = roots
+        volumes.update { it + 1 }
+        fun urisOn(of: Set<String>) = rows.filter { row -> row.path?.let(DownloadRules::rootOf) in of }.map { it.uri }
+        if (gone.isNotEmpty()) {
+            val uris = urisOn(gone)
+            val seq = mutex.withLock { index.next() }
+            index.remove(uris, seq)
+            Log.i(TAG, "${uris.size} downloads are on storage that is not mounted: out of the offline index until it is back")
+        }
+        if (back.isNotEmpty()) {
+            val uris = urisOn(back)
+            val (seq, indexRows) = mutex.withLock { index.next() to uris.chunked(SQL_CHUNK).flatMap { dao.completedIndexRows(it) } }
+            val busy = registerRows(indexRows, seq)
+            if (busy.isNotEmpty()) scope.launch { registerLate(busy) }
+            Log.i(TAG, "${uris.size} downloads are back with their storage")
+        }
+    }
+
+    private val relocateLock = Mutex()
+    @Volatile private var relocateAgain = false
+
+    /**
+     * Moves the downloads that are not on the chosen location there, one file at a time: copied and
+     * verified ([copyVerified]), then the rows and the offline index switched to the copy, then the
+     * original deleted. Resumable at every step (an interrupted pass leaves either the original in
+     * use, or both copies with the rows on one of them; the next pass carries on). Downloads on a card
+     * that is not mounted wait for it. Runs again after a change that arrives meanwhile.
+     */
+    private fun relocate() {
+        scope.launch {
+            if (!relocateLock.tryLock()) {
+                relocateAgain = true
+                return@launch
+            }
+            try {
+                do {
+                    relocateAgain = false
+                    relocatePass()
+                } while (relocateAgain)
+            } finally {
+                storage.relocating = false
+                _relocation.update { it.copy(moving = false) }
+                relocateLock.unlock()
+            }
+            // Leftovers of an interrupted copy, originals another row named until the switch.
+            if (relocateAgain) relocate() else runner.collectGarbageIfIdle()
+        }
+    }
+
+    private suspend fun relocatePass() {
+        val target = storage.target.value as? DownloadStorage.Target.Ready ?: return
+        val available = storage.availability()
+        moveParts(target.root)
+        val plan = DownloadRules.relocationPlan(dao.locatedRows(), target.root.path, available)
+        if (plan.isEmpty()) return
+        Log.i(TAG, "Moving ${plan.size} download files to ${target.root}")
+        // Under the commit lock, which garbage collection holds while it runs: it never sees a copy
+        // that no row names yet.
+        mutex.withLock { storage.relocating = true }
+        _relocation.value = DownloadRelocation(moving = true, moved = 0, total = plan.size)
+        var moved = 0
+        try {
+            for (batch in plan.chunked(RELOCATE_BATCH)) {
+                if (storage.target.value != target) return // changed again: the next pass moves there
+                val copied = ArrayList<DownloadRules.FileMove>(batch.size)
+                for (move in batch) {
+                    currentCoroutineContext().ensureActive()
+                    try {
+                        withContext(Dispatchers.IO) { copyVerified(File(move.from), File(move.to), storage::freeBytes, DownloadRules.MIN_FREE_BYTES) }
+                        copied += move
+                    } catch (e: FileNotFoundException) {
+                        // Removed meanwhile: nothing to move.
+                    }
+                    moved++
+                    _relocation.value = DownloadRelocation(moving = true, moved = moved, total = plan.size)
+                }
+                switchCopies(copied)
+            }
+            _relocation.value = DownloadRelocation(moved = moved, total = plan.size)
+            Log.i(TAG, "Moved $moved download files to ${target.root}")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: NoSpaceException) {
+            Log.w(TAG, "Moving downloads stopped: not enough space at ${e.dir}")
+            _relocation.value = DownloadRelocation(moved = moved, total = plan.size, error = appContext.getString(R.string.data_dl_move_no_space))
+        } catch (e: IOException) {
+            Log.w(TAG, "Moving downloads stopped; retried later", e)
+            _relocation.value = DownloadRelocation(moved = moved, total = plan.size, error = appContext.getString(R.string.data_dl_move_failed))
+        }
+    }
+
+    /**
+     * Points the rows at the verified [copies] and re-registers them with the offline index (the
+     * index plays the copies from then on), then deletes the originals no row names any more.
+     */
+    private suspend fun switchCopies(copies: List<DownloadRules.FileMove>) {
+        if (copies.isEmpty()) return
+        val (seq, rows) = mutex.withLock {
+            val uris = LinkedHashSet<String>()
+            database.withTransaction {
+                copies.forEach { move ->
+                    if (move.image) dao.relocateImage(move.from, move.to) else dao.relocatePath(move.from, move.to)
+                    uris += dao.completedUrisUsing(move.to)
+                }
+            }
+            index.next() to uris.toList().chunked(SQL_CHUNK).flatMap { dao.completedIndexRows(it) }
+        }
+        val busy = registerRows(rows, seq)
+        if (busy.isNotEmpty()) scope.launch { registerLate(busy) }
+        mutex.withLock {
+            val unused = copies.filter { dao.countPathUsers(it.from) == 0 }
+            withContext(Dispatchers.IO) { unused.forEach { if (it.image) storage.deleteImage(it.from) else storage.deleteAudio(it.from) } }
+        }
+    }
+
+    /**
+     * Moves the `.part` files unfinished downloads resume from other mounted locations to [target],
+     * while no download runs (none is being written then); a running download skips it (that item
+     * then starts over in the new location). Takes the queue only when there is something to move,
+     * and schedules the queue again afterwards (a run that started meanwhile found it taken).
+     */
+    private suspend fun moveParts(target: File) {
+        val targetRoot = DownloadRules.normalizeRoot(target.path)
+        val ids = dao.unfinishedFileIds().mapTo(HashSet()) { "${it.lowercase()}.part" }
+        if (ids.isEmpty()) return
+        val parts = withContext(Dispatchers.IO) {
+            storage.locations.list()
+                .filter { DownloadRules.normalizeRoot(it.root.path) != targetRoot }
+                .flatMap { location -> storage.audioDir(location.root).listFiles()?.filter { it.isFile && it.name.lowercase() in ids }.orEmpty() }
+        }
+        if (parts.isEmpty()) return
+        val ran = runner.whileIdle {
+            withContext(Dispatchers.IO) {
+                for (part in parts) {
+                    val dst = File(storage.audioDir(target), part.name)
+                    if (!part.isFile || dst.exists()) continue // gone, or the new location has progress for it
+                    try {
+                        copyVerified(part, dst, storage::freeBytes, DownloadRules.MIN_FREE_BYTES)
+                        part.delete()
+                    } catch (e: IOException) {
+                        Log.w(TAG, "Could not move ${part.name}; that download starts over", e)
+                    }
+                }
+            }
+        }
+        if (ran && dao.pendingCount() > 0) scheduleExecution(kick = true)
     }
 
     // ---- offline covers ------------------------------------------------------------------------------
@@ -1106,7 +1389,9 @@ class DownloadManager(
      */
     private suspend fun deleteFiles(rows: List<DownloadFileRow>) {
         if (rows.isEmpty()) return
-        val audio = DownloadRules.audioToDelete(rows.map { it.path }, dao.allPaths(), dao.allFileIds())
+        // Completed files are named by their path (per location); unfinished downloads by the file
+        // they write.
+        val audio = DownloadRules.audioToDelete(rows.map { it.path }, dao.allPaths(), dao.unfinishedFileIds())
         val remainingImages = dao.allImagePaths().toHashSet()
         withContext(Dispatchers.IO) {
             audio.forEach(storage::deleteAudio)
@@ -1350,16 +1635,18 @@ class DownloadManager(
             val current = settings.awaitLoaded()
             if (current.offlineMode) return@withContext
             val cellular = current.downloadOverCellular
+            // "Storage not low" is about internal storage: not a condition for downloads to a card.
+            val storageNotLow = needsInternalStorage()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 val scheduler = appContext.getSystemService(JobScheduler::class.java)
                 val job = scheduler?.getPendingJob(JOB_ID)
-                val jobStale = job != null && job.requiresUnmetered() == cellular
+                val jobStale = job != null && (job.requiresUnmetered() == cellular || job.isRequireStorageNotLow != storageNotLow)
                 // A pending (or just started) user-initiated job will drain the queue; a WorkManager
                 // fallback next to it would only start and find the queue taken.
                 if (job != null && DownloadRules.keepPendingJob(replace, kick, jobExecuting, jobStale)) return@withContext
                 val estimate = DownloadRules.estimateBytes(pending, current.downloadQuality.kbps)
                 // Scheduling with the same id replaces the pending job: new constraint, no backoff.
-                if (isAppVisible() && scheduleUserInitiatedJob(cellular, estimate)) {
+                if (isAppVisible() && scheduleUserInitiatedJob(cellular, estimate, storageNotLow)) {
                     if (replace) cancelWorker()
                     return@withContext
                 }
@@ -1370,7 +1657,7 @@ class DownloadManager(
                     scheduler.cancel(JOB_ID)
                 }
             }
-            enqueueWorker(cellular, replace, kick)
+            enqueueWorker(cellular, storageNotLow, replace, kick)
             if (replace) appContext.getSystemService(JobScheduler::class.java)?.cancel(JOB_ID)
         } catch (e: CancellationException) {
             throw e
@@ -1396,14 +1683,20 @@ class DownloadManager(
         ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
     }
 
+    /** New downloads go to internal storage (or where they go is not known yet). */
+    private fun needsInternalStorage(): Boolean {
+        val target = storage.target.value as? DownloadStorage.Target.Ready ?: return storage.target.value is DownloadStorage.Target.Unresolved
+        return DownloadRules.normalizeRoot(target.root.path) == DownloadRules.normalizeRoot(storage.locations.internalRoot.path)
+    }
+
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    private fun scheduleUserInitiatedJob(cellular: Boolean, estimatedBytes: Long): Boolean {
+    private fun scheduleUserInitiatedJob(cellular: Boolean, estimatedBytes: Long, storageNotLow: Boolean): Boolean {
         val scheduler = appContext.getSystemService(JobScheduler::class.java) ?: return false
         val job = JobInfo.Builder(JOB_ID, ComponentName(appContext, DownloadJobService::class.java))
             .setUserInitiated(true)
             .setRequiredNetworkType(if (cellular) JobInfo.NETWORK_TYPE_ANY else JobInfo.NETWORK_TYPE_UNMETERED)
             .setEstimatedNetworkBytes(estimatedBytes, 0)
-            .setRequiresStorageNotLow(true)
+            .setRequiresStorageNotLow(storageNotLow)
             .setBackoffCriteria(JOB_BACKOFF_MS, JobInfo.BACKOFF_POLICY_EXPONENTIAL)
             .build()
         return try {
@@ -1416,11 +1709,11 @@ class DownloadManager(
     }
 
     /** Blocking (reads the pending work): call off the main thread. See [scheduleExecution]. */
-    private fun enqueueWorker(cellular: Boolean, replace: Boolean, kick: Boolean) {
+    private fun enqueueWorker(cellular: Boolean, storageNotLow: Boolean, replace: Boolean, kick: Boolean) {
         val network = if (cellular) NetworkType.CONNECTED else NetworkType.UNMETERED
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(network)
-            .setRequiresStorageNotLow(true)
+            .setRequiresStorageNotLow(storageNotLow)
             .build()
         val request = OneTimeWorkRequestBuilder<DownloadWorker>()
             .setConstraints(constraints)
@@ -1437,7 +1730,8 @@ class DownloadManager(
             replace = replace,
             kick = kick,
             enqueued = existing?.state == WorkInfo.State.ENQUEUED,
-            stale = existing != null && existing.constraints.requiredNetworkType != network,
+            stale = existing != null &&
+                (existing.constraints.requiredNetworkType != network || existing.constraints.requiresStorageNotLow() != storageNotLow),
             runAttempts = existing?.runAttemptCount ?: 0,
         )
         workManager.enqueueUniqueWork(WORK_NAME, if (recreate) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP, request)
@@ -1494,6 +1788,8 @@ class DownloadManager(
         private const val EDIT_SYNC_DELAY_MS = 5_000L
         private const val RESEAL_BATCH = 200
         private const val COVERS_SETTLE_MS = 1_000L
+        private const val MOUNT_SETTLE_MS = 500L
+        private const val RELOCATE_BATCH = 50
 
         /** Collections that change on other devices (likes, playlist edits). */
         private val REMOTE_TYPES = setOf(CollectionType.LIKED_SONGS.wire, CollectionType.PLAYLIST.wire)

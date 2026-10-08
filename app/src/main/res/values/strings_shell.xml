@@ -78,6 +78,11 @@
     <string name="shell_action_unfollow">Unfollow</string>
     <string name="shell_action_rename">Rename playlist</string>
     <string name="shell_action_delete_playlist">Delete playlist</string>
+    <string name="shell_action_make_public">Make public</string>
+    <string name="shell_action_make_private">Make private</string>
+    <string name="shell_action_make_collaborative">Make collaborative</string>
+    <string name="shell_action_make_not_collaborative">Make non-collaborative</string>
+    <string name="shell_playlist_public">Show on your profile</string>
     <string name="shell_choose_artist">Choose artist</string>
     <string name="shell_rename_playlist">Rename playlist</string>
     <string name="shell_playlist_name">Playlist name</string>
@@ -114,6 +119,10 @@
     <string name="shell_msg_starting_radio">Starting radio…</string>
     <string name="shell_msg_playlist_renamed">Playlist renamed</string>
     <string name="shell_msg_playlist_deleted">Playlist deleted</string>
+    <string name="shell_msg_playlist_public">Playlist is now public</string>
+    <string name="shell_msg_playlist_private">Playlist is now private</string>
+    <string name="shell_msg_playlist_collaborative">Playlist is now collaborative</string>
+    <string name="shell_msg_playlist_not_collaborative">Playlist is no longer collaborative</string>
     <string name="shell_msg_cannot_share">This can\'t be shared</string>
     <string name="shell_msg_unsupported_link">This link isn\'t supported</string>
     <string name="shell_msg_no_link_in_share">No Spotify link found in the shared text</string>
@@ -236,6 +245,12 @@
     <string name="shell_settings_offline_mode_summary">Only play downloaded music, even when you\'re online</string>
 
     <string name="shell_settings_storage">Storage</string>
+    <string name="shell_settings_download_location">Download location</string>
+    <string name="shell_settings_download_location_option">%1$s · %2$s free</string>
+    <string name="shell_settings_download_location_missing">%1$s · not available</string>
+    <string name="shell_settings_download_moving">Moving downloads</string>
+    <string name="shell_settings_download_moving_summary">%1$d of %2$d files moved</string>
+    <string name="shell_settings_download_move_stopped">Moving downloads stopped</string>
     <string name="shell_settings_cache_size">Streaming cache</string>
     <string name="shell_settings_cache_size_summary">Up to %1$s for faster replays</string>
     <string name="shell_settings_clear_cache">Clear cache</string>

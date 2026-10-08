@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.download
 
 import com.taehagen.spotifygood.auth.KeystoreUnavailableException
+import com.taehagen.spotifygood.data.db.LocatedRow
 import com.taehagen.spotifygood.data.db.RetryRow
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
@@ -487,6 +488,15 @@ internal object DownloadRules {
         if (e is KeystoreUnavailableException) KeyFailure.RETRY_LATER else KeyFailure.UNREADABLE
 
     /**
+     * [items] as shown while the completed downloads [gone] are on storage that is not mounted (an
+     * SD card removed): not available ([message]) instead of downloaded. Their rows stay COMPLETED.
+     */
+    fun withUnavailable(items: List<DownloadItem>, gone: Set<String>, message: String): List<DownloadItem> {
+        if (gone.isEmpty()) return items
+        return items.map { if (it.state == DownloadState.COMPLETED && it.uri in gone) it.copy(state = DownloadState.FAILED, error = message) else it }
+    }
+
+    /**
      * [items] with the live byte progress of the item being downloaded ([currentUri]): the database
      * only gets it every few seconds (each write wakes every observer of the table).
      */
@@ -584,29 +594,80 @@ internal object DownloadRules {
 
     // ---- files ---------------------------------------------------------------------------------------
     //
-    // Audio lives in `<audioDir>/<fileId>` (+ `.part` while unfinished). Several rows can use one file
-    // (relinking, the same recording in two releases): the native downloader reuses a verified file,
-    // so a file belongs to every row whose path or fileId names it. Matching is by lower-case file
-    // name, so path aliases (`/data/user/0` vs `/data/data`) do not matter.
+    // Audio lives in `<root>/audio/<fileId>` (+ `.part` while unfinished) of a download location
+    // ([DownloadLocations]). Several rows can use one file (relinking, the same recording in two
+    // releases): the native downloader reuses a verified file, so a file belongs to every row whose
+    // path names it (in its location) or whose unfinished download writes it (by fileId). Matching is
+    // by location root and lower-case file name, with the aliases of the app's internal storage
+    // (`/data/user/0` vs `/data/data`) folded.
 
     private const val PART_SUFFIX = ".part"
 
     private fun fileName(path: String) = File(path).name.lowercase()
 
+    private fun fileKey(path: String) = "${rootOf(path)}|${fileName(path)}"
+
     /**
      * Of the completed files of removed rows ([removedPaths]), those no remaining row uses: none has
-     * them as its path ([remainingPaths]) or file ([remainingFileIds], also rows still downloading it).
+     * them as its path in the same location ([remainingPaths]) and no unfinished download writes them
+     * ([remainingFileIds]).
      */
     fun audioToDelete(
         removedPaths: Collection<String?>,
         remainingPaths: Collection<String>,
         remainingFileIds: Collection<String>,
     ): List<String> {
-        val used = HashSet<String>()
-        remainingPaths.mapTo(used, ::fileName)
-        remainingFileIds.mapTo(used) { it.lowercase() }
-        return removedPaths.filterNotNull().filter { it.isNotEmpty() && fileName(it) !in used }.distinct()
+        val usedFiles = remainingPaths.mapTo(HashSet(), ::fileKey)
+        val usedIds = remainingFileIds.mapTo(HashSet()) { it.lowercase() }
+        return removedPaths.filterNotNull().filter { it.isNotEmpty() && fileKey(it) !in usedFiles && fileName(it) !in usedIds }.distinct()
     }
+
+    // ---- download locations --------------------------------------------------------------------------
+
+    private const val INTERNAL_ALIAS = "/data/data/"
+    private const val INTERNAL_PATH = "/data/user/0/"
+
+    /** [root] with the alias of the app's internal storage folded (`/data/data/…` = `/data/user/0/…`). */
+    fun normalizeRoot(root: String): String {
+        val trimmed = root.trimEnd('/')
+        return if (trimmed.startsWith(INTERNAL_ALIAS)) INTERNAL_PATH + trimmed.removePrefix(INTERNAL_ALIAS) else trimmed
+    }
+
+    /** The location root of a download file (`<root>/audio/<id>`, `<root>/images/<id>.jpg`). */
+    fun rootOf(path: String): String? = File(path).parentFile?.parentFile?.path?.let(::normalizeRoot)
+
+    /** Of [paths], those under location root [root]. */
+    fun pathsUnder(root: String, paths: Collection<String>): List<String> = paths.filter { rootOf(it) == root }
+
+    /** A file to move to the download location. */
+    data class FileMove(val from: String, val to: String, val image: Boolean)
+
+    /**
+     * What moving the downloads to the location at [target] copies: every distinct audio file and
+     * cover of [rows] that lies under another location that is [available] (a card that is not
+     * mounted keeps its downloads until it is back), to the same name under [target]. Audio first
+     * (what plays), then covers.
+     */
+    fun relocationPlan(rows: List<LocatedRow>, target: String, available: (String) -> Boolean): List<FileMove> {
+        val to = normalizeRoot(target)
+        fun movable(path: String?): Boolean {
+            val root = path?.takeIf { it.isNotEmpty() }?.let(::rootOf) ?: return false
+            return root != to && available(root)
+        }
+        val audio = rows.mapNotNull { it.path?.takeIf(::movable) }.distinct()
+            .map { FileMove(it, "$to/${DownloadStorage.AUDIO}/${File(it).name}", image = false) }
+        val images = rows.mapNotNull { it.imagePath?.takeIf(::movable) }.distinct()
+            .map { FileMove(it, "$to/${DownloadStorage.IMAGES}/${File(it).name}", image = true) }
+        return audio + images
+    }
+
+    /**
+     * Completed downloads ([rows]) whose audio lies on a location that is not [available] (a card
+     * removed or unmounted): they stay downloaded (nothing is deleted or failed) but cannot play
+     * until it is back.
+     */
+    fun unavailableUris(rows: List<LocatedRow>, available: (String) -> Boolean): Set<String> =
+        rows.filterTo(HashSet()) { row -> row.path?.let(::rootOf)?.let { !available(it) } == true }.mapTo(HashSet()) { it.uri }
 
     /**
      * Names in the audio directory garbage collection deletes: completed files no row uses ([paths],

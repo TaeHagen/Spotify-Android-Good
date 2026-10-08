@@ -250,6 +250,9 @@ pub struct Playlist {
     pub items: Vec<PlaylistItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub following: Option<bool>,
+    /// Shown on the user's profile; known when the playlist is in the user's rootlist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_public: Option<bool>,
     /// Some item metadata could not be fetched right now (docs §6.5 `partial`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub partial: bool,
@@ -366,6 +369,9 @@ pub struct RootlistEntry {
     /// True when the logged-in user may add/remove items (owner or collaborative).
     #[serde(default)]
     pub can_edit: bool,
+    /// Playlists: shown on the user's profile (the rootlist item's `public` attribute).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_public: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
