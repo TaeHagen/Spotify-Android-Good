@@ -1080,6 +1080,12 @@ failed lookup (offline, the session still connecting, a network error) stays unk
 while online). Unknown hearts / Save / Follow controls are shown disabled. A toggle writes the
 opposite of the state the control showed, never of the server's current state, so a stale
 "not saved" can't remove an item (and its download).
+Native catalog calls don't wait for a session: they fail `NOT_CONNECTED` at once while it
+connects or reconnects. Browse screens load once the engine's reach (§4.6) is ONLINE and
+again after a reconnect when they failed. Search waits up to 10 s for a connecting session
+(not when offline or in backoff, so a captive portal can't stall it); a search or result page
+that failed before the session was ONLINE shows its error and runs again by itself once it is
+(a connection error while ONLINE: after the next reconnect), without a Retry tap.
 
 ### 9.9 UI
 
