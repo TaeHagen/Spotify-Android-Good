@@ -29,7 +29,10 @@ over JNI). Requires a Spotify Premium account.
   albums, artists and podcasts, follow artists.
 - **Browse:** search across all types with recent searches, home feed, album, artist,
   playlist, show and episode pages, synced lyrics, share links and deep links
-  (`spotify:` URIs and open.spotify.com links).
+  (`spotify:` URIs and open.spotify.com links). On Android 12 and later, open.spotify.com
+  links open in the browser until you allow them for SpotifyGood: Settings › Links in the app
+  takes you to the system's "Open by default" page (shown only while needed). Sharing a link
+  to SpotifyGood works without that.
 - **Downloads:** tracks, albums, playlists, Liked Songs and podcasts for offline playback in
   the app. Files stay encrypted and their keys are protected by the Android Keystore.
   - Optional Wi-Fi only, collection auto-sync, storage management.

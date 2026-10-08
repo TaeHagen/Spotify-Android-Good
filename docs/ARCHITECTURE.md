@@ -875,8 +875,13 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   cleared it, and the half-done login was lost). Every request from outside (the
   `spotifygood://auth` redirect, `spotify:` / open.spotify.com links, shares, voice search)
   arrives through `LinkActivity` (no UI, no history), which forwards it as a launcher intent
-  carrying the request with `CLEAR_TOP | SINGLE_TOP` to the existing `MainActivity`: the
-  redirect closes the tab, and a task a link created still has the launcher's root intent.
+  carrying the request with `NEW_TASK | CLEAR_TOP | SINGLE_TOP` to the existing `MainActivity`:
+  the redirect closes the tab, and a task a link created still has the launcher's root intent.
+  `LinkActivity` has an empty `taskAffinity`: it runs in the caller's task, or (a caller's
+  `NEW_TASK` start: Chrome, the Assistant) in a throwaway task of its own, and is never the root
+  of the app's task, which is always rooted by `MainActivity`. A root keeps the task's identity,
+  and an excluded-from-Recents trampoline root took the app out of Recents and got its task
+  trimmed. A relaunch of `LinkActivity` from history forwards no request.
 * Alternative login: "Use another device" → `session.zeroconfLogin` (mDNS, MulticastLock
   only while that screen is visible: hiding the screen cancels it).
 * A finished login (`LoginState.Success`) goes back to the options as soon as the engine
@@ -1318,7 +1323,13 @@ error while ONLINE: after the next reconnect).
   Add-to-playlist sheet, Create playlist dialog, Settings, Profile.
 * Mini player above the navigation bar (swipe/tap to expand, progress line, play/pause,
   device indicator).
-* Deep links: `https://open.spotify.com/{type}/{id}` and `spotify:{type}:{id}` intents.
+* Deep links: `https://open.spotify.com/{type}/{id}` and `spotify:{type}:{id}` intents. The
+  https links can't be verified for this app: from Android 12 they reach it only after the user
+  approves open.spotify.com in its "Open by default" settings. Settings › Links offers that
+  (`ACTION_APP_OPEN_BY_DEFAULT_SETTINGS`) while `DomainVerificationManager` reports the domain
+  neither selected nor verified, or link handling off (checked again on every resume); if the
+  Spotify app holds the domain, its "Open supported links" has to go off first. Shared links
+  always work.
 * Offline: banner + downloaded-only filtering when offline mode or no network.
 
 ## 10. Lifecycle & battery policy (summary)
