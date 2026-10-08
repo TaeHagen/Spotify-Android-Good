@@ -213,6 +213,9 @@
     <string name="shell_settings_autoplay_summary">Keep listening to similar content when your music ends</string>
     <string name="shell_settings_hide_explicit">Hide explicit content</string>
     <string name="shell_settings_hide_explicit_summary">Explicit tracks are skipped and greyed out</string>
+    <string name="shell_settings_links">Links</string>
+    <string name="shell_settings_open_links">Open Spotify links in SpotifyGood</string>
+    <string name="shell_settings_open_links_summary">Android opens open.spotify.com links in the browser until you allow them. Tap, then Add links and choose open.spotify.com. If the Spotify app opens them, turn off its Open supported links first. Sharing a link to SpotifyGood always works.</string>
     <string name="shell_settings_sleep_timer">Sleep timer</string>
     <string name="shell_sleep_off">Off</string>
     <string name="shell_sleep_end_of_track">At the end of this track</string>
