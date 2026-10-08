@@ -8,14 +8,15 @@ use crate::{
         restrictions::Restrictions,
     },
     shuffle_vec::ShuffleVec,
-    // SPOTIFYGOOD: IDENTIFIER_DELIMITER instead of SPOTIFY_MAX_NEXT_TRACKS_SIZE and IsProvider
+    // SPOTIFYGOOD: IDENTIFIER_DELIMITER instead of SPOTIFY_MAX_NEXT_TRACKS_SIZE and IsProvider,
+    // Anchor for place_in_order
     state::{
-        ConnectState, StateError, metadata::Metadata, provider::Provider,
+        ConnectState, StateError, handle::Anchor, metadata::Metadata, provider::Provider,
         tracks::IDENTIFIER_DELIMITER,
     },
 };
 use protobuf::MessageField;
-// SPOTIFYGOOD: Rng for keep_shuffled_order
+// SPOTIFYGOOD: Rng for keep_shuffled_order and place_in_order
 use rand::Rng;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -104,15 +105,24 @@ impl<'c> TrackMatcher<'c> {
     }
 
     fn take_by_uid(&mut self, track: &ProvidedTrack) -> Option<usize> {
-        if track.uid.is_empty() {
-            return None;
-        }
-        Self::take(self.by_uid.get_mut(track.uid.as_str()), &mut self.taken)
+        self.take_uid(&track.uid)
     }
 
     /// for contexts without stable uids (they are generated on every resolve)
     fn take_by_uri(&mut self, track: &ProvidedTrack) -> Option<usize> {
-        Self::take(self.by_uri.get_mut(track.uri.as_str()), &mut self.taken)
+        self.take_uri(&track.uri)
+    }
+
+    // SPOTIFYGOOD: see ConnectState::place_in_order, which matches track ids (a uid, else a uri)
+    fn take_uid(&mut self, uid: &str) -> Option<usize> {
+        if uid.is_empty() {
+            return None;
+        }
+        Self::take(self.by_uid.get_mut(uid), &mut self.taken)
+    }
+
+    fn take_uri(&mut self, uri: &str) -> Option<usize> {
+        Self::take(self.by_uri.get_mut(uri), &mut self.taken)
     }
 
     /// the positions no track was matched to
@@ -202,6 +212,8 @@ impl ConnectState {
     pub fn reset_context(&mut self, mut reset_as: ResetContext) -> bool {
         // SPOTIFYGOOD: see place_current_track_when_resolved
         self.place_current_track = false;
+        // SPOTIFYGOOD: see shuffle_in_order, the order is gone with the reset
+        self.kept_shuffle_order = None;
 
         if matches!(reset_as, ResetContext::WhenDifferent(ctx) if self.different_context_uri(ctx)) {
             reset_as = ResetContext::Completely
@@ -389,6 +401,9 @@ impl ConnectState {
                 self.context = Some(new_context);
                 // SPOTIFYGOOD: resolved (again), see different_context_uri
                 self.default_context_incomplete = false;
+                // SPOTIFYGOOD: a load keeps its order after this, see shuffle_in_order. An update
+                // (keep_shuffle_on_update) has its own.
+                self.kept_shuffle_order = None;
 
                 if !matches!(context.url, Some(ref url) if url.contains(SEARCH_IDENTIFIER)) {
                     self.player_mut().context_url = context.url.take().unwrap_or_default();
@@ -603,6 +618,127 @@ impl ConnectState {
         Some((order, played_len))
     }
 
+    // SPOTIFYGOOD: see shuffle_in_order (the load) and fill_context_from_page (its further pages)
+    /// Puts the default context into the shuffled order `ids` (see `Options::shuffle_order`): the
+    /// tracks matching them (by uid, else by uri; ids it doesn't have are left out) in their
+    /// order, then the others. Of the others, the ones placed before (the first `placed` of the
+    /// current order) keep their order, and the new ones are shuffled in after the playback
+    /// position. The playback goes on where it is, with the tracks before it as the prev tracks.
+    /// A new current track that isn't one of `ids` (a start track, or one that played outside the
+    /// context until its page came) goes first, the given tracks follow it; it is added to `ids`
+    /// for the next pages.
+    ///
+    /// Returns false, changing nothing, if none of `ids` is in the context.
+    pub(super) fn place_in_order(
+        &mut self,
+        ids: &mut Vec<String>,
+        placed: usize,
+    ) -> Result<bool, Error> {
+        let mut anchor = self.playback_anchor().unwrap_or(Anchor::Start);
+        let ctx = self.get_context(ContextType::Default)?;
+        let len = ctx.tracks.len();
+        let placed = placed.min(len);
+
+        // a uri only takes a track that no uid matches
+        let mut matcher = TrackMatcher::new(ctx);
+        let mut matched = ids
+            .iter()
+            .map(|id| matcher.take_uid(id))
+            .collect::<Vec<_>>();
+        for (to, id) in matched.iter_mut().zip(ids.iter()) {
+            if to.is_none() {
+                *to = matcher.take_uri(id);
+            }
+        }
+        let given = matched.into_iter().flatten().collect::<Vec<_>>();
+        if given.is_empty() {
+            return Ok(false);
+        }
+
+        // the position (in the current order) of the track the playback continues after
+        // (or before)
+        let anchor_at = match &anchor {
+            Anchor::After(uid) | Anchor::Before(uid) => {
+                ctx.tracks.iter().position(|t| &t.uid == uid)
+            }
+            Anchor::Start => None,
+        };
+        let mut first = None;
+        if let (Anchor::After(_), Some(at)) = (&anchor, anchor_at) {
+            if at >= placed && !given.contains(&at) {
+                let uri = &ctx.tracks[at].uri;
+                match given.iter().find(|&&g| &ctx.tracks[g].uri == uri) {
+                    // the same song as a given track (twice in the context): that one plays
+                    Some(&g) => anchor = Anchor::After(ctx.tracks[g].uid.clone()),
+                    None => first = Some(at),
+                }
+            }
+        }
+
+        let mut taken = vec![false; len];
+        for &p in given.iter().chain(first.iter()) {
+            taken[p] = true;
+        }
+        let mut others = (0..placed).filter(|&p| !taken[p]).collect::<Vec<_>>();
+        let after = anchor_at
+            .and_then(|at| others.iter().position(|&p| p == at))
+            .map_or(0, |i| i + 1);
+        let mut rng = rand::rng();
+        for new in (placed..len).filter(|&p| !taken[p]) {
+            let at = rng.random_range(after..=others.len());
+            others.insert(at, new);
+        }
+
+        let original = ctx.tracks.original_positions();
+        let order = first
+            .iter()
+            .chain(&given)
+            .chain(&others)
+            .map(|&p| original[p])
+            .collect::<Vec<_>>();
+        let first_id = first.map(|p| {
+            let track = &ctx.tracks[p];
+            if track.uid.is_empty() {
+                track.uri.clone()
+            } else {
+                track.uid.clone()
+            }
+        });
+
+        let ctx = self.get_context_mut(ContextType::Default)?;
+        if !ctx.tracks.shuffle_to_order(&order) {
+            return Ok(false);
+        }
+        // shuffled (see default_context_shuffled), the order is no seed's and has no first track
+        // to skip in the first pass
+        if ctx.get_shuffle_seed().is_none() {
+            ctx.set_shuffle_seed(rng.random_range(100_000_000_000..1_000_000_000_000u64));
+        }
+        ctx.remove_initial_track();
+        if let Some(id) = first_id {
+            ids.insert(0, id);
+        }
+        // smart shuffle suggestions go after positions of the old order, new ones are fetched
+        if self.smart_shuffle() {
+            self.reset_suggestions();
+        }
+
+        self.reset_playback_to_position(self.anchor_position(&anchor))?;
+        Ok(true)
+    }
+
+    // SPOTIFYGOOD: for ContextResolver::try_finish, see shuffle_in_order
+    /// Whether a load keeps its shuffled order while the further pages of the default context
+    /// resolve (they are placed in it as they come, none is shuffled anew)
+    pub fn keeps_shuffle_order(&self) -> bool {
+        self.kept_shuffle_order.is_some()
+    }
+
+    /// No further page of the default context is to come (see keeps_shuffle_order)
+    pub fn forget_shuffle_order(&mut self) {
+        self.kept_shuffle_order = None;
+    }
+
     fn state_context_from_page(
         &mut self,
         page: ContextPage,
@@ -789,7 +925,29 @@ impl ConnectState {
             }
         }
 
+        // SPOTIFYGOOD: see shuffle_in_order
+        let placed = self.context.as_ref().map_or(0, |ctx| ctx.tracks.len());
+
         self.append_page(page, ty)?;
+
+        // SPOTIFYGOOD: a load that keeps a shuffled order (a reconnect restore, the offline
+        // queue's hand-back) places every page in it: the given tracks it brings go to their
+        // place, its others are shuffled in after the playback position. It went to the end in
+        // the page's order, and the last page shuffled the whole context anew (try_finish): the
+        // prev tracks were gone, Up Next changed and the songs played before came back.
+        if matches!(ty, ContextType::Default) {
+            if let Some(mut ids) = self.kept_shuffle_order.take() {
+                if self.shuffling_context()
+                    && matches!(self.active_context, ContextType::Default)
+                    && matches!(self.fill_up_context, ContextType::Default)
+                    && self.place_in_order(&mut ids, placed)?
+                {
+                    self.kept_shuffle_order = Some(ids);
+                    return Ok(());
+                }
+                // the last page shuffles it as without an order (or not at all if shuffle is off)
+            }
+        }
 
         if matches!(ty, ContextType::Default) {
             self.place_current_track_if_there()?;

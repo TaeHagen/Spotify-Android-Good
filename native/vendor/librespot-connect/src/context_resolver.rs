@@ -488,6 +488,10 @@ impl ContextResolver {
 
         let res = if let Some(transfer) = transfer_state.take() {
             state.finish_transfer_without_context(transfer)
+        } else if state.shuffling_context() && state.keeps_shuffle_order() {
+            // SPOTIFYGOOD: like try_finish, a load that keeps its order placed the pages there
+            // were in it
+            state.fill_up_next_tracks()
         } else if state.shuffling_context() && !(replace && state.default_context_shuffled()) {
             // like try_finish: the further pages of a shuffled load (shuffled with the pages
             // there were, the ones after it went to the end in their order) are shuffled in.
@@ -514,6 +518,8 @@ impl ContextResolver {
         }
         // SPOTIFYGOOD: no page with it is to come
         state.forget_current_track_placement();
+        // SPOTIFYGOOD: no page to place in the kept order either
+        state.forget_shuffle_order();
 
         state.update_restrictions();
         state.update_queue_revision();
@@ -579,6 +585,15 @@ impl ContextResolver {
             state.finish_transfer(transfer_state)
         } else if state.shuffling_context()
             && next.update == ContextType::Default
+            && state.keeps_shuffle_order()
+        {
+            // SPOTIFYGOOD: a load that keeps a shuffled order (a reconnect restore, the offline
+            // queue's hand-back) placed every page in it (ConnectState::fill_context_from_page).
+            // The reshuffle drew a new order, the session's was gone again: the prev tracks, Up
+            // Next, and the songs played before came back.
+            state.fill_up_next_tracks()
+        } else if state.shuffling_context()
+            && next.update == ContextType::Default
             // SPOTIFYGOOD: not after an update of the context that already played shuffled,
             // update_context kept its shuffled order (with the added tracks shuffled in). The
             // reshuffle cleared the prev tracks and brought back the songs played in this pass.
@@ -603,9 +618,11 @@ impl ContextResolver {
         if let Err(why) = res {
             error!("setup of state failed: {why}, last used resolve {next:#?}")
         }
-        // SPOTIFYGOOD: no page with it is to come (see place_current_track_when_resolved)
+        // SPOTIFYGOOD: no page with it is to come (see place_current_track_when_resolved), nor
+        // one to place in the kept order
         if next.update == ContextType::Default {
             state.forget_current_track_placement();
+            state.forget_shuffle_order();
         }
 
         state.update_restrictions();
