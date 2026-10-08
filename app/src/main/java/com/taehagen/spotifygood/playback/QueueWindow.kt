@@ -166,9 +166,11 @@ internal object MediaIds {
 
     /**
      * Resolves controller media items (Auto, Assistant, resumption) into a `player.load` request.
-     * [downloaded] is only invoked for `dl|` ids.
+     * [downloaded] is only invoked for `dl|` ids: the downloads queued around that start item (the
+     * section of the Downloads tab it is listed in, [OfflineTree.Singles.sectionOf]); the start
+     * item goes first when it is not among them.
      */
-    fun plan(mediaIds: List<String>, startIndex: Int, downloaded: () -> List<String>): LoadPlan? {
+    fun plan(mediaIds: List<String>, startIndex: Int, downloaded: (startUri: String) -> List<String>): LoadPlan? {
         if (mediaIds.isEmpty()) return null
         val index = startIndex.coerceIn(0, mediaIds.lastIndex)
         return when (val start = parse(mediaIds[index])) {
@@ -179,7 +181,7 @@ internal object MediaIds {
                 LoadPlan(trackUris = listOf(start.trackUri), startIndex = 0)
             }
             is Parsed.Downloaded -> {
-                val all = downloaded()
+                val all = downloaded(start.trackUri)
                 val queue = if (start.trackUri in all) all else listOf(start.trackUri) + all
                 LoadPlan(trackUris = queue, startIndex = queue.indexOf(start.trackUri))
             }

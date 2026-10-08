@@ -59,7 +59,8 @@ internal class SpotifyPlayer(
     private val devices: DevicesRepository,
     private val volume: VolumeSync,
     private val audioSessionId: Int,
-    private val downloadedUris: () -> List<String>,
+    /** The downloads a `dl|` item of the browse tree plays with ([MediaIds.plan]), by its uri. */
+    private val downloadedQueue: (startUri: String) -> List<String>,
     /** Absolute path of the downloaded cover of a track / episode uri (offline artwork), if any. */
     private val downloadedImage: (String) -> String? = { null },
     /** The error to publish while nothing plays (logged out, Premium, failed start), see [PlayerErrors]. */
@@ -356,7 +357,7 @@ internal class SpotifyPlayer(
 
     override fun handleSetMediaItems(mediaItems: List<MediaItem>, startIndex: Int, startPositionMs: Long): ListenableFuture<*> {
         onCommand()
-        val plan = MediaIds.plan(mediaItems.map { it.mediaId }, startIndex, downloadedUris)
+        val plan = MediaIds.plan(mediaItems.map { it.mediaId }, startIndex, downloadedQueue)
             ?: return Futures.immediateVoidFuture()
         val request = PlayRequest(
             contextUri = plan.contextUri,
