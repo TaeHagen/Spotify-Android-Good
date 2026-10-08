@@ -9,6 +9,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
+import androidx.core.content.IntentCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.initializer
@@ -24,6 +25,9 @@ import com.taehagen.spotifygood.ui.theme.SpotifyGoodTheme
  * Single activity hosting the Compose UI (owned by the UI shell): edge-to-edge, splash screen,
  * notification permission request, deep links (`spotify:`, open.spotify.com), the
  * `spotifygood://auth` login redirect and media notification taps (open Now Playing).
+ *
+ * `singleTop`: requests from outside arrive through [LinkActivity] as [EXTRA_REQUEST], so a
+ * launcher tap never clears the login Custom Tab above this activity.
  */
 class MainActivity : ComponentActivity() {
     private val graph: AppGraph get() = (application as App).graph
@@ -59,15 +63,19 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
     }
 
-    private fun handleIntent(intent: Intent?) {
-        intent ?: return
+    private fun handleIntent(launch: Intent?) {
+        launch ?: return
         // Media notification, lock-screen player or SysUI media card tap (the session activity). The
         // launch intent's action is MAIN, so this is independent of the action switch below.
-        if (intent.getBooleanExtra(PlaybackService.EXTRA_OPEN_PLAYER, false)) {
+        if (launch.getBooleanExtra(PlaybackService.EXTRA_OPEN_PLAYER, false)) {
             // Consumed: later handling of the same intent object must not open the player again.
-            intent.removeExtra(PlaybackService.EXTRA_OPEN_PLAYER)
+            launch.removeExtra(PlaybackService.EXTRA_OPEN_PLAYER)
             shell.openPlayer()
         }
+        // A link, redirect, share or voice search forwarded by LinkActivity (consumed likewise).
+        val intent = IntentCompat.getParcelableExtra(launch, EXTRA_REQUEST, Intent::class.java)
+            ?.also { launch.removeExtra(EXTRA_REQUEST) }
+            ?: launch
         when (intent.action) {
             Intent.ACTION_VIEW -> {
                 val data = intent.data ?: return
@@ -101,8 +109,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private companion object {
-        const val AUTH_SCHEME = "spotifygood"
+    internal companion object {
+        private const val AUTH_SCHEME = "spotifygood"
+
+        /** The outside request [LinkActivity] forwards (an [Intent], never started). */
+        const val EXTRA_REQUEST = "com.taehagen.spotifygood.extra.REQUEST"
 
         /** MediaStore.EXTRA_MEDIA_PLAYLIST (deprecated constant, still sent by assistants). */
         const val EXTRA_MEDIA_PLAYLIST = "android.intent.extra.playlist"

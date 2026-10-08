@@ -342,9 +342,11 @@ class PlaybackService : MediaLibraryService() {
         triggerNotificationUpdate()
         main.removeCallbacks(releaseBrowseHolder)
         synchronized(holderLock) {
-            playbackHolder?.release()
+            // The paused lifetime was the grace: without other holders the engine hides from
+            // Connect and stops now, not 20 s / 60 s of (sleeping) uptime later.
+            playbackHolder?.releaseNow()
             playbackHolder = null
-            browseHolder?.release()
+            browseHolder?.releaseNow()
             browseHolder = null
         }
         stopSelf()

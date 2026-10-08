@@ -62,16 +62,28 @@
             android:name="com.google.android.gms.car.application"
             android:resource="@xml/automotive_app_desc" />
 
+        <!-- singleTop: a launcher tap must not clear the login Custom Tab above it (singleTask
+             did); requests from outside come through LinkActivity -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTask"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.SpotifyGood.Splash"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+        </activity>
+
+        <!-- Links, the login redirect, shares and voice search: forwarded to MainActivity in the
+             app's task (no UI, no history) -->
+        <activity
+            android:name=".LinkActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
             <!-- Login redirect from the loopback server / browser -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -139,6 +151,11 @@
         <!-- Wall-clock bound of the playback service's paused lifetime; not exported -->
         <receiver
             android:name=".playback.PausedIdleAlarmReceiver"
+            android:exported="false" />
+
+        <!-- Wall-clock deadlines of the engine's idle stop and Connect hide; not exported -->
+        <receiver
+            android:name=".engine.EngineIdleAlarmReceiver"
             android:exported="false" />
 
         <!-- Artwork for Android Auto / notification (content:// URIs) -->

@@ -58,7 +58,10 @@ fn next_generation() -> u64 {
 /// Creates the Session for an attempt (not connected yet).
 pub(crate) async fn prepare(settings: &EngineSettings) -> AppResult<Session> {
     let cache = config::build_cache(settings).await?;
-    Ok(Session::new(config::session_config(), Some(cache)))
+    let session = Session::new(config::session_config(), Some(cache));
+    // `connect` binds the Player to it before ProductInfo: filtered like the offline session.
+    player_host::prepare_session(&session, settings);
+    Ok(session)
 }
 
 /// Maps a failed `Spirc::new` (login) to the contract's error codes. AP login errors live in a

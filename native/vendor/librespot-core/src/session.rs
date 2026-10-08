@@ -5,6 +5,8 @@ use std::{
     pin::Pin,
     // SPOTIFYGOOD: removed `process::exit` (check_catalogue no longer exits the process)
     sync::{Arc, OnceLock, RwLock, Weak},
+    // SPOTIFYGOOD: the app's explicit filter (Session::set_filter_explicit_forced)
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -132,6 +134,10 @@ struct SessionInternal {
     cache: Option<Arc<Cache>>,
 
     handle: tokio::runtime::Handle,
+
+    // SPOTIFYGOOD: an app-side explicit filter OR-ed into the account's `filter-explicit-content`
+    // attribute, see [Session::set_filter_explicit_forced]
+    filter_explicit_forced: AtomicBool,
 }
 
 /// A shared reference to a Spotify session.
@@ -174,6 +180,8 @@ impl Session {
             token_provider: OnceLock::new(),
             login5: OnceLock::new(),
             handle: tokio::runtime::Handle::current(),
+            // SPOTIFYGOOD: see Session::set_filter_explicit_forced
+            filter_explicit_forced: AtomicBool::new(false),
         }))
     }
 
@@ -607,10 +615,27 @@ impl Session {
     }
 
     pub fn filter_explicit_content(&self) -> bool {
+        // SPOTIFYGOOD: OR the app's filter (set_filter_explicit_forced) into the account's
+        if self.filter_explicit_forced() {
+            return true;
+        }
         match self.get_user_attribute("filter-explicit-content") {
             Some(value) => matches!(&*value, "1"),
             None => false,
         }
+    }
+
+    // SPOTIFYGOOD: an app-side explicit filter. `filter_explicit_content` is this OR the
+    // `filter-explicit-content` attribute, which stays the account's own value: ProductInfo
+    // (which replaces all attributes), attribute updates and mutations (which flip the local
+    // value) never meet an app value in it, and can't reset the app's filter either.
+    pub fn set_filter_explicit_forced(&self, forced: bool) {
+        self.0.filter_explicit_forced.store(forced, Ordering::Relaxed);
+    }
+
+    // SPOTIFYGOOD: see set_filter_explicit_forced
+    pub fn filter_explicit_forced(&self) -> bool {
+        self.0.filter_explicit_forced.load(Ordering::Relaxed)
     }
 
     pub fn autoplay(&self) -> bool {
