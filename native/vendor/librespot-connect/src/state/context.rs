@@ -807,6 +807,18 @@ impl ConnectState {
         self.place_current_track = true;
     }
 
+    /// Whether the current track is a context track the default context doesn't contain (yet),
+    /// not a queued track or a suggestion
+    pub fn current_track_outside_context(&self) -> bool {
+        self.current_track(|t| {
+            t.is_some()
+                && Self::is_plain_context_track(t)
+                && self
+                    .get_context(ContextType::Default)
+                    .is_ok_and(|ctx| Self::position_in_context(ctx, t).is_none())
+        })
+    }
+
     /// No page with the current track is to come (see place_current_track_when_resolved)
     pub fn forget_current_track_placement(&mut self) {
         self.place_current_track = false;
