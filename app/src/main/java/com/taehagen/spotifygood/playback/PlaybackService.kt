@@ -920,9 +920,9 @@ class PlaybackService : MediaLibraryService() {
                 // Voice: "play X" (empty query = "play something": resume the last context). The
                 // same resolver as the activity's MEDIA_PLAY_FROM_SEARCH (LibraryTree.resolveVoice).
                 val voice = VoiceRequest.of(query, first.requestMetadata.extras)
-                // "Play X" right after a cold start: search needs the session (NOT_CONNECTED otherwise).
-                if (!voice.isBlank) coordinator.environment.awaitSessionStart()
-                when (val outcome = tree.resolveVoice(voice)) {
+                // "Play X" right after a cold start: search needs the session (NOT_CONNECTED
+                // otherwise); ensurePlaybackHolder above lets an idle-stopped one start.
+                when (val outcome = VoiceEntry.resolve(voice, tree::isOffline, coordinator.environment::awaitSessionStart, tree::resolveVoice)) {
                     VoiceOutcome.PlaySomething -> {
                         val last = resumeStore.read() ?: noVoiceMatch(PlaybackErrorKind.NOT_ACTIVE_DEVICE)
                         MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
