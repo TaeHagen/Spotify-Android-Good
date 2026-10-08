@@ -106,6 +106,31 @@ impl ConnectState {
         self.shuffle(new_seed, &current_track)
     }
 
+    // SPOTIFYGOOD: a shuffled session loaded again as it was (a reconnect restore, the offline
+    // queue's hand-back, see Options::shuffle_order). shuffle_new drew a new order there: the
+    // prev tracks were gone, Up Next changed and the songs played in this pass came back.
+    /// Shuffles the default context into the given order around the current track (see
+    /// [ConnectState::place_in_order]) instead of a new one. With further pages to come
+    /// (`pages_pending`) each of them is placed in it as it comes (see fill_context_from_page).
+    /// Returns false if none of `ids` is in the context, the caller shuffles anew then.
+    pub fn shuffle_in_order(&mut self, ids: &[String], pages_pending: bool) -> Result<bool, Error> {
+        self.validate_shuffle_allowed()?;
+
+        // like shuffle: the order starts over (and the prev tracks of what played before go)
+        self.clear_prev_track();
+        self.clear_next_tracks();
+        self.reset_context(ResetContext::DefaultIndex);
+
+        let mut ids = ids.to_vec();
+        if !self.place_in_order(&mut ids, 0)? {
+            return Ok(false);
+        }
+        if pages_pending {
+            self.kept_shuffle_order = Some(ids);
+        }
+        Ok(true)
+    }
+
     fn shuffle(&mut self, seed: u64, initial_track: &str) -> Result<(), Error> {
         self.clear_prev_track();
         self.clear_next_tracks();

@@ -184,6 +184,10 @@ pub(super) struct ConnectState {
     // SPOTIFYGOOD: see ConnectState::place_current_track_when_resolved
     /// the current track plays outside the default context until the page with it is there
     place_current_track: bool,
+    // SPOTIFYGOOD: see ConnectState::shuffle_in_order
+    /// the shuffled order (track ids, see `Options::shuffle_order`) a load keeps while the
+    /// further pages of its context resolve, every page is placed in it
+    kept_shuffle_order: Option<Vec<String>>,
     // SPOTIFYGOOD: see ConnectState::set_playback_speed
     /// the speed playback runs at while playing (podcasts); `None`: normal speed
     playing_speed: Option<f64>,

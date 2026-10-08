@@ -2410,6 +2410,11 @@ impl SpircTask {
         let pages_pending = self
             .context_resolver
             .has_pending_pages(ContextType::Default);
+        // SPOTIFYGOOD: see the shuffled load below
+        let shuffle_order = match cmd_options.context_options {
+            Some(LoadContextOptions::Options(ref options)) => options.shuffle_order.clone(),
+            _ => None,
+        };
 
         if let Some(LoadContextOptions::Options(ref options)) = cmd_options.context_options {
             debug!(
@@ -2435,11 +2440,23 @@ impl SpircTask {
                 self.connect_state.set_current_track_random()?;
             }
 
+            // SPOTIFYGOOD: a shuffled session loaded again (a reconnect restore, the offline
+            // queue's hand-back) keeps its order, see Options::shuffle_order: the start track at
+            // its place in it, the given tracks before it as the prev tracks, the rest of the
+            // context shuffled after them. Further pages are placed in it as they come (no
+            // reshuffle by the last one). Every reconnect drew a new order: Previous restarted
+            // the song, Up Next changed and the songs already heard came back.
+            let kept = match shuffle_order {
+                Some(ref ids) => self.connect_state.shuffle_in_order(ids, pages_pending)?,
+                None => false,
+            };
             // SPOTIFYGOOD: shuffled with the pages there are, also while further pages resolve
             // (the last one shuffles the whole context again, see ContextResolver::try_finish).
             // The shuffle waited for them with empty next tracks, so the playback stopped when
             // the song ended meanwhile (minutes on a flaky link, with the retries).
-            self.connect_state.shuffle_new()?;
+            if !kept {
+                self.connect_state.shuffle_new()?;
+            }
             if !self.context_resolver.has_next() {
                 self.add_autoplay_resolving_when_required();
             }
