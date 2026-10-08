@@ -85,6 +85,10 @@ pub(crate) struct Restoring {
 #[derive(Debug, Clone)]
 pub(crate) struct Frozen {
     pub snap: ConnectSnapshot,
+    /// A user load that was still on its way to the Spirc when the playback was interrupted (see
+    /// `HubState::loading`): it replaced what played before it, so it is what comes back (`snap`
+    /// is empty then).
+    pub load: Option<LoadArgs>,
     pub position_ms: i64,
     /// When the playback was interrupted, local epoch ms ...
     pub at_ms: i64,
@@ -144,7 +148,20 @@ pub(crate) fn position_now(s: &ConnectSnapshot, now_ms: i64) -> i64 {
 
 pub(crate) fn freeze(snap: ConnectSnapshot, now_ms: i64, since: Instant) -> Frozen {
     let was_playing = matches!(snap.status, SnapshotPlayStatus::Playing | SnapshotPlayStatus::LoadingPlay);
-    Frozen { position_ms: position_now(&snap, now_ms), at_ms: now_ms, since, was_playing, snap, intent: None }
+    Frozen { position_ms: position_now(&snap, now_ms), at_ms: now_ms, since, was_playing, snap, load: None, intent: None }
+}
+
+/// A restore point of a user load that was still on its way (see [`Frozen::load`]).
+pub(crate) fn freeze_load(args: LoadArgs, now_ms: i64, since: Instant) -> Frozen {
+    Frozen {
+        snap: ConnectSnapshot::default(),
+        position_ms: args.position_ms.min(i64::MAX as u64) as i64,
+        at_ms: now_ms,
+        since,
+        was_playing: args.play,
+        load: Some(args),
+        intent: None,
+    }
 }
 
 #[derive(Debug)]
@@ -176,6 +193,10 @@ fn options_of(s: &ConnectSnapshot) -> Options {
 
 /// What to load to get back to `f`, starting to play or not.
 pub(crate) fn plan(f: &Frozen, start_playing: bool) -> Option<Plan> {
+    if let Some(args) = &f.load {
+        let request = local::load_request(&LoadArgs { play: start_playing, ..args.clone() }).ok()?;
+        return Some(Plan { request, queued: Vec::new(), then_next: false, then_repeat_track: false, then_play: false });
+    }
     let s = &f.snap;
     let current = s.track.as_ref().filter(|t| !t.hidden)?;
     let options = |playing_track, start_playing, seek_to, o| LoadRequestOptions {
@@ -241,8 +262,8 @@ pub(crate) struct Pass<'a> {
     pub tracks: Vec<&'a SnapshotTrack>,
     pub start: usize,
     /// Where the context goes on after the tracks (an index in `next_tracks`): the next track
-    /// `take` refused, or with repeat-all, when `take` refused one past the wrap, the context's
-    /// start (the tracks don't hold the whole pass).
+    /// `take` refused, or with repeat-all, when `take` refused one past the wrap or the list ran
+    /// out there, the context's start (the tracks don't hold the whole pass).
     pub ended_at: Option<usize>,
     /// The next side took every listed track without reaching the context's end (a delimiter).
     pub ran_out: bool,
@@ -315,6 +336,13 @@ pub(crate) fn one_pass<'a>(
             last_next = Some(i);
         }
     }
+    if ran_out {
+        if let Some(w) = wrap {
+            // The next pass ran out of the list (Spirc's is full) before a track seen already:
+            // the tracks don't hold the whole pass either.
+            ended_at = Some(w + 1);
+        }
+    }
     let start = head.len() + prev;
     head.extend(tracks);
     Pass { tracks: head, start, ended_at, ran_out: ran_out && wrap.is_none() && !delimited, last_next }
@@ -325,6 +353,9 @@ pub(crate) fn one_pass<'a>(
 /// first track at its position): then, like a plain track list, one pass of the visible tracks in
 /// play order (previous tracks, the current one, the user queue and the next tracks).
 pub(crate) fn load_args(f: &Frozen, play: bool) -> Option<LoadArgs> {
+    if let Some(args) = &f.load {
+        return Some(LoadArgs { play, ..args.clone() });
+    }
     let s = &f.snap;
     let current = s.track.as_ref().filter(|t| !t.hidden)?;
     let repeat = if s.repeat_track {
@@ -364,9 +395,21 @@ pub(crate) fn freeze_restore_point(hub: &mut HubState, now_ms: i64, now: Instant
     if hub.reconnect.is_some() {
         return;
     }
+    let link = hub.link.as_ref().map(|l| l.generation);
+    let loading = hub
+        .loading
+        .take()
+        .filter(|l| link.is_none_or(|g| g == l.generation) && now.saturating_duration_since(l.at) < RESTORING_MAX);
+    if let Some(l) = loading {
+        // A user load on its way (the Spirc fetches its context and shows the playback before
+        // it): it replaced that playback, so it comes back instead (§8).
+        hub.last_active = None;
+        hub.restoring = None;
+        hub.reconnect = Some(freeze_load(l.args, now_ms, now));
+        return;
+    }
     let active = hub.snapshot.clone().filter(|s| s.is_active && s.track.is_some());
     // (only the restore into the Spirc going away now, and not one that never took)
-    let link = hub.link.as_ref().map(|l| l.generation);
     let restoring = hub
         .restoring
         .take()
@@ -1268,6 +1311,38 @@ mod tests {
         assert!(hub.restoring.is_none());
         freeze_restore_point(&mut hub, 1_010_000, frozen.since + Duration::from_secs(10));
         assert_eq!(hub.reconnect.as_ref().expect("frozen").position_ms, 20_000);
+    }
+
+    #[test]
+    fn a_reconnect_during_a_load_brings_back_that_load() {
+        let now = Instant::now();
+        let p = LoadArgs { context_uri: Some("spotify:playlist:p".into()), position_ms: 0, play: true, ..Default::default() };
+        let loading = |at| Some(hub::LocalLoad { generation: 3, at, args: p.clone(), ahead: 0 });
+        // album A plays, the user's load of P fetches its context
+        let mut hub = HubState::default();
+        hub::apply_snapshot(&mut hub, snap("spotify:album:a", SpircProvider::Context), false, 1_000_000);
+        hub.loading = loading(now);
+        freeze_restore_point(&mut hub, 1_002_000, now);
+        let f = hub.reconnect.clone().expect("restore point");
+        assert!(f.load.is_some() && f.was_playing && hub.loading.is_none());
+        // the new Spirc: P is restored (playing after a short gap), not A
+        hub::forget_previous_link(&mut hub);
+        hub.cluster = cluster("");
+        let Decision::Restore(p_plan, _) = dec(&mut hub, false) else { panic!("restore") };
+        assert!(format!("{:?}", p_plan.request).contains("spotify:playlist:p"));
+        assert!(p_plan.request.start_playing);
+        // pushed to another device as that load
+        assert_eq!(load_args(&f, false).and_then(|a| a.context_uri).as_deref(), Some("spotify:playlist:p"));
+        // an idle phone (the activation's empty snapshot) keeps it too
+        let mut hub = HubState { snapshot: Some(ConnectSnapshot { is_active: true, ..Default::default() }), loading: loading(now), ..Default::default() };
+        freeze_restore_point(&mut hub, 1_002_000, now);
+        assert!(hub.reconnect.as_ref().is_some_and(|f| f.load.is_some()));
+        // a load marker too old: the playback is frozen as before
+        let mut hub = HubState::default();
+        hub::apply_snapshot(&mut hub, snap("spotify:album:a", SpircProvider::Context), false, 1_000_000);
+        hub.loading = loading(now);
+        freeze_restore_point(&mut hub, 1_002_000, now + RESTORING_MAX);
+        assert!(hub.reconnect.as_ref().is_some_and(|f| f.load.is_none() && f.snap.track.is_some()));
     }
 
     #[test]
