@@ -316,20 +316,20 @@ of anything else fails with `UNAVAILABLE` "Not available offline".
 this device plays (or paused) a downloaded track through Spirc, the OfflineController takes that
 playback over as it is, before anything pauses the Player (a track that ended meanwhile moves
 on to the next one): the track keeps playing without a reload, with the
-visible tracks around it in play order (user queue included, suggestions only if downloaded:
-the others are skipped, not the window's end; one pass of the context with
+visible tracks around it in play order (the user queue included also where it isn't downloaded:
+online it streams, offline the queue skips it; suggestions only if downloaded: the others are
+skipped, not the window's end; one pass of the context with
 repeat-all, its start that Spirc no longer lists as previous tracks in front: the queue's own
-repeat wraps it) up to the first one on either side that isn't downloaded (the queue ends
-there; a full list of Spirc's, 80 next tracks, ends before its last one, where the context goes
-on), the position, repeat mode, shuffle flag and play state. No restore point is kept for
+repeat wraps it) up to the first context track on either side that isn't downloaded (the queue
+ends there; a full list of Spirc's, 80 next tracks, ends before its last one, where the context
+goes on), the position, repeat mode, shuffle flag and play state. No restore point is kept for
 that session; when it is back, the queue plays on as above, and when it reaches the end of the
-handed-over window (stops or would wrap) with a visible session up and no other device active,
-it hands back to Spirc: the queue's track stops, and the context loads at its first track after
-the window (with repeat-all and a pass that isn't all downloaded or all listed, at the context's
-start;
-suggestions skipped, smart shuffle adds new ones; the user queue's tracks there are
-queued again and play after that first track), with its options as now, unless the user changed
-the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
+handed-over window with a visible session up and no other device active, it hands back to
+Spirc: the queue's track stops, and the context loads at its first track after the window
+(suggestions skipped, smart shuffle adds new ones; a shuffled session keeps its order, see
+`Options.shuffle_order`), or, where the window would wrap (repeat-all as it is now, also turned
+on after the handoff), at the context's start for a new pass; with its options as now, unless the
+user changed the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
 stays shown (loading), so the notification and the media session stay; a failed load makes
 this phone inactive (nothing plays, the app's own resume is the fallback).
 A streamed current track is frozen for the reconnect as before (§8), and so is any playback
@@ -716,8 +716,11 @@ For a remote active device, smart shuffle is not supported (the command reports
   tracks in play order instead. A context that can't be loaded again (a plain track list) is
   restored as one pass of its visible tracks (with repeat-all Spirc lists the next passes too).
   A local `player.load` still on its way when the connection goes (the Spirc fetching its
-  context) is the restore point instead of the playback before it (no placeholder is shown for
-  it). An explicit `player.load` (local, remote or offline) or running
+  context) is the restore point instead of the playback before it; its paused placeholder (which
+  keeps the notification and the media foreground) is the load's start item, else the playback
+  before it. A shuffled session comes back in its order (`Options.shuffle_order`: the previous
+  tracks stay, Up Next goes on as it was). While another device played, its playback stays shown
+  across the reconnect until the new Spirc's first cluster (with a network, ≤ 60 s). An explicit `player.load` (local, remote or offline) or running
   offline playback replaces the restore point; a dropped restore point stops the paused track
   nobody owns anymore.
 * **Local-network discovery (the "send" side)**: speakers and receivers on the LAN that are not
