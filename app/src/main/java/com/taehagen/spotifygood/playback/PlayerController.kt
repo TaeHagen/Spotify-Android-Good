@@ -156,6 +156,12 @@ class PlayerController internal constructor(
     /** Engine / downloads knowledge for cold starts and offline loads; installed by [PlaybackCoordinator]. */
     @Volatile var environment: PlaybackEnvironment? = null
 
+    /**
+     * Where a play of an episode resumes when the request names no position: this phone's podcast
+     * progress (`EpisodeProgressStore.resumeMs`, docs §6.5), null for none. Installed by the app graph.
+     */
+    @Volatile var episodeResume: ((episodeUri: String) -> Long?)? = null
+
     private class Command(
         val name: String,
         val conflateKey: String?,
@@ -378,6 +384,7 @@ class PlayerController internal constructor(
     ): Deferred<Boolean> {
         userCommand()
         if (request.play) onPlaybackRequested?.invoke()
+        val resolved = episodeResume?.let { withEpisodeResume(request, it) } ?: request
         lateinit var self: Command
         // A running bulk add keeps going: Spirc and remote devices keep the user queue across a
         // load, so its remaining items still belong to it.
@@ -387,7 +394,7 @@ class PlayerController internal constructor(
             startsPlayback = true,
             onQueued = { command ->
                 self = command
-                command.request = request
+                command.request = resolved
                 command.toPendingTarget = toPendingTarget && !onThisPhone
                 command.onThisPhone = onThisPhone
                 latestLoad = command
@@ -884,6 +891,24 @@ class PlayerController internal constructor(
     internal class NotAvailableOfflineException(contextUri: String) : Exception("$contextUri is not downloaded")
 
     internal companion object {
+        /**
+         * [request] starting at [resumeOf]'s position when its start item is an episode and it
+         * names no position (0): every way of starting an episode (a show or episode page, the
+         * downloads, search, Android Auto) resumes where it was left on this phone.
+         */
+        fun withEpisodeResume(request: PlayRequest, resumeOf: (String) -> Long?): PlayRequest {
+            if (request.positionMs > 0) return request
+            val start = request.startUri
+                ?: request.trackUris?.getOrNull(request.startIndex ?: 0)?.takeIf { request.startUid == null }
+                ?: request.contextUri?.takeIf { request.trackUris == null && request.startUid == null }
+                ?: return request
+            if (!start.startsWith(EPISODE_PREFIX)) return request
+            val position = resumeOf(start)?.takeIf { it > 0 } ?: return request
+            return request.copy(positionMs = position)
+        }
+
+        private const val EPISODE_PREFIX = "spotify:episode:"
+
         private const val TAG = "PlayerController"
         private const val COMMAND_TIMEOUT_MS = 15_000L
         private const val LOAD_TIMEOUT_MS = 30_000L

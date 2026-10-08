@@ -218,10 +218,15 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
         ::Extras,
     )
 
+    /** Saved episodes with this phone's podcast progress where it is newer than Spotify's (docs §6.5). */
+    private val episodes: Flow<PagedState<Episode>> = combine(episodesLoader.state, graph.episodeProgress.version) { page, _ ->
+        page.copy(items = page.items.map(graph.episodeProgress::merge))
+    }
+
     val state: StateFlow<LibraryUiState> = combine(
         listing,
         extras,
-        episodesLoader.state,
+        episodes,
         episodePartialPages.partial,
     ) { (listing, data, presentation, downloaded, collections), extras, episodes, episodesPartial ->
         val nothing = data.playlists.isEmpty() && data.albums.isEmpty() && data.artists.isEmpty() && data.shows.isEmpty()

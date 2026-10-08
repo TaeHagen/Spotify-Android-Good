@@ -115,7 +115,10 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         .distinctUntilChanged()
 
     val state: StateFlow<ShowUiState> = combine(
-        combine(header, list, ::Pair),
+        // Episodes show this phone's podcast progress where it is newer than Spotify's (docs §6.5).
+        combine(header, list, graph.episodeProgress.version) { header, page, _ ->
+            header to page.copy(episodes = page.episodes.map(graph.episodeProgress::merge))
+        },
         playbackInfo,
         graph.savedFlow(uri),
         graph.downloads.collectionUi(uri),
@@ -386,7 +389,10 @@ internal class EpisodeViewModel(graph: AppGraph, private val uri: String) : Deta
             .catch { emit(null) }
 
     val state: StateFlow<EpisodeUiState> = combine(
-        content,
+        // This phone's podcast progress where it is newer than Spotify's (docs §6.5).
+        combine(content, graph.episodeProgress.version) { load, _ ->
+            if (load is LoadState.Ready) load.copy(data = load.data.copy(episode = graph.episodeProgress.merge(load.data.episode))) else load
+        },
         playbackInfo,
         graph.savedFlow(uri),
         downloadState,
