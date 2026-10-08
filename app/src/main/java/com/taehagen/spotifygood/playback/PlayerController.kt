@@ -180,17 +180,13 @@ class PlayerController internal constructor(
     @Volatile var environment: PlaybackEnvironment? = null
 
     /**
-     * Where a play of an episode resumes when the request names no position: this phone's podcast
-     * progress (`EpisodeProgressStore.resumeMs`, docs §6.5), null for none. Installed by the app graph.
+     * Where a play of an episode resumes when the request names no position (0), null for none:
+     * decided in one place, just before the load is sent ([withEpisodeResume]) — this phone's
+     * podcast progress, looked up on Spotify first when it may know better
+     * (`EpisodeProgressStore.resumeOrLookUp`, bounded; docs §6.5). A request naming a position (a
+     * resumption, a seek-to load) keeps it. Installed by the app graph.
      */
-    @Volatile var episodeResume: ((episodeUri: String) -> Long?)? = null
-
-    /**
-     * For a load of an episode whose resume point isn't known ([episodeResume] gave none): looks
-     * Spotify's up before the load is sent (bounded; `EpisodeProgressStore.resumeOrLookUp`).
-     * Installed by the app graph.
-     */
-    @Volatile var episodeResumeLookup: (suspend (episodeUri: String) -> Long?)? = null
+    @Volatile var episodeResume: (suspend (episodeUri: String) -> Long?)? = null
 
     private class Command(
         val name: String,
@@ -428,7 +424,6 @@ class PlayerController internal constructor(
     ): Deferred<Boolean> {
         userCommand()
         if (request.play) onPlaybackRequested?.invoke()
-        val resolved = episodeResume?.let { withEpisodeResume(request, it) } ?: request
         lateinit var self: Command
         // A running bulk add keeps going: Spirc and remote devices keep the user queue across a
         // load, so its remaining items still belong to it.
@@ -438,7 +433,7 @@ class PlayerController internal constructor(
             startsPlayback = true,
             onQueued = { command ->
                 self = command
-                command.request = resolved
+                command.request = request
                 command.toPendingTarget = toPendingTarget && !onThisPhone
                 command.onThisPhone = onThisPhone
                 latestLoad = command
@@ -664,7 +659,8 @@ class PlayerController internal constructor(
     /** [load] of a queued `player.load` [command], with a play merged in until the last moment. */
     private suspend fun sendLoad(command: Command) {
         val queued = synchronized(lock) { checkNotNull(command.request) }
-        val initial = episodeResumeLookup?.let { withEpisodeResumeLookup(queued, it) } ?: queued
+        // An episode's start is decided here, not when the play is queued: the lookup comes first.
+        val initial = episodeResume?.let { withEpisodeResume(queued, it) } ?: queued
         val prepared = prepare(withLoadableContext(keepingModes(initial)))
         val play = synchronized(lock) {
             command.sent = true
@@ -947,9 +943,9 @@ class PlayerController internal constructor(
         /**
          * [request] starting at [resumeOf]'s position when its start item is an episode and it
          * names no position (0): every way of starting an episode (a show or episode page, the
-         * downloads, search, Android Auto) resumes where it was left on this phone.
+         * downloads, search, Android Auto, voice) resumes where it was left ([episodeResume]).
          */
-        fun withEpisodeResume(request: PlayRequest, resumeOf: (String) -> Long?): PlayRequest {
+        suspend fun withEpisodeResume(request: PlayRequest, resumeOf: suspend (String) -> Long?): PlayRequest {
             if (request.positionMs > 0) return request
             val start = request.startUri
                 ?: request.trackUris?.getOrNull(request.startIndex ?: 0)?.takeIf { request.startUid == null }
@@ -958,22 +954,6 @@ class PlayerController internal constructor(
             if (!start.startsWith(EPISODE_PREFIX)) return request
             val position = resumeOf(start)?.takeIf { it > 0 } ?: return request
             return request.copy(positionMs = position)
-        }
-
-        /** [withEpisodeResume] with a suspending [resumeOf] (a lookup before the load). */
-        suspend fun withEpisodeResumeLookup(request: PlayRequest, resumeOf: suspend (String) -> Long?): PlayRequest {
-            val start = episodeStartOf(request) ?: return request
-            val position = resumeOf(start)?.takeIf { it > 0 } ?: return request
-            return request.copy(positionMs = position)
-        }
-
-        /** The episode [request] starts at when it names no position (null: none, or not an episode). */
-        private fun episodeStartOf(request: PlayRequest): String? {
-            if (request.positionMs > 0) return null
-            val start = request.startUri
-                ?: request.trackUris?.getOrNull(request.startIndex ?: 0)?.takeIf { request.startUid == null }
-                ?: request.contextUri?.takeIf { request.trackUris == null && request.startUid == null }
-            return start?.takeIf { it.startsWith(EPISODE_PREFIX) }
         }
 
         private const val EPISODE_PREFIX = "spotify:episode:"
