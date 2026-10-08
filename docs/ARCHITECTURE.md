@@ -644,12 +644,17 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                replaces an older point (a not-started one keeps none). With no reference yet (the
                phone played it, nothing fresh seen since) the furthest point wins. A partly played
                state is kept when nothing is.
-             * Connect: after a remote device's position is saved, Spotify's next state is news
-               when partly or fully played (that device may have played on after the phone stopped
-               following); a not-started one (a device that reports nothing, e.g. librespot)
-               changes nothing. When this phone takes an episode over (seen remote just before, or
-               arriving far from the kept point), the next state (the other device's, older than
-               this phone's progress) only becomes the reference.
+             * Connect marks (each lasts until the next fresh answer, whose state then becomes the
+               reference; the last real state seen is kept under them): after a followed remote
+               device's save, Spotify's next state is news when partly or fully played and
+               different from the last real state seen (with none: when beyond the point); a
+               not-started one (a device that reports nothing, e.g. a librespot receiver) changes
+               nothing. Once this phone saved its own progress after that, and after it took an
+               episode over (seen remote just before, or arriving far from the kept point),
+               Spotify's next state is at best the other device's older one: only a state beyond
+               the point, or finished, is news. A play of an episode whose point came from a
+               followed remote device looks Spotify's point up first (that device may have played
+               on after the phone stopped following).
              * Every play path resumes from the point: the app's pages (rows and the show's Play),
                Your Episodes, Downloads, search, Android Auto / Assistant / media browsers (their
                rows also carry the completion status) via `PlayerController.episodeResume` for a
