@@ -2174,6 +2174,67 @@ fn a_shuffled_transfer_stays_shuffled_while_its_pages_resolve() {
     }
 }
 
+#[test]
+fn further_pages_fill_up_the_next_tracks() {
+    use crate::context_resolver::{ContextAction, ResolveContext};
+
+    let pages = |rt: &tokio::runtime::Runtime, n: usize| {
+        let mut resolver = resolver(rt);
+        for page in 1..=n {
+            resolver.add(ResolveContext::from_uri(
+                format!("spotify:album:{page}"),
+                "",
+                ContextType::Default,
+                ContextAction::Append,
+            ));
+        }
+        resolver
+    };
+
+    // the last of the top tracks plays, without and with repeat
+    for repeat in [false, true] {
+        let (rt, mut state) = state(10);
+        state.set_repeat_context(repeat);
+        state.set_current_track(9).unwrap();
+        state.reset_playback_to_position(Some(9)).unwrap();
+        if !repeat {
+            assert!(state.next_tracks().is_empty());
+        }
+
+        let resolver = pages(&rt, 2);
+        resolver
+            .apply_next_context(&mut state, album(10..20))
+            .unwrap();
+        assert!(!resolver.try_finish(&mut state, &mut None));
+        // the next tracks go on with the album right away (before the wraps of repeat)
+        assert_eq!(next_uids(&state)[..10], uids(10..20));
+        if repeat {
+            assert!(next_uids(&state)[10].starts_with(IDENTIFIER_DELIMITER));
+        }
+        let snapshot = state.snapshot(SnapshotPlayStatus::Playing, 0, None);
+        assert!(snapshot.can_skip_next);
+        assert!(state.next_track().unwrap().is_some());
+        assert_eq!(state.current_track(|t| t.uid.clone()), "uid10");
+    }
+
+    // a start track placed as the last track of its page: the next page fills up after it
+    let (rt, mut state) = state(10);
+    play_outside_the_context(&mut state, track_uri(19, 0), false);
+    let mut resolver = pages(&rt, 3);
+    resolver
+        .apply_next_context(&mut state, album(10..20))
+        .unwrap();
+    resolver.remove_used_and_invalid();
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid19");
+    assert!(state.next_tracks().is_empty(), "the last track there is");
+    resolver
+        .apply_next_context(&mut state, album(20..30))
+        .unwrap();
+    assert!(!resolver.try_finish(&mut state, &mut None));
+    assert_eq!(next_uids(&state), uids(20..30));
+    assert!(state.next_track().unwrap().is_some());
+}
+
 /// compile time check: the engine spawns the task and shares the handle between threads
 #[allow(dead_code)]
 fn spirc_is_send_and_sync(
