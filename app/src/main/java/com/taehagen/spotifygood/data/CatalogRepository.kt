@@ -11,6 +11,7 @@ import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.model.User
 import com.taehagen.spotifygood.nativebridge.NativeRpc
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.put
 
@@ -47,8 +48,14 @@ class CatalogRepository(private val rpc: NativeRpc, private val cache: ResponseC
     suspend fun playlistItemUris(uri: String): List<String> =
         playlistItems(uri, ::playlistPage).mapNotNull { it.uri }.filter(SpotifyUris::isPlayableItem)
 
+    /**
+     * The show's first page. Spotify's played state (resume points) only comes with a fresh answer:
+     * cached copies (fresh within the TTL, or shown while revalidating / offline) carry none, so
+     * an old state can never stand for the current one (docs §6.5, [EpisodeProgressStore.merge]).
+     */
     fun show(uri: String): Flow<Resource<Show>> =
         cache.liveOf(CacheKeys.show(uri), Show.serializer(), CacheKeys.TTL_SHOW) { showPage(uri, 0).let { CacheFill(it, it.partial) } }
+            .map { it.withoutCachedPlayedState() }
 
     suspend fun showPage(uri: String, offset: Int, limit: Int = 50): Show =
         rpc.callOffMain("catalog.show", rpcArgs { put("uri", uri); put("offset", offset); put("limit", limit) })
@@ -101,6 +108,13 @@ class CatalogRepository(private val rpc: NativeRpc, private val cache: ResponseC
 
 @Serializable
 internal data class TracksResult(val tracks: List<Track> = emptyList())
+
+/** [Resource] of a show page with Spotify's played state only where it is a fresh answer. */
+internal fun Resource<Show>.withoutCachedPlayedState(): Resource<Show> = when (this) {
+    is Resource.Success -> if (fromCache) copy(data = data.withoutPlayedState()) else this
+    is Resource.Loading -> copy(cached = cached?.withoutPlayedState())
+    is Resource.Error -> copy(cached = cached?.withoutPlayedState())
+}
 
 @Serializable
 internal data class EpisodesResult(val episodes: List<Episode> = emptyList())

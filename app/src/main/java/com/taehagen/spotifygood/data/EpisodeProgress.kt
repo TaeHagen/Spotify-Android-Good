@@ -4,6 +4,7 @@ import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.PlaybackStatus
+import com.taehagen.spotifygood.model.Show
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -26,14 +27,18 @@ import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import java.io.File
 
-/** Spotify's played state of an episode, as a page reported it (its resume point). */
+/** Spotify's played state of an episode, as a fresh answer reported it (its resume point). */
 @Serializable
-data class PlayedPoint(val positionMs: Long? = null, val fullyPlayed: Boolean? = null)
+data class PlayedPoint(val positionMs: Long? = null, val fullyPlayed: Boolean? = null) {
+    /** Partly played: a point worth resuming from. */
+    val inProgress: Boolean get() = fullyPlayed != true && (positionMs ?: 0) > 0
+}
 
 /**
- * Where this phone left an episode: [positionMs] (0 once [fullyPlayed]) at [updatedAt].
- * [server]: Spotify's played state last seen for it before or while it was played here (null: never
- * seen); a different one later means it was played elsewhere afterwards ([mergeProgress]).
+ * The best known resume point of an episode: where this phone left it, or Spotify's newer one
+ * ([mergeProgress]). [positionMs] (0 once [fullyPlayed]) at [updatedAt]. [server]: Spotify's
+ * played state last seen live for it when this was written (null: never seen); a different live
+ * one later means it was played elsewhere afterwards.
  */
 @Serializable
 data class EpisodeProgress(
@@ -43,42 +48,58 @@ data class EpisodeProgress(
     val server: PlayedPoint? = null,
 )
 
-/** Spotify's played state carried by this episode (null when it carries none). */
+/**
+ * Spotify's played state carried by this episode (null when it carries none). Only a fresh answer
+ * carries one (docs §6.5): cached pages and download metadata are stripped
+ * ([withoutPlayedState]), so a frozen copy can never stand for Spotify's current state.
+ */
 internal fun Episode.playedPoint(): PlayedPoint? =
     if (resumePositionMs == null && fullyPlayed == null) null else PlayedPoint(resumePositionMs, fullyPlayed)
 
-/** What [mergeProgress] decided. */
-internal sealed interface ProgressMerge {
-    /** Show [progress] (this phone's); [baseline]: store it with this server state from now on. */
-    data class Local(val progress: EpisodeProgress, val baseline: PlayedPoint? = null) : ProgressMerge
+/** This episode without Spotify's played state: for copies that are not a fresh answer. */
+fun Episode.withoutPlayedState(): Episode =
+    if (resumePositionMs == null && fullyPlayed == null) this else copy(resumePositionMs = null, fullyPlayed = null)
 
-    /** Show the server's state; [dropLocal]: this phone's entry is older, forget it. */
-    data class Server(val dropLocal: Boolean) : ProgressMerge
-}
+/** This show page without Spotify's played state on its episodes ([withoutPlayedState]). */
+fun Show.withoutPlayedState(): Show =
+    if (episodes.none { it.resumePositionMs != null || it.fullyPlayed != null }) this
+    else copy(episodes = episodes.map { it.withoutPlayedState() })
 
 /**
- * Whose resume point an episode shows: this phone's [local] one or Spotify's [server] one.
+ * The resume point to keep for an episode after a page showed [server] (Spotify's state from a
+ * fresh answer, null: none) while [local] was kept; null keeps nothing. The episode then shows
+ * what is kept, or its own (Spotify's) state.
  *
- * Neither carries a time Spotify's side could be compared with, so the server's state seen when
- * the local one was written ([EpisodeProgress.server]) is the reference: unchanged since, this
- * phone's progress is newer (made here, possibly offline, and never reported to Spotify); changed
- * since, the episode was played elsewhere afterwards and the server's state wins. A local entry
- * that never saw a server state (played offline before any page showed one) wins and adopts the
- * one seen now as its reference.
+ * Neither side carries a time the other could be compared with, so the live state seen when the
+ * point was written ([EpisodeProgress.server]) is the reference:
+ * * unchanged since: this phone's progress is newer (made here, possibly offline, never reported
+ *   to Spotify) and stays;
+ * * changed since: the episode was played elsewhere afterwards, and Spotify's point becomes this
+ *   phone's resume point (a not-started one keeps nothing), so the downloads, Android Auto and
+ *   offline plays follow it too;
+ * * no reference yet (played offline before any live state was seen): this phone's stays and
+ *   adopts the one seen now as its reference;
+ * * nothing kept: Spotify's point is kept when the episode is partly played, so the same paths can
+ *   resume it later (not-started and finished ones are not, they would only crowd out progress).
  */
-internal fun mergeProgress(server: PlayedPoint?, local: EpisodeProgress?): ProgressMerge = when {
-    local == null -> ProgressMerge.Server(dropLocal = false)
-    server == null -> ProgressMerge.Local(local)
-    local.server == null -> ProgressMerge.Local(local, baseline = server)
-    local.server == server -> ProgressMerge.Local(local)
-    else -> ProgressMerge.Server(dropLocal = true)
+internal fun mergeProgress(server: PlayedPoint?, local: EpisodeProgress?, now: Long): EpisodeProgress? = when {
+    server == null -> local
+    local == null -> if (server.inProgress) spotifyPoint(server, now) else null
+    local.server == null -> local.copy(server = server)
+    local.server == server -> local
+    else -> if (server.inProgress || server.fullyPlayed == true) spotifyPoint(server, now) else null
+}
+
+private fun spotifyPoint(server: PlayedPoint, now: Long): EpisodeProgress {
+    val played = server.fullyPlayed == true
+    return EpisodeProgress(positionMs = if (played) 0 else server.positionMs ?: 0, fullyPlayed = played, updatedAt = now, server = server)
 }
 
 /**
- * Podcast progress made on this phone (docs §6.5), per episode: a small JSON file in the app's
- * files, LRU-bounded, wiped with the account's data (§9.3). Spotify's own resume points come with
- * show and episode pages when the web player's API gives them; nothing here is reported back to
- * Spotify, so progress made on this phone (offline above all) stays on this phone.
+ * Podcast resume points (docs §6.5), per episode: progress made on this phone, or Spotify's when
+ * a fresh page showed a newer one; a small JSON file in the app's files, LRU-bounded, wiped with
+ * the account's data (§9.3). Nothing here is reported back to Spotify, so progress made on this
+ * phone (offline above all) stays on this phone.
  *
  * [record] is fed by [recordFrom] (local playback of an episode); [merge] overlays the progress on
  * an [Episode] (pages, downloads); [resumeMs] gives where a play of an episode starts. [version]
@@ -136,35 +157,32 @@ class EpisodeProgressStore internal constructor(
         changed()
     }
 
-    /** [episode] with this phone's progress where it is newer than Spotify's ([mergeProgress]). */
+    /**
+     * [episode] with the best known resume point ([mergeProgress]). Its played state, if any, must
+     * be Spotify's from a fresh answer ([playedPoint]); one without (a cached page, a download)
+     * only shows what is kept and changes nothing.
+     */
     fun merge(episode: Episode): Episode {
         val server = episode.playedPoint()
-        var drop = false
-        var adopted = false
-        val shown = synchronized(lock) {
+        val (kept, changed) = synchronized(lock) {
             if (server != null) lastServer[episode.uri] = server
-            when (val decision = mergeProgress(server, entries[episode.uri])) {
-                is ProgressMerge.Local -> {
-                    decision.baseline?.let {
-                        entries[episode.uri] = decision.progress.copy(server = it)
-                        adopted = true
-                    }
-                    decision.progress
-                }
-                is ProgressMerge.Server -> {
-                    if (decision.dropLocal) {
-                        entries.remove(episode.uri)
-                        drop = true
-                    }
-                    null
+            val local = entries[episode.uri]
+            val next = mergeProgress(server, local, clock())
+            if (next != local) {
+                if (next == null) {
+                    entries.remove(episode.uri)
+                } else {
+                    entries[episode.uri] = next
+                    while (entries.size > maxEntries) entries.remove(entries.keys.first())
                 }
             }
+            next to (next != local)
         }
-        if (drop) changed() else if (adopted) writes.trySend(Unit) // a new reference: persist, nothing shown changed
-        return shown?.let { episode.copy(resumePositionMs = it.positionMs, fullyPlayed = it.fullyPlayed) } ?: episode
+        if (changed) changed()
+        return kept?.let { episode.copy(resumePositionMs = it.positionMs, fullyPlayed = it.fullyPlayed) } ?: episode
     }
 
-    /** Where a play of [uri] resumes from this phone's progress (null: none, or fully played). */
+    /** Where a play of [uri] resumes: the best known point ([merge]); null: none, or fully played. */
     fun resumeMs(uri: String): Long? = synchronized(lock) { entries[uri] }
         ?.takeIf { !it.fullyPlayed && it.positionMs > 0 }
         ?.positionMs

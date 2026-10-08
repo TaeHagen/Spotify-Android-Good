@@ -332,6 +332,23 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         if (filter.value.isNotBlank()) ensureAllLoaded()
     }
 
+    /** Owner: shows the playlist on the profile, or not. The page reloads with the new state. */
+    fun setPublic(public: Boolean) {
+        launchWrite(if (public) R.string.shell_msg_playlist_public else R.string.shell_msg_playlist_private, R.string.detail_playlist_privacy_failed) {
+            graph.playlists.setPublic(uri, public)
+        }
+    }
+
+    /** Owner: makes the playlist collaborative or not (collaborative also makes it private). */
+    fun setCollaborative(collaborative: Boolean) {
+        launchWrite(
+            if (collaborative) R.string.shell_msg_playlist_collaborative else R.string.shell_msg_playlist_not_collaborative,
+            R.string.detail_playlist_privacy_failed,
+        ) {
+            graph.playlists.setCollaborative(uri, collaborative)
+        }
+    }
+
     /** Loads the next page when the list is scrolled near its end. */
     fun loadMore() {
         val playlist = data.value.dataOrNull() ?: return
