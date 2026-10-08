@@ -820,8 +820,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 
 * `PlaybackService : MediaLibraryService`, `foregroundServiceType="mediaPlayback|connectedDevice"`.
   Session player = `SpotifyPlayer : SimpleBasePlayer(mainLooper)` built from
-  `PlaybackRepository.snapshot` (window: last 10 prev + current + next 50, uids from
-  Connect). `invalidateState()` on every snapshot. Position via `PositionSupplier` from the
+  `PlaybackRepository.snapshot` (window: last 10 prev + current + next 50; Media3 item uids
+  are the Connect uids made unique per window, since repeat-all repeats them and some entries
+  have none; queue commands send the Connect uid, never a made-up one: seek-to-item without one
+  steps with `player.next` through context / autoplay entries, ≤ 10, else is ignored).
+  `invalidateState()` on every snapshot. Position via `PositionSupplier` from the
   snapshot (extrapolating). Media items carry title/artist/album/artworkUri
   (`content://<app>.artwork/<urlhash>` served by `ArtworkProvider` from the Coil disk cache).
 * Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
