@@ -931,7 +931,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
   0.2 → restore (a duck keeps focus; a granted request clears the duck). Request failure → pause.
-* `BecomingNoisyReceiver`: registered only while playing locally → `player.pause`.
+* `BecomingNoisyReceiver`: registered while local playback plays, loads or awaits a focus resume
+  (`NoisyRules`: also while the sink is stopped by a focus pause or the stall watchdog), never for
+  remote playback → `player.pause`; a noisy event also cancels a pending focus resume, so a later
+  GAIN cannot restart playback on the speaker.
 * Wake locks: Media3 `WakeLockManager` + `WifiLockManager` `setStayAwake(true)` only while
   local status is playing/loading; false otherwise.
 * Sleep timer (`SleepTimer`): coroutine delays stop while the CPU sleeps (remote playback holds
