@@ -178,7 +178,7 @@ private fun AlbumHeader(
                 HeaderMetaText(songsAndDuration(album.tracks.size, content.totalDurationMs, withSeconds = true))
                 DetailActionRow(
                     leading = {
-                        HeartButton(saved = state.saved == true, onClick = onToggleSaved)
+                        HeartButton(saved = state.saved, onClick = onToggleSaved)
                         CollectionDownloadButton(ui = state.download, onDownload = onDownload, onRemove = onRemoveDownload)
                         MoreButton(onClick = onMore, label = album.name)
                     },

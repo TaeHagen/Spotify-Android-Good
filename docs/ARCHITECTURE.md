@@ -195,7 +195,10 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   credentials still stored natively (possibly another account's) are dropped first, so the
   token is what logs in. A start with only `credentials` drops an earlier access token, so a
   rejection can't fall back on another account's token. When the account changes, the OAuth
-  token (`session.setOAuthToken`) and the username are dropped too. A supervisor that is
+  token (`session.setOAuthToken`) and the username are dropped too; a fresh token login, or
+  stored credentials of another user than the last one, also clear what this process holds of
+  the previous account (`connect::reset()`, the metadata cache, the catalog's per-account state
+  and filter), but not at the first start of a process (§9.2). A supervisor that is
   being stopped or replaced can't store or report credentials any more (login generation). When librespot produces new reusable credentials (taken from the
   Session after connect; the librespot `Cache` has no credentials location, so they are never
   written to disk in plaintext, and a `credentials.json` left by an older build is deleted),
@@ -254,7 +257,7 @@ Explicit filter: `EngineSettings.filterExplicit` is OR-ed into the session's own
 and restored when the setting goes off). librespot reads that attribute everywhere: the Player
 refuses explicit tracks (Spirc skips them) and skips a loaded one when the filter turns on,
 the catalog returns them with `playable:false` (its cached metadata is dropped when the
-effective filter changes), and downloads refuse them. It is applied to the live session (when
+effective filter changes). Downloads ignore it: they are filtered when shown and played (§9.7). It is applied to the live session (when
 it is declared online and on every health tick, since Spirc can overwrite it) and to the
 offline session the Player uses while not online. `User.explicitFilter` stays the account's.
 
@@ -752,6 +755,20 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   Android Auto); the session's full user replaces it once online (product, country, the account's
   explicit filter), logout and rejected credentials clear it. It is no online signal (`isOnline`).
 * Writes reusable credentials from `credentials` events to `CredentialStore`.
+* Rejected credentials (`BAD_CREDENTIALS`) only delete `credentials.bin` and show the login, so
+  the same user logs back in with everything in place. Every login compares its account with the
+  owner of the device's data (`AccountGuard`, §9.3): a token login once its reusable credentials
+  (canonical username) arrived, a zeroconf login before its credentials are stored, and a process
+  start whose stored credentials aren't the owner's (a login that ended before the wipe). Another
+  account gets a clean device before it is marked logged in: `AppGraph` removes the data part of
+  logout (downloads with the native index, the resume state, the response and image caches, the
+  DB with the recent searches, the pending device, the account's event replays; not the
+  settings, the credentials or the session), outside the lifecycle mutex, then the offline index
+  is pushed again (empty). A wipe that fails fails the login and is redone by the next one. A
+  re-login of the same account (case-insensitive) keeps everything. Natively, a fresh token login
+  or stored credentials of another user than the last one also reset this process's state of the
+  previous account (`connect::reset()`, the metadata cache, the catalog's per-account state and
+  filter), but not at the first start of a process.
 
 ### 9.3 Auth
 
@@ -786,10 +803,18 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   replaced when it is permanently invalid (`KeyPermanentlyInvalidatedException`, a corrupted or
   missing key); transient Keystore failures are retried and then reported as
   `KeystoreUnavailableException` without deleting anything.
+* The account that owns the device's data (downloads, caches, history, resume state) is kept
+  apart from the credentials, in plain `noBackupFilesDir/account_owner` (the username; it must
+  outlive rejected credentials and a lost Keystore key). Installs from before it record the
+  stored credentials' account at the first load. A login as another account than the owner,
+  e.g. on the login screen after Spotify rejected the stored credentials, starts from a clean
+  state: the previous account's data is removed first and only then is the new owner recorded
+  (§9.2). Logout forgets the owner only once its whole wipe succeeded.
 * Logout (with confirmation): stops the login flows and deletes the pending device code, then
   `session.logout`, credentials, downloads, the resume state, the response and image caches,
   the DB and the settings. Every step runs even if an earlier one failed; no new login reaches
-  the engine until the wipe is done.
+  the engine until the wipe is done. The account owner is forgotten last, only when every step
+  succeeded (otherwise a later login of another account wipes again).
 
 ### 9.4 Playback service
 
@@ -1035,6 +1060,23 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   writes (`download.fileId`, stored in `fileId`); garbage collection (when the queue is idle)
   keeps a `.part` while an unfinished row (pending, failed, cancelled) names it, so "Retry
   failed" resumes it, and deletes files and `.part`s no row names.
+* Explicit filter ("Hide explicit content", or the account's own): downloads are the user's
+  content, so the filter applies when they are shown and played (the Downloads screens dim
+  explicit entries, the Player refuses them, offline too), never to download rows. `download.track`
+  downloads explicit items whatever the filter. The catalog's `playable` includes the filter, so an
+  explicit item answered `playable:false` while the filter may have applied (`ExplicitFilterWatch`:
+  unless the effective filter was known off and applied by the engine from before the lookup until
+  after it) gets no verdict: re-validation leaves the download COMPLETED (re-validated at a later
+  sync), a failed download is not requeued for it, a member is neither recorded as not playable nor
+  taken out of that set (a new member is queued; `download.track` decides), and a collection with
+  such members is re-checked at the next sync. Catalog metadata stored with a row drops the filter's
+  `playable:false`. When the effective filter goes off (applied by the engine), every collection's
+  unavailable members become due for a re-check and the re-validation (failed downloads, unavailable
+  members, stale downloads) runs at once when online, else once online. Once per installation, the
+  downloads earlier versions failed for the filter are repaired: explicit downloads re-validation
+  marked no longer available are restored to COMPLETED (file and key were kept; registered with
+  `offline.add`, re-validated at the next sync), explicit downloads refused as not available are
+  queued again, and every collection's unavailable members are re-checked.
 * Downloads require Premium (they are always Premium here) and are wiped on logout.
 
 ### 9.8 Data layer
@@ -1086,8 +1128,19 @@ refetched twice while on screen (after 15 s and 30 s). The home feed is treated 
 when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
-app scope, so they complete even if their screen closes. Liked-state of the
-current track is cached in memory (LRU) and refreshed via `library.contains`.
+app scope, so they complete even if their screen closes. Saved/liked state is cached in
+memory (LRU) and looked up via `library.contains` (batched). It is unknown until looked up: a
+failed lookup (offline, the session still connecting, a network error) stays unknown, never
+"not saved", and is looked up again when the session comes online (with backoff if it fails
+while online). Unknown hearts / Save / Follow controls are shown disabled. A toggle writes the
+opposite of the state the control showed, never of the server's current state, so a stale
+"not saved" can't remove an item (and its download).
+Native catalog calls don't wait for a session: they fail `NOT_CONNECTED` at once while it
+connects or reconnects. Browse screens load once the engine's reach (§4.6) is ONLINE and
+again after a reconnect when they failed. Search waits up to 10 s for a connecting session
+(not when offline or in backoff, so a captive portal can't stall it); a search or result page
+that failed before the session was ONLINE shows its error and runs again by itself once it is
+(a connection error while ONLINE: after the next reconnect), without a Retry tap.
 
 ### 9.9 UI
 

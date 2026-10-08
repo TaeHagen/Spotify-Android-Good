@@ -53,6 +53,7 @@ class CredentialStore(context: Context) {
     @Volatile private var cachedCredentials: StoredCredentials? = null
     private var refreshTokenLoaded = false
     private var cachedRefreshToken: String? = null
+    private val owner by lazy { AccountOwnerFile(File(dir, ACCOUNT_OWNER_FILE)) }
 
     /** Stable random device id (hex, 40 chars), created on first use, survives logout. */
     val deviceId: String
@@ -88,9 +89,31 @@ class CredentialStore(context: Context) {
                 }
             }
             credentialsLoaded = true
+            // Installs from before the owner file: the stored credentials' account owns the data
+            // (retried at the next process start if the file can't be written now).
+            cachedCredentials?.let { stored ->
+                try {
+                    if (owner.read() == null) owner.write(stored.username)
+                } catch (e: IOException) {
+                    Log.w(TAG, "Recording the account owner failed", e)
+                }
+            }
         }
         cachedCredentials
     }
+
+    /**
+     * The account the data on this device belongs to (downloads, caches, history, the resume
+     * state), kept outside `credentials.bin`: rejected credentials ([clearCredentials]) and
+     * [clear] keep it, so a login as another account afterwards is noticed
+     * ([com.taehagen.spotifygood.engine.AccountGuard]). Throws [IOException] if unreadable.
+     */
+    fun accountOwner(): String? = synchronized(fileLock) { owner.read() }
+
+    fun setAccountOwner(username: String): Unit = synchronized(fileLock) { owner.write(username) }
+
+    /** The account's data is gone (the end of a complete logout): nobody owns the device now. */
+    fun forgetAccountOwner(): Unit = synchronized(fileLock) { owner.delete() }
 
     fun saveCredentials(credentials: StoredCredentials): Unit = synchronized(fileLock) {
         // Keep them in memory even if persisting fails: the running session stays usable.
@@ -129,7 +152,10 @@ class CredentialStore(context: Context) {
         deleteFile(CREDENTIALS_FILE)
     }
 
-    /** Removes credentials and tokens (not the device id). */
+    /**
+     * Removes credentials and tokens (not the device id, not the [accountOwner]: logout forgets it
+     * only once the account's data is gone, see [forgetAccountOwner]).
+     */
     fun clear(): Unit = synchronized(fileLock) {
         cachedCredentials = null
         credentialsLoaded = true
@@ -345,7 +371,39 @@ class CredentialStore(context: Context) {
         const val CREDENTIALS_FILE = "credentials.bin"
         const val REFRESH_TOKEN_FILE = "refresh_token.bin"
         const val DEVICE_ID_FILE = "device_id"
+        const val ACCOUNT_OWNER_FILE = "account_owner"
         const val DEVICE_ID_BYTES = 20
         val DEVICE_ID_REGEX = Regex("[0-9a-f]{40}")
+    }
+}
+
+/**
+ * The username of the account that owns this device's data, as a plain file (a username is no
+ * secret, and the owner must survive a Keystore key that is gone for good). Read failures are
+ * thrown: an owner that can't be read must not look like "nobody".
+ */
+internal class AccountOwnerFile(private val file: File) {
+    fun read(): String? {
+        if (!file.exists()) return null
+        return file.readText().trim().takeIf { it.isNotEmpty() }
+    }
+
+    fun write(username: String) {
+        val name = username.trim()
+        if (name.isEmpty()) return
+        file.parentFile?.mkdirs()
+        val tmp = File(file.parentFile, "${file.name}.tmp")
+        FileOutputStream(tmp).use { out ->
+            out.write(name.encodeToByteArray())
+            out.fd.sync()
+        }
+        if (!tmp.renameTo(file)) {
+            tmp.delete()
+            throw IOException("Renaming ${tmp.name} failed")
+        }
+    }
+
+    fun delete() {
+        if (file.exists() && !file.delete()) throw IOException("Deleting ${file.name} failed")
     }
 }

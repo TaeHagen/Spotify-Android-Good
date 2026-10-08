@@ -45,6 +45,7 @@ import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
@@ -289,31 +290,40 @@ internal fun DetailActionRow(
     }
 }
 
+/** Save toggle; [saved] null (unknown, e.g. the lookup failed offline) shows it disabled, not "not saved". */
 @Composable
-internal fun HeartButton(saved: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
-    IconButton(onClick = onClick, modifier = modifier) {
+internal fun HeartButton(saved: Boolean?, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    IconButton(onClick = onClick, modifier = modifier, enabled = saved != null) {
         Icon(
-            imageVector = if (saved) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-            contentDescription = stringResource(if (saved) R.string.detail_remove_from_library else R.string.detail_save_to_library),
-            tint = if (saved) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            imageVector = if (saved == true) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
+            contentDescription = stringResource(if (saved == true) R.string.detail_remove_from_library else R.string.detail_save_to_library),
+            tint = savedTint(saved),
         )
     }
 }
 
-/** Plus / check circle used for "save to library" style toggles. */
+/** Accent when saved, the muted icon colour when not, the disabled colour while unknown. */
+@Composable
+private fun savedTint(saved: Boolean?): Color = when (saved) {
+    true -> MaterialTheme.colorScheme.primary
+    false -> MaterialTheme.colorScheme.onSurfaceVariant
+    null -> LocalContentColor.current
+}
+
+/** Plus / check circle used for "save to library" style toggles; disabled while [added] is unknown (null). */
 @Composable
 internal fun AddedButton(
-    added: Boolean,
+    added: Boolean?,
     onClick: () -> Unit,
     @StringRes addDescription: Int,
     @StringRes removeDescription: Int,
     modifier: Modifier = Modifier,
 ) {
-    IconButton(onClick = onClick, modifier = modifier) {
+    IconButton(onClick = onClick, modifier = modifier, enabled = added != null) {
         Icon(
-            imageVector = if (added) Icons.Rounded.CheckCircle else Icons.Rounded.AddCircleOutline,
-            contentDescription = stringResource(if (added) removeDescription else addDescription),
-            tint = if (added) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            imageVector = if (added == true) Icons.Rounded.CheckCircle else Icons.Rounded.AddCircleOutline,
+            contentDescription = stringResource(if (added == true) removeDescription else addDescription),
+            tint = savedTint(added),
         )
     }
 }
@@ -369,17 +379,19 @@ internal fun SmartShuffleButton(active: Boolean, onClick: () -> Unit, modifier: 
     }
 }
 
+/** Follow toggle; disabled while [following] is unknown (null). */
 @Composable
-internal fun FollowButton(following: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+internal fun FollowButton(following: Boolean?, onClick: () -> Unit, modifier: Modifier = Modifier) {
     OutlinedButton(
         onClick = onClick,
         modifier = modifier,
+        enabled = following != null,
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
     ) {
         Text(
-            text = stringResource(if (following) R.string.detail_following else R.string.detail_follow),
+            text = stringResource(if (following == true) R.string.detail_following else R.string.detail_follow),
             style = MaterialTheme.typography.labelLarge,
-            color = MaterialTheme.colorScheme.onSurface,
+            color = if (following != null) MaterialTheme.colorScheme.onSurface else LocalContentColor.current,
         )
     }
 }

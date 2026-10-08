@@ -6,8 +6,8 @@
 //! 1. Metadata (`Track` via TRACK_V4, or the raw `Episode` via EPISODE_V4), relinking through
 //!    `alternatives` when the requested track has no available file; both the requested `uri`
 //!    and the `playedUri` are recorded.
-//! 2. Availability for the session's country/catalogue (embargo, restrictions) and the explicit
-//!    filter.
+//! 2. Availability for the session's country/catalogue (embargo, restrictions). Not the explicit
+//!    filter: it applies when downloads are shown and played, never to downloading them.
 //! 3. File choice per bitrate with fallbacks (Ogg Vorbis 320/160/96, MP3; ≤ 160 kbps for
 //!    non-Premium sessions).
 //! 4. Audio key: reused from the offline index when the same file is registered, otherwise
@@ -242,11 +242,13 @@ async fn run(uri_str: &str, args: &DownloadArgs, progress: &mut Progress) -> App
 // Metadata, relinking, availability, file choice
 // ---------------------------------------------------------------------------------------------
 
-/// Session facts that decide availability and quality.
+/// Session facts that decide availability and quality. The explicit filter is not one of them:
+/// downloads are the user's content, and the filter applies when they are shown and played (the
+/// Player refuses explicit tracks while it is on, offline too), so turning it on and off never
+/// fails or blocks a download (docs §9.7).
 struct Account {
     country: String,
     catalogue: String,
-    filter_explicit: bool,
     cap_160: bool,
 }
 
@@ -255,7 +257,6 @@ impl Account {
         Self {
             country,
             catalogue: session.get_user_attribute("catalogue").unwrap_or_else(|| "premium".to_owned()),
-            filter_explicit: session.filter_explicit_content(),
             // Downloads are a Premium feature; if another product ever gets here, stay ≤ 160 kbps.
             cap_160: session.get_user_attribute("type").is_some_and(|t| t != "premium"),
         }
@@ -311,9 +312,6 @@ async fn prepare(session: &Session, uri: &SpotifyUri, uri_str: &str, bitrate: u3
                     found.ok_or(direct)?
                 }
             };
-            if played.is_explicit && account.filter_explicit {
-                return Err(AppError::unavailable("Explicit content is filtered for this account"));
-            }
             if let Some(alt) = &played_uri {
                 log::info!("{uri_str} is relinked to {alt}");
             }
@@ -348,9 +346,6 @@ async fn prepare_episode(
     }
     check_availability(&episode.availability, &episode.restrictions, None, &account.country, &account.catalogue, now)
         .map_err(unavailable_reason)?;
-    if episode.is_explicit && account.filter_explicit {
-        return Err(AppError::unavailable("Explicit content is filtered for this account"));
-    }
     let Some((fmt, file_id)) = format::choose_file(&episode.audio, bitrate, account.cap_160) else {
         return Err(AppError::unavailable(if episode.external_url.is_empty() {
             "No downloadable audio file"

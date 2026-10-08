@@ -154,7 +154,7 @@ private fun ShowList(
                 actions = {
                     DetailActionRow(
                         leading = {
-                            FollowButton(following = state.following == true, onClick = onToggleFollow, modifier = Modifier.padding(end = 4.dp))
+                            FollowButton(following = state.following, onClick = onToggleFollow, modifier = Modifier.padding(end = 4.dp))
                             CollectionDownloadButton(ui = state.download, onDownload = onDownload, onRemove = onRemoveDownload)
                             MoreButton(
                                 onClick = { navigator.showActions(MediaActionTarget.ShowTarget(show.toRef())) },
@@ -322,7 +322,7 @@ private fun EpisodeDetails(
                         DetailActionRow(
                             leading = {
                                 AddedButton(
-                                    added = state.saved == true,
+                                    added = state.saved,
                                     onClick = onToggleSaved,
                                     addDescription = R.string.detail_save_episode,
                                     removeDescription = R.string.detail_remove_episode,

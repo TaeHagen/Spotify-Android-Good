@@ -189,11 +189,12 @@ internal fun AppGraph.offlineFlow(): Flow<Boolean> =
     }.distinctUntilChanged().catch { emit(false) }
 
 /**
- * Saved/followed state of [uri]; null until known (`isSaved` only emits once the state is known,
- * so this starts with null to never hold back the screen state).
+ * Saved/followed state of [uri]; null while unknown (not looked up yet, or the lookup failed: it is
+ * retried once the session is online). Show null as a disabled control; starts with null so it
+ * never holds back the screen state.
  */
 internal fun AppGraph.savedFlow(uri: String): Flow<Boolean?> =
-    runCatching<Flow<Boolean?>> { library.isSaved(uri) }.getOrElse { flowOf(null) }
+    runCatching { library.isSaved(uri) }.getOrElse { flowOf(null) }
         .onStart { emit(null) }
         .distinctUntilChanged()
         .catch { emit(null) }
@@ -319,7 +320,11 @@ internal abstract class DetailViewModel(
         graph.player.startRadio(contextUri)
     }
 
-    /** Toggles the saved/followed state of [uri]; [saved] is the state the user saw (null = unknown yet). */
+    /**
+     * Toggles the saved/followed state of [uri] from [saved], the state the user saw: writes its
+     * opposite (not the opposite of the server's state, which may differ). Unknown (null) does
+     * nothing; the control is disabled then.
+     */
     fun toggleSaved(
         saved: Boolean?,
         uri: String = contextUri,
@@ -328,7 +333,7 @@ internal abstract class DetailViewModel(
     ) {
         if (saved == null) return
         launchWrite(if (saved) removedMessage else addedMessage, R.string.detail_library_failed) {
-            graph.library.toggleSaved(uri)
+            graph.library.toggleSaved(uri, displayed = saved)
         }
     }
 

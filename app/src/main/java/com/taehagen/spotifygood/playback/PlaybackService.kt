@@ -548,7 +548,10 @@ class PlaybackService : MediaLibraryService() {
         return null
     }
 
-    /** Liked state of the current track (null while unknown). */
+    /**
+     * Liked state of the current track; null while unknown (lookup pending, or failed offline: it is
+     * retried once the session is online), which hides the heart button rather than showing a guess.
+     */
     private fun likedState(): Flow<Boolean?> = graph.playback.currentTrack
         .map { it?.uri }
         .distinctUntilChanged()
@@ -556,8 +559,7 @@ class PlaybackService : MediaLibraryService() {
             if (uri == null) {
                 flowOf(null)
             } else {
-                runCatching { graph.library.isSaved(uri) }.getOrElse { flowOf(false) }
-                    .map<Boolean, Boolean?> { it }
+                runCatching { graph.library.isSaved(uri) }.getOrElse { flowOf(null) }
                     .onStart { emit(null) }
                     .catch { emit(null) }
             }

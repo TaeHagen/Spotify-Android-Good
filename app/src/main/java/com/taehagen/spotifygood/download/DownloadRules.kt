@@ -7,6 +7,11 @@ import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import java.io.File
 
 /**
@@ -235,12 +240,13 @@ internal object DownloadRules {
     data class Availability(val unavailable: Set<String>, val revived: Set<String>)
 
     /**
-     * The availability a resolution knows: the members that came with catalog metadata ([checked];
-     * URI-only listings such as Liked Songs only for the members that were looked up) and whether that
-     * covers every member ([complete]: a complete resolution whose members all came with metadata).
+     * The availability a resolution knows: the members whose catalog answer gave a verdict
+     * ([CollectionResolver.Item.checked]: URI-only listings such as Liked Songs only for the members
+     * that were looked up; never an explicit member while the explicit filter may have applied) and
+     * whether that covers every member (a complete resolution whose members all have a verdict).
      */
     fun availabilityOf(items: List<CollectionResolver.Item>, resolutionComplete: Boolean): Pair<List<CollectionResolver.Item>, Boolean> {
-        val checked = items.filter { it.metadataJson != null }
+        val checked = items.filter { it.checked }
         return checked to (resolutionComplete && checked.size == items.size)
     }
 
@@ -290,6 +296,64 @@ internal object DownloadRules {
      * whose download failed (or was failed by re-validation) would stay failed.
      */
     fun requeueOnSync(queued: List<String>, revived: Set<String>): List<String> = queued.filter { it in revived }
+
+    // ---- explicit filter -----------------------------------------------------------------------------
+    //
+    // Downloads are the user's content: the explicit filter ("Hide explicit content", or the account's
+    // own) is applied when they are shown and played, never to download rows. The catalog's `playable`
+    // includes the filter (every explicit item is `playable:false` while it is on), so for an explicit
+    // item it says nothing about availability then.
+
+    /**
+     * What the catalog's answer about an item means for downloading it: true (playable here), false
+     * (not playable here) or null (no verdict). An explicit item reported not playable while the
+     * explicit filter [filterMayApply] (see [ExplicitFilterWatch]) gets no verdict, nor does a
+     * placeholder without a name (its lookup failed).
+     */
+    fun downloadVerdict(playable: Boolean, explicit: Boolean, filterMayApply: Boolean, resolved: Boolean = true): Boolean? = when {
+        !resolved -> null
+        !playable && explicit && filterMayApply -> null
+        else -> playable
+    }
+
+    /** Whether a row's stored metadata (Track / Episode JSON) or record (`OfflineTrackRecord`) is explicit. */
+    fun storedExplicit(json: Json, metadataJson: String?, recordJson: String?): Boolean {
+        fun parse(text: String?) = text?.let { runCatching { json.parseToJsonElement(it) }.getOrNull() } as? JsonObject
+        fun flag(element: JsonElement?) = ((element as? JsonObject)?.get("explicit") as? JsonPrimitive)?.booleanOrNull == true
+        if (flag(parse(metadataJson))) return true
+        val record = parse(recordJson) ?: return false
+        return flag(record["track"]) || flag(record["episode"])
+    }
+
+    /** A FAILED row as the explicit-filter repair sees it ([explicitRepair]). */
+    data class RepairRow(
+        val uri: String,
+        val error: String?,
+        /** It still has its finished file, key and record (a completed download marked failed). */
+        val finished: Boolean,
+        val explicit: Boolean,
+    )
+
+    /** What [explicitRepair] does: [restore] to COMPLETED (file and key kept), [requeue] to download. */
+    data class ExplicitRepair(val restore: List<String>, val requeue: List<String>)
+
+    /**
+     * The one-time repair of downloads that versions applying the explicit filter to downloads failed:
+     * explicit downloads re-validation marked no longer playable ([unplayableReason]) while their
+     * file and key remained are restored (re-validated again at the next sync, which decides for real
+     * once the filter is off), and explicit rows a download attempt failed as not available
+     * ([unavailableReason], the old downloader refused explicit content while filtered) are queued
+     * again, unless a collection records them as not playable here ([unavailableMembers]: its
+     * re-check queues them once they are). The two reasons cannot tell a filtered item from one that
+     * is really unavailable; restoring or retrying such an item once costs one more check.
+     */
+    fun explicitRepair(rows: List<RepairRow>, unplayableReason: String, unavailableReason: String, unavailableMembers: Set<String>): ExplicitRepair {
+        val explicit = rows.filter { it.explicit }
+        return ExplicitRepair(
+            restore = explicit.filter { it.error == unplayableReason && it.finished }.map { it.uri },
+            requeue = explicit.filter { it.error == unavailableReason && it.uri !in unavailableMembers }.map { it.uri },
+        )
+    }
 
     /**
      * Whether scheduled download work is cancelled after removals: when nothing is pending any more

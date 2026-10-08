@@ -5,12 +5,20 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Coalesces point lookups into batched calls: the first request opens a [windowMs] window, every
@@ -176,3 +184,84 @@ internal class SavedStateStore(private val maxEntries: Int = 5_000) {
         const val MAX_TRACKED_MUTATIONS = 1_000
     }
 }
+
+/**
+ * Live saved state of [uri] in this store: the stored value, null while it is unknown (not looked
+ * up yet, or the lookup failed). Emits at once on collection (no waiting for the lookup), so a
+ * screen can never show the previous item's state for this one.
+ *
+ * While collected and the value is unknown, [uri] is resolved with [lookup]. A failed lookup is not
+ * a "not saved": the flow keeps emitting null (callers show a neutral, disabled control) and the
+ * lookup runs again when the session comes [online] (it fails with NOT_CONNECTED while connecting,
+ * reconnecting or offline), or after [retryDelayMs] if it failed although the session is online
+ * (network hiccup, rate limit). A value that becomes unknown again (logout, a rollback) is looked up
+ * again too.
+ */
+internal fun SavedStateStore.observe(
+    uri: String,
+    lookup: suspend (String) -> Boolean,
+    online: StateFlow<Boolean>,
+    retryDelayMs: (attempt: Int) -> Long = ::savedLookupRetryDelayMs,
+): Flow<Boolean?> = flow {
+    coroutineScope {
+        launch { resolveWhileUnknown(uri, lookup, online, retryDelayMs) }
+        emitAll(version.map { get(uri) })
+    }
+}.distinctUntilChanged()
+
+private suspend fun SavedStateStore.resolveWhileUnknown(
+    uri: String,
+    lookup: suspend (String) -> Boolean,
+    online: StateFlow<Boolean>,
+    retryDelayMs: (attempt: Int) -> Long,
+) {
+    while (true) {
+        version.first { get(uri) == null }
+        var attempt = 0
+        while (get(uri) == null) {
+            val seq = currentSeq()
+            val value = try {
+                lookup(uri)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+            if (value != null) {
+                // Usually already stored by the lookup itself; a later local mutation still wins.
+                applyLookup(mapOf(uri to value), seq)
+                break
+            }
+            awaitLookupRetry(online, retryDelayMs(attempt++))
+        }
+    }
+}
+
+/**
+ * After a failed lookup: until the session is online when it is not (that is why it failed), else
+ * [delayMs] or until the session reconnected, whichever comes first.
+ */
+private suspend fun awaitLookupRetry(online: StateFlow<Boolean>, delayMs: Long) {
+    if (!online.value) {
+        online.first { it }
+        return
+    }
+    withTimeoutOrNull(delayMs) {
+        online.first { !it }
+        online.first { it }
+    }
+}
+
+/** Delay before re-looking up a saved state that failed while online: 5 s, doubling, at most 5 min. */
+internal fun savedLookupRetryDelayMs(attempt: Int): Long =
+    (LOOKUP_RETRY_BASE_MS shl attempt.coerceIn(0, 10)).coerceAtMost(LOOKUP_RETRY_MAX_MS)
+
+private const val LOOKUP_RETRY_BASE_MS = 5_000L
+private const val LOOKUP_RETRY_MAX_MS = 300_000L
+
+/**
+ * What a save/like toggle writes: the opposite of the state the control showed ([displayed]), never
+ * of the server state, which may differ from what the user saw. Null (nothing to write) when the
+ * control showed an unknown state.
+ */
+internal fun toggleTarget(displayed: Boolean?): Boolean? = displayed?.not()

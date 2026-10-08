@@ -23,6 +23,28 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+class LikeStateTest {
+    @Test
+    fun tapActsOnTheShownStateOfTheCurrentItem() {
+        assertEquals(false, LikeState("spotify:track:a", false).shownFor("spotify:track:a"))
+        assertEquals(true, LikeState("spotify:track:a", true).shownFor("spotify:track:a"))
+    }
+
+    @Test
+    fun unknownStateIgnoresTheTap() {
+        // The lookup failed (offline / connecting): the heart is disabled, a tap writes nothing.
+        assertNull(LikeState("spotify:track:a", null).shownFor("spotify:track:a"))
+        assertNull(LikeState.NONE.shownFor(null))
+    }
+
+    @Test
+    fun anotherItemsStateIsNotUsed() {
+        // Right after a track change the heart may still show the previous track's state.
+        assertNull(LikeState("spotify:track:a", true).shownFor("spotify:track:b"))
+        assertNull(LikeState("spotify:track:a", true).shownFor(null))
+    }
+}
+
 class TimeFormatTest {
     @Test
     fun formatsMinutesAndSeconds() {
