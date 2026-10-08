@@ -25,6 +25,13 @@ below. `Cargo.lock`, `Cargo.toml.orig` and `.cargo_vcs_info.json` were removed, 
    recreating the Player (and with it the Sink / AudioTrack and the Spirc binding).
 5. **Resources.** Named threads, a 1-worker player runtime instead of one worker per CPU core,
    and a fix for a leaked loader-thread handle.
+6. **Position corrections at another playback speed.** The app's sink plays podcasts at 0.5x
+   to 3.5x. Stock measures a `PositionCorrection` against a 1x line (`now - position`), so above
+   1x the stream is always ahead of it: a stall (a blocking read of a streamed file) was never
+   reported, and Connect, the app's seek bar, skips, resume points and transfers ran ahead of
+   the audio by speed x stall. After a fast part a slower speed kept the corrections away for
+   long, and below 1x one came every second or two. A seek's wait for its data wasn't reported
+   at any speed.
 
 ## Public API added
 
@@ -66,6 +73,7 @@ impl Player {
     pub fn set_bitrate(&self, bitrate: Bitrate);
     pub fn set_normalisation(&self, settings: NormalisationSettings);
     pub fn set_gapless(&self, gapless: bool);
+    pub fn set_playback_speed(&self, speed: f64);   // the sink's speed; not finite or <= 0 => 1
 }
 pub enum PlayerEvent {
     // ...
@@ -114,6 +122,9 @@ arm), which needed no change.
 | `ensure_sink_stopped` | `sink.stop()` error: log, mark the sink closed, call the sink callback (was `exit(1)`). |
 | `normalisation_factor_for`, `handle_set_normalisation` | New. `start_playback` uses the helper; same behaviour. |
 | `PlayerInternal::load_track` | Named thread `lrs-loader`. Sends the full `Result`. Holds `load_handles` while spawning and inserting (stock could leak a finished thread's handle until Player drop). A failed spawn is logged instead of panicking while the guard is held (that poisoned the mutex, and the unwind's `Drop` panicked again, aborting the process); the load ends as `Unavailable(Other)`. A dropped result sender maps to `Other`. |
+| `PlayerCommand::SetPlaybackSpeed`, `Player::set_playback_speed`, `PlayerInternal::playback_speed`, `handle_set_playback_speed`, `nominal_start_time`, `lags_behind`, `valid_playback_speed` | The playback's line (`reported_nominal_start_time`) is in media time at the playback speed: `now - position / speed` at load-and-play, resume (`paused_to_playing(speed)`) and after a correction, and the playing track's line is re-based at its position when the speed changes. The packet loop reports a correction when the stream lags 1 s of media behind that line (`lags_behind`); being ahead (the sink's buffer) still isn't reported, and the skipped-packet check is unchanged. At 1x both are the stock computations. |
+| `handle_command_seek` | After the wait for the data (`preload_data_before_playback`) the line is `None`, so the first packet reports its position (`PositionCorrection`) and starts the line there. Stock started the line after the wait, so the `Seeked` position (sent before it) stayed ahead of the audio by the wait. |
+| `mod spotifygood_tests` (speed) | A simulated packet loop: a stall at 2x is corrected at the first packet once it is 1 s of media behind (stock: never), a speed change from 2x to 0.5x (and back) keeps corrections working, the 1x line is the stock one. |
 | `lock_load_handles`, `LOAD_HANDLES_POISON_MSG` | Every `load_handles` lock (loader thread, `load_track`, `Drop`) ignores poisoning (`PoisonError::into_inner`) instead of `expect`, so no panic can become a double panic in `PlayerInternal::drop`. The constant is removed. |
 
 ## Behaviour notes for the engine
@@ -141,6 +152,12 @@ arm), which needed no change.
   * `set_gapless` updates `config.gapless`, which `handle_command_load` reads: it applies from
     the next load (track change). Commands are processed in order, so a load sent after the
     command sees the new value.
+* **`set_playback_speed`** tells the player the speed the sink plays at; the sink applies the
+  speed itself (the engine's `AndroidSink`), the player only measures its position corrections
+  against it. The engine sets it with every `player.setSpeed` and on every new Player
+  (`player_host::set_playback_speed`). Corrections then come after a stall or a seek, not
+  periodically; Spirc absorbs the ones on the line of the speed (see the vendored connect
+  crate's item S).
 * **`set_normalisation`** applies from the next packet: the config and knee factor are updated,
   and the current track's gain is recomputed from its normalisation data. `normalisation_type:
   Auto` still follows `set_auto_normalise_as_album`.

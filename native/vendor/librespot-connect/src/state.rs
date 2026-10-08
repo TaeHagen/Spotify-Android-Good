@@ -508,6 +508,13 @@ impl ConnectState {
         )
     }
 
+    // SPOTIFYGOOD: for Spirc's PositionCorrection arm
+    /// Whether the position the player reports at `timestamp` is where the playback is at the
+    /// playing speed (within `tolerance_ms`), so that nothing changes
+    pub fn on_playing_line(&self, position_ms: u32, timestamp: i64, tolerance_ms: i64) -> bool {
+        (self.playing_position(timestamp) - i64::from(position_ms)).abs() < tolerance_ms
+    }
+
     // SPOTIFYGOOD: see extrapolated_position, playing_position and update_position_in_relation
     fn advanced(position: i64, elapsed_ms: i64, speed: f64) -> i64 {
         (position + (elapsed_ms as f64 * speed).round() as i64).max(0)

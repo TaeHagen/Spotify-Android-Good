@@ -400,6 +400,23 @@ fn paused(position_ms: u32) -> SpircPlayStatus {
 }
 
 #[test]
+fn a_position_off_the_line_of_the_speed_is_a_change() {
+    let (_rt, mut state) = state(3);
+    state.set_playback_speed(2.);
+    state.update_position(10_000, 1_000_000);
+    state.prepare_put(&playing(), 1_000_000);
+    // the player's correction where the playback is at 2x: nothing changes (no put)
+    assert!(state.on_playing_line(18_300, 1_004_000, 500));
+    assert!(state.on_playing_line(17_700, 1_004_000, 500));
+    // after a 2 s stall (4 s of media behind) Spirc re-anchors there, on at 2x from it
+    assert!(!state.on_playing_line(14_000, 1_004_000, 500));
+    state.update_position(14_000, 1_004_000);
+    state.prepare_put(&playing(), 1_006_000);
+    assert_eq!(state.player().position_as_of_timestamp, 18_000);
+    assert!(state.on_playing_line(18_000, 1_006_000, 500));
+}
+
+#[test]
 fn positions_follow_the_playback_speed_across_puts() {
     for speed in [1.5, 0.5] {
         // `ms` of wall time played at the speed
