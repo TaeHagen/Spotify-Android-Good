@@ -36,4 +36,12 @@
     <string name="data_dl_error_missing_file">The downloaded file is missing. Download it again.</string>
     <string name="data_dl_paused">%1$d of %2$d downloaded. The rest continue when the network allows.</string>
     <string name="data_dl_error_keystore">The device\'s key storage is busy. Will retry.</string>
+    <string name="data_dl_error_location">The download location isn\'t available. Insert the SD card again, or choose another location in Settings.</string>
+    <string name="data_dl_error_volume">On an SD card that isn\'t available. It plays again once the card is back.</string>
+
+    <!-- Download locations (Settings > Storage) -->
+    <string name="data_dl_location_internal">Device storage</string>
+    <string name="data_dl_location_card">SD card</string>
+    <string name="data_dl_move_no_space">Not enough space to move all downloads there.</string>
+    <string name="data_dl_move_failed">Some downloads couldn\'t be moved. Will try again later.</string>
 </resources>

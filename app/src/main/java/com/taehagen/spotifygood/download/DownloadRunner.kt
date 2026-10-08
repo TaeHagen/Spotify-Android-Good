@@ -241,7 +241,6 @@ internal class DownloadRunner(
                 return if (engine.isLoggedIn.value) RunOutcome.RESCHEDULE else RunOutcome.STOPPED
             }
             var networkWaits = 0
-            withContext(Dispatchers.IO) { storage.ensureDirs() }
             while (true) {
                 currentCoroutineContext().ensureActive()
                 val now = System.currentTimeMillis()
@@ -259,7 +258,20 @@ internal class DownloadRunner(
                     Log.i(TAG, "On a metered network with mobile data downloads off: rescheduling")
                     return RunOutcome.RESCHEDULE
                 }
-                val free = withContext(Dispatchers.IO) { storage.freeBytes() }
+                // The chosen location (setting), checked per item: a card can go at any time.
+                val root = storage.awaitRoot()
+                if (root == null) {
+                    val message = context.getString(R.string.data_dl_error_location)
+                    stats.stopMessage = message
+                    notifications.showStopped(message)
+                    // Resumed when the card is mounted again or another location is chosen.
+                    return RunOutcome.RESCHEDULE
+                }
+                val free = withContext(Dispatchers.IO) {
+                    storage.ensureDirs(root)
+                    storage.freeBytes(root)
+                }
+                // setRequiresStorageNotLow covers internal storage only: on a card this is the guard.
                 if (free < DownloadRules.MIN_FREE_BYTES) {
                     val message = context.getString(
                         R.string.data_dl_error_storage,
@@ -271,7 +283,7 @@ internal class DownloadRunner(
                     // user comes back to the app / retries.
                     return RunOutcome.RESCHEDULE
                 }
-                when (val result = processItem(item, host, stats)) {
+                when (val result = processItem(item, root, host, stats)) {
                     ItemResult.Done -> Unit
                     ItemResult.WaitForNetwork -> {
                         // Bounded: a flapping connection hands the retry over to the system backoff.
@@ -339,23 +351,24 @@ internal class DownloadRunner(
         data object Reschedule : ItemResult
     }
 
-    /** Runs one item as its own child so it can be cancelled alone (item removed meanwhile). */
-    private suspend fun processItem(item: DownloadEntity, host: DownloadHost, stats: RunStats): ItemResult = coroutineScope {
-        val job = async { downloadItem(item, host, stats) }
+    /**
+     * Runs one item as its own child so it can be cancelled alone (item removed meanwhile): see
+     * [awaitItem] for why the run then waits for the removal before it picks the next item.
+     */
+    private suspend fun processItem(item: DownloadEntity, root: File, host: DownloadHost, stats: RunStats): ItemResult = coroutineScope {
+        val job = async { downloadItem(item, root, host, stats) }
         current = CurrentItem(item.uri, job)
         try {
-            job.await()
-        } catch (e: CancellationException) {
-            if (!isActive) throw e // the whole run is being stopped
-            ItemResult.Done // only this item was cancelled (removed by the user)
+            awaitItem(job, commitLock, cancelled = ItemResult.Done)
         } finally {
             current = null
         }
     }
 
-    private suspend fun downloadItem(item: DownloadEntity, host: DownloadHost, stats: RunStats): ItemResult = coroutineScope {
+    private suspend fun downloadItem(item: DownloadEntity, root: File, host: DownloadHost, stats: RunStats): ItemResult = coroutineScope {
         val quality = settings.awaitLoaded().downloadQuality.kbps
-        dao.markPreparing(item.uri, quality)
+        // Removed since it was picked: nothing to download.
+        if (dao.markPreparing(item.uri, quality) == 0) return@coroutineScope ItemResult.Done
         val title = displayTitle(item.metadataJson)
         val total = stats.processed + dao.pendingCount()
         _activity.value = DownloadActivity(running = true, currentUri = item.uri, remaining = total - stats.processed)
@@ -368,8 +381,8 @@ internal class DownloadRunner(
                 rpcArgs {
                     put("uri", item.uri)
                     put("bitrate", quality)
-                    put("dir", storage.audioDir.absolutePath)
-                    put("imageDir", storage.imageDir.absolutePath)
+                    put("dir", storage.audioDir(root).absolutePath)
+                    put("imageDir", storage.imageDir(root).absolutePath)
                 },
             )
             progress.cancelAndJoin()
@@ -629,15 +642,30 @@ internal class DownloadRunner(
             ?: runCatching { json.decodeFromString(Episode.serializer(), metadataJson).name }.getOrNull()
     }
 
-    /** Must hold [runLock] (no download in flight). */
+    /** Must hold [runLock] (no download in flight). Not while downloads move between locations. */
     private suspend fun collectGarbage() {
         withContext(NonCancellable + Dispatchers.IO) {
             commitLock.withLock {
-                if (dao.pendingCount() == 0) {
-                    storage.collectGarbage(dao.allPaths(), dao.allFileIds(), dao.unfinishedFileIds(), dao.allImagePaths())
+                if (dao.pendingCount() == 0 && !storage.relocating) {
+                    storage.collectGarbage(dao.allPaths(), dao.unfinishedFileIds(), dao.allImagePaths())
                 }
             }
         }
+    }
+
+    /**
+     * Runs [block] while no run owns the queue (no download in flight, no garbage collection);
+     * false without running it when a run does. A run that starts meanwhile finds the queue taken
+     * and ends: the caller schedules again afterwards.
+     */
+    suspend fun whileIdle(block: suspend () -> Unit): Boolean {
+        if (!runLock.tryLock()) return false
+        try {
+            block()
+        } finally {
+            runLock.unlock()
+        }
+        return true
     }
 
     private companion object {
@@ -654,4 +682,20 @@ internal class DownloadRunner(
         const val STOP_TIMEOUT_MS = 5_000L
         const val MAX_NETWORK_WAITS = 5
     }
+}
+
+/**
+ * Awaits one queue item's [job]. When only the item was cancelled (the run itself is still active),
+ * that was a removal: the remover holds [removalLock] (the manager's mutation lock) from cancelling
+ * the item until its rows are deleted, while the cancelled item has just put its row back into the
+ * queue. Waiting for the lock before returning [cancelled] keeps the run's next pick from finding
+ * that row again and downloading the removed item in full. No deadlock: the remover only waits for
+ * [job], which is complete here. A stop of the whole run is rethrown.
+ */
+internal suspend fun <T> awaitItem(job: Deferred<T>, removalLock: Mutex, cancelled: T): T = try {
+    job.await()
+} catch (e: CancellationException) {
+    currentCoroutineContext().ensureActive()
+    removalLock.withLock { }
+    cancelled
 }
