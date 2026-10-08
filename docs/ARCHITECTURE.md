@@ -820,8 +820,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 
 * `PlaybackService : MediaLibraryService`, `foregroundServiceType="mediaPlayback|connectedDevice"`.
   Session player = `SpotifyPlayer : SimpleBasePlayer(mainLooper)` built from
-  `PlaybackRepository.snapshot` (window: last 10 prev + current + next 50, uids from
-  Connect). `invalidateState()` on every snapshot. Position via `PositionSupplier` from the
+  `PlaybackRepository.snapshot` (window: last 10 prev + current + next 50; Media3 item uids
+  are the Connect uids made unique per window, since repeat-all repeats them and some entries
+  have none; queue commands send the Connect uid, never a made-up one: seek-to-item without one
+  steps with `player.next` through context / autoplay entries, ≤ 10, else is ignored).
+  `invalidateState()` on every snapshot. Position via `PositionSupplier` from the
   snapshot (extrapolating). Media items carry title/artist/album/artworkUri
   (`content://<app>.artwork/<urlhash>` served by `ArtworkProvider` from the Coil disk cache).
 * Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
@@ -928,7 +931,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
   0.2 → restore (a duck keeps focus; a granted request clears the duck). Request failure → pause.
-* `BecomingNoisyReceiver`: registered only while playing locally → `player.pause`.
+* `BecomingNoisyReceiver`: registered while local playback plays, loads or awaits a focus resume
+  (`NoisyRules`: also while the sink is stopped by a focus pause or the stall watchdog), never for
+  remote playback → `player.pause`; a noisy event also cancels a pending focus resume, so a later
+  GAIN cannot restart playback on the speaker.
 * Wake locks: Media3 `WakeLockManager` + `WifiLockManager` `setStayAwake(true)` only while
   local status is playing/loading; false otherwise.
 * Sleep timer (`SleepTimer`): coroutine delays stop while the CPU sleeps (remote playback holds
