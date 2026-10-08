@@ -63,7 +63,9 @@
             android:resource="@xml/automotive_app_desc" />
 
         <!-- singleTop: a launcher tap must not clear the login Custom Tab above it (singleTask
-             did); requests from outside come through LinkActivity -->
+             did); requests from outside come through LinkActivity. The app starts it only with
+             MainActivity.launchIntent (the launcher's intent, no package), so the task's root
+             intent matches a launcher tap's; an installer "Open" root is handled in onCreate -->
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -1,5 +1,7 @@
 package com.taehagen.spotifygood.engine
 
+import com.taehagen.spotifygood.playback.EngineReach
+import com.taehagen.spotifygood.model.SessionState
 import com.taehagen.spotifygood.model.StoredCredentials
 import com.taehagen.spotifygood.model.User
 import org.junit.Assert.assertEquals
@@ -42,6 +44,19 @@ class EngineHelpersTest {
         assertNull(knownUser(null, null))
         assertSame(online, knownUser(online, null))
         assertNull(knownUser(null, creds.copy(username = " ")))
+    }
+
+    @Test
+    fun aStoppedEnginesNetworkFlagIsReadAgain() {
+        // "No network" left from when the engine stopped in a dead zone; the network is back.
+        val refreshed = refreshedNetwork(running = false, current = false) { true }
+        assertEquals(true, refreshed)
+        // reach() right after acquire(): a session about to start, so a command waits for it.
+        assertEquals(EngineReach.CONNECTING, EngineReach.of(false, SessionState.STOPPED, refreshed))
+        // No network now (a cold start in a garage): offline at once, downloads first.
+        assertEquals(EngineReach.OFFLINE, EngineReach.of(false, SessionState.STOPPED, refreshedNetwork(false, true) { false }))
+        // A running engine's own (callback-kept) value is never overwritten.
+        assertEquals(false, refreshedNetwork(running = true, current = false) { true })
     }
 
     @Test

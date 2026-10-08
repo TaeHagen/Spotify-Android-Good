@@ -44,6 +44,7 @@ import com.google.common.util.concurrent.ListenableFuture
 import com.taehagen.spotifygood.App
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.Notifications
+import com.taehagen.spotifygood.MainActivity
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.download.DownloadedCollection
 import com.taehagen.spotifygood.engine.EngineHolder
@@ -57,6 +58,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
@@ -389,6 +391,14 @@ class PlaybackService : MediaLibraryService() {
     private fun observeState() {
         val playback = graph.playback
         lifecycleScope.launch {
+            // Android Auto orders its tabs by the network (Downloads first offline): re-read the
+            // root when that flips (also when a stopped engine's flag is refreshed on a read).
+            combine(graph.engine.isNetworkAvailable, graph.settings.settings.map { it.offlineMode }) { network, offline -> network && !offline }
+                .distinctUntilChanged()
+                .drop(1)
+                .collect { session?.notifyChildrenChanged(LibraryTree.ROOT, ROOT_TABS, null) }
+        }
+        lifecycleScope.launch {
             // Local or mirrored playback (e.g. "play on this phone" from another device) keeps the
             // engine; a browse-only bind (nothing loaded) does not start it.
             playback.snapshot.map { it.source != PlaybackSource.NONE }.distinctUntilChanged().filter { it }
@@ -534,7 +544,7 @@ class PlaybackService : MediaLibraryService() {
 
     /** "Sign in" resolution (Android Auto shows it with the error): opens the app's login. */
     private fun signInExtras(): Bundle {
-        val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return Bundle.EMPTY
+        val launch = MainActivity.launchIntent(this)
         val intent = PendingIntent.getActivity(this, REQUEST_SIGN_IN, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Bundle().apply {
             putString(MediaConstants.EXTRAS_KEY_ERROR_RESOLUTION_ACTION_LABEL_COMPAT, getString(R.string.playback_error_action_sign_in))
@@ -598,7 +608,7 @@ class PlaybackService : MediaLibraryService() {
     // ---- notifications ------------------------------------------------------------------------
 
     private fun sessionActivity(): PendingIntent? {
-        val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return null
+        val launch = MainActivity.launchIntent(this)
         launch.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         launch.putExtra(EXTRA_OPEN_PLAYER, true)
         return PendingIntent.getActivity(this, REQUEST_SESSION, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -967,6 +977,8 @@ class PlaybackService : MediaLibraryService() {
 
     companion object {
         private const val TAG = "PlaybackService"
+        /** The root's tabs (Home, Library, Downloads, Browse), for the children-changed hint. */
+        private const val ROOT_TABS = 4
 
         /** Start (while the app is visible) to bring up the opt-in Connect presence. */
         const val ACTION_START_PRESENCE = "com.taehagen.spotifygood.playback.START_PRESENCE"

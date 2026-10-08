@@ -58,6 +58,13 @@ class NetworkMonitor(context: Context) {
         }
     }
 
+    /**
+     * The default network as the system reports it right now (synchronous, cheap binder calls; the
+     * last value on failure). For readers while the callback isn't registered: the engine is
+     * stopped, so nothing else keeps [status] current.
+     */
+    fun snapshot(): NetworkStatus = currentStatus()
+
     private fun currentStatus(): NetworkStatus {
         val cm = connectivity ?: return NetworkStatus(available = true, metered = false)
         return try {
