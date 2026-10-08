@@ -48,6 +48,12 @@ data class Settings(
     val gapless: Boolean = true,
     val hideExplicit: Boolean = false,
     val downloadOverCellular: Boolean = false,
+    /**
+     * Where new downloads go: a removable volume's UUID (an SD card,
+     * [com.taehagen.spotifygood.download.DownloadLocation.id]), or empty for internal storage.
+     * Existing downloads move there when it changes.
+     */
+    val downloadLocation: String = "",
     /** Spotify Connect device name; empty = device model. */
     val deviceName: String = "",
     /** Keep the phone visible to Spotify Connect while idle (connectedDevice FGS; battery cost). */

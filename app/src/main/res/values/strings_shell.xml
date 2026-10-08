@@ -245,6 +245,12 @@
     <string name="shell_settings_offline_mode_summary">Only play downloaded music, even when you\'re online</string>
 
     <string name="shell_settings_storage">Storage</string>
+    <string name="shell_settings_download_location">Download location</string>
+    <string name="shell_settings_download_location_option">%1$s · %2$s free</string>
+    <string name="shell_settings_download_location_missing">%1$s · not available</string>
+    <string name="shell_settings_download_moving">Moving downloads</string>
+    <string name="shell_settings_download_moving_summary">%1$d of %2$d files moved</string>
+    <string name="shell_settings_download_move_stopped">Moving downloads stopped</string>
     <string name="shell_settings_cache_size">Streaming cache</string>
     <string name="shell_settings_cache_size_summary">Up to %1$s for faster replays</string>
     <string name="shell_settings_clear_cache">Clear cache</string>
