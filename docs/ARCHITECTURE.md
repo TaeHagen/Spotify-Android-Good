@@ -956,11 +956,15 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   effective speed goes to the sink (`AudioSinkBridge.setPlaybackSpeed`, AudioTrack
   `PlaybackParams`, pitch kept, also for tracks recreated later). The sink decides what plays:
   AudioTrack refuses a speed it cannot time-stretch in its buffer (about the speed times the 1x
-  minimum, more on Bluetooth), so the track's capacity is sized for 3.5× (as ExoPlayer does)
+  minimum, more on Bluetooth), so a track for a speed above 1× is built with a capacity for
+  3.5× (as ExoPlayer does; the first such speed rebuilds a 1× track at the next write, once)
   while its fill level follows the speed (`setBufferSizeInFrames`, ~250 ms of wall-clock audio,
-  so pause and seek stay as quick), and a speed the output still refuses falls back to the
-  highest step it takes below it (`PodcastSpeeds.fallbacks`); a new track and a route change
-  check the chosen speed again. Only the speed the sink plays at goes to the engine
+  so pause and seek stay as quick: librespot's position is the decoded one). Any other track is
+  built at the 1× fill (`SinkBuffer`), which a re-route cannot enlarge. A re-route or restore
+  rebuilds the server track at its capacity: the fill is put back on every route change (also
+  at 1×) and whenever a write finds the buffer larger than the fill last set. A speed the output
+  still refuses falls back to the highest step it takes below it (`PodcastSpeeds.fallbacks`); a
+  new track and a route change check the chosen speed again. Only the speed the sink plays at goes to the engine
   (`player.setSpeed`, §6.2), also when it changes by itself, so positions never extrapolate at a
   speed the audio does not play. `PodcastSpeed.inEffect` is that speed (the chosen one stays,
   and is tried again). Now Playing has a speed menu next to the episode controls (hidden
