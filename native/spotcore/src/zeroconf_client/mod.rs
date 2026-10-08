@@ -15,10 +15,16 @@
 //! RPC methods:
 //! * `connect.localInfo {"url","scopeId"?}` → the parsed getInfo (no key material leaves Rust).
 //! * `connect.localLogin {"url","deviceId"?,"scopeId"?}` → `{"deviceId"}` of the joined device.
+//!
+//! Google Cast devices, which don't speak ZeroConf, are signed in by `cast_client`, which reuses
+//! [`wait_for_cluster_with`] and the address allowlist.
 
 mod blob;
 mod http;
 mod info;
+
+/// The local-network address allowlist, shared with the Cast client (`cast_client`).
+pub(crate) use http::is_local_ip;
 
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::StoredCredentials;
@@ -298,9 +304,17 @@ async fn local_login(args: LoginArgs) -> AppResult<Value> {
 }
 
 /// Waits (bounded by [`CLUSTER_WAIT`]) for the device to appear in the Connect cluster, so the
-/// returned id is the cluster's own id for it; falls back to the getInfo device id on timeout.
-/// Cluster pushes are the normal signal; one explicit refetch covers a missed push.
+/// returned id is the cluster's own id for it; the caller falls back to the getInfo device id on
+/// timeout.
 async fn wait_for_cluster(device_id: &str) -> Option<String> {
+    wait_for_cluster_with(|| connect::find_cluster_device(device_id)).await
+}
+
+/// Waits (bounded by [`CLUSTER_WAIT`]) until `find` sees the freshly signed-in device in the
+/// Connect cluster and returns its cluster id; `None` on timeout. Cluster pushes are the normal
+/// signal; one explicit refetch covers a missed push. Shared by `connect.localLogin` and
+/// `connect.castLogin`.
+pub(crate) async fn wait_for_cluster_with(find: impl Fn() -> Option<String>) -> Option<String> {
     let start = Instant::now();
     let deadline = start + CLUSTER_WAIT;
     let mut refreshed = false;
@@ -309,7 +323,7 @@ async fn wait_for_cluster(device_id: &str) -> Option<String> {
         let notified = connect::cluster_changed().notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if let Some(id) = connect::find_cluster_device(device_id) {
+        if let Some(id) = find() {
             return Some(id);
         }
         let now = Instant::now();
