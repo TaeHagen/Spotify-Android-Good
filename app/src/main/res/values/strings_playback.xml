@@ -62,6 +62,8 @@
     <string name="playback_podcasts">Podcasts</string>
     <string name="playback_songs">Songs</string>
     <string name="playback_episodes">Episodes</string>
+    <!-- Last row of a long list in Android Auto: opens the rest of it -->
+    <string name="playback_more">More</string>
     <string name="playback_popular">Popular</string>
     <string name="playback_top_result">Top result</string>
     <string name="playback_recently_played">Recently played</string>

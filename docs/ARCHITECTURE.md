@@ -619,36 +619,47 @@ partial      present (true) only when some item metadata could not be fetched ri
 resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the account's
              `playedState`). Extended metadata has none; `catalog.show` pages and `catalog.episodes`
              for one or two episodes (an episode page) overlay it from Pathfinder
-             (`queryPodcastEpisodes`, `getEpisodeOrChapter`, `catalog/played.rs`): best effort, only
+             (`queryPodcastEpisodes`, `getEpisodeOrChapter`, `catalog/played.rs`; `library.episodes`
+             pages too, a few `getEpisodeOrChapter` lookups at a time): best effort, only
              when the operation's hash is known (never triggers a hash discovery), at most 3 s, a
              failure leaves the fields out and never makes a page `partial`. Search results carry it
              when Pathfinder sends it. Kotlin keeps one resume point per episode
              (`EpisodeProgressStore`) with the time it was learned: the wall time of this phone's
              last save, or the request time of the fresh answer that brought Spotify's; the newest
              wins.
-             * Local playback of an episode is saved on pause, on a change of item, when playback
-               leaves the phone and every 15 s while playing; within 30 s of the end it is played.
+             * Playback of an episode is saved on pause, on a change of item, when it leaves the
+               device and every 15 s while playing; within 30 s of the end it is played. That is
+               this phone's playback and a remote device's this phone follows (it is its remote, or
+               handed it over): the phone's view of the account's progress. A remote position near
+               the start doesn't replace a point further on.
              * Only a fresh answer carries Spotify's state: cached show pages (fresh hits, copies
                shown while revalidating or offline) and download metadata are stripped (when
                emitted / stored / decoded). Fresh answers are observed once, where they arrive
-               (`CatalogRepository.showPage` / `episodes`, `SearchRepository.search`); an answer
+               (`CatalogRepository.showPage` / `episodes`, `SearchRepository.search`,
+               `LibraryRepository.episodes`); an answer
                requested before the last one seen is ignored, so an older page can't undo a newer
                one. Everything that shows an episode only overlays the point (no side effects).
              * A fresh state is news only when it differs from the last one seen (nothing is
                reported to Spotify, so otherwise its state lags this phone's progress); then it
-               replaces an older point (a not-started one keeps none). The first state seen after
-               an offline play only becomes the reference. A partly played state is kept when
-               nothing is.
-             * Connect: while another device plays an episode (this phone is its remote, or handed
-               it over), Spotify's next state for it is news; when this phone takes an episode over
-               (seen remote just before, or arriving far from the kept point), the next state (the
-               other device's, older than this phone's progress) only becomes the reference.
+               replaces an older point (a not-started one keeps none). With no reference yet (the
+               phone played it, nothing fresh seen since) the furthest point wins. A partly played
+               state is kept when nothing is.
+             * Connect: after a remote device's position is saved, Spotify's next state is news
+               when partly or fully played (that device may have played on after the phone stopped
+               following); a not-started one (a device that reports nothing, e.g. librespot)
+               changes nothing. When this phone takes an episode over (seen remote just before, or
+               arriving far from the kept point), the next state (the other device's, older than
+               this phone's progress) only becomes the reference.
              * Every play path resumes from the point: the app's pages (rows and the show's Play),
-               Downloads, search, Android Auto / Assistant / media browsers (their rows also carry
-               the completion status) via `PlayerController.episodeResume` for a play with no
-               position; auto-advance and next (Spirc, the offline queue) by one seek when local
-               playback arrives near the start of a partly played episode (the point isn't
-               overwritten before it lands).
+               Your Episodes, Downloads, search, Android Auto / Assistant / media browsers (their
+               rows also carry the completion status) via `PlayerController.episodeResume` for a
+               play with no position. With no point known and the session online (and no fresh
+               answer about it in the last 10 min), the load first looks Spotify's up
+               (`episodeResumeLookup`: `catalog.episodes`, at most 3.5 s). Auto-advance, next and
+               context loads (Spirc, the offline queue) seek once when local playback arrives near
+               the start of a partly played episode, after the same lookup when nothing is known
+               (nothing is saved below the point until the seek lands or the lookup answers).
+               Tapping the episode that is playing (here or on a Connect device) toggles it.
              Nothing is reported back to Spotify: progress made on this phone, offline above all,
              is not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
@@ -956,11 +967,15 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   effective speed goes to the sink (`AudioSinkBridge.setPlaybackSpeed`, AudioTrack
   `PlaybackParams`, pitch kept, also for tracks recreated later). The sink decides what plays:
   AudioTrack refuses a speed it cannot time-stretch in its buffer (about the speed times the 1x
-  minimum, more on Bluetooth), so the track's capacity is sized for 3.5× (as ExoPlayer does)
+  minimum, more on Bluetooth), so a track for a speed above 1× is built with a capacity for
+  3.5× (as ExoPlayer does; the first such speed rebuilds a 1× track at the next write, once)
   while its fill level follows the speed (`setBufferSizeInFrames`, ~250 ms of wall-clock audio,
-  so pause and seek stay as quick), and a speed the output still refuses falls back to the
-  highest step it takes below it (`PodcastSpeeds.fallbacks`); a new track and a route change
-  check the chosen speed again. Only the speed the sink plays at goes to the engine
+  so pause and seek stay as quick: librespot's position is the decoded one). Any other track is
+  built at the 1× fill (`SinkBuffer`), which a re-route cannot enlarge. A re-route or restore
+  rebuilds the server track at its capacity: the fill is put back on every route change (also
+  at 1×) and whenever a write finds the buffer larger than the fill last set. A speed the output
+  still refuses falls back to the highest step it takes below it (`PodcastSpeeds.fallbacks`); a
+  new track and a route change check the chosen speed again. Only the speed the sink plays at goes to the engine
   (`player.setSpeed`, §6.2), also when it changes by itself, so positions never extrapolate at a
   speed the audio does not play. `PodcastSpeed.inEffect` is that speed (the chosen one stays,
   and is tried again). Now Playing has a speed menu next to the episode controls (hidden
@@ -1006,16 +1021,35 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   A queue clear stops bulk adds queued before it (silently: the user cleared); a load does not
   (Spirc and remote devices keep the user queue across loads).
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
-  Downloads, Browse; Downloads first offline); search. The downloads come from the download
-  database alone (`OfflineTree`, `LibraryTree.pagedChildren`), a page at a time (Media3 paging:
-  only the rows of the page are read; an unpaged request gets the first 500): the Downloads tab is
-  grouped as the app's Downloads screen (Liked Songs and playlists, albums, podcasts with
-  something downloaded, browsable and playable as their context; then the songs and the episodes
-  downloaded on their own, newest first, a `dl|` row playing its own section), all marked
-  downloaded. A downloaded collection (Liked Songs, a playlist, album or show, from the tab or
-  Library) browsed offline, or when the catalog has nothing for it (no session, a failed or empty
-  answer, a cleared cache), lists its downloads in collection order as `ctx|` rows (the offline
-  load plays them in that order), without waiting for or starting the session; `onPlaybackResumption` from `ResumeStore` (DataStore:
+  Downloads, Browse; Downloads first offline); search. Lists are read a window at a time
+  (`LibraryTree.pagedChildren`, `BrowsePaging`), as Media3 asks (page and page size): Library's
+  playlists, albums, artists and podcasts (the saved lists), Liked Songs (`library.tracks`, ≤ 500
+  a call), a playlist's or show's rows (the cached first page, then the further pages) and an
+  album's, and the downloads. One answer holds at most 200 rows (Media3 cuts a legacy browser's
+  result at 256 KB, and Android Auto does not page); when rows lie past an answer the browser
+  will not page to, it ends with a "More" row (`more|<offset>|<list>`) opening the rest, so every
+  row stays reachable. The composite parents (tabs, Home, Browse, an artist) stay bounded. The
+  downloads come from the download database alone (`OfflineTree`), only the rows of a window
+  read: the Downloads tab is grouped as the app's Downloads screen (Liked Songs and playlists,
+  albums, podcasts with something downloaded, browsable and playable as their context; then the
+  songs and the episodes downloaded on their own, newest first, a `dl|` row playing its own
+  section), all marked downloaded. A downloaded collection (Liked Songs, a playlist, album or
+  show, from the tab or Library) browsed offline lists its downloads in collection order as
+  `ctx|` rows (the offline load plays them in that order), without waiting for or starting the
+  session; online it lists the catalog's copy, all of it, and its downloads when the catalog has
+  nothing for it (no session, a failed or empty answer, a cleared cache). Voice "play X"
+  (Assistant, Auto: `LibraryTree.resolveVoiceQuery`, `VoiceMatch`) matches the user's own
+  collections by name first (case, accents and punctuation aside; "my", "the", "playlist", ...
+  dropped), honouring `EXTRA_MEDIA_FOCUS` and the `EXTRA_MEDIA_*` names: Liked Songs and the
+  downloaded collections, then online Library's playlists, albums, artists and podcasts. The
+  same or loosely the same name wins over the catalog's search (the user's own, maybe private,
+  playlist over a stranger's); a name that only starts so is used when the search has nothing.
+  Offline only the downloads count: their collections, then the downloaded songs and episodes
+  by title, else all of an artist's, album's or show's, played as a list. A request that finds
+  nothing (also "play something" with no stored session) fails with the player's error (Not
+  found, or Not available offline) instead of an empty answer, which Media3 would still prepare
+  and play, resuming whatever was loaded. Auto's search offline lists the downloads whose names
+  have the query's words; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
   on a mode change and every 15 s while playing (`ResumeSaver`): the account's last session as
   this phone sees it, local or the remote device it mirrors (after a transfer it follows the
