@@ -71,7 +71,7 @@ class AppGraph(val app: Application) {
     val settings: SettingsRepository by lazy { SettingsRepository(app, appScope) }
     val credentialStore: CredentialStore by lazy { CredentialStore(app) }
 
-    val engine: SpotifyEngine by lazy {
+    private val engineLazy = lazy {
         SpotifyEngine(
             app, appScope, rpc, events, settings, credentialStore, audioSink,
             onAccountChanged = { removePreviousAccountData() },
@@ -79,6 +79,11 @@ class AppGraph(val app: Application) {
             engine.setOfflineIndexProvider { downloads.offlineRecords() }
         }
     }
+    val engine: SpotifyEngine by engineLazy
+
+    /** The engine if this process created it (an alarm must not create one just to stop it). */
+    fun engineIfCreated(): SpotifyEngine? = if (engineLazy.isInitialized()) engine else null
+
     val auth: AuthRepository by lazy { AuthRepository(app, appScope, engine, credentialStore, httpClient) }
 
     val playback: PlaybackRepository by lazy { PlaybackRepository(appScope, events) }

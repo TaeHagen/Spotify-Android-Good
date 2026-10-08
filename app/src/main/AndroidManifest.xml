@@ -141,6 +141,11 @@
             android:name=".playback.PausedIdleAlarmReceiver"
             android:exported="false" />
 
+        <!-- Wall-clock deadlines of the engine's idle stop and Connect hide; not exported -->
+        <receiver
+            android:name=".engine.EngineIdleAlarmReceiver"
+            android:exported="false" />
+
         <!-- Artwork for Android Auto / notification (content:// URIs) -->
         <provider
             android:name=".playback.ArtworkProvider"

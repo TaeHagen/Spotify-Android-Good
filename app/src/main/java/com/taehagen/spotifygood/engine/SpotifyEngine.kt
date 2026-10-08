@@ -2,6 +2,7 @@ package com.taehagen.spotifygood.engine
 
 import android.content.Context
 import android.media.AudioManager
+import android.os.SystemClock
 import android.util.Log
 import com.taehagen.spotifygood.auth.CredentialStore
 import com.taehagen.spotifygood.auth.KeystoreUnavailableException
@@ -59,6 +60,14 @@ enum class HolderType { UI, PLAYBACK, DOWNLOAD, PRESENCE }
 interface EngineHolder : AutoCloseable {
     val type: HolderType
     fun release()
+
+    /**
+     * [release], with the idle graces already served (the playback service let go after its
+     * paused lifetime): if no holder remains, the phone is hidden from Connect and the session
+     * stopped at once instead of after the grace.
+     */
+    fun releaseNow() = release()
+
     override fun close() = release()
 }
 
@@ -103,6 +112,8 @@ class SpotifyEngine(
     private val onAccountChanged: suspend () -> Unit = {},
 ) {
     private val appContext = context.applicationContext
+    /** Wall time for the idle graces: counts deep sleep, unlike coroutine delays. */
+    private val clock: () -> Long = SystemClock::elapsedRealtime
     private val audioManager: AudioManager? = appContext.getSystemService(AudioManager::class.java)
     private val networkMonitor = NetworkMonitor(appContext)
     private val deviceName = defaultDeviceName()
@@ -139,15 +150,46 @@ class SpotifyEngine(
      * holder is held. A DOWNLOAD holder alone, or the idle grace, keeps the session without
      * Spirc. Hiding waits [CONNECT_HIDE_GRACE_MS] (a quick app switch must not cost a re-login).
      */
-    private val connectVisibility = ConnectVisibility(scope, CONNECT_HIDE_GRACE_MS)
+    private val connectVisibility = ConnectVisibility(scope, CONNECT_HIDE_GRACE_MS, clock)
 
-    /** Caller holds [holderLock]. */
-    private fun updateConnectVisibleLocked() {
-        connectVisibility.update(connectVisibleFor(
-            ui = holderCounts[HolderType.UI.ordinal],
-            playback = holderCounts[HolderType.PLAYBACK.ordinal],
-            presence = holderCounts[HolderType.PRESENCE.ordinal],
-        ))
+    /** Caller holds [holderLock]. [immediate]: see [EngineHolder.releaseNow]. */
+    private fun updateConnectVisibleLocked(immediate: Boolean = false) {
+        connectVisibility.update(
+            connectVisibleFor(
+                ui = holderCounts[HolderType.UI.ordinal],
+                playback = holderCounts[HolderType.PLAYBACK.ordinal],
+                presence = holderCounts[HolderType.PRESENCE.ordinal],
+            ),
+            immediate,
+        )
+        syncIdleAlarm()
+    }
+
+    /** The idle stop's deadline after the last holder went (guarded by [lifecycle]). */
+    private val idleStop = WallClockGrace(clock, IDLE_GRACE_MS)
+    @Volatile private var idleAlarmAt: Long? = null
+
+    /** Arms [EngineIdleAlarm] for the earliest pending wall-clock deadline (hide, idle stop), or cancels it. */
+    private fun syncIdleAlarm() {
+        val at = listOfNotNull(idleStop.deadline, connectVisibility.hideDeadline).minOrNull()
+        if (at == idleAlarmAt) return
+        idleAlarmAt = at
+        if (at == null) EngineIdleAlarm.cancel(appContext) else EngineIdleAlarm.schedule(appContext, at)
+    }
+
+    /**
+     * [EngineIdleAlarmReceiver]: a hide or the idle stop may have come due while the CPU slept
+     * (coroutine delays don't count deep sleep). Also checked when a session event wakes the process.
+     */
+    fun onIdleAlarm() {
+        idleAlarmAt = null
+        connectVisibility.expireDue()
+        if (idleStop.isDue()) requestReconcile(acquired = false)
+        syncIdleAlarm()
+    }
+
+    private fun checkIdleDeadlines() {
+        if (connectVisibility.isHideDue() || idleStop.isDue()) onIdleAlarm()
     }
 
     /** Number of holders currently held. */
@@ -451,8 +493,7 @@ class SpotifyEngine(
     suspend fun logout(): Unit = withContext(NonCancellable) {
         lifecycle.withLock {
             loginPending = false
-            stopTimer?.cancel()
-            stopTimer = null
+            cancelIdleStopLocked()
             runningJob?.cancel()
             runningJob = null
             generation++
@@ -515,29 +556,36 @@ class SpotifyEngine(
     private inner class Holder(override val type: HolderType) : EngineHolder {
         private val released = AtomicBoolean(false)
 
-        override fun release() {
+        override fun release() = release(immediate = false)
+
+        override fun releaseNow() = release(immediate = true)
+
+        private fun release(immediate: Boolean) {
             if (!released.compareAndSet(false, true)) return
             synchronized(holderLock) {
                 holderCounts[type.ordinal]--
                 holderTotal--
-                updateConnectVisibleLocked()
+                updateConnectVisibleLocked(immediate)
             }
-            Log.d(TAG, "release $type")
-            requestReconcile(acquired = false)
+            Log.d(TAG, if (immediate) "release $type (graces served)" else "release $type")
+            requestReconcile(acquired = false, immediate = immediate)
         }
 
         override fun toString(): String = "EngineHolder($type, released=${released.get()})"
     }
 
-    private fun requestReconcile(acquired: Boolean) {
-        launchSafe("reconcile") { lifecycle.withLock { reconcileLocked(acquired) } }
+    private fun requestReconcile(acquired: Boolean, immediate: Boolean = false) {
+        launchSafe("reconcile") { lifecycle.withLock { reconcileLocked(acquired, immediate) } }
     }
 
-    /** Brings the native session in line with the holders and credentials. Caller holds [lifecycle]. */
-    private suspend fun reconcileLocked(acquired: Boolean) {
+    /**
+     * Brings the native session in line with the holders and credentials. Without holders the
+     * session stops [IDLE_GRACE_MS] of wall time later ([immediate]: at once, see
+     * [EngineHolder.releaseNow]). Caller holds [lifecycle].
+     */
+    private suspend fun reconcileLocked(acquired: Boolean, immediate: Boolean = false) {
         if (holderCount > 0) {
-            stopTimer?.cancel()
-            stopTimer = null
+            cancelIdleStopLocked()
             if (!credentialsLoaded || loginPending) return
             val creds = credentials ?: return
             if (!running) {
@@ -545,26 +593,42 @@ class SpotifyEngine(
             } else if (acquired && needsRestart(_state.value)) {
                 restartLocked()
             }
-        } else if (running && stopTimer == null && !loginPending) {
-            stopTimer = launchSafe("idle-stop") {
-                delay(IDLE_GRACE_MS)
-                lifecycle.withLock {
-                    // Clear first: stopLocked() cancels stopTimer, which must not be this job.
-                    stopTimer = null
-                    if (holderCount == 0 && !loginPending) {
-                        Log.i(TAG, "No holders for ${IDLE_GRACE_MS}ms, stopping the session")
-                        stopLocked()
+        } else if (running && !loginPending) {
+            val deadline = idleStop.arm(immediate)
+            if (idleStop.isDue()) {
+                Log.i(TAG, if (immediate) "Released after the paused lifetime, stopping the session" else "No holders for ${IDLE_GRACE_MS}ms, stopping the session")
+                stopLocked()
+            } else if (stopTimer == null) {
+                syncIdleAlarm()
+                stopTimer = launchSafe("idle-stop") {
+                    delayUntil(deadline, clock)
+                    lifecycle.withLock {
+                        // Clear first: stopLocked() cancels stopTimer, which must not be this job.
+                        stopTimer = null
+                        if (holderCount == 0 && !loginPending && idleStop.isDue()) {
+                            Log.i(TAG, "No holders for ${IDLE_GRACE_MS}ms, stopping the session")
+                            stopLocked()
+                        }
                     }
                 }
             }
         }
     }
 
+    /** Caller holds [lifecycle]. */
+    private fun cancelIdleStopLocked() {
+        stopTimer?.cancel()
+        stopTimer = null
+        if (idleStop.deadline != null) {
+            idleStop.cancel()
+            syncIdleAlarm()
+        }
+    }
+
     // ---- start / stop (caller holds [lifecycle]) --------------------------------------------
 
     private suspend fun startLocked(credentials: StoredCredentials?, accessToken: String?): Deferred<Unit> {
-        stopTimer?.cancel()
-        stopTimer = null
+        cancelIdleStopLocked()
         if (!NativeStatus.isAvailable) {
             val info = nativeUnavailableInfo()
             updateState { it.copy(session = SessionState.ERROR, error = info) }
@@ -615,8 +679,7 @@ class SpotifyEngine(
     }
 
     private suspend fun stopLocked(releasePlayer: Boolean = false) {
-        stopTimer?.cancel()
-        stopTimer = null
+        cancelIdleStopLocked()
         if (!running) return
         generation++
         runningJob?.cancel()
@@ -744,6 +807,8 @@ class SpotifyEngine(
     // ---- native events ------------------------------------------------------------------------
 
     private fun onSessionEvent(event: SessionEvent) {
+        // The event woke the process: a grace that ran out in deep sleep applies now.
+        checkIdleDeadlines()
         // Late events of a session we already stopped must not resurrect its state.
         if (!running && event.state != SessionState.STOPPED) return
         updateState { s ->

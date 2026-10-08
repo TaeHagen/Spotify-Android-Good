@@ -656,8 +656,9 @@ For a remote active device, smart shuffle is not supported (the command reports
 * **Visibility**: the phone is listed only while it can play. Kotlin sets `connectVisible`
   while a UI (app in the foreground), PLAYBACK or PRESENCE holder is held; a DOWNLOAD holder
   alone and the idle grace keep it hidden. Becoming visible applies at once; becoming hidden only
-  after 20 s without such a holder (`ConnectVisibility`), because becoming visible again costs a
-  re-login, so a quick switch to another app and back changes nothing. A fresh start uses the
+  after 20 s of wall time (`elapsedRealtime`, see §9.2) without such a holder
+  (`ConnectVisibility`), because becoming visible again costs a re-login, so a quick switch to
+  another app and back changes nothing. A fresh start uses the
   holders as they are (a start for downloads alone is hidden from the beginning). Hidden, the supervisor connects the Session without
   Spirc (catalog, downloads and tokens keep working). `connect` then never starts offline
   playback: `player.load`, control, queue and `connect.transfer` fail with `NOT_CONNECTED`
@@ -777,6 +778,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `DOWNLOAD` (DownloadWorker while running), `PRESENCE` (opt-in Connect presence).
 * When the first holder is acquired and credentials exist → `session.start`.
   When the last holder is released → after `IDLE_GRACE` (60 s) `session.stop`.
+* Both idle graces (the 60 s stop and the 20 s Connect hide, §8) are wall time
+  (`elapsedRealtime`): they usually start right before the phone sleeps (the app was left, the
+  paused service let go, a download job ended) and coroutine delays only count awake time. The
+  waits look at the clock at least every second of awake time, an inexact non-wakeup
+  allow-while-idle alarm at the earliest deadline (`EngineIdleAlarm`) applies them at the first
+  wake-up after it, and so does any session event. When the playback service lets go after its
+  paused lifetime (§9.4) it releases with `releaseNow()`: that lifetime was the grace, so without
+  other holders the phone is hidden and the session stopped at once.
 * With every start, the offline index (`offline.setIndex`, §6.4) is pushed right away,
   independent of the session state, and retried until it went through.
 * `NetworkMonitor` (ConnectivityManager default-network callback, registered only while
@@ -1232,7 +1241,7 @@ error while ONLINE: after the next reconnect).
 | App visible | Online | yes | none unless playing | none |
 | Playing locally | Online (or offline mode) | yes | mediaPlayback | wake + Wi-Fi |
 | Paused < 10 min (wall time, `PausedIdle`) | Online | yes | mediaPlayback (Media3 timeout, bounded by an elapsed-realtime alarm) | none |
-| Paused ≥ 10 min, app background | hidden 20 s after release, stopped after 60 s | no | none | none |
+| Paused ≥ 10 min, app background | hidden and stopped when the service lets go (other releases: hidden after 20 s, stopped after 60 s, both wall time) | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
 | Presence opt-in, idle | Online | yes | connectedDevice (low-importance) | none |
