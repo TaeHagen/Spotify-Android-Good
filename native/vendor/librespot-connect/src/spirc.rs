@@ -1304,6 +1304,9 @@ impl SpircTask {
             self.context_resolver.next_update(),
             Some(ContextType::Default)
         );
+        // SPOTIFYGOOD: a further page fills up the next tracks (see
+        // ConnectState::fill_context_from_page)
+        let default_page = self.context_resolver.next_is_page(ContextType::Default);
 
         match self
             .context_resolver
@@ -1351,7 +1354,12 @@ impl SpircTask {
         };
 
         self.context_resolver.remove_used_and_invalid();
-        transfer_finished || finished
+        // SPOTIFYGOOD: a preload triggered while the next tracks were empty goes to the track that
+        // follows now, and the next tracks are put
+        if default_page {
+            self.handle_next_tracks_changed();
+        }
+        transfer_finished || finished || default_page
     }
 
     // todo: is the time_delta still necessary?
