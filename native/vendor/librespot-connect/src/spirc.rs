@@ -1195,6 +1195,12 @@ impl SpircTask {
 
             // SPOTIFYGOOD: covers every path above without touching each handler
             self.maybe_fetch_suggestions();
+            // SPOTIFYGOOD: the state's play flags (and the restrictions of them) follow the status
+            // of every command and event; they did only once a put was built, and one waiting
+            // behind a put in flight is built only when that one is done (see continues_playing)
+            if self.connect_state.is_active() {
+                self.connect_state.set_status(&self.play_status);
+            }
             self.publish_snapshot();
             self.queue_gauge
                 .queued
@@ -1741,6 +1747,11 @@ impl SpircTask {
         // SPOTIFYGOOD: the announce below carries the whole state, a put of before (in flight or
         // waiting, see StatePuts) must not land after it
         self.state_puts.cancel();
+        // SPOTIFYGOOD: the announce is the put of the dropped one: the status, the position and
+        // the time of now. It went out as the state was at the last put built (playing, with
+        // the position going on, after a pause), and nothing put it again.
+        self.connect_state
+            .prepare_put(&self.play_status, self.now_ms());
 
         // SPOTIFYGOOD: bounded, see NEW_DEVICE_PUT_TIMEOUT (unbounded, a live task never
         // delivered its first cluster: the app never knew which device was active)
@@ -2797,7 +2808,8 @@ impl SpircTask {
 
     // SPOTIFYGOOD: see Spirc::skip_to
     fn handle_skip_to(&mut self, uid: &str) -> Result<(), Error> {
-        let continue_playing = self.connect_state.is_playing();
+        // SPOTIFYGOOD: see continues_playing
+        let continue_playing = continues_playing(&self.play_status);
         self.connect_state.skip_to_uid(uid)?;
         self.add_autoplay_resolving_when_required();
         self.load_track(continue_playing, 0)
@@ -3164,7 +3176,8 @@ impl SpircTask {
     }
 
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
-        let continue_playing = self.connect_state.is_playing();
+        // SPOTIFYGOOD: see continues_playing
+        let continue_playing = continues_playing(&self.play_status);
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let mut has_next_track =
@@ -3221,12 +3234,14 @@ impl SpircTask {
                 // SPOTIFYGOOD: also load the track the state was reset to
                 None if repeat_context => {
                     self.connect_state.reset_playback_to_position(None)?;
-                    self.load_track(self.connect_state.is_playing(), 0)?
+                    // SPOTIFYGOOD: see continues_playing
+                    self.load_track(continues_playing(&self.play_status), 0)?
                 }
                 // SPOTIFYGOOD: without a previous track, previous restarts the current one
                 // (prev_track no longer touches the state then); it used to stop playback.
                 None => self.handle_seek(0),
-                Some(_) => self.load_track(self.connect_state.is_playing(), 0)?,
+                // SPOTIFYGOOD: see continues_playing
+                Some(_) => self.load_track(continues_playing(&self.play_status), 0)?,
             }
         } else {
             self.handle_seek(0);
@@ -3505,6 +3520,18 @@ fn play_action(status: &SpircPlayStatus, toggle: bool, has_track: bool) -> PlayA
     }
 }
 
+// SPOTIFYGOOD: Next, Prev and skip_to went by the state's is_playing, whose flags were only
+// brought up to date when a put was built (prepare_put). A put waiting behind one in flight
+// (StatePuts, up to its timeout and the retries) left the status of before a pause or a resume:
+// Next after a pause played the next song out loud, Next after a resume loaded it paused.
+/// Whether the track that follows plays (else it is loaded paused), from Spirc's own status
+fn continues_playing(status: &SpircPlayStatus) -> bool {
+    matches!(
+        status,
+        SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. }
+    )
+}
+
 fn pauses_on_drop(owns_player: bool, pause_on_drop: bool, stopped: bool) -> bool {
     owns_player && (pause_on_drop || !stopped)
 }
@@ -3534,7 +3561,7 @@ impl Drop for SpircTask {
 mod tests {
     use super::{
         PlayAction, SpircPlayStatus, StatePut, StatePutResult, StatePuts, SuggestionFetch,
-        pauses_on_drop, play_action,
+        continues_playing, pauses_on_drop, play_action,
     };
     use futures_util::FutureExt;
     use std::time::Duration;
@@ -3699,6 +3726,29 @@ mod tests {
         assert_eq!(play_action(&playing, false, true), Nothing);
         assert_eq!(play_action(&playing, true, true), Pause);
         assert_eq!(play_action(&loading, true, true), Pause);
+    }
+
+    // SPOTIFYGOOD: see continues_playing
+    #[test]
+    fn the_next_track_follows_the_status_of_now() {
+        let paused = SpircPlayStatus::Paused {
+            position_ms: 1,
+            preloading_of_next_track_triggered: false,
+        };
+        let playing = SpircPlayStatus::Playing {
+            nominal_start_time: 0,
+            preloading_of_next_track_triggered: false,
+        };
+        // a pause, then Next: loaded paused; a resume, then Next: it plays
+        assert!(!continues_playing(&paused));
+        assert!(continues_playing(&playing));
+        assert!(continues_playing(&SpircPlayStatus::LoadingPlay {
+            position_ms: 0
+        }));
+        assert!(!continues_playing(&SpircPlayStatus::LoadingPause {
+            position_ms: 0
+        }));
+        assert!(!continues_playing(&SpircPlayStatus::Stopped));
     }
 
     #[test]

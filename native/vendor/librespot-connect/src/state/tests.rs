@@ -400,6 +400,22 @@ fn paused(position_ms: u32) -> SpircPlayStatus {
 }
 
 #[test]
+fn the_announce_after_a_reconnect_carries_the_status_of_now() {
+    let (_rt, mut state) = state(3);
+    state.update_position(10_000, 1_000_000);
+    state.prepare_put(&playing(), 1_000_000);
+    // paused 5 s later (handle_pause anchors it), its put waits behind one in flight, and the
+    // reconnect drops it
+    state.update_position(15_000, 1_005_000);
+    assert!(!state.is_pause(), "still the status of the last put");
+    // the announce (handle_connection_id_update) is prepared like a put
+    state.prepare_put(&paused(15_000), 1_009_000);
+    assert!(state.is_pause());
+    assert_eq!(state.player().playback_speed, 0.);
+    assert_eq!(state.player().position_as_of_timestamp, 15_000);
+}
+
+#[test]
 fn a_position_off_the_line_of_the_speed_is_a_change() {
     let (_rt, mut state) = state(3);
     state.set_playback_speed(2.);
