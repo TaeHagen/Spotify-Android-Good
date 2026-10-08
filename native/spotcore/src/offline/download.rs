@@ -6,8 +6,10 @@
 //! 1. Metadata (`Track` via TRACK_V4, or the raw `Episode` via EPISODE_V4), relinking through
 //!    `alternatives` when the requested track has no available file; both the requested `uri`
 //!    and the `playedUri` are recorded.
-//! 2. Availability for the session's country/catalogue (embargo, restrictions). Not the explicit
-//!    filter: it applies when downloads are shown and played, never to downloading them.
+//! 2. Availability for the session's country/catalogue (embargo, restrictions), and the
+//!    account's own explicit filter (Spotify's parental setting): explicit items are refused
+//!    while it is on. Not "Hide explicit content": that app setting applies when downloads are
+//!    shown and played, never to downloading them.
 //! 3. File choice per bitrate with fallbacks (Ogg Vorbis 320/160/96, MP3; ≤ 160 kbps for
 //!    non-Premium sessions).
 //! 4. Audio key: reused from the offline index when the same file is registered, otherwise
@@ -242,13 +244,14 @@ async fn run(uri_str: &str, args: &DownloadArgs, progress: &mut Progress) -> App
 // Metadata, relinking, availability, file choice
 // ---------------------------------------------------------------------------------------------
 
-/// Session facts that decide availability and quality. The explicit filter is not one of them:
-/// downloads are the user's content, and the filter applies when they are shown and played (the
-/// Player refuses explicit tracks while it is on, offline too), so turning it on and off never
-/// fails or blocks a download (docs §9.7).
+/// Session facts that decide availability and quality (docs §9.7).
 struct Account {
     country: String,
     catalogue: String,
+    /// The account's own explicit filter (a Family plan child, "Allow explicit content" off), not
+    /// "Hide explicit content": explicit items are not downloaded for such an account. The app
+    /// setting applies when downloads are shown and played, never to downloading them.
+    account_filter: bool,
     cap_160: bool,
 }
 
@@ -257,9 +260,18 @@ impl Account {
         Self {
             country,
             catalogue: session.get_user_attribute("catalogue").unwrap_or_else(|| "premium".to_owned()),
+            account_filter: crate::engine::explicit::account_filter(session),
             // Downloads are a Premium feature; if another product ever gets here, stay ≤ 160 kbps.
             cap_160: session.get_user_attribute("type").is_some_and(|t| t != "premium"),
         }
+    }
+
+    /// Refuses an explicit item while the account's own filter is on.
+    fn check_explicit(&self, explicit: bool) -> AppResult<()> {
+        if explicit && self.account_filter {
+            return Err(AppError::unavailable("Explicit content is filtered for this account"));
+        }
+        Ok(())
     }
 }
 
@@ -312,6 +324,7 @@ async fn prepare(session: &Session, uri: &SpotifyUri, uri_str: &str, bitrate: u3
                     found.ok_or(direct)?
                 }
             };
+            account.check_explicit(played.is_explicit || track.is_explicit)?;
             if let Some(alt) = &played_uri {
                 log::info!("{uri_str} is relinked to {alt}");
             }
@@ -346,6 +359,7 @@ async fn prepare_episode(
     }
     check_availability(&episode.availability, &episode.restrictions, None, &account.country, &account.catalogue, now)
         .map_err(unavailable_reason)?;
+    account.check_explicit(episode.is_explicit)?;
     let Some((fmt, file_id)) = format::choose_file(&episode.audio, bitrate, account.cap_160) else {
         return Err(AppError::unavailable(if episode.external_url.is_empty() {
             "No downloadable audio file"
@@ -441,6 +455,16 @@ async fn lock_file(file_hex: &str) -> tokio::sync::OwnedMutexGuard<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn explicit_items_are_refused_only_on_the_accounts_own_filter() {
+        let account = |account_filter| Account { country: "SE".into(), catalogue: "premium".into(), account_filter, cap_160: false };
+        // "Hide explicit content" never reaches the downloader: only the account's filter counts.
+        assert!(account(false).check_explicit(true).is_ok());
+        assert!(account(true).check_explicit(false).is_ok());
+        let refused = account(true).check_explicit(true).unwrap_err();
+        assert_eq!(refused.code, crate::error::ErrorCode::Unavailable);
+    }
 
     #[tokio::test]
     async fn file_lock_serialises_same_file() {
