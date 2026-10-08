@@ -37,10 +37,11 @@ pub(crate) enum Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Continuation {
     pub context_uri: String,
-    pub start_uri: String,
+    /// `None`: the context's start (a new pass, see [`Adoption::restart`]).
+    pub start_uri: Option<String>,
     pub smart_shuffle: bool,
-    /// The user queue's tracks after the window (queued again).
-    pub queued: Vec<String>,
+    /// A shuffled session's order to keep (see `Options::shuffle_order`).
+    pub order: Option<Vec<String>>,
 }
 
 /// Spirc loads the context at the continuation (online again): the end of the handed-over window
@@ -48,14 +49,15 @@ pub(crate) struct Continuation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HandBack {
     pub context_uri: String,
-    pub start_uri: String,
+    /// `None`: the context's start.
+    pub start_uri: Option<String>,
     pub play: bool,
     pub shuffle: bool,
     pub smart_shuffle: bool,
     pub repeat_context: bool,
     pub repeat_track: bool,
-    /// Added to Spirc's queue after the load.
-    pub queued: Vec<String>,
+    /// See [`Continuation::order`].
+    pub order: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +157,8 @@ pub(crate) struct OfflineQueue {
     ended_request: Option<u64>,
     /// See [`Continuation`] (kept until a load or a shuffle toggle changes the window).
     continuation: Option<Continuation>,
+    /// See [`Adoption::restart`].
+    restart: Option<Continuation>,
     /// Items that aren't tracks of `context_uri` (see [`Adoption::outside`]).
     outside: Vec<usize>,
     /// ... of which these came from Spirc's user queue (see [`Adoption::user_queued`]).
@@ -191,6 +195,10 @@ pub(crate) struct Adoption {
     pub shuffle: bool,
     /// Where the context continues after the window (see [`Continuation`]).
     pub continuation: Option<Continuation>,
+    /// The context's start, where a new pass begins: a window end that wraps (repeat-all, also
+    /// turned on after the handoff) hands back there instead of the queue wrapping a part of the
+    /// context, unless the context goes on after the window ([`Adoption::continuation`]).
+    pub restart: Option<Continuation>,
 }
 
 impl Default for OfflineQueue {
@@ -222,6 +230,7 @@ impl Default for OfflineQueue {
             last_request: None,
             ended_request: None,
             continuation: None,
+            restart: None,
             outside: Vec::new(),
             user_queued: Vec::new(),
             hand_back: false,
@@ -456,10 +465,15 @@ impl OfflineQueue {
         }
         let from = if self.order.is_empty() { None } else { Some(self.pos) };
         let next = self.next_context_pos(from);
-        // The end of a handed-over window (it would stop, or wrap): online, Spirc goes on with the
-        // context there.
-        let window_end = next.is_none_or(|p| from.is_some_and(|f| p <= f));
-        if let Some(c) = self.continuation.as_ref().filter(|_| self.hand_back && window_end) {
+        // The end of a handed-over window (it would stop, or wrap with repeat-all, as it is now):
+        // online, Spirc goes on with the context after the window, or at its start for a new pass.
+        let wraps = next.is_some_and(|p| from.is_some_and(|f| p <= f));
+        let goes_on = if next.is_none() || wraps {
+            self.continuation.as_ref().or(self.restart.as_ref().filter(|_| wraps))
+        } else {
+            None
+        };
+        if let Some(c) = goes_on.filter(|_| self.hand_back) {
             let back = HandBack {
                 context_uri: c.context_uri.clone(),
                 start_uri: c.start_uri.clone(),
@@ -468,7 +482,7 @@ impl OfflineQueue {
                 smart_shuffle: c.smart_shuffle,
                 repeat_context: self.repeat_context,
                 repeat_track: self.repeat == RepeatMode::Track,
-                queued: c.queued.clone(),
+                order: c.order.clone(),
             };
             self.status = PlaybackStatus::Loading;
             self.play_intent = play;
@@ -488,6 +502,7 @@ impl OfflineQueue {
     /// The hand-back couldn't be sent: the window goes on (wraps) or stops as without one.
     pub fn hand_back_failed(&mut self, auto: bool, now_ms: i64) -> Action {
         self.continuation = None;
+        self.restart = None;
         let play = self.play_intent;
         self.advance(auto, play, now_ms)
     }
@@ -741,6 +756,7 @@ impl OfflineQueue {
         // Already in play order: shown as shuffled, a toggle reshuffles or keeps this order.
         self.shuffle = a.shuffle;
         self.continuation = a.continuation;
+        self.restart = a.restart;
         self.outside = a.outside;
         self.user_queued = a.user_queued;
         let Some(request) = request else { return Some(load) };
@@ -957,8 +973,8 @@ impl OfflineQueue {
     }
 
     /// The user queue still ahead, in the order it plays: the entries queued here, then the
-    /// adopted ones of Spirc's after the current position (without wrapping), then the ones that
-    /// ended the handed-over window (see [`Continuation::queued`]); at most [`MAX_NEXT`].
+    /// adopted ones of Spirc's after the current position (without wrapping); at most
+    /// [`MAX_NEXT`].
     fn user_queue(&self) -> Vec<String> {
         let adopted = self
             .order
@@ -966,8 +982,7 @@ impl OfflineQueue {
             .skip(self.pos + 1)
             .filter(|&&i| self.user_queued.contains(&i) && self.playable(i))
             .map(|&i| self.items[i].uri.clone());
-        let after = self.continuation.iter().flat_map(|c| c.queued.iter().cloned());
-        self.queue.iter().map(|q| q.uri.clone()).chain(adopted).chain(after).take(MAX_NEXT).collect()
+        self.queue.iter().map(|q| q.uri.clone()).chain(adopted).take(MAX_NEXT).collect()
     }
 
     /// The snapshot (bare tracks; metadata is filled by the caller). Positions are reported as
@@ -1484,9 +1499,9 @@ mod tests {
     fn the_end_of_a_handed_over_window_goes_back_to_spirc_when_online() {
         let continuation = Continuation {
             context_uri: "spotify:playlist:p".into(),
-            start_uri: "spotify:track:gap".into(),
+            start_uri: Some("spotify:track:gap".into()),
             smart_shuffle: false,
-            queued: vec!["spotify:track:q".into()],
+            order: None,
         };
         for repeat_context in [false, true] {
             let mut q = OfflineQueue::default();
@@ -1506,10 +1521,9 @@ mod tests {
             q.set_hand_back(true);
             let out = q.on_event(Event::EndOfTrack(7), 1_000);
             let Some(Action::HandBack(back)) = out.action else { panic!("hand back: {:?}", out.action) };
-            assert_eq!((back.context_uri.as_str(), back.start_uri.as_str()), ("spotify:playlist:p", "spotify:track:gap"));
+            assert_eq!((back.context_uri.as_str(), back.start_uri.as_deref()), ("spotify:playlist:p", Some("spotify:track:gap")));
             assert!(back.play);
             assert_eq!(back.repeat_context, repeat_context);
-            assert_eq!(back.queued, ["spotify:track:q"], "the user queue after the window");
             // it couldn't be sent: as without one
             let action = q.hand_back_failed(true, 1_000);
             assert!(matches!(action, Action::Stop | Action::Load { .. }));
@@ -1525,6 +1539,48 @@ mod tests {
         q.on_event(Event::RequestId(8), 0);
         q.on_event(Event::Playing { id: 8, position_ms: 0 }, 0);
         assert!(!matches!(q.next(0), Some(Action::HandBack(_))));
+    }
+
+    #[test]
+    fn a_restart_hands_back_only_where_the_window_wraps() {
+        let restart = Continuation { context_uri: "spotify:playlist:p".into(), start_uri: None, smart_shuffle: false, order: None };
+        let adopted = |repeat_context| {
+            let mut q = OfflineQueue::default();
+            q.on_event(Event::RequestId(7), 0);
+            q.adopt(Adoption { restart: Some(restart.clone()), repeat_context, ..adoption(2, 1) }, 0);
+            q.set_hand_back(true);
+            q
+        };
+        // repeat-all: the window's wrap hands back, a new pass at the context's start
+        let mut q = adopted(true);
+        let Some(Action::HandBack(back)) = q.on_event(Event::EndOfTrack(7), 0).action else { panic!("hand back") };
+        assert_eq!((back.start_uri, back.repeat_context), (None, true));
+        // repeat-all turned off meanwhile: it stops at the end
+        let mut q = adopted(true);
+        q.set_repeat(RepeatMode::Off);
+        assert_eq!(q.on_event(Event::EndOfTrack(7), 0).action, Some(Action::Stop));
+        // turned on after a handoff without it: it hands back instead of looping the window
+        let mut q = adopted(false);
+        q.set_repeat(RepeatMode::Context);
+        assert!(matches!(q.on_event(Event::EndOfTrack(7), 0).action, Some(Action::HandBack(_))));
+        // offline: the queue's own repeat wraps the window
+        let mut q = adopted(true);
+        q.set_hand_back(false);
+        assert_eq!(load_uri(&q.on_event(Event::EndOfTrack(7), 0).action).as_deref(), Some("spotify:track:0"));
+    }
+
+    #[test]
+    fn a_queued_track_that_cant_play_offline_is_skipped() {
+        // the handed-over window holds a queued track that isn't downloaded
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        let uris = vec!["spotify:track:0".into(), "spotify:track:qx".into(), "spotify:track:1".into()];
+        q.adopt(Adoption { uris, outside: vec![1], user_queued: vec![1], ..adoption(3, 0) }, 0);
+        assert_eq!(load_uri(&q.on_event(Event::EndOfTrack(7), 0).action).as_deref(), Some("spotify:track:qx"));
+        q.on_event(Event::RequestId(8), 0);
+        let out = q.on_event(Event::Unavailable { id: 8, uri: "spotify:track:qx".into() }, 0);
+        assert_eq!(load_uri(&out.action).as_deref(), Some("spotify:track:1"), "the playlist plays on");
+        assert!(!out.exhausted_after_error);
     }
 
     #[test]
@@ -1553,22 +1609,16 @@ mod tests {
 
     #[test]
     fn a_handover_as_the_context_keeps_the_adopted_user_queue() {
-        // Spirc's user queue: 2 adopted after the current track (3 is a suggestion), 9 ended
-        // the window; then one queued here
-        let continuation = Continuation {
-            context_uri: "spotify:playlist:p".into(),
-            start_uri: "spotify:track:8".into(),
-            smart_shuffle: false,
-            queued: vec!["spotify:track:9".into()],
-        };
+        // Spirc's user queue: 2 adopted after the current track (3 is a suggestion); then one
+        // queued here
         let mut q = OfflineQueue::default();
         q.on_event(Event::RequestId(7), 0);
-        let a = Adoption { outside: vec![2, 3], user_queued: vec![2], continuation: Some(continuation), ..adoption(5, 1) };
+        let a = Adoption { outside: vec![2, 3], user_queued: vec![2], ..adoption(5, 1) };
         q.adopt(a, 0);
         q.add_to_queue("spotify:track:here".into());
         let h = q.handover(0, 50);
         assert_eq!(h.context.as_ref().map(|c| c.track_uri.as_str()), Some("spotify:track:1"));
-        assert_eq!(h.queued, ["spotify:track:here", "spotify:track:2", "spotify:track:9"], "in the order they play");
+        assert_eq!(h.queued, ["spotify:track:here", "spotify:track:2"], "in the order they play");
         // played past: not any more (the one queued here played first)
         q.on_event(Event::EndOfTrack(7), 0);
         q.on_event(Event::RequestId(8), 0);
@@ -1580,7 +1630,7 @@ mod tests {
         assert_eq!(q.handover(0, 50).context, None, "a suggestion plays");
         q.on_event(Event::EndOfTrack(10), 0);
         assert_eq!(q.current_uri(), Some("spotify:track:4"));
-        assert_eq!(q.handover(0, 50).queued, ["spotify:track:9"]);
+        assert!(q.handover(0, 50).queued.is_empty());
     }
 
     fn adoption(n: usize, start: usize) -> Adoption {
@@ -1598,6 +1648,7 @@ mod tests {
             repeat_context: false,
             shuffle: false,
             continuation: None,
+            restart: None,
         }
     }
 

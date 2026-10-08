@@ -122,14 +122,18 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
     let mut f = s.clone();
     f.prev_tracks.retain(keep);
     f.next_tracks.retain(keep);
-    let pass = super::restore::one_pass(&f, current, |t, _| downloaded(&t.uri));
+    // The user queue's tracks that aren't downloaded stay too: online they stream, offline the
+    // queue skips them (unavailable) and plays on.
+    let pass = super::restore::one_pass(&f, current, |t, _| t.provider == TrackProvider::Queue || downloaded(&t.uri));
+    let order = super::restore::shuffle_order(&f, current);
+    let goes_on_at = |i| continuation(&f, i, order.clone());
     let mut tracks = pass.tracks;
-    let mut goes_on = pass.ended_at.and_then(|i| continuation(&f, i));
+    let mut goes_on = pass.ended_at.and_then(goes_on_at);
     // Spirc lists at most MAX_NEXT next tracks (one less before a smart-shuffle pair): a full
     // list that ran out before the context's end goes on past it, so the window ends before its
     // last track and the context goes on there.
     if pass.ended_at.is_none() && pass.ran_out && s.next_tracks.len() + 1 >= MAX_NEXT {
-        if let Some(c) = pass.last_next.and_then(|i| continuation(&f, i)) {
+        if let Some(c) = pass.last_next.and_then(goes_on_at) {
             tracks.pop();
             goes_on = Some(c);
         }
@@ -162,35 +166,33 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
         repeat_context: s.repeat_context,
         shuffle: s.shuffle || s.smart_shuffle,
         continuation: goes_on,
+        restart: uri::is_resolvable_context(&s.context_uri).then(|| Continuation {
+            context_uri: s.context_uri.clone(),
+            start_uri: None,
+            smart_shuffle: s.smart_shuffle,
+            order: None,
+        }),
     })
 }
 
 /// Where the context of `s` goes on after a handed-over window that ends at its next track `from`
-/// (not downloaded, the end of Spirc's full list, or with repeat-all the context's start when the
-/// window doesn't hold the whole pass): Spirc continues there when the session is back (see
-/// `HandBack`). At the first context track from there, before the context's end: suggestions are
-/// skipped (with smart shuffle on Spirc adds new ones), the user queue's tracks are queued again
-/// (they come after that first track then). `None` for a context that can't be loaded again.
-fn continuation(s: &ConnectSnapshot, from: usize) -> Option<Continuation> {
+/// (not downloaded, or the end of Spirc's full list): Spirc continues there when the session is
+/// back (see `HandBack`), a shuffled session in its `order`. At the first context track from
+/// there, before the context's end (suggestions are skipped: with smart shuffle on Spirc adds
+/// new ones; the user queue comes before the context's tracks, so it is in the window). `None`
+/// for a context that can't be loaded again.
+fn continuation(s: &ConnectSnapshot, from: usize, order: Option<Vec<String>>) -> Option<Continuation> {
     if !uri::is_resolvable_context(&s.context_uri) {
         return None;
     }
-    let mut queued = Vec::new();
     for t in &s.next_tracks[from..] {
         if t.uri == uri::DELIMITER_URI {
             // The context's end (repeat-all wraps there, else autoplay follows).
             return None;
         }
-        if t.hidden {
-            continue;
-        }
-        match t.provider {
-            TrackProvider::Context => {
-                let (context_uri, start_uri) = (s.context_uri.clone(), t.uri.clone());
-                return Some(Continuation { context_uri, start_uri, smart_shuffle: s.smart_shuffle, queued });
-            }
-            TrackProvider::Queue => queued.push(t.uri.clone()),
-            _ => {}
+        if !t.hidden && t.provider == TrackProvider::Context {
+            let (context_uri, start_uri) = (s.context_uri.clone(), Some(t.uri.clone()));
+            return Some(Continuation { context_uri, start_uri, smart_shuffle: s.smart_shuffle, order });
         }
     }
     None
@@ -211,13 +213,14 @@ fn hand_back(back: HandBack) -> AppResult<()> {
             repeat: back.repeat_context,
             repeat_track: back.repeat_track,
             smart_shuffle: back.smart_shuffle,
+            shuffle_order: back.order.clone(),
         };
         let request = LoadRequest::from_context_uri(
             back.context_uri.clone(),
             LoadRequestOptions {
                 start_playing: back.play,
                 seek_to: 0,
-                playing_track: Some(PlayingTrack::Uri(back.start_uri.clone())),
+                playing_track: back.start_uri.clone().map(PlayingTrack::Uri),
                 context_options: Some(LoadContextOptions::Options(options)),
             },
         );
@@ -226,14 +229,7 @@ fn hand_back(back: HandBack) -> AppResult<()> {
             player.stop();
         }
         super::local::sent(spirc.activate())?;
-        super::local::sent(spirc.load(request))?;
-        for uri in &back.queued {
-            if let Err(e) = super::local::queue_add(&spirc, uri) {
-                log::warn!("hand-back: {e}, the rest of the queue is dropped");
-                break;
-            }
-        }
-        Ok::<(), AppError>(())
+        super::local::sent(spirc.load(request))
     })();
     match sent {
         Ok(()) => {
@@ -705,7 +701,9 @@ mod tests {
         assert_eq!(a.repeat, RepeatMode::Off);
         assert_eq!(a.context_uri.as_deref(), Some("spotify:playlist:p"));
         // the context goes on at the first track that isn't downloaded
-        assert_eq!(a.continuation.as_ref().map(|c| c.start_uri.as_str()), Some("t:5x"));
+        assert_eq!(a.continuation.as_ref().and_then(|c| c.start_uri.as_deref()), Some("t:5x"));
+        // a new pass (repeat-all turned on later) starts at the context's start
+        assert_eq!(a.restart.as_ref().map(|c| (c.context_uri.as_str(), c.start_uri.as_deref())), Some(("spotify:playlist:p", None)));
         // paused stays paused
         let paused = ConnectSnapshot { status: SnapshotPlayStatus::Paused, ..s.clone() };
         assert!(handoff(&paused, downloaded, 1_005_000).is_some_and(|a| !a.playing && a.position_ms == 10_000));
@@ -752,15 +750,15 @@ mod tests {
         let a = handoff(&s, |_| true, 1_000_000).expect("handed over");
         assert_eq!((a.uris.clone(), a.start), (names(1..=20), 17));
         assert_eq!(a.continuation, None);
-        // ... up to a track that isn't downloaded: then the window doesn't hold the whole pass,
-        // the context goes on at its start
+        // ... up to a track that isn't downloaded: the window's wrap goes to the context's start
+        // (online, see `Adoption::restart`)
         let a = handoff(&s, |u| u != "t:3", 1_000_000).expect("handed over");
         assert_eq!(a.uris[..3], ["t:1", "t:2", "t:8"]);
         assert_eq!(a.start, 12);
-        assert_eq!(a.continuation.map(|c| c.start_uri).as_deref(), Some("t:1"));
+        assert_eq!((a.continuation, a.restart.and_then(|c| c.start_uri)), (None, None));
         let a = handoff(&s, |u| !["t:1", "t:2", "t:3", "t:4", "t:5"].contains(&u), 1_000_000).expect("handed over");
         assert_eq!((a.uris.first().map(String::as_str), a.start), (Some("t:8"), 10));
-        assert_eq!(a.continuation.map(|c| c.start_uri).as_deref(), Some("t:1"));
+        assert!(a.continuation.is_none() && a.restart.is_some());
     }
 
     #[test]
@@ -776,7 +774,8 @@ mod tests {
         let a = handoff(&s, |_| true, 0).expect("handed over");
         assert_eq!(a.uris, names(1..=69).chain(names(180..=200)).collect::<Vec<_>>());
         assert_eq!(a.start, 79);
-        assert_eq!(a.continuation.map(|c| c.start_uri).as_deref(), Some("t:1"), "back online Spirc plays the rest");
+        // the window's wrap: back online Spirc plays the whole context from its start
+        assert!(a.continuation.is_none() && a.restart.is_some());
     }
 
     #[test]
@@ -789,11 +788,11 @@ mod tests {
         s.next_tracks = (1..=80).map(|n| st(&format!("t:{n}"), Context)).collect();
         let a = handoff(&s, |_| true, 0).expect("handed over");
         assert_eq!(a.uris.len(), 80, "the current track and 79 next");
-        assert_eq!(a.continuation.map(|c| c.start_uri).as_deref(), Some("t:80"));
+        assert_eq!(a.continuation.and_then(|c| c.start_uri).as_deref(), Some("t:80"));
         // hidden entries in it too
         s.next_tracks[79].hidden = true;
         let a = handoff(&s, |_| true, 0).expect("handed over");
-        assert_eq!(a.continuation.map(|c| c.start_uri).as_deref(), Some("t:79"));
+        assert_eq!(a.continuation.and_then(|c| c.start_uri).as_deref(), Some("t:79"));
         // a short list is all there is
         s.next_tracks.truncate(5);
         let a = handoff(&s, |_| true, 0).expect("handed over");
@@ -840,13 +839,13 @@ mod tests {
         let a = handoff(&s, downloaded, 0).expect("handed over");
         assert_eq!(a.uris, ["t:0", "t:1"]);
         let c = a.continuation.expect("continuation");
-        assert_eq!((c.start_uri.as_str(), c.smart_shuffle, c.queued.len()), ("t:2x", true, 0));
-        // a queued track that isn't downloaded: queued again, the context after it
+        assert_eq!((c.start_uri.as_deref(), c.smart_shuffle), (Some("t:2x"), true));
+        // a queued track that isn't downloaded stays in the window (streamed online, skipped
+        // offline), the context goes on after it
         s.next_tracks = vec![st("t:qx", Queue), st("t:q2", Queue), st("t:1", Context)];
         let a = handoff(&s, downloaded, 0).expect("handed over");
-        assert_eq!(a.uris, ["t:0"]);
-        let c = a.continuation.expect("continuation");
-        assert_eq!((c.start_uri.as_str(), c.queued.as_slice()), ("t:1", ["t:qx".to_string(), "t:q2".to_string()].as_slice()));
+        assert_eq!(a.uris, ["t:0", "t:qx", "t:q2", "t:1"]);
+        assert_eq!((a.user_queued.as_slice(), a.continuation), ([1, 2].as_slice(), None));
         // the context's end before any of its tracks: none
         s.next_tracks = vec![st("t:sx", Suggestion), st(uri::DELIMITER_URI, Context), st("t:auto", Context)];
         assert_eq!(handoff(&s, downloaded, 0).expect("handed over").continuation, None);

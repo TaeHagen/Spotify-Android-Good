@@ -25,6 +25,9 @@ use tokio::sync::{broadcast, watch, Notify};
 
 /// A placeholder of the last local playback is shown while reconnecting, for at most this long.
 const RECONNECT_PLACEHOLDER_MAX: Duration = Duration::from_secs(30 * 60);
+/// Another device's playback stays shown across a reconnect for at most this long (see
+/// [`HubState::reconnect_remote`]), like the wait for a new Spirc's first cluster.
+pub(crate) const RECONNECT_REMOTE_MAX: Duration = Duration::from_secs(60);
 /// A local activation (load or restore) counts as "this device is active" for this long until
 /// the Spirc's snapshot says so (or it failed).
 const ACTIVATION_GRACE: Duration = Duration::from_secs(10);
@@ -71,6 +74,10 @@ pub(crate) struct HubState {
     /// that load on the target. Gone once the Spirc has a track, the load failed, or it went
     /// inactive.
     pub loading: Option<LocalLoad>,
+    /// The last cluster while another device played, kept across a reconnect (the new Spirc's
+    /// first cluster comes later): "Playing on <device>" stays shown meanwhile (the notification
+    /// and the media foreground with it), for at most [`RECONNECT_REMOTE_MAX`].
+    pub reconnect_remote: Option<(Arc<Cluster>, Instant)>,
     /// A start of this layer failed on the attached Spirc, which goes inactive (its disconnect is
     /// on its way, see [`on_local_load_failed`]): its empty active snapshots read inactive until
     /// an inactive one or one with a track arrives (a play meanwhile gets `NOT_ACTIVE_DEVICE`, a
@@ -249,12 +256,19 @@ fn loads_ahead(hub: &HubState, link: Option<u64>, now: Instant) -> u32 {
         + u32::from(handing_back_view(hub, link, now).is_some())
 }
 
-/// A local load failed on the attached Spirc: one ahead of the user load on its way, or that one.
-fn load_failed(hub: &mut HubState) {
+/// A local load on the attached Spirc failed or took: one ahead of the user load on its way, or
+/// that one.
+fn load_settled(hub: &mut HubState) {
     match hub.loading.as_mut() {
         Some(l) if l.ahead > 0 => l.ahead -= 1,
         _ => hub.loading = None,
     }
+}
+
+/// `snap` (active with a track) plays something else than `prev`: another context or track.
+fn playback_changed(prev: Option<&ConnectSnapshot>, snap: &ConnectSnapshot) -> bool {
+    let track = |s: &ConnectSnapshot| s.track.as_ref().map(|t| (t.uri.clone(), t.uid.clone()));
+    prev.is_none_or(|p| !p.is_active || p.context_uri != snap.context_uri || track(p) != track(snap))
 }
 
 /// The user load on its way to the attached Spirc, if any (for as long as a restore would be).
@@ -583,11 +597,15 @@ pub(crate) fn apply_snapshot(hub: &mut HubState, mut snap: ConnectSnapshot, sess
     }
     if snap.is_active && snap.track.is_some() {
         hub.last_active = Some(LastActive { snap: snap.clone(), ended_at_ms: None });
-        // A restore being applied, a hand-back or a load took (the Spirc publishes nothing while
-        // it fetches a load's context).
+        // A restore being applied or a hand-back took.
         hub.restoring = None;
         hub.handing_back = None;
-        hub.loading = None;
+        // A load took when the playback changed (the Spirc publishes nothing while it fetches a
+        // load's context; the same playback again is a republish, e.g. with a failed load's
+        // error): the one ahead of the user load on its way, or that one.
+        if playback_changed(hub.snapshot.as_ref(), &snap) {
+            load_settled(hub);
+        }
     } else if !snap.is_active {
         if was_active {
             // Taken over or stopped before the hand-back or the load took.
@@ -621,6 +639,7 @@ fn on_cluster(generation: u64, cluster: Arc<Cluster>) {
             hub.remote_activation = None;
         }
         hub.cluster = Some(cluster.clone());
+        hub.reconnect_remote = None;
     }
     CLUSTER_CHANGED.notify_waiters();
     changed();
@@ -636,7 +655,7 @@ fn on_spirc_error(err: SpircCommandError) {
         return;
     }
     if !err.remote && err.command == "load" {
-        load_failed(&mut HUB.lock());
+        load_settled(&mut HUB.lock());
         on_local_load_failed();
     }
     use librespot_core::error::ErrorKind;
@@ -755,19 +774,29 @@ fn local_view(hub: &HubState, link: Option<u64>, now: Instant, now_ms: i64) -> L
     LocalView {
         active,
         hand_back: handing_back_view(hub, link, now).cloned(),
-        // (a load that was on its way has no playback to show)
-        placeholder: frozen.filter(|f| f.load.is_none() && f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned(),
+        placeholder: frozen.filter(|f| f.snap.track.is_some() && f.age(now, now_ms) < RECONNECT_PLACEHOLDER_MAX).cloned(),
         activating: activating(hub, link, now),
     }
+}
+
+/// The cluster kept across a reconnect (see [`HubState::reconnect_remote`]): with a network, for
+/// at most [`RECONNECT_REMOTE_MAX`].
+fn kept_remote(hub: &HubState, network: bool, now: Instant) -> Option<Arc<Cluster>> {
+    hub.reconnect_remote
+        .as_ref()
+        .filter(|(_, at)| network && now.saturating_duration_since(*at) < RECONNECT_REMOTE_MAX)
+        .map(|(c, _)| c.clone())
 }
 
 /// Composes the snapshot from the current sources (without emitting).
 pub(crate) fn compose() -> PlaybackSnapshot {
     let device = this_device_ref();
+    let network = engine::network_available();
     let (view, cluster, refused) = {
         let hub = HUB.lock();
         let link = hub.link.as_ref().map(|l| l.generation);
-        (local_view(&hub, link, Instant::now(), super::now_ms()), hub.cluster.clone(), hub.refused_error.clone())
+        let cluster = hub.cluster.clone().or_else(|| kept_remote(&hub, network, Instant::now()));
+        (local_view(&hub, link, Instant::now(), super::now_ms()), cluster, hub.refused_error.clone())
     };
     // None once a paused or finished offline queue gave way to a device that took over.
     let offline = offline::snapshot(device.clone(), mixer_volume());
@@ -1082,6 +1111,43 @@ mod hub_tests {
         assert!(hub.loading.is_none());
     }
 
+    fn track_snapshot(uri: &str) -> ConnectSnapshot {
+        let mut s = playing_track();
+        if let Some(t) = s.track.as_mut() {
+            t.uri = uri.into();
+            t.uid = uri.into();
+        }
+        s
+    }
+
+    #[test]
+    fn only_a_load_that_took_settles_the_newer_loads_marker() {
+        let now = Instant::now();
+        let marker = |ahead| Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default(), ahead });
+        // A0 plays; load A is on its way, then B (one ahead of it)
+        let mut hub = HubState::default();
+        apply_snapshot(&mut hub, track_snapshot("a0"), false, 0);
+        hub.loading = marker(1);
+        // A failed: A0 again (with the error) changes nothing, the error settles A
+        apply_snapshot(&mut hub, ConnectSnapshot { last_error: Some("load failed".into()), ..track_snapshot("a0") }, false, 0);
+        assert_eq!(hub.loading.as_ref().map(|l| l.ahead), Some(1));
+        load_settled(&mut hub);
+        assert!(local_load_in(&hub, Some(3), now).is_some(), "B is still on its way");
+        // B's track: B took
+        apply_snapshot(&mut hub, track_snapshot("b"), false, 0);
+        assert!(hub.loading.is_none());
+        // A took instead: its track settles A, B's marker stays until B's track
+        let mut hub = HubState::default();
+        apply_snapshot(&mut hub, track_snapshot("a0"), false, 0);
+        hub.loading = marker(1);
+        apply_snapshot(&mut hub, track_snapshot("a"), false, 0);
+        assert_eq!(hub.loading.as_ref().map(|l| l.ahead), Some(0));
+        apply_snapshot(&mut hub, track_snapshot("a"), false, 0);
+        assert!(hub.loading.is_some());
+        apply_snapshot(&mut hub, track_snapshot("b"), false, 0);
+        assert!(hub.loading.is_none());
+    }
+
     #[test]
     fn a_failed_load_ahead_keeps_the_newer_loads_marker() {
         let now = Instant::now();
@@ -1091,11 +1157,11 @@ mod hub_tests {
         assert_eq!(loads_ahead(&hub, Some(3), now), 1);
         let mut hub = HubState { snapshot: Some(empty_active()), loading: load(1), ..Default::default() };
         // A failed: B is still on its way
-        load_failed(&mut hub);
+        load_settled(&mut hub);
         assert!(local_load_in(&hub, Some(3), now).is_some());
         assert!(!local_active_empty_in(&hub, Some(3), now + ACTIVATION_GRACE));
         // B failed
-        load_failed(&mut hub);
+        load_settled(&mut hub);
         assert!(hub.loading.is_none());
         assert!(local_active_empty_in(&hub, Some(3), now + ACTIVATION_GRACE));
         // a restore being applied, or a hand-back, that a user load replaces: their loads are ahead
@@ -1108,6 +1174,21 @@ mod hub_tests {
         };
         assert_eq!(loads_ahead(&hub, Some(3), now), 2);
         assert_eq!(loads_ahead(&hub, Some(4), now), 0, "another Spirc's");
+    }
+
+    #[test]
+    fn another_devices_playback_stays_shown_across_a_reconnect() {
+        let now = Instant::now();
+        let mut hub = HubState { cluster: Some(cluster("speaker")), ..Default::default() };
+        // the teardown: kept, while the cluster goes with the old Spirc
+        hub.reconnect_remote = Some((hub.cluster.clone().expect("cluster"), now));
+        detach_state(&mut hub, 1, false);
+        forget_previous_link(&mut hub);
+        assert!(hub.cluster.is_none());
+        assert_eq!(kept_remote(&hub, true, now + Duration::from_secs(5)).map(|c| c.active_device_id.clone()).as_deref(), Some("speaker"));
+        // not without a network, nor past the bound
+        assert!(kept_remote(&hub, false, now).is_none());
+        assert!(kept_remote(&hub, true, now + RECONNECT_REMOTE_MAX).is_none());
     }
 
     #[test]
