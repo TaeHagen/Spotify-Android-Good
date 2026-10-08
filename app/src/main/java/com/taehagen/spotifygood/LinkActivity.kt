@@ -2,7 +2,6 @@ package com.taehagen.spotifygood
 
 import android.app.Activity
 import android.app.SearchManager
-import android.content.ComponentName
 import android.content.Intent
 import android.os.Bundle
 import android.provider.MediaStore
@@ -17,7 +16,8 @@ import android.util.Log
  * Assistant), in a throwaway task of its own: its `taskAffinity` is empty, so it never roots the
  * app's task. A root's identity stays with the task, and this excluded-from-Recents root would
  * take the app out of Recents and get the whole task trimmed. The forward finds the app's task by
- * [MainActivity]'s affinity, or creates it rooted by [MainActivity] with the launcher intent.
+ * [MainActivity]'s affinity, or creates it rooted by [MainActivity] with the launcher intent
+ * ([MainActivity.launchIntent]; see there for roots from the package installer).
  *
  * [MainActivity] is only `singleTop`, so a launcher tap brings the task to the front as it is,
  * with a login Custom Tab still on top of it; a `singleTask` relaunch used to finish the tab and
@@ -39,8 +39,8 @@ class LinkActivity : Activity() {
     }
 
     private fun forward(request: Intent?) {
-        val main = Intent.makeMainActivity(ComponentName(this, MainActivity::class.java))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val main = MainActivity.launchIntent(this)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         request?.let { copyRequest(it) }?.let { main.putExtra(MainActivity.EXTRA_REQUEST, it) }
         startActivity(main)
     }

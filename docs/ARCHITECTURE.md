@@ -833,6 +833,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   other holders the phone is hidden and the session stopped at once.
 * With every start, the offline index (`offline.setIndex`, §6.4) is pushed right away,
   independent of the session state, and retried until it went through.
+* While the engine is stopped no callback runs, so `isNetworkAvailable` is read from the system
+  (`NetworkMonitor.snapshot()`, synchronous) when it matters: at construction, when a holder is
+  taken (callers decide on `state` right away, e.g. `PlaybackEnvironment.reach` before the start
+  ran), when the engine stops, and for readers that hold no holder
+  (`currentNetworkAvailable()`: Android Auto's root order and downloads shortcut). No polling;
+  the media session tells Auto the root changed when the flag flips.
 * `NetworkMonitor` (ConnectivityManager default-network callback, registered only while
   the engine is running) → `session.setNetworkAvailable` `{available, metered, network}`, where
   `network` is the default network's handle (`Network.getNetworkHandle`, absent without one),
@@ -895,6 +901,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   of the app's task, which is always rooted by `MainActivity`. A root keeps the task's identity,
   and an excluded-from-Recents trampoline root took the app out of Recents and got its task
   trimmed. A relaunch of `LinkActivity` from history forwards no request.
+  All of this needs the task's root intent to be the launcher's (`makeMainActivity`, no
+  package): a launcher tap then only brings the task to the front. Every way the app starts
+  `MainActivity` uses `MainActivity.launchIntent` (that intent plus `NEW_TASK`): the forward, the
+  media session activity, the download and presence notifications, Android Auto's "Sign in". A
+  root from the package installer's or Play Store's "Open" (`getLaunchIntentForPackage`, with
+  the package) doesn't match on Android 13 and below, and a launcher tap would stack a second
+  `MainActivity` on the tab: `MainActivity` finishes such a plain launcher start at once when
+  it isn't the root of its own task (before any ViewModel, so the login below keeps its flow).
 * Alternative login: "Use another device" → `session.zeroconfLogin` (mDNS, MulticastLock
   only while that screen is visible: hiding the screen cancels it).
 * A finished login (`LoginState.Success`) goes back to the options as soon as the engine

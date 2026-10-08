@@ -13,6 +13,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.Notifications
+import com.taehagen.spotifygood.MainActivity
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.engine.EngineHolder
 import com.taehagen.spotifygood.engine.HolderType
@@ -121,9 +122,12 @@ internal class PresenceController(private val service: Service, private val grap
             PlaybackActionReceiver.intent(service, PlaybackActionReceiver.ACTION_STOP_PRESENCE),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val open = service.packageManager.getLaunchIntentForPackage(service.packageName)?.let { launch ->
-            PendingIntent.getActivity(service, REQUEST_OPEN, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        }
+        val open = PendingIntent.getActivity(
+            service,
+            REQUEST_OPEN,
+            MainActivity.launchIntent(service),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
         return NotificationCompat.Builder(service, Notifications.CHANNEL_CONNECT_PRESENCE)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(service.getString(R.string.playback_presence_title))

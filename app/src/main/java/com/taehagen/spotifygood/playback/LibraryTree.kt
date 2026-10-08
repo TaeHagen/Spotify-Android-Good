@@ -76,7 +76,8 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         val limit = params?.extras?.getInt(MediaConstants.EXTRAS_KEY_ROOT_CHILDREN_LIMIT, MAX_TABS)
             ?.takeIf { it > 0 } ?: MAX_TABS
         val settings = graph.settings.settings.value
-        val offline = settings.offlineMode || !graph.engine.isNetworkAvailable.value
+        // Holds no engine holder: the network as of now, also while the engine is stopped.
+        val offline = settings.offlineMode || !graph.engine.currentNetworkAvailable()
         val home = folder(HOME, R.string.playback_tab_home, R.drawable.pb_ic_auto_home)
         val library = folder(LIBRARY, R.string.playback_tab_library, R.drawable.pb_ic_auto_library, listStyle = true)
         val downloads = folder(DOWNLOADS, R.string.playback_tab_downloads, R.drawable.pb_ic_auto_downloads)
@@ -421,8 +422,11 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         OfflineTree.Section.EPISODES -> R.string.playback_episodes
     }
 
-    /** No network, or offline mode: only the downloads play (and can be browsed or found). */
-    fun isOffline(): Boolean = graph.settings.settings.value.offlineMode || !graph.engine.isNetworkAvailable.value
+    /**
+     * No network, or offline mode: only the downloads play (and can be browsed or found). The
+     * network as of now, also while the engine is stopped (no holder is taken here).
+     */
+    fun isOffline(): Boolean = graph.settings.settings.value.offlineMode || !graph.engine.currentNetworkAvailable()
 
     private fun explicitFilter(): Boolean {
         val settings = graph.settings.settings.value
