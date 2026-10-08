@@ -271,6 +271,7 @@ private fun NowPlayingBody(
     // One lifecycle-aware ticker feeds the seek bar and the lyrics preview (stops when not visible).
     val position = viewModel.position.collectAsStateWithLifecycle(initialValue = remember { viewModel.positionNow() })
     val podcastSpeed by viewModel.podcastSpeed.collectAsStateWithLifecycle()
+    val podcastSpeedInEffect by viewModel.podcastSpeedInEffect.collectAsStateWithLifecycle()
 
     val topBar: @Composable () -> Unit = {
         NowPlayingTopBar(
@@ -346,7 +347,8 @@ private fun NowPlayingBody(
             lyricsButton = if (track.isEpisode) null else !lyricsUnavailable,
             onLyrics = navigator::openLyrics,
             // Episodes played here (Spotify Connect has no speed command for other devices).
-            speed = if (track.isEpisode && !isRemote) podcastSpeed else null,
+            speed = if (track.isEpisode && !isRemote) podcastSpeedInEffect else null,
+            chosenSpeed = podcastSpeed,
             onSpeed = viewModel::setPodcastSpeed,
             onShare = onShare,
             onQueue = navigator::openQueue,
@@ -883,6 +885,7 @@ private fun BottomActions(
     onLyrics: () -> Unit,
     /** null: no speed button (music, another device playing); otherwise the podcast speed. */
     speed: Float?,
+    chosenSpeed: Float,
     onSpeed: (Float) -> Unit,
     onShare: () -> Unit,
     onQueue: () -> Unit,
@@ -930,7 +933,7 @@ private fun BottomActions(
                 Icon(Icons.Rounded.Lyrics, contentDescription = stringResource(R.string.player_open_lyrics))
             }
         }
-        if (speed != null) SpeedButton(speed = speed, onSpeed = onSpeed)
+        if (speed != null) SpeedButton(speed = speed, chosen = chosenSpeed, onSpeed = onSpeed)
         IconButton(onClick = onShare) {
             Icon(Icons.Rounded.Share, contentDescription = stringResource(R.string.player_share))
         }
@@ -940,9 +943,13 @@ private fun BottomActions(
     }
 }
 
-/** The podcast speed ("1.5×"), Spotify's choices in a menu. */
+/**
+ * The podcast speed in effect ("1.5×"), Spotify's choices in a menu. When the audio output
+ * refused the [chosen] speed ([speed] is the highest it takes below it), the menu says so and
+ * the speeds known to be refused are disabled.
+ */
 @Composable
-private fun SpeedButton(speed: Float, onSpeed: (Float) -> Unit) {
+private fun SpeedButton(speed: Float, chosen: Float, onSpeed: (Float) -> Unit) {
     var open by remember { mutableStateOf(false) }
     val description = stringResource(R.string.playback_speed)
     val label = PodcastSpeeds.label(speed)
@@ -965,10 +972,18 @@ private fun SpeedButton(speed: Float, onSpeed: (Float) -> Unit) {
             )
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            if (!PodcastSpeeds.same(speed, chosen)) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.playback_speed_unsupported, PodcastSpeeds.label(chosen))) },
+                    onClick = {},
+                    enabled = false,
+                )
+            }
             PodcastSpeeds.STEPS.forEach { step ->
                 val selected = PodcastSpeeds.same(step, speed)
                 DropdownMenuItem(
                     text = { Text(PodcastSpeeds.label(step), fontWeight = if (selected) FontWeight.Bold else null) },
+                    enabled = !PodcastSpeeds.refused(step, chosen = chosen, inEffect = speed),
                     onClick = {
                         open = false
                         onSpeed(step)

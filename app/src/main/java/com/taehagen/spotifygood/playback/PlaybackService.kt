@@ -160,7 +160,7 @@ class PlaybackService : MediaLibraryService() {
             playerError = ::currentPlayerError,
             onRetry = ::retryAfterError,
             onCommand = ::ensurePlaybackHolder,
-            podcastSpeed = { graph.podcastSpeed.speed.value },
+            podcastSpeed = { graph.podcastSpeed.inEffect.value },
             onSpeed = graph.podcastSpeed::set,
         )
 
@@ -399,7 +399,7 @@ class PlaybackService : MediaLibraryService() {
                 // Inputs of the player error.
                 graph.engine.state.map { },
                 graph.player.failure.map { },
-                graph.podcastSpeed.speed.map { },
+                graph.podcastSpeed.inEffect.map { },
             ).collect {
                 player.refresh()
                 // Runs on most wake-ups (engine and snapshot events): a cheap check of the

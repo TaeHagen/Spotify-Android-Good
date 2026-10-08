@@ -71,7 +71,7 @@ internal class SpotifyPlayer(
      * sent: the service then holds its engine holder (a pause or stop does not start anything).
      */
     private val onCommand: () -> Unit = {},
-    /** The chosen podcast speed ([PodcastSpeed]); controllers may change it ([onSpeed]). */
+    /** The podcast speed in effect ([PodcastSpeed.inEffect]); controllers may choose another ([onSpeed]). */
     private val podcastSpeed: () -> Float = { PodcastSpeeds.NORMAL },
     private val onSpeed: (Float) -> Unit = {},
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
@@ -183,7 +183,7 @@ internal class SpotifyPlayer(
 
         if (hasItem) {
             val loading = s.status == PlaybackStatus.LOADING
-            // An episode here shows the chosen speed (also while paused, when the engine reports 0).
+            // An episode here shows the speed it plays at (also while paused, when the engine reports 0).
             val speed = if (PodcastSpeeds.appliesTo(s)) podcastSpeed() else s.playbackSpeed.toFloat().takeIf { it > 0f } ?: 1f
             builder.setCurrentMediaItemIndex(w.currentIndex)
                 .setPlaybackState(if (loading) STATE_BUFFERING else STATE_READY)
