@@ -61,12 +61,17 @@ internal enum class RunOutcome {
     FINISHED,
 
     /**
-     * Work remains but cannot proceed now (offline, backoff, storage full, metered network not
-     * allowed): reschedule with system backoff (the host's constraints include storage not low).
+     * Work remains but cannot proceed now (offline, backoff, internal storage full, metered network
+     * not allowed): reschedule with system backoff (for internal storage the host's constraints
+     * include storage not low).
      */
     RESCHEDULE,
 
-    /** Stopped for a reason the user must resolve (cancel, account, offline mode): do not reschedule. */
+    /**
+     * Stopped for a reason the user must resolve (cancel, account, offline mode, the chosen SD card
+     * missing or full): do not reschedule. A mount, a change of location, the app coming back or
+     * "Retry" schedule the queue again.
+     */
     STOPPED,
 }
 
@@ -190,6 +195,17 @@ internal class DownloadRunner(
         withTimeoutOrNull(STOP_TIMEOUT_MS) { runLock.withLock {} }
     }
 
+    /**
+     * The queue cannot run for [message] (the chosen card is missing) while no run is active: shown
+     * on the Downloads screen, and in a notification the first time.
+     */
+    fun reportStopped(message: String) {
+        if (isRunning) return
+        val shown = _activity.value.lastError == message
+        _activity.value = DownloadActivity(lastError = message)
+        if (!shown) notifications.showStopped(message)
+    }
+
     /** Deletes orphaned files when nothing is running or pending (after removals). */
     suspend fun collectGarbageIfIdle() {
         if (!runLock.tryLock()) return
@@ -228,6 +244,16 @@ internal class DownloadRunner(
         if (paused != null && paused > MAX_INLINE_WAIT_MS) return RunOutcome.RESCHEDULE
         // The settings as stored: a cold-started job must not act on the defaults shown before load.
         if (meteredNotAllowed(settings.awaitLoaded())) return RunOutcome.RESCHEDULE
+        // Where the downloads go, before a session is brought up for them: a chosen card that is
+        // missing or full stops the run, full internal storage waits for the host's constraint.
+        when (val place = place()) {
+            is Place.Ready -> Unit
+            is Place.Blocked -> {
+                notifications.showStopped(place.message)
+                _activity.value = DownloadActivity(lastError = place.message)
+                return place.outcome
+            }
+        }
         val holder = engine.acquire(HolderType.DOWNLOAD)
         val receiver = notifications.registerCancelReceiver(::requestCancel)
         val stats = RunStats()
@@ -237,8 +263,10 @@ internal class DownloadRunner(
             notifications.clearDone()
             if (settings.awaitLoaded().offlineMode) return RunOutcome.STOPPED // resumed when offline mode ends
             if (!engine.awaitOnline(ONLINE_TIMEOUT_MS)) {
-                // Logged out: nothing will ever come online (logout wipes the queue anyway).
-                return if (engine.isLoggedIn.value) RunOutcome.RESCHEDULE else RunOutcome.STOPPED
+                // Logged out: nothing will ever come online (logout wipes the queue anyway). An
+                // account Spotify refuses (no longer Premium) would be refused at every retry too.
+                val refused = engine.state.value.error?.code in ACCOUNT_REFUSALS
+                return if (engine.isLoggedIn.value && !refused) RunOutcome.RESCHEDULE else RunOutcome.STOPPED
             }
             var networkWaits = 0
             while (true) {
@@ -258,30 +286,15 @@ internal class DownloadRunner(
                     Log.i(TAG, "On a metered network with mobile data downloads off: rescheduling")
                     return RunOutcome.RESCHEDULE
                 }
-                // The chosen location (setting), checked per item: a card can go at any time.
-                val root = storage.awaitRoot()
-                if (root == null) {
-                    val message = context.getString(R.string.data_dl_error_location)
-                    stats.stopMessage = message
-                    notifications.showStopped(message)
-                    // Resumed when the card is mounted again or another location is chosen.
-                    return RunOutcome.RESCHEDULE
-                }
-                val free = withContext(Dispatchers.IO) {
-                    storage.ensureDirs(root)
-                    storage.freeBytes(root)
-                }
-                // setRequiresStorageNotLow covers internal storage only: on a card this is the guard.
-                if (free < DownloadRules.MIN_FREE_BYTES) {
-                    val message = context.getString(
-                        R.string.data_dl_error_storage,
-                        Formatter.formatShortFileSize(context, DownloadRules.MIN_FREE_BYTES),
-                    )
-                    stats.stopMessage = message
-                    notifications.showStopped(message)
-                    // Resumed by the host once storage is no longer low (its constraint), or when the
-                    // user comes back to the app / retries.
-                    return RunOutcome.RESCHEDULE
+                // The chosen location (setting) and its space, checked per item: a card can go or
+                // fill up at any time.
+                val root = when (val place = place()) {
+                    is Place.Ready -> place.root
+                    is Place.Blocked -> {
+                        stats.stopMessage = place.message
+                        notifications.showStopped(place.message)
+                        return place.outcome
+                    }
                 }
                 when (val result = processItem(item, root, host, stats)) {
                     ItemResult.Done -> Unit
@@ -315,6 +328,31 @@ internal class DownloadRunner(
                 _activity.value = DownloadActivity(lastError = stats.stopMessage)
             }
         }
+    }
+
+    private sealed interface Place {
+        /** Downloads can go to [root]. */
+        class Ready(val root: File) : Place
+
+        /** They cannot: [message] for the user, the run ends with [outcome] ([DownloadRules.storageOutcome]). */
+        class Blocked(val message: String, val outcome: RunOutcome) : Place
+    }
+
+    /** The download location and its free space ([DownloadRules.storageCheck]); no session needed. */
+    private suspend fun place(): Place {
+        val root = storage.awaitRoot()
+        val check = withContext(Dispatchers.IO) {
+            DownloadRules.storageCheck(root?.path, storage.locations.internalRoot.path) {
+                root?.let { storage.ensureDirs(it); storage.freeBytes(it) } ?: 0L
+            }
+        }
+        val outcome = DownloadRules.storageOutcome(check) ?: return Place.Ready(checkNotNull(root))
+        val message = if (check == DownloadRules.StorageCheck.LOCATION_MISSING) {
+            context.getString(R.string.data_dl_error_location)
+        } else {
+            context.getString(R.string.data_dl_error_storage, Formatter.formatShortFileSize(context, DownloadRules.MIN_FREE_BYTES))
+        }
+        return Place.Blocked(message, outcome)
     }
 
     /** Mobile data downloads are off and the default network is metered (no network: false). */
@@ -670,6 +708,7 @@ internal class DownloadRunner(
 
     private companion object {
         const val TAG = "DownloadRunner"
+        val ACCOUNT_REFUSALS = setOf(NativeErrorCode.PREMIUM_REQUIRED, NativeErrorCode.PLAYBACK_REFUSED)
         const val ONLINE_TIMEOUT_MS = 60_000L
         const val MAX_INLINE_WAIT_MS = 2 * 60_000L
         const val MIN_WAIT_MS = 250L

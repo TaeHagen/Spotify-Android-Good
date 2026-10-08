@@ -859,8 +859,13 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   cleared it, and the half-done login was lost). Every request from outside (the
   `spotifygood://auth` redirect, `spotify:` / open.spotify.com links, shares, voice search)
   arrives through `LinkActivity` (no UI, no history), which forwards it as a launcher intent
-  carrying the request with `CLEAR_TOP | SINGLE_TOP` to the existing `MainActivity`: the
-  redirect closes the tab, and a task a link created still has the launcher's root intent.
+  carrying the request with `NEW_TASK | CLEAR_TOP | SINGLE_TOP` to the existing `MainActivity`:
+  the redirect closes the tab, and a task a link created still has the launcher's root intent.
+  `LinkActivity` has an empty `taskAffinity`: it runs in the caller's task, or (a caller's
+  `NEW_TASK` start: Chrome, the Assistant) in a throwaway task of its own, and is never the root
+  of the app's task, which is always rooted by `MainActivity`. A root keeps the task's identity,
+  and an excluded-from-Recents trampoline root took the app out of Recents and got its task
+  trimmed. A relaunch of `LinkActivity` from history forwards no request.
 * Alternative login: "Use another device" → `session.zeroconfLogin` (mDNS, MulticastLock
   only while that screen is visible: hiding the screen cancels it).
 * A finished login (`LoginState.Success`) goes back to the options as soon as the engine
@@ -893,7 +898,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   steps with `player.next` through context / autoplay entries, ≤ 10, else is ignored).
   `invalidateState()` on every snapshot. Position via `PositionSupplier` from the
   snapshot (extrapolating). Media items carry title/artist/album/artworkUri
-  (`content://<app>.artwork/<urlhash>` served by `ArtworkProvider` from the Coil disk cache).
+  (`content://<app>.artwork/img?u=<url>` served by the exported `ArtworkProvider`): only https
+  images of Spotify's CDN hosts (`scdn.co`, `spotifycdn.com` and subdomains: from a downloaded
+  copy, the Coil disk cache or a fetch) and files in the offline images directory of a download
+  location (`DownloadLocations.imageDirs`: internal storage, every app-specific external files
+  dir such as an SD card, the legacy `filesDir/offline/images`; canonical-path containment). A
+  downloaded cover that is not there (a card removed) gets no uri, so the CDN url is used.
 * Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
   set-media-items (Auto/Assistant/resumption), device volume only when remote (relative
   steps accumulate from the last sent target for 2 s), seek back/forward 15 s for episodes.
@@ -1090,11 +1100,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   queued items one at a time with `download.track` (cancellation propagates to
   `nativeCancel`), stores records (encrypted key), updates `offline.add`, retries failures
   with backoff (max 3), stops gracefully on `onStopped`/timeout (Android 15 6 h limit),
-  re-enqueues itself if work remains. "Not enough storage" (under 200 MiB free at the download
-  location) reschedules instead of stopping for good; the hosts require storage not low only while
-  downloads go to internal storage (the constraint tracks internal storage). A chosen SD card that
-  is not mounted stops the run ("location not available") until it is back or another location is
-  chosen. Removing the item being downloaded stops it for good: the run waits for the removal to
+  re-enqueues itself if work remains. The download location and its space are checked before
+  the run brings a session up, and per item: under 200 MiB free on internal storage reschedules
+  (the hosts require storage not low only while downloads go to internal storage, the constraint
+  tracks internal storage); a chosen SD card that is not mounted ("location not available") or
+  full stops the run (no retries), and a mount, a change of location, the app coming back or
+  "Retry" schedule the queue again; nothing is scheduled while the chosen card is missing (the
+  Downloads screen and one notification say why). An account Spotify refuses (not Premium) stops
+  the run too instead of logging in again at every retry. Removing the item being downloaded stops it for good: the run waits for the removal to
   delete its row before it picks the next item (the cancelled item puts its row back into the queue
   first), and an item whose row is gone when it starts is skipped. Progress is persisted on a state change and every
   5 s (resume / crash recovery); live bytes reach the Downloads screens through the runner's
@@ -1157,7 +1170,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   completed file and cover, each copied to `<file>.tmp`, synced, read back and compared (SHA-256),
   renamed, then the rows and the offline index (`offline.add`, numbered) switched to the copy, then
   the original deleted. Every step is resumable: an interrupted move leaves the original in use or
-  both copies with the rows on one of them, and the next pass (start, mount, change) carries on.
+  both copies with the rows on one of them, and the next pass (start, mount, change) carries on;
+  the files copied before a stop (no space, an I/O error) are switched all the same. The cover
+  maps and the session artwork follow the moved covers at once.
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
 * A card that is removed or unmounted (the system's media broadcasts): its downloads stay COMPLETED
@@ -1302,7 +1317,13 @@ error while ONLINE: after the next reconnect).
   Add-to-playlist sheet, Create playlist dialog, Settings, Profile.
 * Mini player above the navigation bar (swipe/tap to expand, progress line, play/pause,
   device indicator).
-* Deep links: `https://open.spotify.com/{type}/{id}` and `spotify:{type}:{id}` intents.
+* Deep links: `https://open.spotify.com/{type}/{id}` and `spotify:{type}:{id}` intents. The
+  https links can't be verified for this app: from Android 12 they reach it only after the user
+  approves open.spotify.com in its "Open by default" settings. Settings › Links offers that
+  (`ACTION_APP_OPEN_BY_DEFAULT_SETTINGS`) while `DomainVerificationManager` reports the domain
+  neither selected nor verified, or link handling off (checked again on every resume); if the
+  Spotify app holds the domain, its "Open supported links" has to go off first. Shared links
+  always work.
 * Offline: banner + downloaded-only filtering when offline mode or no network.
 
 ## 10. Lifecycle & battery policy (summary)
