@@ -2539,3 +2539,89 @@ fn further_pages_keep_a_restored_shuffle() {
     new.sort();
     assert_eq!(new, uids(25..30));
 }
+
+/// a context without uids: `len` tracks, the last one is the first one again
+fn uidless(len: usize) -> Context {
+    let mut ctx = context(len, 0);
+    for track in &mut ctx.pages[0].tracks {
+        track.uid = None;
+    }
+    ctx.pages[0].tracks[len - 1].uri = Some(track_uri(0, 0));
+    ctx
+}
+
+/// the uids of the default context after `ctx` was resolved (by a new state)
+fn resolved_uids(ctx: Context) -> Vec<String> {
+    let (_rt, mut state) = state(3);
+    state.reset_context(ResetContext::Completely);
+    state.update_context(ctx, ContextType::Default).unwrap();
+    default_uids(&state)
+}
+
+#[test]
+fn tracks_without_a_uid_get_the_same_uid_on_every_resolve() {
+    use crate::state::context::GENERATED_UID_PREFIX;
+
+    let uids = resolved_uids(uidless(20));
+    assert_eq!(
+        uids,
+        resolved_uids(uidless(20)),
+        "the same on every resolve"
+    );
+    assert!(uids.iter().all(|uid| uid.starts_with(GENERATED_UID_PREFIX)));
+    // unique, also for the track that is there twice
+    assert_eq!(uids.iter().collect::<HashSet<_>>().len(), 20);
+
+    // another context has other ones
+    let mut other = uidless(20);
+    other.uri = Some("spotify:album:1".to_string());
+    assert!(resolved_uids(other).iter().all(|uid| !uids.contains(uid)));
+
+    // a uid the context has stays
+    let mut with_uid = uidless(20);
+    with_uid.pages[0].tracks[3].uid = Some("server".to_string());
+    let with_uid = resolved_uids(with_uid);
+    assert_eq!(with_uid[3], "server");
+    assert_eq!(with_uid[4], uids[4]);
+
+    // further pages: the same on every resolve, and distinct from the tracks of the first page
+    // that they repeat
+    let mut paged = uidless(10);
+    let mut second = paged.pages[0].clone();
+    second.tracks.truncate(5);
+    paged.pages.push(second);
+    let uids = resolved_uids(paged.clone());
+    assert_eq!(uids.len(), 15);
+    assert_eq!(uids.iter().collect::<HashSet<_>>().len(), 15);
+    assert_eq!(uids, resolved_uids(paged));
+}
+
+#[test]
+fn a_restored_shuffle_of_a_context_without_uids_keeps_its_order() {
+    // a shuffled session of an album without uids, 14 tracks in
+    let (_rt, mut state) = state(3);
+    state.reset_context(ResetContext::Completely);
+    state
+        .update_context(uidless(30), ContextType::Default)
+        .unwrap();
+    state.set_current_track(0).unwrap();
+    state.reset_playback_to_position(Some(0)).unwrap();
+    state.handle_shuffle(true).unwrap();
+    play_through(&mut state, 14);
+    let current = state.current_track(|t| t.uid.clone());
+    let mut ids = prev_uids(&state);
+    ids.push(current.clone());
+    ids.extend(next_uids(&state));
+
+    // a reconnect: the album is resolved again (another Spirc), and the session comes back
+    let (_rt, mut restored) = self::state(3);
+    restored.reset_context(ResetContext::Completely);
+    restored
+        .update_context(uidless(30), ContextType::Default)
+        .unwrap();
+    assert!(load_in_order(&mut restored, &current, &ids, false));
+    assert_eq!(restored.current_track(|t| t.uid.clone()), current);
+    assert_eq!(prev_uids(&restored), prev_uids(&state));
+    let next = next_uids(&state);
+    assert_eq!(next_uids(&restored)[..next.len()], next[..]);
+}
