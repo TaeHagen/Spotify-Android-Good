@@ -8,6 +8,7 @@ import com.taehagen.spotifygood.data.TracksResult
 import com.taehagen.spotifygood.data.callOffMain
 import com.taehagen.spotifygood.data.putStrings
 import com.taehagen.spotifygood.data.rpcArgs
+import com.taehagen.spotifygood.data.withoutPlayedState
 import com.taehagen.spotifygood.model.Album
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.Playlist
@@ -281,8 +282,9 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
         private fun Track.stored(filter: ExplicitFilterWatch.Filter): Track =
             if (DownloadRules.rowVerdict(playable, explicit, filter) == null) copy(playable = true) else this
 
+        /** Spotify's played state is not stored: it would be frozen at download time (docs §6.5). */
         private fun Episode.stored(filter: ExplicitFilterWatch.Filter): Episode =
-            if (DownloadRules.rowVerdict(playable, explicit, filter) == null) copy(playable = true) else this
+            withoutPlayedState().let { if (DownloadRules.rowVerdict(playable, explicit, filter) == null) it.copy(playable = true) else it }
 
         private const val PAGE_SIZE = 100
         private const val URI_PAGE_SIZE = 500

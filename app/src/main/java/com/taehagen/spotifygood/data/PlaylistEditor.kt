@@ -140,6 +140,30 @@ class PlaylistEditor(
         }
     }
 
+    /**
+     * Shows the playlist on the user's profile, or not (`playlist.setPublic`, the rootlist item's
+     * `public` attribute). Owner only in the UI; the playlist must be in the library.
+     */
+    suspend fun setPublic(playlistUri: String, public: Boolean) = detached {
+        rpc.callUnitOffMain("playlist.setPublic", rpcArgs {
+            put("uri", playlistUri)
+            put("public", public)
+        })
+        library.onPlaylistAttributesChanged(playlistUri)
+    }
+
+    /**
+     * Makes the playlist collaborative (people it is shared with may add items) or not
+     * (`playlist.setCollaborative`). As in Spotify, making it collaborative also makes it private.
+     */
+    suspend fun setCollaborative(playlistUri: String, collaborative: Boolean) = detached {
+        rpc.callUnitOffMain("playlist.setCollaborative", rpcArgs {
+            put("uri", playlistUri)
+            put("collaborative", collaborative)
+        })
+        library.onPlaylistAttributesChanged(playlistUri)
+    }
+
     suspend fun delete(playlistUri: String) = detached {
         rpc.callUnitOffMain("playlist.delete", rpcArgs { put("uri", playlistUri) })
         library.onPlaylistDeleted(playlistUri)

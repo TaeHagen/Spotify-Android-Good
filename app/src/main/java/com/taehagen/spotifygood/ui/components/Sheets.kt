@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -40,14 +41,17 @@ import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.GroupAdd
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.LibraryAdd
 import androidx.compose.material.icons.rounded.LibraryAddCheck
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.PersonRemove
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Podcasts
+import androidx.compose.material.icons.rounded.Public
 import androidx.compose.material.icons.rounded.Radio
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
 import androidx.compose.material.icons.rounded.Share
@@ -61,6 +65,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -111,6 +116,7 @@ import com.taehagen.spotifygood.ui.navigation.MainNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -403,6 +409,7 @@ private fun PlaylistActions(t: MediaActionTarget.PlaylistTarget, s: ActionScope)
     }
     if (t.isOwned) {
         SheetAction(Icons.Rounded.Edit, stringResource(R.string.shell_action_rename)) { s.setPage(SheetPage.Rename) }
+        PlaylistPrivacyActions(playlist.uri, s)
         SheetAction(Icons.Rounded.Delete, stringResource(R.string.shell_action_delete_playlist)) { s.setPage(SheetPage.ConfirmDelete) }
     } else {
         SavedAction(
@@ -442,6 +449,40 @@ private fun ShowActions(t: MediaActionTarget.ShowTarget, s: ActionScope) {
     }
     SheetAction(Icons.Rounded.Podcasts, stringResource(R.string.shell_action_go_to_show)) { s.go(Route.Show(show.uri)) }
     SheetAction(Icons.Rounded.Share, stringResource(R.string.shell_action_share)) { s.share(show.uri, show.name) }
+}
+
+/**
+ * "Make public / private" and "Make collaborative / non-collaborative" for an owned playlist, from
+ * its state in the library (rootlist). A collaborative playlist is private (as in Spotify): it
+ * offers no "Make public". Nothing is offered until the state is known.
+ */
+@Composable
+private fun PlaylistPrivacyActions(uri: String, s: ActionScope) {
+    val entry by remember(uri) {
+        s.graph.library.playlists().map { resource -> resource.dataOrNull?.flatPlaylists()?.firstOrNull { it.uri == uri } }
+    }.collectAsStateWithLifecycle(null)
+    val current = entry ?: return
+    val isPublic = current.isPublic
+    if (isPublic != null && !current.collaborative) {
+        SheetAction(
+            icon = if (isPublic) Icons.Rounded.Lock else Icons.Rounded.Public,
+            label = stringResource(if (isPublic) R.string.shell_action_make_private else R.string.shell_action_make_public),
+        ) {
+            s.dismiss()
+            s.runner.launch(if (isPublic) R.string.shell_msg_playlist_private else R.string.shell_msg_playlist_public) {
+                s.graph.playlists.setPublic(uri, !isPublic)
+            }
+        }
+    }
+    SheetAction(
+        icon = if (current.collaborative) Icons.Rounded.PersonRemove else Icons.Rounded.GroupAdd,
+        label = stringResource(if (current.collaborative) R.string.shell_action_make_not_collaborative else R.string.shell_action_make_collaborative),
+    ) {
+        s.dismiss()
+        s.runner.launch(if (current.collaborative) R.string.shell_msg_playlist_not_collaborative else R.string.shell_msg_playlist_collaborative) {
+            s.graph.playlists.setCollaborative(uri, !current.collaborative)
+        }
+    }
 }
 
 // ---- Shared action rows -------------------------------------------------------------------------
@@ -885,6 +926,8 @@ fun CreatePlaylistDialog(onDismiss: () -> Unit, onCreated: (String) -> Unit, ini
     val context = LocalContext.current
     val defaultName = stringResource(R.string.shell_new_playlist_default_name)
     var name by rememberSaveable { mutableStateOf("") }
+    // As Spotify: new playlists show on the profile unless the user says otherwise.
+    var public by rememberSaveable { mutableStateOf(true) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
@@ -897,7 +940,7 @@ fun CreatePlaylistDialog(onDismiss: () -> Unit, onCreated: (String) -> Unit, ini
             error = null
             scope.launch {
                 val result = withContext(NonCancellable) {
-                    runCatching { graph.playlists.create(finalName, initialUris = initialUris) }
+                    runCatching { graph.playlists.create(finalName, public = public, initialUris = initialUris) }
                 }
                 busy = false
                 result
@@ -914,24 +957,36 @@ fun CreatePlaylistDialog(onDismiss: () -> Unit, onCreated: (String) -> Unit, ini
         onDismissRequest = { if (!busy) onDismiss() },
         title = { Text(stringResource(R.string.shell_create_playlist_title)) },
         text = {
-            OutlinedTextField(
-                value = name,
-                onValueChange = {
-                    name = it
-                    error = null
-                },
-                singleLine = true,
-                enabled = !busy,
-                placeholder = { Text(defaultName) },
-                label = { Text(stringResource(R.string.shell_playlist_name)) },
-                isError = error != null,
-                supportingText = error?.let { message -> { Text(message) } },
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = { create() }),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .focusRequester(focus),
-            )
+            Column {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = {
+                        name = it
+                        error = null
+                    },
+                    singleLine = true,
+                    enabled = !busy,
+                    placeholder = { Text(defaultName) },
+                    label = { Text(stringResource(R.string.shell_playlist_name)) },
+                    isError = error != null,
+                    supportingText = error?.let { message -> { Text(message) } },
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { create() }),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focus),
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .toggleable(value = public, enabled = !busy, role = Role.Switch, onValueChange = { public = it })
+                        .heightIn(min = 48.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(stringResource(R.string.shell_playlist_public), style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                    Switch(checked = public, onCheckedChange = null, enabled = !busy)
+                }
+            }
         },
         confirmButton = {
             TextButton(onClick = create, enabled = !busy) {

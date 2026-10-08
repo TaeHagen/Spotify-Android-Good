@@ -111,6 +111,8 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
         "playlist.removeItems" => playlist::remove_items(args).await,
         "playlist.moveItems" => playlist::move_items(args).await,
         "playlist.updateDetails" => playlist::update_details(args).await,
+        "playlist.setPublic" => playlist::set_public(args).await,
+        "playlist.setCollaborative" => playlist::set_collaborative(args).await,
         "playlist.delete" | "playlist.unfollow" => playlist::unfollow(args).await,
         "playlist.follow" => playlist::follow(args).await,
         _ => Err(AppError::invalid(format!("unknown method {method}"))),

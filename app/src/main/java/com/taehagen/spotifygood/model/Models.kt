@@ -161,6 +161,8 @@ data class Playlist(
     val total: Int = 0,
     val items: List<PlaylistItem> = emptyList(),
     val following: Boolean? = null,
+    /** Shown on the user's profile; null when unknown (not in the user's library). */
+    val isPublic: Boolean? = null,
     /** Some item metadata failed to load; those items are uri-only placeholders (docs §6.5). */
     val partial: Boolean = false,
 ) {
@@ -251,6 +253,8 @@ data class RootlistEntry(
     val collaborative: Boolean = false,
     /** True when the logged-in user may add/remove items (owner or collaborative). */
     val canEdit: Boolean = false,
+    /** Playlists: shown on the user's profile (null for folders). */
+    val isPublic: Boolean? = null,
 )
 
 /** `library.playlists`; [partial]: some playlist names could not be looked up right now and are missing. */

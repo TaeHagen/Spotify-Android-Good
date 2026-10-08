@@ -30,8 +30,12 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.DragHandle
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.GroupAdd
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
+import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.PersonRemove
+import androidx.compose.material.icons.rounded.Public
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.AlertDialog
@@ -315,6 +319,11 @@ internal fun EditToolbar(
     onEditDetails: () -> Unit,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
+    /** Shown on the profile; null while unknown (no "Make public / private" then). */
+    isPublic: Boolean? = null,
+    collaborative: Boolean = false,
+    onSetPublic: (Boolean) -> Unit = {},
+    onSetCollaborative: (Boolean) -> Unit = {},
 ) {
     FlowRow(
         modifier = modifier
@@ -332,6 +341,19 @@ internal fun EditToolbar(
                 Icon(Icons.Rounded.Edit, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
                 Text(stringResource(R.string.detail_edit_details))
+            }
+            // A collaborative playlist is private (as in Spotify): no "Make public" for it.
+            if (isPublic != null && !collaborative) {
+                OutlinedButton(onClick = { onSetPublic(!isPublic) }) {
+                    Icon(if (isPublic) Icons.Rounded.Lock else Icons.Rounded.Public, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(if (isPublic) R.string.shell_action_make_private else R.string.shell_action_make_public))
+                }
+            }
+            OutlinedButton(onClick = { onSetCollaborative(!collaborative) }) {
+                Icon(if (collaborative) Icons.Rounded.PersonRemove else Icons.Rounded.GroupAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(stringResource(if (collaborative) R.string.shell_action_make_not_collaborative else R.string.shell_action_make_collaborative))
             }
             OutlinedButton(
                 onClick = onDelete,
