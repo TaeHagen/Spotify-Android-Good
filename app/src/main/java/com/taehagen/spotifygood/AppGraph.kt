@@ -18,6 +18,8 @@ import com.taehagen.spotifygood.data.db.AppDatabase
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.download.DownloadManager
 import com.taehagen.spotifygood.engine.SpotifyEngine
+import com.taehagen.spotifygood.engine.WipeStep
+import com.taehagen.spotifygood.engine.runWipeSteps
 import com.taehagen.spotifygood.nativebridge.AudioSinkBridge
 import com.taehagen.spotifygood.nativebridge.NativeEvents
 import com.taehagen.spotifygood.nativebridge.NativeRpc
@@ -68,7 +70,10 @@ class AppGraph(val app: Application) {
     val credentialStore: CredentialStore by lazy { CredentialStore(app) }
 
     val engine: SpotifyEngine by lazy {
-        SpotifyEngine(app, appScope, rpc, events, settings, credentialStore, audioSink).also { engine ->
+        SpotifyEngine(
+            app, appScope, rpc, events, settings, credentialStore, audioSink,
+            onAccountChanged = { removePreviousAccountData() },
+        ).also { engine ->
             engine.setOfflineIndexProvider { downloads.offlineRecords() }
         }
     }
@@ -135,35 +140,49 @@ class AppGraph(val app: Application) {
      */
     suspend fun logout(): Unit = withContext(NonCancellable) {
         auth.whileLoggingOut {
-            var failure: Throwable? = null
-            suspend fun step(name: String, block: suspend () -> Unit) {
-                try {
-                    block()
-                } catch (t: Throwable) {
-                    Log.e(TAG, "Logout: $name failed", t)
-                    if (failure == null) failure = t
-                }
-            }
-            // Browsing the LAN for the old account's Connect targets ends with it.
-            step("local discovery") { if (localDiscoveryLazy.isInitialized()) localDiscovery.stop() }
-            step("engine") { engine.logout() }
-            step("downloads") { downloads.removeAll() }
-            // The playback service clears it too, but only while it runs.
-            step("resume state") { resumeStore.clear() }
-            step("response cache") { responseCache.clear() }
-            step("database") { withContext(Dispatchers.IO) { database.clearAllTables() } }
-            step("image cache") {
-                val loader = SingletonImageLoader.get(app)
-                loader.memoryCache?.clear()
-                withContext(Dispatchers.IO) { loader.diskCache?.clear() }
-            }
-            step("settings") { settings.reset() }
-            step("events") { events.reset() }
-            // A device picked for the next play was the old account's.
-            step("pending device") { devices.clearPendingTarget() }
-            failure?.let { throw it }
+            val steps = listOf(
+                // Browsing the LAN for the old account's Connect targets ends with it.
+                WipeStep("local discovery") { if (localDiscoveryLazy.isInitialized()) localDiscovery.stop() },
+                WipeStep("engine") { engine.logout() },
+            ) + accountDataSteps() + listOf(
+                WipeStep("settings") { settings.reset() },
+                WipeStep("events") { events.reset() },
+            )
+            runWipeSteps(steps) { step, t -> Log.e(TAG, "Logout: ${step.name} failed", t) }
+            // Only once everything went: a later login of another account wipes again otherwise.
+            withContext(Dispatchers.IO) { credentialStore.forgetAccountOwner() }
         }
     }
+
+    /**
+     * The data part of [logout], for a login as another account than the one the data belongs to
+     * (after rejected credentials, docs/ARCHITECTURE.md §9.3). The new login's credentials, the
+     * session and the settings stay; the live session state is republished natively for the new
+     * account, so only the account's event replays go. Every step runs; the first failure is
+     * rethrown (the login then fails, and the next one tries again). Not cancellable.
+     */
+    private suspend fun removePreviousAccountData(): Unit = withContext(NonCancellable) {
+        val steps = accountDataSteps() + WipeStep("event replays") { events.resetAccountReplays() }
+        runWipeSteps(steps) { step, t -> Log.e(TAG, "Account change: ${step.name} failed", t) }
+    }
+
+    /** What belongs to the account: downloads, the resume state, the caches, the history, the pending device. */
+    private fun accountDataSteps(): List<WipeStep> = listOf(
+        // Rows, files, the key vault and the native offline index.
+        WipeStep("downloads") { downloads.removeAll() },
+        // The playback service clears it too, but only while it runs.
+        WipeStep("resume state") { resumeStore.clear() },
+        WipeStep("response cache") { responseCache.clear() },
+        // Recent searches, downloaded collections and the rest of the account's tables.
+        WipeStep("database") { withContext(Dispatchers.IO) { database.clearAllTables() } },
+        WipeStep("image cache") {
+            val loader = SingletonImageLoader.get(app)
+            loader.memoryCache?.clear()
+            withContext(Dispatchers.IO) { loader.diskCache?.clear() }
+        },
+        // A device picked for the next play was the old account's.
+        WipeStep("pending device") { devices.clearPendingTarget() },
+    )
 
     private companion object {
         const val TAG = "AppGraph"

@@ -95,6 +95,12 @@ class SpotifyEngine(
     private val settings: SettingsRepository,
     private val credentialStore: CredentialStore,
     private val audioSink: AudioSinkBridge,
+    /**
+     * Removes the previous account's data when another account logs in (docs/ARCHITECTURE.md
+     * §9.3): downloads, the resume state, the caches, the database, the pending device. Never the
+     * credentials or the session. Throws if any of it may be left.
+     */
+    private val onAccountChanged: suspend () -> Unit = {},
 ) {
     private val appContext = context.applicationContext
     private val audioManager: AudioManager? = appContext.getSystemService(AudioManager::class.java)
@@ -170,10 +176,23 @@ class SpotifyEngine(
     @Volatile private var offlineIndexPushed = false
     @Volatile private var offlineIndexProvider: (suspend () -> List<OfflineTrackRecord>)? = null
 
+    /** The data on this device stays with its account (§9.3); declared before `init` uses it. */
+    private val accountGuard = AccountGuard(
+        readOwner = credentialStore::accountOwner,
+        writeOwner = credentialStore::setAccountOwner,
+        onOwnerNotRecorded = { Log.w(TAG, "Recording the account owner failed", it) },
+    ) {
+        Log.i(TAG, "Another account logs in: removing the previous account's data")
+        onAccountChanged()
+        // The index pushed when the engine started held the previous account's downloads (the
+        // removal took them out again natively; this makes it match the empty database).
+        tryPushOfflineIndex()
+    }
+
     init {
         launchSafe("load-credentials") {
             try {
-                val stored = try {
+                val loaded = try {
                     loadStoredCredentials()
                 } catch (e: CancellationException) {
                     throw e
@@ -181,6 +200,20 @@ class SpotifyEngine(
                     // Nothing was deleted: the next process start reads them again.
                     Log.e(TAG, "Loading credentials failed", e)
                     null
+                }
+                // Credentials of another account than the data's (a login that ended before the
+                // previous account's data was removed): that is finished first, and they are not
+                // used next to another account's data (read again at the next start).
+                val stored = loaded?.takeIf { creds ->
+                    try {
+                        accountGuard.adopt(creds.username)
+                        true
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Removing the previous account's data failed", t)
+                        false
+                    }
                 }
                 lifecycle.withLock {
                     if (!credentialsLoaded) {
@@ -311,19 +344,21 @@ class SpotifyEngine(
             }
             val gotCredentials = credentialsVersion.value > versionBefore
             when {
-                completed -> loggedIn = true
-                gotCredentials && failure?.code != NativeErrorCode.BAD_CREDENTIALS -> {
-                    // Spotify accepted the login (reusable credentials exist); what failed is the
-                    // session afterwards. Premium is reported via state.error; network problems
-                    // recover on their own.
-                    loggedIn = true
-                    if (failure?.code == NativeErrorCode.PREMIUM_REQUIRED) {
-                        markLoggedIn()
-                        setAccountError(failure.info)
-                        throw failure
-                    }
-                }
+                completed -> {}
+                // Spotify accepted the login (reusable credentials exist); what failed is the
+                // session afterwards. Premium is reported via state.error; network problems
+                // recover on their own.
+                gotCredentials && failure?.code != NativeErrorCode.BAD_CREDENTIALS -> {}
                 else -> throw failure ?: NativeException(NativeErrorInfo(NativeErrorCode.NETWORK, "Timed out waiting for Spotify"))
+            }
+            // The reusable credentials carry the canonical username: another account than the
+            // data's gets a clean device before it is logged in.
+            adoptAccount(lifecycle.withLock { credentials?.username })
+            loggedIn = true
+            if (!completed && failure?.code == NativeErrorCode.PREMIUM_REQUIRED) {
+                markLoggedIn()
+                setAccountError(failure.info)
+                throw failure
             }
             markLoggedIn()
             Log.i(TAG, "Logged in with access token")
@@ -362,6 +397,8 @@ class SpotifyEngine(
             throw t.asNativeException()
         }
         disableOfflineModeForLogin()
+        // Another account than the data's: a clean device first (before its credentials exist).
+        adoptAccount(result.credentials.username)
         withContext(Dispatchers.IO) { credentialStore.saveCredentials(result.credentials) }
         val holder = acquire(HolderType.UI)
         var loggedIn = true
@@ -764,6 +801,25 @@ class SpotifyEngine(
     }
 
     // ---- login helpers ------------------------------------------------------------------------
+
+    /**
+     * [username] is being logged in. When the device's data belongs to another account (after
+     * rejected credentials the login screen accepts any account) it is removed first
+     * ([AccountGuard]); a re-login of the same account keeps everything. Runs outside
+     * [lifecycle]: the removal makes RPCs and touches the downloads. A failed removal fails the
+     * login, and the next login tries again.
+     */
+    private suspend fun adoptAccount(username: String?) {
+        if (username.isNullOrBlank()) return
+        try {
+            accountGuard.adopt(username)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.e(TAG, "Removing the previous account's data failed", t)
+            throw NativeException(NativeErrorInfo(NativeErrorCode.INTERNAL, "Couldn't remove the previous account's data. Try again."))
+        }
+    }
 
     private suspend fun markLoggedIn() {
         lifecycle.withLock { updateState { it.copy(loggedIn = true) } }

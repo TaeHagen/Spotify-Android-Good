@@ -268,6 +268,11 @@ struct LoginPlan {
     changed: bool,
     /// The account may differ from the previous one: its OAuth token and username are dropped.
     new_account: bool,
+    /// ... and this process may hold that previous account's state (a fresh token login, or
+    /// another user than the last one): its Connect state, offline playback and catalog caches
+    /// go too. Not at the first start of a process (nothing to forget, and offline playback
+    /// that started before it must go on).
+    forget_previous_account: bool,
 }
 
 /// * token only: a fresh login. Stored reusable credentials (possibly of another account) are
@@ -304,7 +309,8 @@ fn plan_login(
             (None, _) => false,
         }
     };
-    LoginPlan { credentials: next_credentials, access_token: next_token, changed, new_account }
+    let forget_previous_account = new_account && (fresh || previous_user.is_some());
+    LoginPlan { credentials: next_credentials, access_token: next_token, changed, new_account, forget_previous_account }
 }
 
 #[derive(Debug, Deserialize)]
@@ -381,6 +387,15 @@ async fn configure_start(args: StartArgs) -> AppResult<u64> {
     }
     if plan.new_account {
         state::forget_account_state();
+    }
+    if plan.forget_previous_account {
+        // As at logout (docs/ARCHITECTURE.md §9.3): the previous account's Connect state and
+        // offline playback, cached metadata (its country / filter in `playable`) and the
+        // catalog's per-account state. The old supervisor is gone already (`changed` restarts).
+        connect::reset();
+        crate::catalog::metadata::clear_cache();
+        crate::catalog::clear_user_state();
+        *CATALOG_FILTER.lock() = None;
     }
     if restart {
         update_status(|s| {
@@ -815,10 +830,25 @@ mod tests {
         assert_eq!(plan.credentials, None, "A's credentials are dropped");
         assert_eq!(plan.access_token.as_deref(), Some("tokenB"));
         assert!(plan.changed && plan.new_account);
+        assert!(plan.forget_previous_account, "A's Connect state and caches go");
 
         // The same token again (a repeated start of the same login) changes nothing.
         let plan = plan_login(&login(None, Some("tokenB")), None, None, Some("tokenB".into()));
-        assert!(!plan.changed && !plan.new_account);
+        assert!(!plan.changed && !plan.new_account && !plan.forget_previous_account);
+
+        // After rejected credentials (the stopped session's login is still known): any fresh
+        // login may be another account.
+        let plan = plan_login(&login(Some(creds("a", "A1")), None), None, None, Some("tokenX".into()));
+        assert!(plan.new_account && plan.forget_previous_account);
+    }
+
+    #[test]
+    fn the_first_start_of_a_process_forgets_nothing() {
+        // Stored credentials at a cold start: nothing of another account is in this process,
+        // and offline playback that started before the session must go on.
+        let plan = plan_login(&login(None, None), None, Some(creds("a", "A1")), None);
+        assert!(plan.changed && plan.new_account);
+        assert!(!plan.forget_previous_account);
     }
 
     #[test]
@@ -828,7 +858,7 @@ mod tests {
         let plan = plan_login(&login(Some(creds("a", "A1")), Some("tokenA")), Some("a"), Some(creds("c", "C1")), None);
         assert_eq!(plan.credentials, Some(creds("c", "C1")));
         assert_eq!(plan.access_token, None);
-        assert!(plan.changed && plan.new_account);
+        assert!(plan.changed && plan.new_account && plan.forget_previous_account);
 
         // The same account's credentials (a restart): no restart for that alone, same account.
         let plan = plan_login(&login(Some(creds("a", "A1")), Some("tokenA")), Some("a"), Some(creds("a", "A1")), None);
@@ -837,7 +867,7 @@ mod tests {
 
         // Newer credentials of the same account: restart, but the account state stays.
         let plan = plan_login(&login(Some(creds("a", "A1")), None), Some("a"), Some(creds("a", "A2")), None);
-        assert!(plan.changed && !plan.new_account);
+        assert!(plan.changed && !plan.new_account && !plan.forget_previous_account);
 
         // First start after a token login that never got online: compared with the last user.
         let plan = plan_login(&login(None, Some("tokenA")), Some("a"), Some(creds("b", "B1")), None);
