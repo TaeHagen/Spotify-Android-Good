@@ -478,16 +478,20 @@ impl ContextResolver {
         state: &mut ConnectState,
         transfer_state: &mut Option<TransferState>,
     ) -> bool {
-        match self.last_of_kind(state) {
-            Some(next) if next.update == ContextType::Default => {}
+        let replace = match self.last_of_kind(state) {
+            Some(next) if next.update == ContextType::Default => {
+                next.action == ContextAction::Replace
+            }
             // an autoplay resolve: nothing waits for it
             _ => return false,
-        }
+        };
 
         let res = if let Some(transfer) = transfer_state.take() {
             state.finish_transfer_without_context(transfer)
-        } else if state.shuffling_context() && !state.default_context_shuffled() {
-            // the shuffle a load deferred until its pages were resolved
+        } else if state.shuffling_context() && !(replace && state.default_context_shuffled()) {
+            // like try_finish: the further pages of a shuffled load (shuffled with the pages
+            // there were, the ones after it went to the end in their order) are shuffled in.
+            // Not after a failed update of the context that plays shuffled.
             state.shuffle_new()
         } else if matches!(state.get_context(state.active_context), Ok(ctx) if ctx.index.track == 0)
         {
@@ -510,6 +514,45 @@ impl ContextResolver {
         }
         // SPOTIFYGOOD: no page with it is to come
         state.forget_current_track_placement();
+
+        state.update_restrictions();
+        state.update_queue_revision();
+        true
+    }
+
+    // SPOTIFYGOOD: a transfer waited for the last page of its context, with empty next tracks
+    // (handle_initial_transfer cleared them): the song ending, or a Next, meanwhile stopped the
+    // playback. Like a load, it is set up with the pages there are.
+    /// Finishes a pending transfer once the resolve of its context was applied (call it before
+    /// [ContextResolver::try_finish], the resolve is still the next one): with the pages there
+    /// are, and a current track that isn't on them yet is placed once its page is there.
+    /// Returns whether it did.
+    pub fn finish_transfer_early(
+        &self,
+        state: &mut ConnectState,
+        transfer_state: &mut Option<TransferState>,
+    ) -> bool {
+        let Some((next, _, _)) = self.find_next() else {
+            return false;
+        };
+        if next.update != ContextType::Default
+            || next.action != ContextAction::Replace
+            || next.page
+            || !matches!(state.active_context, ContextType::Default)
+            || state.get_context(ContextType::Default).is_err()
+        {
+            return false;
+        }
+        let Some(transfer) = transfer_state.take() else {
+            return false;
+        };
+
+        if let Err(why) = state.finish_transfer(transfer) {
+            error!("setup of the transfer failed: {why}")
+        }
+        if self.has_pending_pages(ContextType::Default) && state.current_track_outside_context() {
+            state.place_current_track_when_resolved();
+        }
 
         state.update_restrictions();
         state.update_queue_revision();

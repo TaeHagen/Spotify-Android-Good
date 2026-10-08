@@ -191,4 +191,60 @@ class ResumeStoreTest {
         assertEquals(MediaIds.inContext("spotify:album:a", "spotify:track:t"), broken.mediaId)
         assertEquals("spotify:album:a", broken.toPlayRequest().contextUri)
     }
+
+    private fun pt(n: Int, uid: String, provider: TrackProvider = TrackProvider.CONTEXT) =
+        PlaybackTrack(uri = t(n), uid = uid, provider = provider)
+
+    @Test
+    fun aRepeatingListIsStoredAsOnePass() {
+        // A plain track list (not reloadable), repeat-all: Spirc repeats it in the next tracks.
+        val pass = listOf(pt(1, "u1"), pt(2, "u2"))
+        val s = PlaybackSnapshot(
+            source = com.taehagen.spotifygood.model.PlaybackSource.LOCAL,
+            status = PlaybackStatus.PAUSED,
+            context = PlaybackContext("spotify:web-api"),
+            track = pt(0, "u0"),
+            nextTracks = pass + pt(0, "u0") + pass + pt(0, "u0") + pass,
+            repeat = RepeatMode.CONTEXT,
+        )
+        assertEquals(listOf(t(0), t(1), t(2)), ResumeState.from(s)?.trackUris)
+        // Paused in the middle: the rest of the pass comes after the wrap, each track once.
+        val mid = s.copy(track = pt(1, "u1"), nextTracks = listOf(pt(2, "u2"), pt(0, "u0"), pt(1, "u1"), pt(2, "u2")))
+        assertEquals(listOf(t(1), t(2), t(0)), ResumeState.from(mid)?.trackUris)
+        // A single track with repeat-all: one copy, not 41.
+        val single = s.copy(track = pt(7, "ux"), nextTracks = List(40) { pt(7, "ux") })
+        assertEquals(listOf(t(7)), ResumeState.from(single)?.trackUris)
+        assertEquals(RepeatMode.CONTEXT, ResumeState.from(single)?.repeat) // Spirc cycles the pass
+        // A queued entry's uid still ends the pass when it comes round again.
+        val queued = s.copy(track = pt(5, "q5", TrackProvider.QUEUE), nextTracks = listOf(pt(1, "u1"), pt(5, "q5", TrackProvider.QUEUE), pt(1, "u1")))
+        assertEquals(listOf(t(5), t(1)), ResumeState.from(queued)?.trackUris)
+        // A visible delimiter while repeating: the walk goes on into the next pass up to the start,
+        // and never past a second wrap.
+        val delimited = s.copy(
+            track = pt(1, ""),
+            nextTracks = listOf(pt(2, ""), PlaybackTrack(uri = "spotify:delimiter"), pt(3, ""), PlaybackTrack(uri = "spotify:delimiter"), pt(4, "")),
+        )
+        assertEquals(listOf(t(1), t(2), t(3)), ResumeState.from(delimited)?.trackUris)
+    }
+
+    @Test
+    fun withoutRepeatAnAutoplayTailIsKept() {
+        val s = PlaybackSnapshot(
+            status = PlaybackStatus.PAUSED,
+            context = PlaybackContext("spotify:album:a"),
+            track = pt(9, "q9", TrackProvider.QUEUE),
+            nextTracks = listOf(pt(10, "c10"), pt(11, "c11"), pt(20, "a20", TrackProvider.AUTOPLAY), pt(21, "a21", TrackProvider.AUTOPLAY)),
+        )
+        assertEquals(listOf(t(9), t(10), t(11), t(20), t(21)), ResumeState.from(s)?.trackUris)
+    }
+
+    @Test
+    fun aListStoredWithRepeatedPassesIsRepairedWhenRead() {
+        val old = state.copy(trackUri = t(5), contextUri = null, trackUris = listOf(t(5), t(6), t(1), t(5), t(6), t(1), t(5)))
+        val request = old.toPlayRequest()
+        assertEquals(listOf(t(5), t(6), t(1)), request.trackUris)
+        assertEquals(listOf(t(5), t(6), t(1)), old.resumeLoad.trackUris)
+        val single = state.copy(trackUri = t(7), contextUri = null, trackUris = List(41) { t(7) })
+        assertEquals(listOf(t(7)), single.toPlayRequest().trackUris)
+    }
 }
