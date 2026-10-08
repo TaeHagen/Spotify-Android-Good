@@ -285,7 +285,11 @@ pub(crate) fn plan(f: &Frozen, start_playing: bool) -> Option<Plan> {
         .filter(|(i, t)| *i == pass.start || is_ctx(t))
         .map(|(_, t)| t.uri.clone())
         .collect();
-    let request = LoadRequest::from_tracks(tracks, options(PlayingTrack::Index(index), start_playing, seek_to, options_of(s, current)));
+    // Shuffled: the list is its play order already, which it keeps (by uri: a list's uids are
+    // made from its positions, so the old ones don't match the new list).
+    let o = options_of(s, current);
+    let o = Options { shuffle_order: o.shuffle.then(|| tracks.clone()), ..o };
+    let request = LoadRequest::from_tracks(tracks, options(PlayingTrack::Index(index), start_playing, seek_to, o));
     Some(Plan { request, queued, then_next: false, then_repeat_track: false, then_play: false })
 }
 
@@ -1363,7 +1367,7 @@ mod tests {
     fn a_reconnect_during_a_load_brings_back_that_load() {
         let now = Instant::now();
         let p = LoadArgs { context_uri: Some("spotify:playlist:p".into()), position_ms: 0, play: true, ..Default::default() };
-        let loading = |at| Some(hub::LocalLoad { generation: 3, at, args: p.clone(), ahead: 0 });
+        let loading = |at| Some(hub::LocalLoad { generation: 3, at, args: p.clone(), unsettled: std::collections::VecDeque::from([0]) });
         // album A plays, the user's load of P fetches its context
         let mut hub = HubState::default();
         hub::apply_snapshot(&mut hub, snap("spotify:album:a", SpircProvider::Context), false, 1_000_000);
@@ -1419,6 +1423,14 @@ mod tests {
         let p = plan(&f, true).expect("plan");
         let Some(LoadContextOptions::Options(o)) = &p.request.context_options else { panic!("options") };
         assert_eq!(o.shuffle_order.as_deref(), Some(["p".to_string(), "n".to_string()].as_slice()));
+        // a plain track list or autoplay: the list sent, by uri (its uids come from positions)
+        let list = ["spotify:track:p", "spotify:track:cur", "spotify:track:n"].map(String::from).to_vec();
+        for (ctx, provider) in [("spotify:web-api", SpircProvider::Context), ("spotify:album:a", SpircProvider::Autoplay)] {
+            let p = plan(&freeze(snap(ctx, provider), 1_002_000, Instant::now()), true).expect("plan");
+            assert!(format!("{:?}", p.request).contains(&format!("Tracks({list:?})")), "{:?}", p.request);
+            let Some(LoadContextOptions::Options(o)) = &p.request.context_options else { panic!("options") };
+            assert_eq!(o.shuffle_order.as_ref(), Some(&list));
+        }
         // not shuffled: none
         let mut s = snap("spotify:album:a", SpircProvider::Context);
         s.shuffle = false;

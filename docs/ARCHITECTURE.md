@@ -322,8 +322,9 @@ of anything else fails with `UNAVAILABLE` "Not available offline".
 this device plays (or paused) a downloaded track through Spirc, the OfflineController takes that
 playback over as it is, before anything pauses the Player (a track that ended meanwhile moves
 on to the next one): the track keeps playing without a reload, with the
-visible tracks around it in play order (the user queue included also where it isn't downloaded:
-online it streams, offline the queue skips it; suggestions only if downloaded: the others are
+visible tracks around it in play order (the user queue included, as the queue's user queue
+again, before later adds and cleared with it, also where it isn't downloaded: online it streams,
+offline the queue skips it, without the load brake; suggestions only if downloaded: the others are
 skipped, not the window's end; one pass of the context with
 repeat-all, its start that Spirc no longer lists as previous tracks in front: the queue's own
 repeat wraps it) up to the first context track on either side that isn't downloaded (the queue
@@ -739,7 +740,8 @@ For a remote active device, smart shuffle is not supported (the command reports
   context) is the restore point instead of the playback before it; its paused placeholder (which
   keeps the notification and the media foreground) is the load's start item, else the playback
   before it. A shuffled session comes back in its order (`Options.shuffle_order`: the previous
-  tracks stay, Up Next goes on as it was). While another device played, its playback stays shown
+  tracks stay, Up Next goes on as it was; a plain track list or autoplay, loaded as a list in
+  that order, keeps it by uri). While another device played, its playback stays shown
   across the reconnect until the new Spirc's first cluster (with a network, ≤ 60 s). An explicit `player.load` (local, remote or offline) or running
   offline playback replaces the restore point; a dropped restore point stops the paused track
   nobody owns anymore.

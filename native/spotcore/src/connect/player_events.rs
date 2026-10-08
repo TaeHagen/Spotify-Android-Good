@@ -102,9 +102,10 @@ impl State {
         State { refusal: Refusal { consecutive: 0, transient: 0, latched: None }, last_unavailable: None, loading: None }
     }
 
-    fn on_unavailable(&mut self, play_request_id: u64, track_id: &SpotifyUri, reason: UnavailableReason) -> RefusalAction {
+    /// `brake`: the failure counts for the load brake.
+    fn on_unavailable(&mut self, play_request_id: u64, track_id: &SpotifyUri, reason: UnavailableReason, brake: bool) -> RefusalAction {
         self.last_unavailable = Some((reason, Instant::now()));
-        let load_failed = self.loading.as_ref().is_some_and(|(id, uri)| *id == play_request_id && uri == track_id);
+        let load_failed = brake && self.loading.as_ref().is_some_and(|(id, uri)| *id == play_request_id && uri == track_id);
         if load_failed {
             self.refusal.on_unavailable(reason)
         } else {
@@ -201,7 +202,10 @@ pub(crate) fn on_player_event(event: PlayerEvent) {
         PlayerEvent::Paused { .. } | PlayerEvent::Stopped { .. } => STATE.lock().loading = None,
         PlayerEvent::Unavailable { reason, track_id, play_request_id } => {
             log::info!("unavailable: {} ({reason:?})", track_id.to_uri().unwrap_or_default());
-            let action = STATE.lock().on_unavailable(*play_request_id, track_id, *reason);
+            // The offline queue skips what it can't play itself (a queued track that isn't
+            // downloaded) and reports its own end: not Spirc's skip chain, no brake.
+            let brake = !offline::is_active();
+            let action = STATE.lock().on_unavailable(*play_request_id, track_id, *reason, brake);
             if let RefusalAction::Stop { reason, notify } = action {
                 halt(reason, notify);
             }
@@ -292,19 +296,31 @@ mod tests {
         st.loading = None; // Playing
         // the preloads of the following tracks are refused (they carry the playing request id)
         for n in 2..6 {
-            assert_eq!(st.on_unavailable(5, &uri(n), UnavailableReason::KeyDenied), RefusalAction::None);
+            assert_eq!(st.on_unavailable(5, &uri(n), UnavailableReason::KeyDenied, true), RefusalAction::None);
         }
         assert!(st.last_unavailable.is_some(), "still reported when the queue runs out");
         // a preload while a track loads isn't the load either
         st.loading = Some((6, uri(6)));
-        assert_eq!(st.on_unavailable(6, &uri(7), UnavailableReason::KeyDenied), RefusalAction::None);
-        assert_eq!(st.on_unavailable(5, &uri(6), UnavailableReason::KeyDenied), RefusalAction::None);
+        assert_eq!(st.on_unavailable(6, &uri(7), UnavailableReason::KeyDenied, true), RefusalAction::None);
+        assert_eq!(st.on_unavailable(5, &uri(6), UnavailableReason::KeyDenied, true), RefusalAction::None);
         // failed loads count
-        assert_eq!(st.on_unavailable(6, &uri(6), UnavailableReason::KeyDenied), RefusalAction::None);
+        assert_eq!(st.on_unavailable(6, &uri(6), UnavailableReason::KeyDenied, true), RefusalAction::None);
         st.loading = Some((7, uri(7)));
-        assert_eq!(st.on_unavailable(7, &uri(7), UnavailableReason::KeyDenied), RefusalAction::None);
+        assert_eq!(st.on_unavailable(7, &uri(7), UnavailableReason::KeyDenied, true), RefusalAction::None);
         st.loading = Some((8, uri(8)));
-        assert_eq!(st.on_unavailable(8, &uri(8), UnavailableReason::KeyDenied), stop(UnavailableReason::KeyDenied, true));
+        assert_eq!(st.on_unavailable(8, &uri(8), UnavailableReason::KeyDenied, true), stop(UnavailableReason::KeyDenied, true));
+    }
+
+    #[test]
+    fn the_offline_queues_skips_dont_brake() {
+        // queued tracks that aren't downloaded fail one after the other on the offline session
+        let mut st = State::new();
+        for n in 1..8u8 {
+            st.loading = Some((u64::from(n), uri(n)));
+            assert_eq!(st.on_unavailable(u64::from(n), &uri(n), UnavailableReason::NetworkError, false), RefusalAction::None);
+        }
+        assert!(!st.refusal.is_latched());
+        assert!(st.last_unavailable.is_some(), "still the reason if the queue runs out");
     }
 
     #[test]
