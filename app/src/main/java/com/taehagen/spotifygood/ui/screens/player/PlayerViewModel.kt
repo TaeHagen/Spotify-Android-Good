@@ -94,6 +94,7 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
     private val library = graph.library
     private val lyricsRepository = graph.lyrics
     private val sleepTimer = graph.sleepTimer
+    private val speedControl = graph.podcastSpeed
     private val outputs = graph.outputs
     private val devices = graph.devices
     private val resumeStore = graph.resumeStore
@@ -228,6 +229,11 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
         )
 
     val sleepTimerState: StateFlow<SleepTimerState> = sleepTimer.state
+
+    /** The podcast playback speed (episodes played on this phone, one speed for all). */
+    val podcastSpeed: StateFlow<Float> = speedControl.speed
+
+    fun setPodcastSpeed(speed: Float) = speedControl.set(speed)
 
     // ----------------------------------------------------------------------------------------- lyrics
 

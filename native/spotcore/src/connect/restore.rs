@@ -86,8 +86,9 @@ pub(crate) struct Restoring {
 pub(crate) struct Frozen {
     pub snap: ConnectSnapshot,
     /// A user load that was still on its way to the Spirc when the playback was interrupted (see
-    /// `HubState::loading`): it replaced what played before it, so it is what comes back (`snap`
-    /// is empty then).
+    /// `HubState::loading`): it replaced what played before it, so it is what comes back. `snap`
+    /// and `position_ms` are only shown then (the paused placeholder keeps the notification and
+    /// the media foreground): the load's start item, else what played before it.
     pub load: Option<LoadArgs>,
     pub position_ms: i64,
     /// When the playback was interrupted, local epoch ms ...
@@ -151,17 +152,34 @@ pub(crate) fn freeze(snap: ConnectSnapshot, now_ms: i64, since: Instant) -> Froz
     Frozen { position_ms: position_now(&snap, now_ms), at_ms: now_ms, since, was_playing, snap, load: None, intent: None }
 }
 
-/// A restore point of a user load that was still on its way (see [`Frozen::load`]).
-pub(crate) fn freeze_load(args: LoadArgs, now_ms: i64, since: Instant) -> Frozen {
-    Frozen {
-        snap: ConnectSnapshot::default(),
-        position_ms: args.position_ms.min(i64::MAX as u64) as i64,
-        at_ms: now_ms,
-        since,
-        was_playing: args.play,
-        load: Some(args),
-        intent: None,
-    }
+/// A restore point of a user load that was still on its way (see [`Frozen::load`]), shown as its
+/// start item (paused), else as `shown` (the playback before it).
+pub(crate) fn freeze_load(args: LoadArgs, shown: Option<ConnectSnapshot>, now_ms: i64, since: Instant) -> Frozen {
+    let start = args.start_uri.clone().filter(|u| !u.is_empty()).or_else(|| {
+        let tracks = args.track_uris.as_ref()?;
+        tracks.get(args.start_index.unwrap_or(0) as usize).cloned()
+    });
+    let start = start.or_else(|| args.context_uri.clone().filter(|c| uri::is_track(c) || uri::is_episode(c)));
+    let (snap, position_ms) = match start {
+        Some(uri) => {
+            let track = SnapshotTrack {
+                uri,
+                uid: String::new(),
+                provider: SpircProvider::Context,
+                context_index: None,
+                hidden: false,
+                metadata: Default::default(),
+            };
+            let context_uri = args.context_uri.clone().unwrap_or_default();
+            let snap = ConnectSnapshot { is_active: true, status: SnapshotPlayStatus::Paused, context_uri, track: Some(track), ..Default::default() };
+            (snap, args.position_ms.min(i64::MAX as u64) as i64)
+        }
+        None => shown.map(|s| {
+            let position = position_now(&s, now_ms);
+            (s, position)
+        }).unwrap_or_default(),
+    };
+    Frozen { snap, position_ms, at_ms: now_ms, since, was_playing: args.play, load: Some(args), intent: None }
 }
 
 #[derive(Debug)]
@@ -182,13 +200,28 @@ fn visible(t: &&SnapshotTrack) -> bool {
     !t.hidden && t.uri != uri::DELIMITER_URI
 }
 
-fn options_of(s: &ConnectSnapshot) -> Options {
+/// The options of `s`, played at `current`: a shuffled session keeps its order (see
+/// [`shuffle_order`]).
+fn options_of(s: &ConnectSnapshot, current: &SnapshotTrack) -> Options {
     Options {
         shuffle: s.shuffle || s.smart_shuffle,
         repeat: s.repeat_context,
         repeat_track: s.repeat_track,
         smart_shuffle: s.smart_shuffle,
+        shuffle_order: shuffle_order(s, current),
     }
+}
+
+/// A track's id in `Options::shuffle_order`: its uid, else its uri.
+fn track_id(t: &SnapshotTrack) -> String {
+    if t.uid.is_empty() { t.uri.clone() } else { t.uid.clone() }
+}
+
+/// The shuffled order `s` plays in around `current` (one pass of its context tracks, see
+/// `Options::shuffle_order`), for a load that brings it back; `None` unless it shuffles.
+pub(crate) fn shuffle_order(s: &ConnectSnapshot, current: &SnapshotTrack) -> Option<Vec<String>> {
+    let pass = (s.shuffle || s.smart_shuffle).then(|| one_pass(s, current, |_, _| true))?;
+    Some(pass.tracks.iter().filter(|t| t.provider == SpircProvider::Context).map(|t| track_id(t)).collect())
 }
 
 /// What to load to get back to `f`, starting to play or not.
@@ -213,7 +246,7 @@ pub(crate) fn plan(f: &Frozen, start_playing: bool) -> Option<Plan> {
     if resolvable && current.provider == SpircProvider::Context {
         let request = LoadRequest::from_context_uri(
             s.context_uri.clone(),
-            options(PlayingTrack::Uri(current.uri.clone()), start_playing, seek_to, options_of(s)),
+            options(PlayingTrack::Uri(current.uri.clone()), start_playing, seek_to, options_of(s, current)),
         );
         return Some(Plan { request, queued, then_next: false, then_repeat_track: false, then_play: false });
     }
@@ -228,11 +261,11 @@ pub(crate) fn plan(f: &Frozen, start_playing: bool) -> Option<Plan> {
             // (Spirc plays a start track that isn't in the context before it).
             let request = LoadRequest::from_context_uri(
                 s.context_uri.clone(),
-                options(PlayingTrack::Uri(current.uri.clone()), start_playing, seek_to, options_of(s)),
+                options(PlayingTrack::Uri(current.uri.clone()), start_playing, seek_to, options_of(s, current)),
             );
             return Some(Plan { request, queued, then_next: false, then_repeat_track: false, then_play: false });
         };
-        let o = Options { repeat_track: false, ..options_of(s) };
+        let o = Options { repeat_track: false, ..options_of(s, current) };
         let request =
             LoadRequest::from_context_uri(s.context_uri.clone(), options(PlayingTrack::Uri(anchor.uri.clone()), false, 0, o));
         let mut requeue = vec![current.uri.clone()];
@@ -252,7 +285,7 @@ pub(crate) fn plan(f: &Frozen, start_playing: bool) -> Option<Plan> {
         .filter(|(i, t)| *i == pass.start || is_ctx(t))
         .map(|(_, t)| t.uri.clone())
         .collect();
-    let request = LoadRequest::from_tracks(tracks, options(PlayingTrack::Index(index), start_playing, seek_to, options_of(s)));
+    let request = LoadRequest::from_tracks(tracks, options(PlayingTrack::Index(index), start_playing, seek_to, options_of(s, current)));
     Some(Plan { request, queued, then_next: false, then_repeat_track: false, then_play: false })
 }
 
@@ -262,8 +295,7 @@ pub(crate) struct Pass<'a> {
     pub tracks: Vec<&'a SnapshotTrack>,
     pub start: usize,
     /// Where the context goes on after the tracks (an index in `next_tracks`): the next track
-    /// `take` refused, or with repeat-all, when `take` refused one past the wrap or the list ran
-    /// out there, the context's start (the tracks don't hold the whole pass).
+    /// `take` refused before the wrap.
     pub ended_at: Option<usize>,
     /// The next side took every listed track without reaching the context's end (a delimiter).
     pub ran_out: bool,
@@ -325,7 +357,7 @@ pub(crate) fn one_pass<'a>(
             break;
         }
         if !take(t, true) {
-            ended_at = Some(wrap.map_or(i, |w| w + 1));
+            ended_at = wrap.is_none().then_some(i);
             ran_out = false;
             break;
         }
@@ -334,13 +366,6 @@ pub(crate) fn one_pass<'a>(
         } else {
             tracks.push(t);
             last_next = Some(i);
-        }
-    }
-    if ran_out {
-        if let Some(w) = wrap {
-            // The next pass ran out of the list (Spirc's is full) before a track seen already:
-            // the tracks don't hold the whole pass either.
-            ended_at = Some(w + 1);
         }
     }
     let start = head.len() + prev;
@@ -403,9 +428,10 @@ pub(crate) fn freeze_restore_point(hub: &mut HubState, now_ms: i64, now: Instant
     if let Some(l) = loading {
         // A user load on its way (the Spirc fetches its context and shows the playback before
         // it): it replaced that playback, so it comes back instead (§8).
+        let shown = hub.snapshot.clone().filter(|s| s.is_active && s.track.is_some());
         hub.last_active = None;
         hub.restoring = None;
-        hub.reconnect = Some(freeze_load(l.args, now_ms, now));
+        hub.reconnect = Some(freeze_load(l.args, shown, now_ms, now));
         return;
     }
     let active = hub.snapshot.clone().filter(|s| s.is_active && s.track.is_some());
@@ -439,19 +465,38 @@ pub(crate) fn freeze_restore_point(hub: &mut HubState, now_ms: i64, now: Instant
 /// stuck in a request doesn't, and CDN fetches don't need the session, so it would play on with
 /// nothing able to control it.
 pub(crate) fn prepare_reconnect() {
-    let pause = {
+    let (pause, remote) = {
         let mut hub = HUB.lock();
         freeze_restore_point(&mut hub, now_ms(), Instant::now());
+        let remote = keep_remote(&mut hub, &hub::me(), Instant::now());
         // Whatever the attached Spirc published last: it can lag a handler that started the
         // Player (a resume or a remote transfer whose state put hangs).
-        hub.link.is_some()
+        (hub.link.is_some(), remote)
     };
     if pause && !offline::is_active() {
         if let Some(player) = crate::engine::player_host::player() {
             player.pause();
         }
     }
+    if remote {
+        // The kept view's end is published too.
+        crate::runtime::handle().spawn(async {
+            tokio::time::sleep(hub::RECONNECT_REMOTE_MAX).await;
+            hub::publish();
+        });
+    }
     hub::publish();
+}
+
+/// Keeps the cluster while another device is active (see `HubState::reconnect_remote`); returns
+/// whether it did.
+fn keep_remote(hub: &mut HubState, me: &str, now: Instant) -> bool {
+    let cluster = hub.cluster.clone().filter(|c| !c.active_device_id.is_empty() && c.active_device_id != me);
+    let kept = cluster.is_some();
+    if let Some(c) = cluster {
+        hub.reconnect_remote = Some((c, now));
+    }
+    kept
 }
 
 /// Forgets a pending restore (stop, logout, offline mode, terminal errors, an explicit load,
@@ -501,10 +546,11 @@ fn drop_restore() {
         let mut hub = HUB.lock();
         hub.last_active = None;
         hub.restoring = None;
+        let remote = hub.reconnect_remote.take().is_some();
         let dropped = hub.reconnect.take().is_some();
         let running = spirc_running(&hub);
         let owned = running && hub.snapshot.as_ref().is_some_and(|s| s.is_active);
-        (dropped, (dropped && !owned) || (hub.link.is_some() && !running))
+        (dropped || remote, (dropped && !owned) || (hub.link.is_some() && !running))
     };
     if orphaned && !offline::is_active() {
         if let Some(player) = crate::engine::player_host::player() {
@@ -1325,6 +1371,9 @@ mod tests {
         freeze_restore_point(&mut hub, 1_002_000, now);
         let f = hub.reconnect.clone().expect("restore point");
         assert!(f.load.is_some() && f.was_playing && hub.loading.is_none());
+        // shown meanwhile as what played (P names no start item), paused: the notification stays
+        assert_eq!(f.snap.track.as_ref().map(|t| t.uri.as_str()), Some("spotify:track:cur"));
+        assert_eq!(f.position_ms, 12_000);
         // the new Spirc: P is restored (playing after a short gap), not A
         hub::forget_previous_link(&mut hub);
         hub.cluster = cluster("");
@@ -1336,13 +1385,46 @@ mod tests {
         // an idle phone (the activation's empty snapshot) keeps it too
         let mut hub = HubState { snapshot: Some(ConnectSnapshot { is_active: true, ..Default::default() }), loading: loading(now), ..Default::default() };
         freeze_restore_point(&mut hub, 1_002_000, now);
-        assert!(hub.reconnect.as_ref().is_some_and(|f| f.load.is_some()));
+        assert!(hub.reconnect.as_ref().is_some_and(|f| f.load.is_some() && f.snap.track.is_none()));
+        // a load that names its start item is shown as that item, at its position
+        let q = LoadArgs {
+            context_uri: Some("spotify:playlist:p".into()),
+            start_uri: Some("spotify:track:x".into()),
+            position_ms: 5_000,
+            play: true,
+            ..Default::default()
+        };
+        let f = freeze_load(q, Some(snap("spotify:album:a", SpircProvider::Context)), 1_002_000, now);
+        assert_eq!(f.snap.track.as_ref().map(|t| t.uri.as_str()), Some("spotify:track:x"));
+        assert_eq!((f.snap.context_uri.as_str(), f.position_ms), ("spotify:playlist:p", 5_000));
+        let list = LoadArgs { track_uris: Some(vec!["spotify:track:a".into(), "spotify:track:b".into()]), start_index: Some(1), ..Default::default() };
+        assert_eq!(freeze_load(list, None, 0, now).snap.track.map(|t| t.uri).as_deref(), Some("spotify:track:b"));
         // a load marker too old: the playback is frozen as before
         let mut hub = HubState::default();
         hub::apply_snapshot(&mut hub, snap("spotify:album:a", SpircProvider::Context), false, 1_000_000);
         hub.loading = loading(now);
         freeze_restore_point(&mut hub, 1_002_000, now + RESTORING_MAX);
         assert!(hub.reconnect.as_ref().is_some_and(|f| f.load.is_none() && f.snap.track.is_some()));
+    }
+
+    #[test]
+    fn a_shuffled_session_keeps_its_order() {
+        // shuffled: the context tracks in play order go with the load (the queued one doesn't)
+        let f = freeze(snap("spotify:album:a", SpircProvider::Context), 1_002_000, Instant::now());
+        let p = plan(&f, true).expect("plan");
+        let Some(LoadContextOptions::Options(o)) = &p.request.context_options else { panic!("options") };
+        assert_eq!(o.shuffle_order.as_deref(), Some(["p".to_string(), "c".to_string(), "n".to_string()].as_slice()));
+        // the anchor of a queued track: the same order
+        let f = freeze(snap("spotify:playlist:x", SpircProvider::Queue), 1_002_000, Instant::now());
+        let p = plan(&f, true).expect("plan");
+        let Some(LoadContextOptions::Options(o)) = &p.request.context_options else { panic!("options") };
+        assert_eq!(o.shuffle_order.as_deref(), Some(["p".to_string(), "n".to_string()].as_slice()));
+        // not shuffled: none
+        let mut s = snap("spotify:album:a", SpircProvider::Context);
+        s.shuffle = false;
+        let p = plan(&freeze(s, 1_002_000, Instant::now()), true).expect("plan");
+        let Some(LoadContextOptions::Options(o)) = &p.request.context_options else { panic!("options") };
+        assert_eq!(o.shuffle_order, None);
     }
 
     #[test]

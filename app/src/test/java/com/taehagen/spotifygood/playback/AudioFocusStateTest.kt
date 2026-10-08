@@ -130,4 +130,25 @@ class AudioFocusStateTest {
         state.onFocusChange(AudioManager.AUDIOFOCUS_GAIN)
         assertEquals(listOf("pause"), f.events)
     }
+
+    @Test
+    fun aUserPauseDuringAFocusPauseIsNotUndoneByTheGain() {
+        // "Hey Google, pause": the Assistant takes transient focus (the podcast pauses, a resume
+        // is pending), then sends pause, which cancels the resume.
+        f.speech = true
+        assertTrue(state.request())
+        state.onFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK)
+        assertTrue(state.isWaitingForGain)
+        state.cancelPendingResume()
+        state.onFocusChange(AudioManager.AUDIOFOCUS_GAIN)
+        assertEquals(listOf("pause"), f.events)
+    }
+
+    @Test
+    fun withoutAUserPauseTheGainStillResumes() {
+        assertTrue(state.request())
+        state.onFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        state.onFocusChange(AudioManager.AUDIOFOCUS_GAIN)
+        assertEquals(listOf("pause", "resume"), f.events)
+    }
 }

@@ -35,6 +35,7 @@ import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Album
 import androidx.compose.material.icons.rounded.Bedtime
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Lyrics
@@ -101,6 +102,7 @@ import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.model.TrackProvider
+import com.taehagen.spotifygood.playback.PodcastSpeeds
 import com.taehagen.spotifygood.playback.SleepTimerState
 import com.taehagen.spotifygood.ui.appViewModel
 import com.taehagen.spotifygood.ui.components.Artwork
@@ -268,6 +270,7 @@ private fun NowPlayingBody(
     val isRemote = snapshot.source == PlaybackSource.REMOTE
     // One lifecycle-aware ticker feeds the seek bar and the lyrics preview (stops when not visible).
     val position = viewModel.position.collectAsStateWithLifecycle(initialValue = remember { viewModel.positionNow() })
+    val podcastSpeed by viewModel.podcastSpeed.collectAsStateWithLifecycle()
 
     val topBar: @Composable () -> Unit = {
         NowPlayingTopBar(
@@ -342,6 +345,9 @@ private fun NowPlayingBody(
             // load; the full screen offers Retry). Disabled once Spotify has none for the track.
             lyricsButton = if (track.isEpisode) null else !lyricsUnavailable,
             onLyrics = navigator::openLyrics,
+            // Episodes played here (Spotify Connect has no speed command for other devices).
+            speed = if (track.isEpisode && !isRemote) podcastSpeed else null,
+            onSpeed = viewModel::setPodcastSpeed,
             onShare = onShare,
             onQueue = navigator::openQueue,
         )
@@ -875,6 +881,9 @@ private fun BottomActions(
     /** null: no lyrics button (podcast episodes); otherwise whether it is enabled. */
     lyricsButton: Boolean?,
     onLyrics: () -> Unit,
+    /** null: no speed button (music, another device playing); otherwise the podcast speed. */
+    speed: Float?,
+    onSpeed: (Float) -> Unit,
     onShare: () -> Unit,
     onQueue: () -> Unit,
 ) {
@@ -921,11 +930,56 @@ private fun BottomActions(
                 Icon(Icons.Rounded.Lyrics, contentDescription = stringResource(R.string.player_open_lyrics))
             }
         }
+        if (speed != null) SpeedButton(speed = speed, onSpeed = onSpeed)
         IconButton(onClick = onShare) {
             Icon(Icons.Rounded.Share, contentDescription = stringResource(R.string.player_share))
         }
         IconButton(onClick = onQueue) {
             Icon(Icons.AutoMirrored.Rounded.QueueMusic, contentDescription = stringResource(R.string.player_open_queue))
+        }
+    }
+}
+
+/** The podcast speed ("1.5×"), Spotify's choices in a menu. */
+@Composable
+private fun SpeedButton(speed: Float, onSpeed: (Float) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    val description = stringResource(R.string.playback_speed)
+    val label = PodcastSpeeds.label(speed)
+    val normal = PodcastSpeeds.same(speed, PodcastSpeeds.NORMAL)
+    Box {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .clickable(role = Role.Button) { open = true }
+                .heightIn(min = 48.dp)
+                .padding(horizontal = 12.dp)
+                .semantics(mergeDescendants = true) { contentDescription = "$description, $label" },
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                color = if (normal) PlayerDefaults.PrimaryText else MaterialTheme.colorScheme.primary,
+            )
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            PodcastSpeeds.STEPS.forEach { step ->
+                val selected = PodcastSpeeds.same(step, speed)
+                DropdownMenuItem(
+                    text = { Text(PodcastSpeeds.label(step), fontWeight = if (selected) FontWeight.Bold else null) },
+                    onClick = {
+                        open = false
+                        onSpeed(step)
+                    },
+                    trailingIcon = if (selected) {
+                        { Icon(Icons.Rounded.Check, contentDescription = null) }
+                    } else {
+                        null
+                    },
+                )
+            }
         }
     }
 }

@@ -402,6 +402,7 @@ enum SpircCommand {
     SetAudioOutput(AudioOutputKind, Option<String>),
     SetAutoplay(bool),
     RefreshCluster,
+    SetPlaybackSpeed(f64),
 }
 
 // SPOTIFYGOOD: names used in the reported command errors
@@ -435,11 +436,16 @@ impl SpircCommand {
             SetAudioOutput(..) => "set_audio_output",
             SetAutoplay(_) => "set_autoplay",
             RefreshCluster => "refresh_cluster",
+            SetPlaybackSpeed(_) => "set_playback_speed",
         }
     }
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
+
+// SPOTIFYGOOD: a position correction this close to the state's extrapolation (at the playback
+// speed) changes nothing, see handle_player_event
+const SPEED_CORRECTION_TOLERANCE_MS: i64 = 500;
 
 // SPOTIFYGOOD: upper bound for the network calls during shutdown
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -915,6 +921,13 @@ impl Spirc {
         Ok(self
             .commands
             .send(SpircCommand::SmartShuffle(smart_shuffle))?)
+    }
+
+    /// Reports the speed the playback runs at (podcasts, applied by the app's audio sink): the
+    /// state's `playback_speed` while playing, so that other clients extrapolate the position at
+    /// that rate. Also works while we are not the active device (it applies once active).
+    pub fn set_playback_speed(&self, speed: f64) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::SetPlaybackSpeed(speed))?)
     }
 
     /// Reports the audio output the playback currently goes to (shown by other clients)
@@ -1457,6 +1470,11 @@ impl SpircTask {
             }
             // SPOTIFYGOOD: allowed while not active
             SpircCommand::SetAutoplay(autoplay) => self.handle_set_autoplay(autoplay)?,
+            // SPOTIFYGOOD: allowed while not active
+            SpircCommand::SetPlaybackSpeed(speed) => {
+                self.handle_set_playback_speed(speed);
+                return Ok(());
+            }
             // SPOTIFYGOOD: allowed while not active, the response of the state put contains the
             // cluster. A failure isn't reported, the refresh is a background request.
             SpircCommand::RefreshCluster => {
@@ -1561,6 +1579,9 @@ impl SpircTask {
             return Ok(());
         }
 
+        // SPOTIFYGOOD: see the Playing / PositionCorrection arm
+        let correction = matches!(event, PlayerEvent::PositionCorrection { .. });
+
         match event {
             PlayerEvent::EndOfTrack { .. } => {
                 let next_track = self
@@ -1593,6 +1614,24 @@ impl SpircTask {
             }
             PlayerEvent::Playing { position_ms, .. }
             | PlayerEvent::PositionCorrection { position_ms, .. } => {
+                // SPOTIFYGOOD: at another playback speed (podcasts) the player, which expects
+                // 1x, reports a correction every second or two. One that matches the position
+                // the state extrapolates at the real speed only keeps Spirc's own (1x) anchor
+                // current: no state put (it was one every second or two, for all clients).
+                if correction && self.connect_state.playing_speed() != 1. {
+                    let now = self.now_ms();
+                    let expected = self.connect_state.extrapolated_position(now);
+                    if (expected - position_ms as i64).abs() < SPEED_CORRECTION_TOLERANCE_MS {
+                        if let SpircPlayStatus::Playing {
+                            ref mut nominal_start_time,
+                            ..
+                        } = self.play_status
+                        {
+                            *nominal_start_time = now - position_ms as i64;
+                        }
+                        return Ok(());
+                    }
+                }
                 trace!("==> Playing");
                 let new_nominal_start_time = self.now_ms() - position_ms as i64;
                 match self.play_status {
@@ -2371,6 +2410,11 @@ impl SpircTask {
         let pages_pending = self
             .context_resolver
             .has_pending_pages(ContextType::Default);
+        // SPOTIFYGOOD: see the shuffled load below
+        let shuffle_order = match cmd_options.context_options {
+            Some(LoadContextOptions::Options(ref options)) => options.shuffle_order.clone(),
+            _ => None,
+        };
 
         if let Some(LoadContextOptions::Options(ref options)) = cmd_options.context_options {
             debug!(
@@ -2396,11 +2440,23 @@ impl SpircTask {
                 self.connect_state.set_current_track_random()?;
             }
 
+            // SPOTIFYGOOD: a shuffled session loaded again (a reconnect restore, the offline
+            // queue's hand-back) keeps its order, see Options::shuffle_order: the start track at
+            // its place in it, the given tracks before it as the prev tracks, the rest of the
+            // context shuffled after them. Further pages are placed in it as they come (no
+            // reshuffle by the last one). Every reconnect drew a new order: Previous restarted
+            // the song, Up Next changed and the songs already heard came back.
+            let kept = match shuffle_order {
+                Some(ref ids) => self.connect_state.shuffle_in_order(ids, pages_pending)?,
+                None => false,
+            };
             // SPOTIFYGOOD: shuffled with the pages there are, also while further pages resolve
             // (the last one shuffles the whole context again, see ContextResolver::try_finish).
             // The shuffle waited for them with empty next tracks, so the playback stopped when
             // the song ended meanwhile (minutes on a flaky link, with the retries).
-            self.connect_state.shuffle_new()?;
+            if !kept {
+                self.connect_state.shuffle_new()?;
+            }
             if !self.context_resolver.has_next() {
                 self.add_autoplay_resolving_when_required();
             }
@@ -2748,6 +2804,24 @@ impl SpircTask {
     // SPOTIFYGOOD: see Spirc::set_audio_output
     // SPOTIFYGOOD: the put runs next to the loop (see StatePuts), a failure is only logged; the
     // state holds the new output, so every later put carries it
+    // SPOTIFYGOOD: see Spirc::set_playback_speed. The position reached at the previous speed is
+    // the new anchor; an active device puts the state once.
+    fn handle_set_playback_speed(&mut self, speed: f64) {
+        let now = self.now_ms();
+        let position = self.connect_state.extrapolated_position(now);
+        if !self.connect_state.set_playback_speed(speed) {
+            return;
+        }
+        if matches!(self.play_status, SpircPlayStatus::Playing { .. }) {
+            self.connect_state
+                .update_position(position.clamp(0, u32::MAX as i64) as u32, now);
+        }
+        self.connect_state.set_status(&self.play_status);
+        if self.connect_state.is_active() {
+            self.update_state = true;
+        }
+    }
+
     fn handle_set_audio_output(&mut self, kind: AudioOutputKind, name: Option<String>) {
         if self.connect_state.set_audio_output(kind, name) {
             self.put_state(StatePut::AudioOutput);

@@ -135,6 +135,16 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
 
     private fun initOnMain() {
         graph.player.onPlaybackRequested = ::ensureServiceStarted
+        // Applies the podcast speed to the sink and the engine from now on.
+        graph.podcastSpeed
+        // A pause made on purpose during a transient focus loss: the next GAIN must not undo it.
+        // Posted: the sleep timer pauses off the main thread; a GAIN arrives on main after it.
+        graph.player.onDeliberatePause = {
+            main.post {
+                focus.cancelPendingResume()
+                updateNoisy()
+            }
+        }
         graph.player.errorMessages = PlaybackErrorMessages.fromResources(app)
         graph.sleepTimer.fader = { graph.audioSink.setFadeVolume(it) }
         graph.sleepTimer.wakeups = AndroidSleepWakeups(app)
@@ -279,7 +289,7 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
     fun refuseBackgroundPlayback() {
         if (refusedThisActivation) return
         refusedThisActivation = true
-        graph.player.pause(user = false)
+        graph.player.pause(user = false, deliberate = true)
         ResumeAlert.post(app, graph.playback.snapshot.value.track?.name)
     }
 

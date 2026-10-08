@@ -149,6 +149,28 @@ impl<T> ShuffleVec<T> {
         true
     }
 
+    // SPOTIFYGOOD: for ConnectState::place_in_order, which reorders a shuffled vec with
+    // shuffle_to_order (that takes positions in the original order)
+    /// For each position of the current order, the position of its item in the original order
+    /// (the order [ShuffleVec::unshuffle] restores)
+    pub fn original_positions(&self) -> Vec<usize> {
+        let len = self.vec.len();
+        let mut positions = (0..len).collect::<Vec<_>>();
+        // the swaps of the shuffle (see shuffle_with_rng) applied to the positions, the last
+        // position first
+        if let Some(indices) = self.indices.as_ref().filter(|i| i.len() < len) {
+            for (i, &n) in (1..=indices.len()).rev().zip(indices) {
+                if n < len {
+                    positions.swap(i, n);
+                }
+            }
+        }
+        if let Some(first) = self.original_first_position.filter(|&p| p < len) {
+            positions.swap(0, first);
+        }
+        positions
+    }
+
     pub fn unshuffle(&mut self) {
         let indices = match self.indices.take() {
             Some(indices) => indices,
@@ -328,5 +350,36 @@ mod test {
         single.extend_keep_shuffle(1..4);
         single.unshuffle();
         assert_eq!(*single, vec![0, 1, 2, 3]);
+    }
+
+    // SPOTIFYGOOD: see ShuffleVec::original_positions
+    #[test]
+    fn test_original_positions() {
+        let check = |vec: &ShuffleVec<usize>| {
+            let positions = vec.original_positions();
+            let mut original = vec.clone();
+            original.unshuffle();
+            for (k, &p) in positions.iter().enumerate() {
+                assert_eq!(vec[k], original[p]);
+            }
+        };
+
+        for len in [0, 1, 2, 3, 10, 200] {
+            let (mut vec, seed) = base(0..len);
+            check(&vec);
+            // shuffled, with a first item
+            let first = len / 2;
+            vec.shuffle_with_seed(seed, |i| *i == first);
+            check(&vec);
+            // with items appended
+            vec.extend_keep_shuffle(len..len + 5);
+            check(&vec);
+            // put into an order
+            let mut order = (0..len + 5).rev().collect::<Vec<_>>();
+            order.swap(0, len / 3);
+            assert!(vec.shuffle_to_order(&order));
+            check(&vec);
+            assert_eq!(vec.original_positions(), order);
+        }
     }
 }

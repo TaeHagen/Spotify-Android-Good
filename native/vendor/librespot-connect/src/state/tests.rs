@@ -4,6 +4,7 @@
 use crate::{
     AudioOutputKind, ConnectConfig, SnapshotPlayStatus, TrackProvider,
     core::{Session, SessionConfig, SpotifyId, SpotifyUri, dealer::protocol::Request},
+    model::SpircPlayStatus,
     protocol::{
         connect::AudioOutputDeviceType, context::Context, context_page::ContextPage,
         context_track::ContextTrack, player::ProvidedTrack,
@@ -2259,4 +2260,368 @@ fn spirc_is_send_and_sync(
         task.await;
         drop(spirc);
     });
+}
+
+#[test]
+fn the_playback_speed_is_reported_while_playing() {
+    let (_rt, mut state) = state(3);
+    let playing = SpircPlayStatus::Playing {
+        nominal_start_time: 0,
+        preloading_of_next_track_triggered: false,
+    };
+    let paused = SpircPlayStatus::Paused {
+        position_ms: 0,
+        preloading_of_next_track_triggered: false,
+    };
+    state.set_status(&playing);
+    assert_eq!(state.player().playback_speed, 1.);
+
+    assert!(state.set_playback_speed(1.5));
+    assert!(!state.set_playback_speed(1.5));
+    state.set_status(&playing);
+    assert_eq!(state.player().playback_speed, 1.5);
+    // the position extrapolates at that speed
+    state.update_position(10_000, 100_000);
+    assert_eq!(state.extrapolated_position(102_000), 13_000);
+
+    state.set_status(&paused);
+    assert_eq!(state.player().playback_speed, 0.);
+    assert_eq!(state.extrapolated_position(102_000), 10_000);
+
+    // back to normal speed
+    assert!(state.set_playback_speed(1.0));
+    assert_eq!(state.playing_speed(), 1.);
+    state.set_status(&playing);
+    assert_eq!(state.player().playback_speed, 1.);
+}
+
+/// what handle_load does for a shuffled load with `Options::shuffle_order`: the start track
+/// (a uid of the context, else a uri the context doesn't have) is set, then the order applied;
+/// returns whether it was (else the load shuffles anew)
+fn load_in_order(state: &mut ConnectState, start: &str, ids: &[String], pages: bool) -> bool {
+    state.clear_next_tracks();
+    state.set_shuffle(true);
+    let index = state
+        .get_context(ContextType::Default)
+        .unwrap()
+        .tracks
+        .iter()
+        .position(|t| t.uid == start);
+    match index {
+        Some(index) => state.set_current_track(index).unwrap(),
+        None => {
+            let track = state
+                .context_to_provided_track(
+                    &ContextTrack {
+                        uri: Some(start.to_string()),
+                        ..Default::default()
+                    },
+                    Some(CONTEXT_URI),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            state.set_track(track);
+        }
+    }
+    state.shuffle_in_order(ids, pages).unwrap()
+}
+
+fn prev_uids(state: &ConnectState) -> Vec<String> {
+    state.prev_tracks().iter().map(|t| t.uid.clone()).collect()
+}
+
+/// a shuffled order of `uid0..uid{len}`
+fn shuffled_ids(len: usize) -> Vec<String> {
+    // 7 has no factor in common with the lengths used
+    (0..len).map(|i| format!("uid{}", (i * 7) % len)).collect()
+}
+
+#[test]
+fn a_restored_shuffle_keeps_its_order() {
+    let ids = shuffled_ids(30);
+    let (_rt, mut state) = state(30);
+    // the previous session had played 12 tracks, the 13th plays
+    assert!(load_in_order(&mut state, &ids[12], &ids, false));
+
+    assert!(state.default_context_shuffled());
+    assert_eq!(state.current_track(|t| t.uid.clone()), ids[12]);
+    // Previous goes back through the session's tracks (as many as there are prev tracks)
+    assert_eq!(prev_uids(&state), ids[2..12]);
+    // Up Next is the session's
+    assert_eq!(next_uids(&state), ids[13..]);
+    assert_eq!(play_through(&mut state, 3), ids[13..16]);
+    assert_eq!(
+        state.prev_track().unwrap().map(|t| t.uid.clone()),
+        Some(ids[14].clone())
+    );
+
+    // a track without a uid is given by its uri
+    let mut by_uri = ids.clone();
+    by_uri[5] = track_uri(uid_index(&ids[5]), 0);
+    let (_rt, mut state) = self::state(30);
+    assert!(load_in_order(&mut state, &ids[12], &by_uri, false));
+    assert_eq!(prev_uids(&state), ids[2..12]);
+    assert_eq!(next_uids(&state), ids[13..]);
+
+    // unshuffled, the context is in its order again
+    state.handle_shuffle(false).unwrap();
+    let current = uid_index(&ids[12]);
+    assert_eq!(next_uids(&state), uids(current + 1..30));
+}
+
+#[test]
+fn a_restored_shuffle_with_a_part_of_its_order() {
+    let given = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+    // the rest of the context: once each, after the given ones
+    let assert_rest = |next: &[String], skip: &[&str]| {
+        let mut rest = next.to_vec();
+        rest.sort();
+        let mut expected = uids(0..30);
+        expected.retain(|uid| !skip.contains(&uid.as_str()));
+        expected.sort();
+        assert_eq!(rest, expected);
+    };
+
+    // a track no longer in the context is left out
+    let ids = given(&["uid20", "gone", "uid3", "uid7", "uid11", "uid25"]);
+    let (_rt, mut state) = state(30);
+    assert!(load_in_order(&mut state, "uid7", &ids, false));
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid7");
+    assert_eq!(prev_uids(&state), ["uid20", "uid3"]);
+    assert_eq!(next_uids(&state)[..2], ["uid11", "uid25"]);
+    assert_rest(
+        &next_uids(&state)[2..],
+        &["uid20", "uid3", "uid7", "uid11", "uid25"],
+    );
+
+    // a start track that isn't in the order: the given ones follow it
+    let (_rt, mut state) = self::state(30);
+    assert!(load_in_order(&mut state, "uid15", &ids, false));
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid15");
+    assert!(state.prev_tracks().is_empty());
+    let next = next_uids(&state);
+    assert_eq!(next[..5], ["uid20", "uid3", "uid7", "uid11", "uid25"]);
+    assert_rest(
+        &next[5..],
+        &["uid15", "uid20", "uid3", "uid7", "uid11", "uid25"],
+    );
+
+    // the same song as a given track (twice in the context): that one plays, at its place
+    let (_rt, mut state) = self::state(30);
+    let mut ctx = context(30, 0);
+    ctx.pages[0].tracks[29].uri = Some(track_uri(7, 0));
+    state.update_context(ctx, ContextType::Default).unwrap();
+    let index = state
+        .get_context(ContextType::Default)
+        .unwrap()
+        .tracks
+        .iter()
+        .position(|t| t.uid == "uid29")
+        .unwrap();
+    state.set_shuffle(true);
+    state.set_current_track(index).unwrap();
+    assert!(
+        state
+            .shuffle_in_order(&given(&["uid20", "uid3", "uid7"]), false)
+            .unwrap()
+    );
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid7");
+    assert_eq!(prev_uids(&state), ["uid20", "uid3"]);
+
+    // a start outside the context (a further page has it): the given ones come next
+    let (_rt, mut state) = self::state(30);
+    assert!(load_in_order(&mut state, &track_uri(40, 0), &ids, false));
+    assert_eq!(state.current_track(|t| t.uri.clone()), track_uri(40, 0));
+    assert!(state.prev_tracks().is_empty());
+    let next = next_uids(&state);
+    assert_eq!(next[..5], ["uid20", "uid3", "uid7", "uid11", "uid25"]);
+    assert_rest(&next[5..], &["uid20", "uid3", "uid7", "uid11", "uid25"]);
+}
+
+#[test]
+fn a_restored_shuffle_without_a_known_track_shuffles_anew() {
+    let (_rt, mut state) = state(30);
+    let ids = ["gone".to_string(), "spotify:track:gone".to_string()];
+    assert!(!load_in_order(&mut state, "uid7", &ids, true));
+    assert!(!state.keeps_shuffle_order());
+    // handle_load shuffles as without an order then
+    state.shuffle_new().unwrap();
+    assert!(state.default_context_shuffled());
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid7");
+    assert!(state.prev_tracks().is_empty());
+    assert_eq!(state.next_tracks().len(), 29);
+}
+
+#[test]
+fn further_pages_keep_a_restored_shuffle() {
+    // an artist session: the previous one played 15 of its tracks, the 16th plays (on an album)
+    let ids = shuffled_ids(30);
+    let start = 15;
+    let start_uid = ids[start].clone();
+    assert_eq!(start_uid, "uid15", "on the first album");
+    // the tracks of `ids` there are with the pages up to `below`
+    let known = |ids: &[String], below: usize| {
+        ids.iter()
+            .filter(|uid| uid_index(uid) < below)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let last_ten = |ids: Vec<String>| ids[ids.len().saturating_sub(10)..].to_vec();
+
+    for fail_last in [false, true] {
+        let (rt, mut state) = state(3);
+        state.reset_context(ResetContext::Completely);
+        let mut resolver = artist_resolved(&rt, &mut state, 0..10, 2);
+        resolver.remove_used_and_invalid();
+        let pending = resolver.has_pending_pages(ContextType::Default);
+        assert!(pending);
+        assert!(load_in_order(&mut state, &track_uri(15, 0), &ids, pending));
+        assert!(state.keeps_shuffle_order());
+
+        // the start track isn't there yet, the top tracks follow it in the session's order
+        assert!(state.prev_tracks().is_empty());
+        assert_eq!(next_uids(&state), known(&ids, 10));
+
+        // its album arrives while it plays: it goes to its place, the session's order around it
+        resolver
+            .apply_next_context(&mut state, album(10..20))
+            .unwrap();
+        assert!(!resolver.try_finish(&mut state, &mut None));
+        resolver.remove_used_and_invalid();
+        assert_eq!(state.current_track(|t| t.uid.clone()), start_uid);
+        assert_eq!(prev_uids(&state), last_ten(known(&ids[..start], 20)));
+        assert_eq!(next_uids(&state), known(&ids[start + 1..], 20));
+
+        // the last album: the whole order of the session, not shuffled anew
+        if fail_last {
+            assert!(resolver.finish_after_failure(&mut state, &mut None));
+            assert_eq!(prev_uids(&state), last_ten(known(&ids[..start], 20)));
+            assert_eq!(next_uids(&state), known(&ids[start + 1..], 20));
+        } else {
+            resolver
+                .apply_next_context(&mut state, album(20..30))
+                .unwrap();
+            assert!(resolver.try_finish(&mut state, &mut None));
+            assert_eq!(prev_uids(&state), ids[start - 10..start]);
+            assert_eq!(next_uids(&state), ids[start + 1..]);
+        }
+        assert_eq!(state.current_track(|t| t.uid.clone()), start_uid);
+        assert!(state.default_context_shuffled());
+        assert!(!state.keeps_shuffle_order());
+    }
+
+    // the playback went on meanwhile, and the album has tracks the order doesn't have: those
+    // are shuffled in after the given ones, the order before the current track stays
+    let ids = shuffled_ids(25);
+    let (rt, mut state) = state(3);
+    state.reset_context(ResetContext::Completely);
+    let mut resolver = artist_resolved(&rt, &mut state, 0..20, 1);
+    resolver.remove_used_and_invalid();
+    assert!(load_in_order(&mut state, &ids[2], &ids, true));
+    assert_eq!(prev_uids(&state), known(&ids[..2], 20));
+    assert_eq!(next_uids(&state), known(&ids[3..], 20));
+    let played = play_through(&mut state, 2);
+    assert_eq!(played, known(&ids[3..], 20)[..2]);
+    let current = state.current_track(|t| t.uid.clone());
+
+    resolver
+        .apply_next_context(&mut state, album(20..30))
+        .unwrap();
+    assert!(resolver.try_finish(&mut state, &mut None));
+    assert_eq!(state.current_track(|t| t.uid.clone()), current);
+    let position = ids.iter().position(|uid| *uid == current).unwrap();
+    assert_eq!(prev_uids(&state), last_ten(ids[..position].to_vec()));
+    let next = next_uids(&state);
+    assert_eq!(next[..ids.len() - position - 1], ids[position + 1..]);
+    let mut new = next[ids.len() - position - 1..].to_vec();
+    new.sort();
+    assert_eq!(new, uids(25..30));
+}
+
+/// a context without uids: `len` tracks, the last one is the first one again
+fn uidless(len: usize) -> Context {
+    let mut ctx = context(len, 0);
+    for track in &mut ctx.pages[0].tracks {
+        track.uid = None;
+    }
+    ctx.pages[0].tracks[len - 1].uri = Some(track_uri(0, 0));
+    ctx
+}
+
+/// the uids of the default context after `ctx` was resolved (by a new state)
+fn resolved_uids(ctx: Context) -> Vec<String> {
+    let (_rt, mut state) = state(3);
+    state.reset_context(ResetContext::Completely);
+    state.update_context(ctx, ContextType::Default).unwrap();
+    default_uids(&state)
+}
+
+#[test]
+fn tracks_without_a_uid_get_the_same_uid_on_every_resolve() {
+    use crate::state::context::GENERATED_UID_PREFIX;
+
+    let uids = resolved_uids(uidless(20));
+    assert_eq!(
+        uids,
+        resolved_uids(uidless(20)),
+        "the same on every resolve"
+    );
+    assert!(uids.iter().all(|uid| uid.starts_with(GENERATED_UID_PREFIX)));
+    // unique, also for the track that is there twice
+    assert_eq!(uids.iter().collect::<HashSet<_>>().len(), 20);
+
+    // another context has other ones
+    let mut other = uidless(20);
+    other.uri = Some("spotify:album:1".to_string());
+    assert!(resolved_uids(other).iter().all(|uid| !uids.contains(uid)));
+
+    // a uid the context has stays
+    let mut with_uid = uidless(20);
+    with_uid.pages[0].tracks[3].uid = Some("server".to_string());
+    let with_uid = resolved_uids(with_uid);
+    assert_eq!(with_uid[3], "server");
+    assert_eq!(with_uid[4], uids[4]);
+
+    // further pages: the same on every resolve, and distinct from the tracks of the first page
+    // that they repeat
+    let mut paged = uidless(10);
+    let mut second = paged.pages[0].clone();
+    second.tracks.truncate(5);
+    paged.pages.push(second);
+    let uids = resolved_uids(paged.clone());
+    assert_eq!(uids.len(), 15);
+    assert_eq!(uids.iter().collect::<HashSet<_>>().len(), 15);
+    assert_eq!(uids, resolved_uids(paged));
+}
+
+#[test]
+fn a_restored_shuffle_of_a_context_without_uids_keeps_its_order() {
+    // a shuffled session of an album without uids, 14 tracks in
+    let (_rt, mut state) = state(3);
+    state.reset_context(ResetContext::Completely);
+    state
+        .update_context(uidless(30), ContextType::Default)
+        .unwrap();
+    state.set_current_track(0).unwrap();
+    state.reset_playback_to_position(Some(0)).unwrap();
+    state.handle_shuffle(true).unwrap();
+    play_through(&mut state, 14);
+    let current = state.current_track(|t| t.uid.clone());
+    let mut ids = prev_uids(&state);
+    ids.push(current.clone());
+    ids.extend(next_uids(&state));
+
+    // a reconnect: the album is resolved again (another Spirc), and the session comes back
+    let (_rt, mut restored) = self::state(3);
+    restored.reset_context(ResetContext::Completely);
+    restored
+        .update_context(uidless(30), ContextType::Default)
+        .unwrap();
+    assert!(load_in_order(&mut restored, &current, &ids, false));
+    assert_eq!(restored.current_track(|t| t.uid.clone()), current);
+    assert_eq!(prev_uids(&restored), prev_uids(&state));
+    let next = next_uids(&state);
+    assert_eq!(next_uids(&restored)[..next.len()], next[..]);
 }

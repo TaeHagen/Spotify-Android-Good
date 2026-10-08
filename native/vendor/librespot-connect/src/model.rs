@@ -80,6 +80,15 @@ pub struct Options {
     /// Suggested tracks are interleaved into the shuffled context, see
     /// [Spirc::smart_shuffle](crate::Spirc::smart_shuffle).
     pub smart_shuffle: bool,
+    // SPOTIFYGOOD: a shuffled session loaded again as it was (a reconnect restore, the offline
+    // queue's hand-back) keeps its order
+    /// With `shuffle`: the shuffled order to keep instead of a new shuffle, as the context
+    /// tracks' uids (the uri of a track without one) in play order around the start track (the
+    /// previous ones, the start track, the next ones). The start track plays at its place in it,
+    /// the ones before it are the previous tracks, and the rest of the context follows the given
+    /// ones, shuffled. Tracks no longer in the context are left out; without the start track in
+    /// it (or a start outside the context) the given ones come first.
+    pub shuffle_order: Option<Vec<String>>,
 }
 
 impl From<ContextPlayerOptionOverrides> for Options {
@@ -90,6 +99,8 @@ impl From<ContextPlayerOptionOverrides> for Options {
             repeat_track: value.repeating_track.unwrap_or_default(),
             // SPOTIFYGOOD: spotify's own smart shuffle protocol (`modes`) is unknown
             smart_shuffle: false,
+            // SPOTIFYGOOD: see `shuffle_order`
+            shuffle_order: None,
         }
     }
 }

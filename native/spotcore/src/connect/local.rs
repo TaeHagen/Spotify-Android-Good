@@ -38,6 +38,7 @@ fn context_options(args: &LoadArgs) -> Option<LoadContextOptions> {
         repeat: matches!(args.repeat, Some(RepeatMode::Context)),
         repeat_track: matches!(args.repeat, Some(RepeatMode::Track)),
         smart_shuffle,
+        shuffle_order: None,
     }))
 }
 
