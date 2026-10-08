@@ -3,8 +3,9 @@
 //!
 //! librespot reads that attribute wherever explicit content matters
 //! (`Session::filter_explicit_content`): the Player refuses to load explicit tracks (Spirc then
-//! skips them) and skips the current one when the filter turns on, the catalog marks them
-//! unplayable, and downloads refuse them. Forcing it on the session is the single choke point.
+//! skips them) and skips the current one when the filter turns on, and the catalog marks them
+//! unplayable. Downloads ignore it (the Player still refuses a downloaded explicit track at play
+//! time). Forcing it on the session is the single choke point.
 //!
 //! The account's own value is kept in a private attribute of the same session, so turning the
 //! setting off restores it. ProductInfo and Spirc (server attribute pushes and mutations) can
