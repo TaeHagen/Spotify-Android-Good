@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.ui.screens.player
 
+import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.ConnectDevice
 import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.NativeErrorInfo
@@ -166,5 +167,41 @@ class TransferFailureEventTest {
             DevicesEvent.TransferFailed("s", "Living Room", network = false),
             transferFailureEvent("s", "Living Room", isThisDevice = false, error = IllegalStateException()),
         )
+    }
+}
+
+class SheetResultMessageTest {
+    @Test
+    fun resultsForAGoneSheetHaveAMessageForTheAppSnackbar() {
+        assertNull("the sheet just closes", DevicesEvent.TransferSucceeded("s").message())
+        assertEquals(
+            SheetMessage(R.string.player_devices_transfer_failed_network, listOf("Kitchen")),
+            DevicesEvent.TransferFailed("s", "Kitchen", network = true).message(),
+        )
+        assertEquals(
+            SheetMessage(R.string.player_devices_selected, listOf("Kitchen")),
+            DevicesEvent.NothingToPlay("s", "Kitchen", isThisDevice = false, selected = true).message(),
+        )
+        assertEquals(SheetMessage(R.string.player_devices_refresh_failed), DevicesEvent.RefreshFailed("s").message())
+    }
+
+    @Test
+    fun lanResultsKeepTheirErrorOrNotice() {
+        val failed = LocalConnectEvent.Failed("s", "Kitchen", network = false, offline = true)
+        assertEquals(SheetMessage(R.string.local_connect_login_failed_offline, listOf("Kitchen")), failed.message())
+        assertTrue(failed.isFailure)
+        val added = LocalConnectEvent.Added("s", "Kitchen")
+        assertEquals(SheetMessage(R.string.local_connect_added, listOf("Kitchen")), added.message())
+        assertTrue(!added.isFailure)
+        assertNull(LocalConnectEvent.Connected("s").message())
+    }
+
+    @Test
+    fun shownSheetsTrackTheTokensOnScreen() {
+        val sheets = ShownSheets()
+        sheets.add("a")
+        assertTrue("a" in sheets)
+        sheets.remove("a")
+        assertTrue("a" !in sheets)
     }
 }
