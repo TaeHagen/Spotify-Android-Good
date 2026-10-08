@@ -381,6 +381,13 @@ pub(crate) fn hash_for(op: &str) -> Option<String> {
         .or_else(|| DEFAULT_HASHES.iter().find(|(n, _)| *n == op).map(|(_, h)| h.to_string()))
 }
 
+/// Whether a hash for `op` is known (discovered or shipped), without triggering a discovery: for
+/// optional operations a page must not wait for ([`query`] refreshes for an unknown one).
+pub(crate) async fn has_operation(op: &str) -> bool {
+    ensure_loaded().await;
+    hash_for(op).is_some()
+}
+
 fn app_version() -> String {
     STATE.lock().persisted.app_version.clone().unwrap_or_else(|| DEFAULT_APP_VERSION.to_string())
 }

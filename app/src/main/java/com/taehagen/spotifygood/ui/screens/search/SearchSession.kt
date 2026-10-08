@@ -1,34 +1,20 @@
 package com.taehagen.spotifygood.ui.screens.search
 
-import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.playback.EngineReach
-import com.taehagen.spotifygood.ui.screens.album.engineReach
+import com.taehagen.spotifygood.ui.screens.album.retryWhenOnline
 import com.taehagen.spotifygood.ui.screens.library.PagedState
-import com.taehagen.spotifygood.ui.screens.library.TRACK_START_SESSION_WAIT_MS
 import com.taehagen.spotifygood.ui.screens.library.attempt
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.dropWhile
-import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 
 // Searches and the session: native catalog calls don't wait for one, they fail NOT_CONNECTED at
 // once while it is connecting or reconnecting (cold start, idle stop, a network change). Search
-// waits for a connecting session (bounded) and searches again by itself once it is ONLINE.
-
-/**
- * Bounded wait for a session that is connecting right now, before a search: returns once it is
- * ONLINE, or at once when nothing is connecting — offline (a captive portal must not stall the
- * search), in backoff (the engine reported a retry), ERROR — or after [TRACK_START_SESSION_WAIT_MS].
- */
-internal suspend fun AppGraph.awaitConnectingSession() {
-    if (engineReach() == EngineReach.CONNECTING && engine.state.value.nextRetryMs == null) {
-        engine.awaitOnline(TRACK_START_SESSION_WAIT_MS)
-    }
-}
+// waits for a connecting session (bounded, `awaitConnectingSession`) and searches again by itself
+// once it is ONLINE. The shared pieces are in album/SessionReach.kt.
 
 /** One run of a search, as [searchWhenOnline] reports it. */
 internal sealed interface SearchAttempt<out T> {
@@ -85,13 +71,12 @@ internal suspend fun <T> retryFailedListWhenOnline(
     reach: Flow<EngineReach>,
     state: () -> StateFlow<PagedState<T>>?,
     retry: () -> Unit,
-) {
-    reach.drop(1).filter { it == EngineReach.ONLINE }.collectLatest {
-        val list = state() ?: return@collectLatest
-        val settled = list.first { !it.isLoading }
-        if (settled.error != null && state() === list) retry()
-    }
-}
+) = retryWhenOnline(
+    reach,
+    settled = { state()?.let { list -> list to list.first { !it.isLoading } } },
+    needsRetry = { (list, settled) -> settled.error != null && state() === list },
+    retry = retry,
+)
 
 /**
  * Keeps a result list loaded across connectivity changes: whenever [reach] is reachable (ONLINE, or

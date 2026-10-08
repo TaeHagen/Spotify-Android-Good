@@ -604,6 +604,20 @@ Show         ShowRef + {"description","episodes":[Episode],"total","offset","fol
 partial      present (true) only when some item metadata could not be fetched right now; those items
              are placeholders with just `uri` (and `playable:false`). Artist: some top tracks,
              releases or related artists are missing. Do not cache as fresh; retry (§6.3).
+resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the account's
+             `playedState`). Extended metadata has none; `catalog.show` pages and `catalog.episodes`
+             for one or two episodes (an episode page) overlay it from Pathfinder
+             (`queryPodcastEpisodes`, `getEpisodeOrChapter`, `catalog/played.rs`): best effort, only
+             when the operation's hash is known (never triggers a hash discovery), at most 3 s, a
+             failure leaves the fields out and never makes a page `partial`. Search results carry it
+             when Pathfinder sends it. Kotlin overlays the phone's own progress on top
+             (`EpisodeProgressStore`): local playback of an episode is recorded (on pause, on a change
+             of item, when playback leaves the phone, every 15 s while playing; within 30 s of the
+             end it is played), shown on show / episode pages, saved episodes and downloads, and a
+             play of an episode with no position resumes there (`PlayerController.episodeResume`).
+             The phone's progress wins unless Spotify's state changed since it was recorded (the
+             episode was played elsewhere afterwards). Nothing is reported back to Spotify: progress
+             made on this phone, offline above all, is not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
               "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
@@ -825,8 +839,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   state: the previous account's data is removed first and only then is the new owner recorded
   (§9.2). Logout forgets the owner only once its whole wipe succeeded.
 * Logout (with confirmation): stops the login flows and deletes the pending device code, then
-  `session.logout`, credentials, downloads, the resume state, the response and image caches,
-  the DB and the settings. Every step runs even if an earlier one failed; no new login reaches
+  `session.logout`, credentials, downloads, the resume state, the podcast progress, the
+  response and image caches, the DB and the settings. Every step runs even if an earlier one failed; no new login reaches
   the engine until the wipe is done. The account owner is forgotten last, only when every step
   succeeded (otherwise a later login of another account wipes again).
 
@@ -1174,11 +1188,18 @@ while online). Unknown hearts / Save / Follow controls are shown disabled. A tog
 opposite of the state the control showed, never of the server's current state, so a stale
 "not saved" can't remove an item (and its download).
 Native catalog calls don't wait for a session: they fail `NOT_CONNECTED` at once while it
-connects or reconnects. Browse screens load once the engine's reach (§4.6) is ONLINE and
-again after a reconnect when they failed. Search waits up to 10 s for a connecting session
-(not when offline or in backoff, so a captive portal can't stall it); a search or result page
-that failed before the session was ONLINE shows its error and runs again by itself once it is
-(a connection error while ONLINE: after the next reconnect), without a Retry tap.
+connects or reconnects (cold start, the idle stop, a network change, a link opened from
+another app). Screens wait up to 10 s for a connecting session (not when offline or in
+backoff, so a captive portal can't stall them) and load again by themselves once the
+engine's reach (§4.6) is ONLINE, without a Retry tap (`ui/screens/album/SessionReach.kt`).
+Detail pages (album, playlist, artist, discography, show, episode), the profile and the
+library lists start their stale-while-revalidate load at once (a cached copy shows right
+away); a `NOT_CONNECTED` of that first load while connecting keeps the page loading instead
+of saying "You're offline", and the load runs again once the session is up. Each time the
+reach becomes ONLINE, a page that failed, shows a stale cached copy (its refresh failed) or
+the download loads again, once a load still running has settled. A search or result page that
+failed before the session was ONLINE shows its error and runs again once it is (a connection
+error while ONLINE: after the next reconnect).
 
 ### 9.9 UI
 
@@ -1220,7 +1241,9 @@ and receive (phone as Connect device), shuffle, smart shuffle with suggestions, 
 all/one, queue (view, add, remove, reorder, clear, jump), autoplay, gapless,
 normalisation, streaming quality, playlists (view, create, edit, reorder, delete,
 follow), Liked Songs, saved albums/artists/podcasts, follow artists, search (all types,
-recent searches), home feed, album/artist/playlist/show/episode pages, lyrics (synced),
+recent searches), home feed, album/artist/playlist/show/episode pages, podcast resume
+points (this phone's progress, kept on the phone and not synced to other devices; Spotify's
+when its web API provides them, §6.5), lyrics (synced),
 radio, share links, deep links, downloads (track/album/playlist/liked/podcast, Wi-Fi only
 option, storage management, auto-sync), offline mode, sleep timer, explicit-content
 filter, system equalizer, settings, adaptive layouts, accessibility (content

@@ -134,6 +134,12 @@ fun DownloadsContent.withExplicitFilter(filter: Boolean): DownloadsContent {
     return copy(songs = songs.map { it.filtered() }, episodes = episodes.map { it.filtered() }, active = active?.filtered())
 }
 
+/** [transform] applied to every episode listed (e.g. this phone's podcast progress). */
+fun DownloadsContent.withEpisodes(transform: (Episode) -> Episode): DownloadsContent {
+    fun DownloadEntry.mapped() = episode?.let { copy(episode = transform(it)) } ?: this
+    return copy(episodes = episodes.map { it.mapped() }, active = active?.mapped())
+}
+
 /** What tapping a song or episode of the Downloads screen does ([planEntryPlay]). */
 sealed interface EntryPlay {
     /** Play [uris] (the section) from [index]. */
