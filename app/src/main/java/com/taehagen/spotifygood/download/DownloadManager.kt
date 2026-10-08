@@ -33,6 +33,7 @@ import com.taehagen.spotifygood.data.db.DownloadCollectionEntity
 import com.taehagen.spotifygood.data.db.DownloadEntity
 import com.taehagen.spotifygood.data.db.DownloadFileRow
 import com.taehagen.spotifygood.data.db.IndexRow
+import com.taehagen.spotifygood.data.db.LocatedRow
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.engine.SpotifyEngine
@@ -61,6 +62,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
@@ -230,11 +232,27 @@ class DownloadManager(
     private val volumes = MutableStateFlow(0)
 
     /**
+     * Completed downloads' files (one shared database observer): what moves with a change of the
+     * download location, and what a card that goes takes with it.
+     */
+    private val completedLocated: SharedFlow<List<LocatedRow>> = dao.observeCompletedLocated()
+        .shareIn(scope, SharingStarted.Eagerly, replay = 1)
+
+    /**
+     * uri → cover path (null: none) of completed downloads. Changes when the set of completed
+     * downloads changes and when a cover moves to another location, never on progress writes.
+     */
+    private val completedImagePaths: Flow<Map<String, String?>> = completedLocated
+        .map { rows -> rows.associate { it.uri to it.imagePath } }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+
+    /**
      * Completed downloads on a location that is not available (an SD card removed or unmounted):
      * they stay COMPLETED (nothing is failed or deleted) and come back with the card, but are shown
      * as not available and are left out of the offline index meanwhile.
      */
-    private val unavailable: StateFlow<Set<String>> = combine(dao.observeCompletedLocated(), volumes) { rows, _ -> rows }
+    private val unavailable: StateFlow<Set<String>> = combine(completedLocated, volumes) { rows, _ -> rows }
         .map { rows -> DownloadRules.unavailableUris(rows, storage.availability()) }
         .distinctUntilChanged()
         .flowOn(Dispatchers.IO)
@@ -281,10 +299,9 @@ class DownloadManager(
      * uri → cover path of completed downloads, for long-lived observers (the playback service): it
      * changes only when the set of completed downloads does, never on progress writes.
      */
-    val downloadedImages: Flow<Map<String, String>> = downloadedUris
-        .map { dao.completedImages().associate { it.uri to it.imagePath } }
+    val downloadedImages: Flow<Map<String, String>> = combine(completedImagePaths, unavailable, DownloadRules::downloadedImagesOf)
         .distinctUntilChanged()
-        .flowOn(Dispatchers.IO)
+        .flowOn(Dispatchers.Default)
     val usedBytes: Flow<Long> = dao.observeUsedBytes()
     val pendingCount: Flow<Int> = dao.observePendingCount()
 
@@ -863,19 +880,16 @@ class DownloadManager(
         try {
             for (batch in plan.chunked(RELOCATE_BATCH)) {
                 if (storage.target.value != target) return // changed again: the next pass moves there
-                val copied = ArrayList<DownloadRules.FileMove>(batch.size)
-                for (move in batch) {
-                    currentCoroutineContext().ensureActive()
-                    try {
-                        withContext(Dispatchers.IO) { copyVerified(File(move.from), File(move.to), storage::freeBytes, DownloadRules.MIN_FREE_BYTES) }
-                        copied += move
-                    } catch (e: FileNotFoundException) {
-                        // Removed meanwhile: nothing to move.
-                    }
-                    moved++
-                    _relocation.value = DownloadRelocation(moving = true, moved = moved, total = plan.size)
-                }
-                switchCopies(copied)
+                // The copies made before a stop (no space, an I/O error) are switched all the same.
+                copyThenSwitch(
+                    batch,
+                    copy = { move -> withContext(Dispatchers.IO) { copyVerified(File(move.from), File(move.to), storage::freeBytes, DownloadRules.MIN_FREE_BYTES) } },
+                    onDone = {
+                        moved++
+                        _relocation.value = DownloadRelocation(moving = true, moved = moved, total = plan.size)
+                    },
+                    switch = { copies -> switchCopies(copies) },
+                )
             }
             _relocation.value = DownloadRelocation(moved = moved, total = plan.size)
             Log.i(TAG, "Moved $moved download files to ${target.root}")
@@ -950,19 +964,19 @@ class DownloadManager(
     // ---- offline covers ------------------------------------------------------------------------------
 
     /**
-     * Keeps [covers] in step with the completed downloads and the downloaded collections. Each
-     * download's metadata is read once (memoised by URI); a download run that completes items one
-     * after another updates the maps once it settles.
+     * Keeps [covers] in step with the completed downloads, their cover files (a move to another
+     * location) and the downloaded collections. Each download's metadata is read once (memoised by
+     * URI; a moved cover only changes its file); a download run that completes items one after
+     * another updates the maps once it settles.
      */
     private suspend fun followCovers() {
         val known = HashMap<String, DownloadRules.CoverSource>()
-        combine(downloadedUris, collectionDao.observeAll()) { uris, collections -> uris to collections }
-            .collectLatest { (uris, collections) ->
+        combine(completedImagePaths, unavailable, collectionDao.observeAll()) { paths, gone, collections -> Triple(paths, gone, collections) }
+            .collectLatest { (paths, gone, collections) ->
                 delay(COVERS_SETTLE_MS)
                 try {
                     val maps = withContext(Dispatchers.Default) {
-                        known.keys.retainAll(uris)
-                        val fresh = uris.filter { it !in known }
+                        val fresh = DownloadRules.refreshCoverSources(known, paths, gone)
                         fresh.chunked(SQL_CHUNK).flatMap { dao.coverRows(it) }.forEach { row ->
                             known[row.uri] = DownloadRules.CoverSource(row.uri, row.imagePath, DownloadRules.coverUrls(json, row.metadataJson, row.recordJson))
                         }
@@ -1631,6 +1645,12 @@ class DownloadManager(
             if (runner.isRunning) return@withContext
             val pending = dao.pendingCount()
             if (pending == 0) return@withContext
+            // The chosen card is not mounted: nothing could run (applyLocation schedules on its
+            // return). Said once on the Downloads screen and in a notification instead.
+            if (storage.target.value is DownloadStorage.Target.Missing) {
+                runner.reportStopped(appContext.getString(R.string.data_dl_error_location))
+                return@withContext
+            }
             // Loaded from disk: the defaults before that would give the wrong network constraint.
             val current = settings.awaitLoaded()
             if (current.offlineMode) return@withContext

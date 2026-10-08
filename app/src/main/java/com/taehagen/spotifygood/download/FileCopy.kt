@@ -1,5 +1,9 @@
 package com.taehagen.spotifygood.download
 
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileNotFoundException
@@ -43,6 +47,39 @@ internal fun copyVerified(src: File, dst: File, freeBytes: (File) -> Long, reser
         tmp.delete()
         throw e
     }
+}
+
+/**
+ * Copies [batch] with [copy], one item at a time, and always hands the items copied so far to
+ * [switch]: also when a copy stops the batch (no space, an I/O error) or the pass is cancelled, so
+ * a verified copy is never thrown away and redone at the next pass. An item whose original is gone
+ * ([FileNotFoundException]) is skipped. [onDone] runs after each item. What stopped the batch is
+ * rethrown after the switch; a failing switch does not hide it.
+ */
+internal suspend fun <T> copyThenSwitch(batch: List<T>, copy: suspend (T) -> Unit, onDone: () -> Unit, switch: suspend (List<T>) -> Unit) {
+    val copied = ArrayList<T>(batch.size)
+    var stop: Throwable? = null
+    try {
+        for (item in batch) {
+            currentCoroutineContext().ensureActive()
+            try {
+                copy(item)
+                copied += item
+            } catch (e: FileNotFoundException) {
+                // Removed meanwhile: nothing to move.
+            }
+            onDone()
+        }
+    } catch (e: Throwable) {
+        stop = e
+    }
+    try {
+        withContext(NonCancellable) { switch(copied) }
+    } catch (e: Exception) {
+        if (stop == null) throw e
+        stop.addSuppressed(e)
+    }
+    stop?.let { throw it }
 }
 
 /** Not enough space at [dir] for a copy. */
