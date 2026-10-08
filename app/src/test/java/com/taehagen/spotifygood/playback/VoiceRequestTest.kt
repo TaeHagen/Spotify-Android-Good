@@ -3,6 +3,7 @@ package com.taehagen.spotifygood.playback
 import androidx.media3.common.MediaItem
 import com.taehagen.spotifygood.playback.VoiceMatch.Candidate
 import com.taehagen.spotifygood.playback.VoiceMatch.Kind
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -60,5 +61,30 @@ class VoiceRequestTest {
             PlayRequest(trackUris = songs, startIndex = 0, play = true),
             MediaIds.plan(songs, 0) { emptyList() }?.toPlayRequest(),
         )
+    }
+
+    @Test
+    fun aRequestWaitsForTheSessionUnlessOfflineOrBlank() = runBlocking {
+        val steps = mutableListOf<String>()
+        var offline = false
+        suspend fun run(request: VoiceRequest) = VoiceEntry.resolve(
+            request,
+            isOffline = { steps += "network"; offline },
+            awaitSession = { steps += "wait" },
+            resolve = { steps += "resolve"; it.query },
+        )
+        // An idle-stopped engine online: the session is waited for before the catalog is asked.
+        assertEquals("daft punk", run(VoiceRequest("daft punk")))
+        assertEquals(listOf("network", "wait", "resolve"), steps)
+        // No network (as of now) or offline mode: the downloads answer at once.
+        steps.clear()
+        offline = true
+        run(VoiceRequest("road trip"))
+        assertEquals(listOf("network", "resolve"), steps)
+        // "Play something" needs no search.
+        steps.clear()
+        offline = false
+        run(VoiceRequest(""))
+        assertEquals(listOf("resolve"), steps)
     }
 }

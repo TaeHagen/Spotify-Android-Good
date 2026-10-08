@@ -72,3 +72,22 @@ internal sealed interface VoiceOutcome {
         }
     }
 }
+
+/**
+ * How both entries resolve a [VoiceRequest]: the catalog's search needs the session, so unless the
+ * request is blank ("play something") or the phone is offline ([isOffline]: offline mode, or no
+ * network as of now, also read while the engine is stopped) it waits for the session first
+ * ([awaitSession], bounded). The caller holds the engine meanwhile: an idle-stopped session only
+ * starts for a holder (the activity's MEDIA_PLAY_FROM_SEARCH arrives before its own UI holder).
+ */
+internal object VoiceEntry {
+    suspend fun <T> resolve(
+        request: VoiceRequest,
+        isOffline: () -> Boolean,
+        awaitSession: suspend () -> Unit,
+        resolve: suspend (VoiceRequest) -> T,
+    ): T {
+        if (!request.isBlank && !isOffline()) awaitSession()
+        return resolve(request)
+    }
+}
