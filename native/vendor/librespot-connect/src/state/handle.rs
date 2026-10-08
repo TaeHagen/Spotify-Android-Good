@@ -12,10 +12,10 @@ use crate::{
 };
 use protobuf::MessageField;
 
-// SPOTIFYGOOD: see ConnectState::playback_anchor
+// SPOTIFYGOOD: see ConnectState::playback_anchor (pub(super) for ConnectState::place_in_order)
 /// Where the playback continues in the default context, worked out before its order or the
 /// repeat option change and applied after
-enum Anchor {
+pub(super) enum Anchor {
     /// after the context track with this uid: the current track, the track a playing smart
     /// shuffle suggestion follows, or the last context track played before a queued track
     After(String),
@@ -37,6 +37,8 @@ impl ConnectState {
         self.set_shuffle(false);
         // SPOTIFYGOOD: smart shuffle only exists on top of shuffle
         self.clear_smart_shuffle();
+        // SPOTIFYGOOD: and a kept order (see shuffle_in_order) only while shuffled
+        self.kept_shuffle_order = None;
 
         if matches!(self.active_context, ContextType::Autoplay) {
             // SPOTIFYGOOD: the default context was played to its end, unshuffling it changes no
@@ -99,7 +101,7 @@ impl ConnectState {
     // SPOTIFYGOOD: see Anchor
     /// Where the playback continues in the default context, `None` without a current track or
     /// default context
-    fn playback_anchor(&self) -> Option<Anchor> {
+    pub(super) fn playback_anchor(&self) -> Option<Anchor> {
         if self.current_track(MessageField::is_none) {
             return None;
         }
@@ -140,7 +142,7 @@ impl ConnectState {
 
     /// The position in the (current order of the) default context that the playback continues
     /// after, see [ConnectState::reset_playback_to_position]
-    fn anchor_position(&self, anchor: &Anchor) -> Option<usize> {
+    pub(super) fn anchor_position(&self, anchor: &Anchor) -> Option<usize> {
         let ctx = self.get_context(ContextType::Default).ok()?;
         let position = |uid: &str| ctx.tracks.iter().position(|t| t.uid == uid);
         match anchor {
