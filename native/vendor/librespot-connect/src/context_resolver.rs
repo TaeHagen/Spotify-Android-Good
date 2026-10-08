@@ -520,6 +520,45 @@ impl ContextResolver {
         true
     }
 
+    // SPOTIFYGOOD: a transfer waited for the last page of its context, with empty next tracks
+    // (handle_initial_transfer cleared them): the song ending, or a Next, meanwhile stopped the
+    // playback. Like a load, it is set up with the pages there are.
+    /// Finishes a pending transfer once the resolve of its context was applied (call it before
+    /// [ContextResolver::try_finish], the resolve is still the next one): with the pages there
+    /// are, and a current track that isn't on them yet is placed once its page is there.
+    /// Returns whether it did.
+    pub fn finish_transfer_early(
+        &self,
+        state: &mut ConnectState,
+        transfer_state: &mut Option<TransferState>,
+    ) -> bool {
+        let Some((next, _, _)) = self.find_next() else {
+            return false;
+        };
+        if next.update != ContextType::Default
+            || next.action != ContextAction::Replace
+            || next.page
+            || !matches!(state.active_context, ContextType::Default)
+            || state.get_context(ContextType::Default).is_err()
+        {
+            return false;
+        }
+        let Some(transfer) = transfer_state.take() else {
+            return false;
+        };
+
+        if let Err(why) = state.finish_transfer(transfer) {
+            error!("setup of the transfer failed: {why}")
+        }
+        if self.has_pending_pages(ContextType::Default) && state.current_track_outside_context() {
+            state.place_current_track_when_resolved();
+        }
+
+        state.update_restrictions();
+        state.update_queue_revision();
+        true
+    }
+
     pub fn try_finish(
         &self,
         state: &mut ConnectState,
