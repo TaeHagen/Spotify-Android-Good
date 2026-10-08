@@ -615,9 +615,14 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
              of item, when playback leaves the phone, every 15 s while playing; within 30 s of the
              end it is played), shown on show / episode pages, saved episodes and downloads, and a
              play of an episode with no position resumes there (`PlayerController.episodeResume`).
-             The phone's progress wins unless Spotify's state changed since it was recorded (the
-             episode was played elsewhere afterwards). Nothing is reported back to Spotify: progress
-             made on this phone, offline above all, is not synced to other devices.
+             Only a fresh answer counts as Spotify's current state: cached show pages (fresh hits,
+             copies shown while revalidating or offline) and download metadata carry no played state
+             (stripped when emitted / stored / decoded). The phone's progress wins unless a fresh
+             state differs from the one seen when it was recorded (the episode was played elsewhere
+             afterwards); then Spotify's point becomes the phone's resume point, so the downloads,
+             Android Auto and offline plays resume it too. A partly played fresh state is also kept
+             when the phone has none. Nothing is reported back to Spotify: progress made on this
+             phone, offline above all, is not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
               "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}

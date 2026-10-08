@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.ui.screens.library
 
 import androidx.compose.runtime.Immutable
+import com.taehagen.spotifygood.data.withoutPlayedState
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.download.CollectionType
 import com.taehagen.spotifygood.download.DownloadedCollection as StoredCollection
@@ -188,7 +189,9 @@ fun decodeDownloadMetadata(json: Json, uri: String, metadataJson: String?): Down
     if (metadataJson.isNullOrBlank()) return null
     return runCatching {
         if (uri.startsWith("spotify:episode:")) {
-            DownloadMetadata.OfEpisode(json.decodeFromString<Episode>(metadataJson))
+            // Played state stored with a download is frozen at download time, not Spotify's
+            // current one (docs §6.5): never used.
+            DownloadMetadata.OfEpisode(json.decodeFromString<Episode>(metadataJson).withoutPlayedState())
         } else {
             DownloadMetadata.OfTrack(json.decodeFromString<Track>(metadataJson))
         }
