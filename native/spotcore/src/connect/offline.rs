@@ -158,7 +158,8 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
         start: pass.start,
         outside,
         user_queued,
-        position_ms: super::restore::position_now(s, now_ms).max(0) as u64,
+        // As far as it was heard (a stalled stream goes on in the snapshot).
+        position_ms: super::restore::position_heard(s, now_ms, super::restore::player_decoded().as_ref()).max(0) as u64,
         duration_ms: s.duration_ms.max(0) as u64,
         playing,
         loading,
