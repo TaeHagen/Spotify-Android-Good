@@ -75,6 +75,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -229,7 +230,7 @@ private fun MediaActionsContent(target: MediaActionTarget, dismiss: () -> Unit, 
 @Composable
 private fun TrackActions(t: MediaActionTarget.TrackTarget, s: ActionScope) {
     val track = t.track
-    val liked by remember(track.uri) { s.graph.library.isSaved(track.uri) }.collectAsStateWithLifecycle(false)
+    val liked by remember(track.uri) { s.graph.library.isSaved(track.uri) }.collectAsStateWithLifecycle(null)
     val download by remember(track.uri) { s.graph.downloads.state(track.uri) }.collectAsStateWithLifecycle(null)
     SheetHeader(
         imageUrl = track.album?.images?.best(160),
@@ -242,8 +243,8 @@ private fun TrackActions(t: MediaActionTarget.TrackTarget, s: ActionScope) {
             s.runner.addToQueue(listOf(track.uri))
         }
     }
-    LikeAction(liked, s) {
-        s.runner.setSaved(track.uri, !liked, R.string.shell_msg_liked, R.string.shell_msg_unliked)
+    LikeAction(liked, s) { shown ->
+        s.runner.setSaved(track.uri, !shown, R.string.shell_msg_liked, R.string.shell_msg_unliked)
     }
     SheetAction(Icons.AutoMirrored.Rounded.PlaylistAdd, stringResource(R.string.shell_action_add_to_playlist)) {
         s.dismissNow()
@@ -285,7 +286,7 @@ private fun TrackActions(t: MediaActionTarget.TrackTarget, s: ActionScope) {
 @Composable
 private fun EpisodeActions(t: MediaActionTarget.EpisodeTarget, s: ActionScope) {
     val episode = t.episode
-    val saved by remember(episode.uri) { s.graph.library.isSaved(episode.uri) }.collectAsStateWithLifecycle(false)
+    val saved by remember(episode.uri) { s.graph.library.isSaved(episode.uri) }.collectAsStateWithLifecycle(null)
     val download by remember(episode.uri) { s.graph.downloads.state(episode.uri) }.collectAsStateWithLifecycle(null)
     SheetHeader(
         imageUrl = episode.images.best(160) ?: episode.show?.images?.best(160),
@@ -297,13 +298,13 @@ private fun EpisodeActions(t: MediaActionTarget.EpisodeTarget, s: ActionScope) {
         s.dismiss()
         s.runner.addToQueue(listOf(episode.uri))
     }
-    SheetAction(
-        icon = if (saved) Icons.Rounded.LibraryAddCheck else Icons.Rounded.LibraryAdd,
-        label = stringResource(if (saved) R.string.shell_action_remove_from_episodes else R.string.shell_action_save_to_episodes),
-        tint = if (saved) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-    ) {
-        s.dismiss()
-        s.runner.setSaved(episode.uri, !saved, R.string.shell_msg_saved_episode, R.string.shell_msg_removed_episode)
+    SavedAction(
+        saved = saved,
+        icon = { if (it) Icons.Rounded.LibraryAddCheck else Icons.Rounded.LibraryAdd },
+        label = { if (it) R.string.shell_action_remove_from_episodes else R.string.shell_action_save_to_episodes },
+        s = s,
+    ) { shown ->
+        s.runner.setSaved(episode.uri, !shown, R.string.shell_msg_saved_episode, R.string.shell_msg_removed_episode)
     }
     ItemDownloadAction(episode.uri, download, s)
     episode.show?.takeIf { it.uri.isNotBlank() }?.let { show ->
@@ -316,7 +317,7 @@ private fun EpisodeActions(t: MediaActionTarget.EpisodeTarget, s: ActionScope) {
 @Composable
 private fun AlbumActions(t: MediaActionTarget.AlbumTarget, s: ActionScope) {
     val album = t.album
-    val saved by remember(album.uri) { s.graph.library.isSaved(album.uri) }.collectAsStateWithLifecycle(false)
+    val saved by remember(album.uri) { s.graph.library.isSaved(album.uri) }.collectAsStateWithLifecycle(null)
     val downloaded by remember(album.uri) { s.graph.downloads.isCollectionDownloaded(album.uri) }.collectAsStateWithLifecycle(false)
     SheetHeader(
         imageUrl = album.images.best(160),
@@ -334,13 +335,13 @@ private fun AlbumActions(t: MediaActionTarget.AlbumTarget, s: ActionScope) {
             s.graph.catalog.album(album.uri).awaitData()?.tracks.orEmpty().filter { it.playable }.map { it.uri }
         }
     }
-    SheetAction(
-        icon = if (saved) Icons.Rounded.LibraryAddCheck else Icons.Rounded.LibraryAdd,
-        label = stringResource(if (saved) R.string.shell_action_remove_from_library else R.string.shell_action_save_to_library),
-        tint = if (saved) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-    ) {
-        s.dismiss()
-        s.runner.setSaved(album.uri, !saved, R.string.shell_msg_saved_to_library, R.string.shell_msg_removed_from_library)
+    SavedAction(
+        saved = saved,
+        icon = { if (it) Icons.Rounded.LibraryAddCheck else Icons.Rounded.LibraryAdd },
+        label = { if (it) R.string.shell_action_remove_from_library else R.string.shell_action_save_to_library },
+        s = s,
+    ) { shown ->
+        s.runner.setSaved(album.uri, !shown, R.string.shell_msg_saved_to_library, R.string.shell_msg_removed_from_library)
     }
     CollectionDownloadAction(downloaded, s) {
         CollectionRef(album.uri, CollectionType.ALBUM, album.name, album.images.best(300))
@@ -358,7 +359,7 @@ private fun AlbumActions(t: MediaActionTarget.AlbumTarget, s: ActionScope) {
 @Composable
 private fun ArtistActions(t: MediaActionTarget.ArtistTarget, s: ActionScope) {
     val artist = t.artist
-    val following by remember(artist.uri) { s.graph.library.isSaved(artist.uri) }.collectAsStateWithLifecycle(false)
+    val following by remember(artist.uri) { s.graph.library.isSaved(artist.uri) }.collectAsStateWithLifecycle(null)
     SheetHeader(
         imageUrl = artist.images.best(160),
         title = artist.name,
@@ -366,12 +367,14 @@ private fun ArtistActions(t: MediaActionTarget.ArtistTarget, s: ActionScope) {
         shape = CircleShape,
         placeholder = Icons.Rounded.Person,
     )
-    SheetAction(
-        icon = if (following) Icons.Rounded.PersonRemove else Icons.Rounded.PersonAdd,
-        label = stringResource(if (following) R.string.shell_action_unfollow else R.string.shell_action_follow),
-    ) {
-        s.dismiss()
-        s.runner.setSaved(artist.uri, !following, R.string.shell_msg_following, R.string.shell_msg_unfollowed)
+    SavedAction(
+        saved = following,
+        icon = { if (it) Icons.Rounded.PersonRemove else Icons.Rounded.PersonAdd },
+        label = { if (it) R.string.shell_action_unfollow else R.string.shell_action_follow },
+        s = s,
+        accent = false,
+    ) { shown ->
+        s.runner.setSaved(artist.uri, !shown, R.string.shell_msg_following, R.string.shell_msg_unfollowed)
     }
     SheetAction(Icons.Rounded.Person, stringResource(R.string.shell_action_view_artist)) { s.go(Route.Artist(artist.uri)) }
     SheetAction(Icons.Rounded.Radio, stringResource(R.string.shell_action_start_radio)) { s.radio(artist.uri) }
@@ -381,7 +384,7 @@ private fun ArtistActions(t: MediaActionTarget.ArtistTarget, s: ActionScope) {
 @Composable
 private fun PlaylistActions(t: MediaActionTarget.PlaylistTarget, s: ActionScope) {
     val playlist = t.playlist
-    val following by remember(playlist.uri) { s.graph.library.isSaved(playlist.uri) }.collectAsStateWithLifecycle(false)
+    val following by remember(playlist.uri) { s.graph.library.isSaved(playlist.uri) }.collectAsStateWithLifecycle(null)
     val downloaded by remember(playlist.uri) { s.graph.downloads.isCollectionDownloaded(playlist.uri) }.collectAsStateWithLifecycle(false)
     val owner = playlist.owner?.let { it.displayName ?: it.username }
     SheetHeader(
@@ -402,14 +405,14 @@ private fun PlaylistActions(t: MediaActionTarget.PlaylistTarget, s: ActionScope)
         SheetAction(Icons.Rounded.Edit, stringResource(R.string.shell_action_rename)) { s.setPage(SheetPage.Rename) }
         SheetAction(Icons.Rounded.Delete, stringResource(R.string.shell_action_delete_playlist)) { s.setPage(SheetPage.ConfirmDelete) }
     } else {
-        SheetAction(
-            icon = if (following) Icons.Rounded.LibraryAddCheck else Icons.Rounded.LibraryAdd,
-            label = stringResource(if (following) R.string.shell_action_remove_from_library else R.string.shell_action_save_to_library),
-            tint = if (following) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-        ) {
-            s.dismiss()
-            s.runner.launch(if (following) R.string.shell_msg_removed_from_library else R.string.shell_msg_saved_to_library) {
-                if (following) s.graph.playlists.unfollow(playlist.uri) else s.graph.playlists.follow(playlist.uri)
+        SavedAction(
+            saved = following,
+            icon = { if (it) Icons.Rounded.LibraryAddCheck else Icons.Rounded.LibraryAdd },
+            label = { if (it) R.string.shell_action_remove_from_library else R.string.shell_action_save_to_library },
+            s = s,
+        ) { shown ->
+            s.runner.launch(if (shown) R.string.shell_msg_removed_from_library else R.string.shell_msg_saved_to_library) {
+                if (shown) s.graph.playlists.unfollow(playlist.uri) else s.graph.playlists.follow(playlist.uri)
             }
         }
     }
@@ -422,20 +425,20 @@ private fun PlaylistActions(t: MediaActionTarget.PlaylistTarget, s: ActionScope)
 @Composable
 private fun ShowActions(t: MediaActionTarget.ShowTarget, s: ActionScope) {
     val show = t.show
-    val following by remember(show.uri) { s.graph.library.isSaved(show.uri) }.collectAsStateWithLifecycle(false)
+    val following by remember(show.uri) { s.graph.library.isSaved(show.uri) }.collectAsStateWithLifecycle(null)
     SheetHeader(
         imageUrl = show.images.best(160),
         title = show.name,
         subtitle = show.publisher ?: stringResource(R.string.shell_type_podcast),
         placeholder = Icons.Rounded.Podcasts,
     )
-    SheetAction(
-        icon = if (following) Icons.Rounded.LibraryAddCheck else Icons.Rounded.LibraryAdd,
-        label = stringResource(if (following) R.string.shell_action_unfollow else R.string.shell_action_follow),
-        tint = if (following) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-    ) {
-        s.dismiss()
-        s.runner.setSaved(show.uri, !following, R.string.shell_msg_following, R.string.shell_msg_unfollowed)
+    SavedAction(
+        saved = following,
+        icon = { if (it) Icons.Rounded.LibraryAddCheck else Icons.Rounded.LibraryAdd },
+        label = { if (it) R.string.shell_action_unfollow else R.string.shell_action_follow },
+        s = s,
+    ) { shown ->
+        s.runner.setSaved(show.uri, !shown, R.string.shell_msg_following, R.string.shell_msg_unfollowed)
     }
     SheetAction(Icons.Rounded.Podcasts, stringResource(R.string.shell_action_go_to_show)) { s.go(Route.Show(show.uri)) }
     SheetAction(Icons.Rounded.Share, stringResource(R.string.shell_action_share)) { s.share(show.uri, show.name) }
@@ -444,14 +447,40 @@ private fun ShowActions(t: MediaActionTarget.ShowTarget, s: ActionScope) {
 // ---- Shared action rows -------------------------------------------------------------------------
 
 @Composable
-private fun LikeAction(liked: Boolean, s: ActionScope, toggle: () -> Unit) {
+private fun LikeAction(liked: Boolean?, s: ActionScope, toggle: (shown: Boolean) -> Unit) {
+    SavedAction(
+        saved = liked,
+        icon = { if (it) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder },
+        label = { if (it) R.string.shell_action_unlike else R.string.shell_action_like },
+        s = s,
+        toggle = toggle,
+    )
+}
+
+/**
+ * A save/like/follow row. [toggle] gets the state the row showed and writes its opposite. While
+ * [saved] is unknown (null: lookup pending, or it failed offline and is retried online) the row
+ * shows the "not saved" action disabled: a tap must not act on a guess.
+ */
+@Composable
+private fun SavedAction(
+    saved: Boolean?,
+    icon: (Boolean) -> ImageVector,
+    label: (Boolean) -> Int,
+    s: ActionScope,
+    accent: Boolean = true,
+    toggle: (shown: Boolean) -> Unit,
+) {
+    val shown = saved == true
     SheetAction(
-        icon = if (liked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-        label = stringResource(if (liked) R.string.shell_action_unlike else R.string.shell_action_like),
-        tint = if (liked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+        icon = icon(shown),
+        label = stringResource(label(shown)),
+        tint = if (shown && accent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+        enabled = saved != null,
     ) {
+        if (saved == null) return@SheetAction
         s.dismiss()
-        toggle()
+        toggle(saved)
     }
 }
 
@@ -644,14 +673,16 @@ private fun SheetAction(
     icon: ImageVector,
     label: String,
     tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(role = Role.Button, onClick = onClick)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
             .heightIn(min = 56.dp)
-            .padding(horizontal = 20.dp, vertical = 12.dp),
+            .padding(horizontal = 20.dp, vertical = 12.dp)
+            .alpha(if (enabled) 1f else DISABLED_ALPHA),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(24.dp))
@@ -659,6 +690,9 @@ private fun SheetAction(
         Text(label, style = MaterialTheme.typography.bodyLarge)
     }
 }
+
+/** Material's disabled content alpha. */
+private const val DISABLED_ALPHA = 0.38f
 
 // ---- Add to playlist ------------------------------------------------------------------------
 

@@ -15,6 +15,9 @@ import com.taehagen.spotifygood.model.MediaRef
 import com.taehagen.spotifygood.model.MediaType
 import com.taehagen.spotifygood.model.SearchResults
 import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.ui.screens.album.engineReach
+import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
+import com.taehagen.spotifygood.ui.screens.album.isNetworkClassError
 import com.taehagen.spotifygood.ui.screens.library.BrowseError
 import com.taehagen.spotifygood.ui.screens.library.NowPlaying
 import com.taehagen.spotifygood.ui.screens.library.PageResult
@@ -42,6 +45,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
@@ -136,8 +140,13 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
     private val immediate = MutableSharedFlow<String>(extraBufferCapacity = 1)
     private val cache = SearchCache<SearchResults>()
 
-    /** The selected type filter's list, kept while the screen is away (back from a result, tabs). */
+    /**
+     * The selected type filter's list, kept while the screen is away (back from a result, tabs).
+     * A page waits for a connecting session first; one that failed anyway loads again once the
+     * session is ONLINE (see init).
+     */
     private val typedPages = KeptPages<TypedKey, SearchItem>(viewModelScope, TYPED_PAGE_SIZE, SearchItem::key) { key, offset, limit ->
+        graph.awaitConnectingSession()
         graph.search.search(key.query, setOf(key.type), offset, limit).let { PageResult(it.itemsOf(key.type), total = it.totalOf(key.type)) }
     }
     @Volatile private var lastReady: TopResultsState.Ready? = null
@@ -178,6 +187,11 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
                 retry.update { it + 1 }
             }
             .launchIn(viewModelScope)
+        // A typed list that failed while the session was connecting (NOT_CONNECTED) loads again
+        // once it is ONLINE, without a Retry tap. Top results do the same in [topResults].
+        viewModelScope.launch {
+            retryFailedListWhenOnline(graph.engineReachFlow(), { typedPages.loader?.state }) { retry() }
+        }
     }
 
     private val recent: Flow<List<RecentSearch>> = graph.search.recent
@@ -204,6 +218,11 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SearchUiState())
 
+    /**
+     * Top results of [query]: cached, or searched once a connecting session is online (bounded
+     * wait). A search that failed because the session wasn't online yet shows the error and runs
+     * again by itself once it is ([searchWhenOnline]).
+     */
     private fun topResults(query: String): Flow<TopResultsState> = flow {
         val key = query.lowercase()
         cache[key]?.let { cached ->
@@ -211,14 +230,26 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
             return@flow
         }
         emit(lastReady?.copy(isRefreshing = true) ?: TopResultsState.Loading)
-        attempt { graph.search.search(query).distinct() }
-            .onSuccess { results ->
-                // Empty or partial results are not kept: revisiting the query or Retry asks the
-                // engine again (a failed source can be transient).
-                if (results.cacheable()) cache[key] = results
-                emit(readyOrEmpty(query, results))
-            }
-            .onFailure { emit(TopResultsState.Failed(query, it.toBrowseError())) }
+        val runs = searchWhenOnline(
+            reach = graph.engineReachFlow(),
+            currentReach = { graph.engineReach() },
+            awaitSession = { graph.awaitConnectingSession() },
+            isConnectionError = ::isNetworkClassError,
+        ) { graph.search.search(query).distinct() }
+        emitAll(
+            runs.map { run ->
+                when (run) {
+                    SearchAttempt.Running -> TopResultsState.Loading
+                    is SearchAttempt.Succeeded -> {
+                        // Empty or partial results are not kept: revisiting the query or Retry asks
+                        // the engine again (a failed source can be transient).
+                        if (run.value.cacheable()) cache[key] = run.value
+                        readyOrEmpty(query, run.value)
+                    }
+                    is SearchAttempt.Failed -> TopResultsState.Failed(query, run.error.toBrowseError())
+                }
+            },
+        )
     }
 
     private fun readyOrEmpty(query: String, results: SearchResults): TopResultsState =
@@ -335,6 +366,7 @@ class SearchResultsViewModel(private val graph: AppGraph, private val query: Str
     private val type: SearchType = searchTypeOf(typeWire) ?: SearchType.TRACK
 
     private val loader = PagedLoader(viewModelScope, PAGE_SIZE, SearchItem::key) { offset, limit ->
+        graph.awaitConnectingSession()
         graph.search.search(query, setOf(type), offset, limit).let { PageResult(it.itemsOf(type), total = it.totalOf(type)) }
     }
 
@@ -350,14 +382,13 @@ class SearchResultsViewModel(private val graph: AppGraph, private val query: Str
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SearchResultsUiState(type))
 
     init {
-        // First page as soon as we are online, and again after coming back online with nothing loaded
-        // or a failed load (e.g. the reload after an explicit-filter change: it then replaces the
-        // stale rows).
+        // First page as soon as the session is reachable (a connecting one is awaited by the
+        // fetch), and again once it is ONLINE with nothing loaded or a failed load: a page that
+        // failed NOT_CONNECTED while connecting, or the reload after an explicit-filter change
+        // (it then replaces the stale rows). The network flag alone is not enough: requests fail
+        // while the session reconnects. [offline] only drives the banner.
         viewModelScope.launch {
-            offline.collect { isOffline ->
-                val paged = loader.state.value
-                if (!isOffline && (paged.items.isEmpty() || paged.error != null)) loader.loadMore()
-            }
+            keepLoadedWhileReachable(graph.engineReachFlow(), loader.state, loader::loadMore)
         }
         // Loaded pages carry playable flags of the old explicit filter.
         graph.explicitFilterChanges().onEach { loader.reload() }.launchIn(viewModelScope)

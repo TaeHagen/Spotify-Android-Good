@@ -116,7 +116,7 @@ class AppGraph(val app: Application) {
 
     val responseCache: ResponseCache by lazy { ResponseCache(database.responseCache(), json) }
     val catalog: CatalogRepository by lazy { CatalogRepository(rpc, responseCache) }
-    val library: LibraryRepository by lazy { LibraryRepository(appScope, rpc, responseCache) }
+    val library: LibraryRepository by lazy { LibraryRepository(appScope, rpc, responseCache, engine.isOnline) }
     val search: SearchRepository by lazy { SearchRepository(rpc, database.recentSearches()) }
     val home: HomeRepository by lazy { HomeRepository(rpc, responseCache) }
     val lyrics: LyricsRepository by lazy { LyricsRepository(rpc) }

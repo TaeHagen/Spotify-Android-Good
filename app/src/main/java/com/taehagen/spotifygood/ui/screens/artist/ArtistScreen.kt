@@ -153,7 +153,7 @@ private fun ArtistList(
             DetailActionRow(
                 modifier = Modifier.padding(horizontal = 12.dp),
                 leading = {
-                    FollowButton(following = state.following == true, onClick = onToggleFollow, modifier = Modifier.padding(start = 4.dp, end = 4.dp))
+                    FollowButton(following = state.following, onClick = onToggleFollow, modifier = Modifier.padding(start = 4.dp, end = 4.dp))
                     MoreButton(
                         onClick = { navigator.showActions(MediaActionTarget.ArtistTarget(ArtistRef(artist.uri, artist.name, artist.images))) },
                         label = artist.name,

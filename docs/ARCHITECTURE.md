@@ -312,11 +312,13 @@ on to the next one): the track keeps playing without a reload, with the
 visible tracks around it in play order (user queue included, one pass of the context with
 repeat-all, its start that Spirc no longer lists as previous tracks in front: the queue's own
 repeat wraps it) up to the first one on either side that isn't downloaded (the queue ends
-there), the position, repeat mode, shuffle flag and play state. No restore point is kept for
+there; a full list of Spirc's, 80 next tracks, ends before its last one, where the context goes
+on), the position, repeat mode, shuffle flag and play state. No restore point is kept for
 that session; when it is back, the queue plays on as above, and when it reaches the end of the
 handed-over window (stops or would wrap) with a visible session up and no other device active,
 it hands back to Spirc: the queue's track stops, and the context loads at its first track after
-the window (suggestions skipped, smart shuffle adds new ones; the user queue's tracks there are
+the window (with repeat-all and a pass that isn't all downloaded, at the context's start;
+suggestions skipped, smart shuffle adds new ones; the user queue's tracks there are
 queued again and play after that first track), with its options as now, unless the user changed
 the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
 stays shown (loading), so the notification and the media session stay; a failed load makes
@@ -471,7 +473,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
-| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs","shuffle"?,"smartShuffle"?,"repeat"?,"trackUris"?:["…"]}?}` (`trackUris`: the session as a track list, when its current track wasn't a context track; played from `trackUri` on instead of the context) (self = pull, other = push). When no device is active, or this phone is active with nothing loaded (a failed load) and nothing on its way, `resume` (the app's last session, with its modes; smart shuffle becomes a plain shuffle on another device) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE` (Kotlin then keeps the device as the pending target for the next play, see §8). Pushing offline playback whose current track is a track of a context that can be loaded again hands over that context at the track (position, shuffle, repeat; its user queue added after it), other offline playback its tracks (in play order), current position and repeat mode; either is kept paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as one pass of the visible tracks in play order) |
+| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs","shuffle"?,"smartShuffle"?,"repeat"?,"trackUris"?:["…"]}?}` (`trackUris`: the session as a track list, when its current track wasn't a context track; played from `trackUri` on instead of the context) (self = pull, other = push). When no device is active, or this phone is active with nothing loaded (a failed load) and nothing on its way, `resume` (the app's last session, with its modes; smart shuffle becomes a plain shuffle on another device) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE` (Kotlin then keeps the device as the pending target for the next play, see §8). A push while a `player.load` here is still on its way (fetching its context) starts that load on the target, and this phone lets go of it. Pushing offline playback whose current track is a track of a context that can be loaded again hands over that context at the track (position, shuffle, repeat; its user queue, also the part adopted from Spirc, added after it in the background once this phone stopped), other offline playback its tracks (in play order), current position and repeat mode; either is kept paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as one pass of the visible tracks in play order) |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
@@ -1109,8 +1111,19 @@ refetched twice while on screen (after 15 s and 30 s). The home feed is treated 
 when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
-app scope, so they complete even if their screen closes. Liked-state of the
-current track is cached in memory (LRU) and refreshed via `library.contains`.
+app scope, so they complete even if their screen closes. Saved/liked state is cached in
+memory (LRU) and looked up via `library.contains` (batched). It is unknown until looked up: a
+failed lookup (offline, the session still connecting, a network error) stays unknown, never
+"not saved", and is looked up again when the session comes online (with backoff if it fails
+while online). Unknown hearts / Save / Follow controls are shown disabled. A toggle writes the
+opposite of the state the control showed, never of the server's current state, so a stale
+"not saved" can't remove an item (and its download).
+Native catalog calls don't wait for a session: they fail `NOT_CONNECTED` at once while it
+connects or reconnects. Browse screens load once the engine's reach (§4.6) is ONLINE and
+again after a reconnect when they failed. Search waits up to 10 s for a connecting session
+(not when offline or in backoff, so a captive portal can't stall it); a search or result page
+that failed before the session was ONLINE shows its error and runs again by itself once it is
+(a connection error while ONLINE: after the next reconnect), without a Retry tap.
 
 ### 9.9 UI
 

@@ -163,9 +163,20 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
 
     private val currentUri: Flow<String?> = snapshot.map { it.track?.uri }.distinctUntilChanged()
 
-    val isLiked: StateFlow<Boolean> = currentUri
-        .flatMapLatest { uri -> if (uri == null) flowOf(false) else library.isSaved(uri).catch { emit(false) } }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), false)
+    /** Liked state of the current item, with the item it belongs to (see [LikeState.shownFor]). */
+    private val likeState: StateFlow<LikeState> = currentUri
+        .flatMapLatest { uri ->
+            if (uri == null) {
+                flowOf(LikeState.NONE)
+            } else {
+                library.isSaved(uri).map { LikeState(uri, it) }.catch { emit(LikeState(uri, null)) }
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), LikeState.NONE)
+
+    /** Whether the current item is liked; null while unknown (lookup pending or failed): the heart is disabled. */
+    val isLiked: StateFlow<Boolean?> = likeState.map { it.liked }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), null)
 
     /**
      * (uri, downloaded cover path) of the current item; the path is null until it is downloaded.
@@ -351,11 +362,13 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
     fun setVolume(volume: Int) = volumeThrottle.offer(volume)
     fun startRadio(uri: String) = player.startRadio(uri)
 
+    /** Heart tap: writes the opposite of what the heart showed for the current item; nothing while unknown. */
     fun toggleLike() {
         val uri = snapshot.value.track?.uri ?: return
+        val shown = likeState.value.shownFor(uri) ?: return
         viewModelScope.launch {
             try {
-                library.toggleSaved(uri)
+                library.toggleSaved(uri, displayed = shown)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
