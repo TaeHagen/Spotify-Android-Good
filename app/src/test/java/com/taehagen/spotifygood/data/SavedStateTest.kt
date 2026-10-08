@@ -3,6 +3,9 @@ package com.taehagen.spotifygood.data
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
@@ -186,5 +189,140 @@ class CoalescingBatcherTest {
         } catch (e: kotlinx.coroutines.CancellationException) {
             // expected
         }
+    }
+}
+
+class SavedStateObserveTest {
+    private class NotConnected : Exception("NOT_CONNECTED")
+
+    @Test
+    fun knownStateEmitsAtOnceWithoutALookup() = runTest {
+        val store = SavedStateStore()
+        store.applyLookup(mapOf("a" to true), store.currentSeq())
+        var calls = 0
+        val values = mutableListOf<Boolean?>()
+        val job = launch { store.observe("a", { calls++; false }, MutableStateFlow(true)).toList(values) }
+        runCurrent()
+        assertEquals(listOf<Boolean?>(true), values)
+        assertEquals(0, calls)
+        job.cancel()
+    }
+
+    @Test
+    fun failedLookupIsUnknownNotFalseAndIsRetriedWhenTheSessionComesOnline() = runTest {
+        // Cold start / airplane mode: the session is not online, `library.contains` fails.
+        val online = MutableStateFlow(false)
+        val store = SavedStateStore()
+        var serverConnected = false
+        var calls = 0
+        val lookup: suspend (String) -> Boolean = {
+            calls++
+            if (!serverConnected) throw NotConnected()
+            true // the song is liked
+        }
+        val values = mutableListOf<Boolean?>()
+        val job = launch { store.observe("track", lookup, online).toList(values) }
+        runCurrent()
+        assertEquals("unknown, never a definitive false", listOf<Boolean?>(null), values)
+        assertEquals(1, calls)
+
+        // Nothing retries while the session is down (no polling).
+        advanceTimeBy(600_000)
+        assertEquals(1, calls)
+
+        serverConnected = true
+        online.value = true
+        runCurrent()
+        assertEquals(listOf(null, true), values)
+        assertEquals(2, calls)
+        assertEquals(true, store.get("track"))
+        job.cancel()
+    }
+
+    @Test
+    fun failureWhileOnlineRetriesWithBackoff() = runTest {
+        val store = SavedStateStore()
+        val attempts = mutableListOf<Long>()
+        val lookup: suspend (String) -> Boolean = {
+            attempts += testScheduler.currentTime
+            if (attempts.size < 3) throw IllegalStateException("RATE_LIMITED")
+            false
+        }
+        val values = mutableListOf<Boolean?>()
+        val job = launch { store.observe("a", lookup, MutableStateFlow(true)).toList(values) }
+        advanceTimeBy(60_000)
+        assertEquals(listOf(0L, 5_000L, 15_000L), attempts)
+        assertEquals(listOf(null, false), values)
+        job.cancel()
+    }
+
+    @Test
+    fun reconnectRetriesBeforeTheBackoffEnds() = runTest {
+        val online = MutableStateFlow(true)
+        val store = SavedStateStore()
+        var calls = 0
+        val lookup: suspend (String) -> Boolean = {
+            calls++
+            if (calls == 1) throw NotConnected()
+            true
+        }
+        val values = mutableListOf<Boolean?>()
+        val job = launch { store.observe("a", lookup, online, retryDelayMs = { 60_000 }).toList(values) }
+        runCurrent()
+        assertEquals(1, calls)
+        advanceTimeBy(1_000)
+        online.value = false
+        runCurrent()
+        online.value = true
+        runCurrent()
+        assertEquals(2, calls)
+        assertEquals(listOf(null, true), values)
+        job.cancel()
+    }
+
+    @Test
+    fun aStateThatBecomesUnknownIsLookedUpAgain() = runTest {
+        val store = SavedStateStore()
+        store.applyLookup(mapOf("a" to true), store.currentSeq())
+        var calls = 0
+        val values = mutableListOf<Boolean?>()
+        val job = launch { store.observe("a", { calls++; false }, MutableStateFlow(true)).toList(values) }
+        runCurrent()
+        store.clear() // logout
+        runCurrent()
+        assertEquals(1, calls)
+        assertEquals(listOf(true, null, false), values)
+        job.cancel()
+    }
+
+    @Test
+    fun localMutationWinsOverAnUnknownState() = runTest {
+        val online = MutableStateFlow(false)
+        val store = SavedStateStore()
+        val values = mutableListOf<Boolean?>()
+        val job = launch { store.observe("a", { throw NotConnected() }, online).toList(values) }
+        runCurrent()
+        store.mutate(listOf("a"), true) // e.g. liked from the notification
+        runCurrent()
+        assertEquals(listOf(null, true), values)
+        job.cancel()
+    }
+
+    @Test
+    fun toggleWritesTheOppositeOfWhatWasShown() {
+        // The heart showed "not liked" (the user saw it empty): the tap saves, whatever the server
+        // state is (the old toggle flipped the server's `true` and removed the song).
+        assertEquals(true, toggleTarget(false))
+        assertEquals(false, toggleTarget(true))
+        // Unknown: nothing is written.
+        assertNull(toggleTarget(null))
+    }
+
+    @Test
+    fun retryDelayDoublesUpToFiveMinutes() {
+        assertEquals(5_000L, savedLookupRetryDelayMs(0))
+        assertEquals(10_000L, savedLookupRetryDelayMs(1))
+        assertEquals(300_000L, savedLookupRetryDelayMs(6))
+        assertEquals(300_000L, savedLookupRetryDelayMs(1_000))
     }
 }

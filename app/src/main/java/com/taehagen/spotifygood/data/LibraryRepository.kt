@@ -15,16 +15,21 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.emitAll
-import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.map
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.put
+
+/** A library change the app itself made (downloads re-sync the downloaded collection it affects). */
+sealed interface LibraryEdit {
+    /** Tracks liked ([saved]) or unliked: Liked Songs changed. */
+    data class LikedTracks(val uris: List<String>, val saved: Boolean) : LibraryEdit
+
+    /** Items of playlist [uri] were added, removed or moved (or it was renamed). */
+    data class PlaylistEdited(val uri: String) : LibraryEdit
+}
 
 /**
  * The user's library (native `library.*`): playlists (rootlist), Liked Songs, saved albums,
@@ -36,19 +41,18 @@ import kotlinx.serialization.json.put
  * * Saved state lives in an LRU memory map fed by fetched lists and by `library.contains` lookups
  *   that are coalesced (50 ms window, ≤ 50 URIs per call). Playlists are "saved" when they are in
  *   the rootlist; following/unfollowing them uses `playlist.follow` / `playlist.unfollow`.
+ * * A saved state is unknown (null) until looked up; a failed lookup stays unknown and runs again
+ *   once the session is [online] (`SpotifyEngine.isOnline`). Toggles act on the state the control
+ *   showed ([toggleSaved]).
  * * Mutations run in the repository scope (a like is not lost when the screen closes), flip the
  *   local state immediately and roll back the URIs that failed.
  */
-/** A library change the app itself made (downloads re-sync the downloaded collection it affects). */
-sealed interface LibraryEdit {
-    /** Tracks liked ([saved]) or unliked: Liked Songs changed. */
-    data class LikedTracks(val uris: List<String>, val saved: Boolean) : LibraryEdit
-
-    /** Items of playlist [uri] were added, removed or moved (or it was renamed). */
-    data class PlaylistEdited(val uri: String) : LibraryEdit
-}
-
-class LibraryRepository(private val scope: CoroutineScope, private val rpc: NativeRpc, private val cache: ResponseCache) {
+class LibraryRepository(
+    private val scope: CoroutineScope,
+    private val rpc: NativeRpc,
+    private val cache: ResponseCache,
+    private val online: StateFlow<Boolean>,
+) {
     private val saved = SavedStateStore()
     private val lookups = CoalescingBatcher(scope, LOOKUP_WINDOW_MS, LOOKUP_BATCH, ::resolveSaved)
 
@@ -107,25 +111,13 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
     }
 
     /**
-     * Live saved/followed state of [uri] (track/album/artist/show/episode/playlist).
-     *
-     * Unknown URIs trigger a (batched) lookup; until it answers nothing is emitted, so the UI does
-     * not flicker. If the lookup fails (e.g. offline) `false` is emitted so combined flows proceed.
+     * Live saved/followed state of [uri] (track/album/artist/show/episode/playlist); null while it
+     * is unknown. Emits at once: the known state, or null until the (batched) lookup answers. A
+     * failed lookup (offline, the session still connecting, a network error) keeps it null, never a
+     * definitive `false`, and is retried when the session comes online ([SavedStateStore.observe]).
+     * Show null as a neutral, disabled control; a toggle passes what was shown ([toggleSaved]).
      */
-    fun isSaved(uri: String): Flow<Boolean> = flow {
-        if (saved.get(uri) == null) {
-            val found = try {
-                lookups.get(uri)
-                true
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                false
-            }
-            if (!found && saved.get(uri) == null) emit(false)
-        }
-        emitAll(saved.version.map { saved.get(uri) }.filterNotNull())
-    }.distinctUntilChanged()
+    fun isSaved(uri: String): Flow<Boolean?> = saved.observe(uri, lookups::get, online)
 
     suspend fun setSaved(uris: List<String>, saved: Boolean) {
         val targets = uris.distinct()
@@ -135,9 +127,18 @@ class LibraryRepository(private val scope: CoroutineScope, private val rpc: Nati
         scope.async { mutate(targets, saved) }.await()
     }
 
-    suspend fun toggleSaved(uri: String) {
-        val current = saved.get(uri) ?: lookups.get(uri)
-        setSaved(listOf(uri), !current)
+    /**
+     * Toggle of a control that showed [displayed] for [uri]: writes the opposite of what the user
+     * saw, never of the server's current state (which may differ, e.g. after a failed lookup showed
+     * the wrong state). Unknown (null) writes nothing and only looks the state up again.
+     */
+    suspend fun toggleSaved(uri: String, displayed: Boolean?) {
+        val target = toggleTarget(displayed)
+        if (target == null) {
+            lookups.request(listOf(uri))
+            return
+        }
+        setSaved(listOf(uri), target)
     }
 
     /** Emits after any library mutation (lists can refresh). */

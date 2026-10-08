@@ -411,7 +411,7 @@ private fun PlaylistHeader(
                         leading = {
                             if (!meta.isOwnedByMe) {
                                 AddedButton(
-                                    added = state.following == true,
+                                    added = state.following,
                                     onClick = actions.onToggleFollow,
                                     addDescription = R.string.detail_save_playlist,
                                     removeDescription = R.string.detail_remove_playlist,

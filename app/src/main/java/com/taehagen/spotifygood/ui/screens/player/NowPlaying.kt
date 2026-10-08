@@ -244,7 +244,7 @@ private fun NowPlayingBody(
     snapshot: PlaybackSnapshot,
     track: PlaybackTrack,
     artwork: String?,
-    liked: Boolean,
+    liked: Boolean?,
     indicator: DeviceIndicator,
     remoteVolumeSupported: Boolean,
     lyrics: Lyrics?,
@@ -735,7 +735,7 @@ private fun NowPlayingArtwork(
 @Composable
 private fun TitleRow(
     track: PlaybackTrack,
-    liked: Boolean,
+    liked: Boolean?,
     onToggleLike: () -> Unit,
     onOpenUri: (String) -> Unit,
 ) {
