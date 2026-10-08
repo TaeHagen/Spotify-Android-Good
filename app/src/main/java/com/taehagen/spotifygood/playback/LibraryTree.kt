@@ -383,12 +383,12 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
     }
 
     /** A downloaded collection of the Downloads tab: browsable (its downloads) and playable (its context). */
-    private fun downloadedCollectionItem(collection: DownloadedCollection, group: String): MediaItem? {
+    private fun downloadedCollectionItem(collection: DownloadedCollection, group: String?): MediaItem? {
         val ref = collection.ref
         val liked = ref.type == CollectionType.LIKED_SONGS
         val title = if (liked) context.getString(R.string.playback_liked_songs) else ref.name
         if (isPlaceholder(title)) return null
-        val extras = groupExtras(group).apply {
+        val extras = (group?.let(::groupExtras) ?: Bundle()).apply {
             putLong(MediaConstants.EXTRAS_KEY_DOWNLOAD_STATUS, MediaConstants.EXTRAS_VALUE_STATUS_DOWNLOADED)
         }
         return MediaItem.Builder()
@@ -421,7 +421,8 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         OfflineTree.Section.EPISODES -> R.string.playback_episodes
     }
 
-    private fun isOffline(): Boolean = graph.settings.settings.value.offlineMode || !graph.engine.isNetworkAvailable.value
+    /** No network, or offline mode: only the downloads play (and can be browsed or found). */
+    fun isOffline(): Boolean = graph.settings.settings.value.offlineMode || !graph.engine.isNetworkAvailable.value
 
     private fun explicitFilter(): Boolean {
         val settings = graph.settings.settings.value
@@ -503,6 +504,8 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
 
     suspend fun search(query: String): List<MediaItem> {
         if (query.isBlank()) return emptyList()
+        // Offline the catalog cannot search (no session): what is downloaded can be found.
+        if (isOffline()) return offlineSearch(query)
         val results = graph.search.search(query, limit = SEARCH_LIMIT)
         return searchItems(results)
     }
@@ -526,16 +529,186 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
     }
 
     /**
-     * Resolves a voice request ("play X on SpotifyGood") into a playable item, honouring the
-     * `MediaStore.EXTRA_MEDIA_FOCUS` hint. Returns null when nothing matches.
+     * Resolves a voice request ("play X on SpotifyGood") into the items to play; empty when
+     * nothing matches. The user's own collections come first, by name ([VoiceMatch]), honouring
+     * the `MediaStore.EXTRA_MEDIA_FOCUS` hint and the names in the `EXTRA_MEDIA_*` extras: the
+     * downloaded ones and Liked Songs, then (online) Library's playlists, albums, artists and
+     * podcasts. The same or loosely the same name wins over the catalog's search (the user's own,
+     * maybe private, "Road Trip" over a stranger's), a name that only starts so when the search
+     * has nothing. Offline only the downloads count: their collections, then the downloaded songs
+     * and episodes by title, artist, album or show.
      */
-    suspend fun resolveVoiceQuery(query: String, extras: Bundle?): MediaItem? {
-        val r = graph.search.search(query, limit = VOICE_LIMIT)
+    suspend fun resolveVoiceQuery(query: String, extras: Bundle?): List<MediaItem> {
+        val offline = isOffline()
         val focus = extras?.getString(MediaStore.EXTRA_MEDIA_FOCUS)
+        val kinds = VoiceMatch.kindsFor(focus)
+        val named = voiceNames(extras)
+        val local = if (kinds.any { it != VoiceMatch.Kind.SONG }) ownCollection(query, kinds, named, offline) else null
+        if (local != null && local.strength >= VoiceMatch.Strength.LOOSE) local.candidate.value()?.let { return listOf(it) }
+        if (!offline) {
+            val found = try {
+                catalogVoiceQuery(query, focus)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Voice search failed", e)
+                null
+            }
+            if (found != null) return listOf(found)
+        }
+        local?.candidate?.value()?.let { return listOf(it) }
+        // Offline, or the search had nothing (or failed): the downloaded songs and episodes.
+        return downloadedVoiceMatches(query, kinds, named)
+    }
+
+    /** The names a voice request's extras give per kind (`EXTRA_MEDIA_PLAYLIST`, `_ALBUM`, `_ARTIST`, `_TITLE`). */
+    private fun voiceNames(extras: Bundle?): Map<VoiceMatch.Kind, String> = buildMap {
+        fun put(kind: VoiceMatch.Kind, key: String) {
+            extras?.getString(key)?.takeIf { it.isNotBlank() }?.let { put(kind, it) }
+        }
+        put(VoiceMatch.Kind.PLAYLIST, MediaStore.EXTRA_MEDIA_PLAYLIST)
+        put(VoiceMatch.Kind.ALBUM, MediaStore.EXTRA_MEDIA_ALBUM)
+        put(VoiceMatch.Kind.ARTIST, MediaStore.EXTRA_MEDIA_ARTIST)
+        put(VoiceMatch.Kind.SONG, MediaStore.EXTRA_MEDIA_TITLE)
+    }
+
+    /**
+     * The best of the user's own collections for a voice request: Liked Songs, the downloaded
+     * collections, and online Library's playlists, albums, artists and podcasts (cached lists).
+     */
+    private suspend fun ownCollection(
+        query: String,
+        kinds: Set<VoiceMatch.Kind>,
+        named: Map<VoiceMatch.Kind, String>,
+        offline: Boolean,
+    ): VoiceMatch.Match<() -> MediaItem?>? {
+        val candidates = ownCollections(offline)
+        return VoiceMatch.best(query, candidates, kinds, named)
+    }
+
+    /** The user's collections by name (downloaded ones first; offline only those). */
+    private suspend fun ownCollections(offline: Boolean): List<VoiceMatch.Candidate<() -> MediaItem?>> {
+        val list = ArrayList<VoiceMatch.Candidate<() -> MediaItem?>>()
+        val downloaded = downloadedCollections()
+        val done = if (offline) downloadedUris() else emptySet()
+        val liked = downloaded.firstOrNull { it.ref.type == CollectionType.LIKED_SONGS }
+        val likedName = context.getString(R.string.playback_liked_songs)
+        when {
+            !offline && likedContextUri() != null -> list += VoiceMatch.Candidate(likedName, VoiceMatch.Kind.PLAYLIST) { likedFolder() }
+            liked != null -> list += VoiceMatch.Candidate(likedName, VoiceMatch.Kind.PLAYLIST) { downloadedCollectionItem(liked, group = null) }
+        }
+        for (c in downloaded) {
+            val kind = when (c.ref.type) {
+                CollectionType.PLAYLIST -> VoiceMatch.Kind.PLAYLIST
+                CollectionType.ALBUM -> VoiceMatch.Kind.ALBUM
+                CollectionType.SHOW -> VoiceMatch.Kind.SHOW
+                CollectionType.LIKED_SONGS -> continue
+            }
+            // Offline only what plays: something of it is downloaded.
+            if (offline && c.itemUris.none(done::contains)) continue
+            list += VoiceMatch.Candidate(c.ref.name, kind) { downloadedCollectionItem(c, group = null) }
+        }
+        if (offline) return list
+        graph.library.playlists().cachedOrSettled()?.flatPlaylists().orEmpty().forEach { entry ->
+            val uri = entry.uri ?: return@forEach
+            list += VoiceMatch.Candidate(entry.name, VoiceMatch.Kind.PLAYLIST) {
+                contextItem(uri, entry.name, entry.owner?.displayName ?: entry.owner?.username, entry.images, MediaMetadata.MEDIA_TYPE_PLAYLIST)
+            }
+        }
+        graph.library.albums().cachedOrSettled().orEmpty().forEach { saved ->
+            list += VoiceMatch.Candidate(saved.album.name, VoiceMatch.Kind.ALBUM) { albumItem(saved.album) }
+        }
+        graph.library.artists().cachedOrSettled().orEmpty().forEach { saved ->
+            list += VoiceMatch.Candidate(saved.artist.name, VoiceMatch.Kind.ARTIST) { artistItem(saved.artist) }
+        }
+        graph.library.shows().cachedOrSettled().orEmpty().forEach { saved ->
+            list += VoiceMatch.Candidate(saved.show.name, VoiceMatch.Kind.SHOW) { showItem(saved.show) }
+        }
+        return list
+    }
+
+    /** A downloaded song or episode with its stored metadata, for matching by name. */
+    private class StoredItem(val uri: String, val track: Track?, val episode: Episode?)
+
+    /** The completed downloads with their stored metadata, newest first. */
+    private suspend fun storedItems(): List<StoredItem> {
+        val uris = downloadedUris().toList()
+        val rows = storedDownloads(uris)
+        return uris.mapNotNull { uri ->
+            val json = rows[uri]?.metadataJson ?: return@mapNotNull null
+            if (uri.startsWith("spotify:episode:")) {
+                runCatching { graph.json.decodeFromString<Episode>(json) }.getOrNull()?.let { StoredItem(uri, null, it) }
+            } else {
+                runCatching { graph.json.decodeFromString<Track>(json) }.getOrNull()?.let { StoredItem(uri, it, null) }
+            }
+        }
+    }
+
+    /**
+     * The downloaded songs and episodes a voice request names: by title (the best matches), else
+     * by artist, album or show (all of theirs), newest download first; played as a list.
+     */
+    private suspend fun downloadedVoiceMatches(query: String, kinds: Set<VoiceMatch.Kind>, named: Map<VoiceMatch.Kind, String>): List<MediaItem> {
+        val items = storedItems()
+        if (items.isEmpty()) return emptyList()
+        val filter = explicitFilter()
+        fun row(item: StoredItem): MediaItem? = item.track?.let { trackItem(it.copy(playable = !(filter && it.explicit)), null) }
+            ?: item.episode?.let { episodeItem(it.copy(playable = !(filter && it.explicit)), null) }
+        fun bestBy(text: String, nameOf: (StoredItem) -> List<String>): List<StoredItem> {
+            val scored = items.mapNotNull { item -> nameOf(item).mapNotNull { VoiceMatch.strength(text, it) }.maxOrNull()?.let { item to it } }
+            val top = scored.maxOfOrNull { it.second } ?: return emptyList()
+            return scored.filter { it.second == top }.map { it.first }
+        }
+        val artist = named[VoiceMatch.Kind.ARTIST]
+        if (VoiceMatch.Kind.SONG in kinds) {
+            var titled = bestBy(named[VoiceMatch.Kind.SONG] ?: query) { listOfNotNull(it.track?.name ?: it.episode?.name) }
+            if (artist != null) {
+                titled = titled.filter { item -> item.track?.artists.orEmpty().any { VoiceMatch.strength(artist, it.name) != null } }
+            }
+            if (titled.isNotEmpty()) return titled.take(VOICE_MAX_ITEMS).mapNotNull(::row)
+        }
+        val byKind = listOf(
+            VoiceMatch.Kind.ARTIST to { item: StoredItem -> item.track?.artists.orEmpty().map { it.name } },
+            VoiceMatch.Kind.ALBUM to { item: StoredItem -> listOfNotNull(item.track?.album?.name) },
+            VoiceMatch.Kind.SHOW to { item: StoredItem -> listOfNotNull(item.episode?.show?.name) },
+        )
+        for ((kind, nameOf) in byKind) {
+            if (kind !in kinds) continue
+            val found = bestBy(named[kind] ?: query, nameOf)
+            if (found.isNotEmpty()) return found.take(VOICE_MAX_ITEMS).mapNotNull(::row)
+        }
+        return emptyList()
+    }
+
+    /**
+     * Search offline: the downloaded collections and the downloaded songs and episodes whose
+     * names have the query's words (by title, artist, album or show).
+     */
+    private suspend fun offlineSearch(query: String): List<MediaItem> {
+        val collections = ownCollections(offline = true)
+            .filter { VoiceMatch.mentions(query, it.name) }
+            .mapNotNull { it.value() }
+        val songs = context.getString(R.string.playback_songs)
+        val episodes = context.getString(R.string.playback_episodes)
+        val filter = explicitFilter()
+        val items = storedItems().asSequence().filter { item ->
+            val names = item.track?.let { t -> listOf(t.name) + t.artists.map { it.name } + listOfNotNull(t.album?.name) }
+                ?: item.episode?.let { e -> listOfNotNull(e.name, e.show?.name) }.orEmpty()
+            names.any { VoiceMatch.mentions(query, it) }
+        }.take(OFFLINE_SEARCH_ITEMS).mapNotNull { item ->
+            item.track?.let { trackItem(it.copy(playable = !(filter && it.explicit)), null, group = songs) }
+                ?: item.episode?.let { episodeItem(it.copy(playable = !(filter && it.explicit)), null, group = episodes) }
+        }.toList()
+        return (collections + items).distinctBy { it.mediaId }
+    }
+
+    /** The catalog's search for a voice request, honouring the [focus] hint; null when it has nothing. */
+    private suspend fun catalogVoiceQuery(query: String, focus: String?): MediaItem? {
+        val r = graph.search.search(query, limit = VOICE_LIMIT)
         return when (focus) {
             MediaStore.Audio.Artists.ENTRY_CONTENT_TYPE -> r.artists.firstOrNull()?.let { artistItem(it) }
             MediaStore.Audio.Albums.ENTRY_CONTENT_TYPE -> r.albums.firstOrNull()?.let { albumItem(it) }
-            PLAYLIST_FOCUS -> r.playlists.firstOrNull()?.let { playlistItem(it) }
+            VoiceMatch.PLAYLIST_FOCUS -> r.playlists.firstOrNull()?.let { playlistItem(it) }
             MediaStore.Audio.Media.ENTRY_CONTENT_TYPE -> r.tracks.firstOrNull { it.playable }?.let { trackItem(it, it.album?.uri) }
             else -> null
         } ?: r.topResult?.takeIf { top -> isPlayableResult(r, top) }?.let { mediaRefItem(it, null) }
@@ -763,6 +936,13 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         .appendPath(res.toString())
         .build()
 
+    /**
+     * The cached value of a stale-while-revalidate flow at once, else its first answer (bounded):
+     * a voice request does not wait for a revalidation.
+     */
+    private suspend fun <T> Flow<Resource<T>>.cachedOrSettled(): T? =
+        withTimeoutOrNull(VOICE_LOOKUP_TIMEOUT_MS) { first { it.dataOrNull != null || it !is Resource.Loading } }?.dataOrNull
+
     /** First non-loading value of a stale-while-revalidate flow (or the cached one on timeout). */
     private suspend fun <T> Flow<Resource<T>>.settle(): T? {
         var cached: T? = null
@@ -828,7 +1008,11 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         private const val FIRST_READ_TIMEOUT_MS = 2_000L
         /** Uris per download-row query (SQLite's variable limit is 999 on older devices). */
         private const val SQL_CHUNK = 400
-        /** `MediaStore.Audio.Playlists.ENTRY_CONTENT_TYPE` (the constant is deprecated). */
-        private const val PLAYLIST_FOCUS = "vnd.android.cursor.item/playlist"
+        /** Longest wait for one of Library's lists in a voice request (they are cached). */
+        private const val VOICE_LOOKUP_TIMEOUT_MS = 3_000L
+        /** Most downloads one voice request plays as a list (an artist's, a show's). */
+        private const val VOICE_MAX_ITEMS = 500
+        /** Most downloaded songs and episodes an offline search lists. */
+        private const val OFFLINE_SEARCH_ITEMS = 50
     }
 }

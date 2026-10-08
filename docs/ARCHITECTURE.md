@@ -1026,7 +1026,19 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   show, from the tab or Library) browsed offline lists its downloads in collection order as
   `ctx|` rows (the offline load plays them in that order), without waiting for or starting the
   session; online it lists the catalog's copy, all of it, and its downloads when the catalog has
-  nothing for it (no session, a failed or empty answer, a cleared cache); `onPlaybackResumption` from `ResumeStore` (DataStore:
+  nothing for it (no session, a failed or empty answer, a cleared cache). Voice "play X"
+  (Assistant, Auto: `LibraryTree.resolveVoiceQuery`, `VoiceMatch`) matches the user's own
+  collections by name first (case, accents and punctuation aside; "my", "the", "playlist", ...
+  dropped), honouring `EXTRA_MEDIA_FOCUS` and the `EXTRA_MEDIA_*` names: Liked Songs and the
+  downloaded collections, then online Library's playlists, albums, artists and podcasts. The
+  same or loosely the same name wins over the catalog's search (the user's own, maybe private,
+  playlist over a stranger's); a name that only starts so is used when the search has nothing.
+  Offline only the downloads count: their collections, then the downloaded songs and episodes
+  by title, else all of an artist's, album's or show's, played as a list. A request that finds
+  nothing (also "play something" with no stored session) fails with the player's error (Not
+  found, or Not available offline) instead of an empty answer, which Media3 would still prepare
+  and play, resuming whatever was loaded. Auto's search offline lists the downloads whose names
+  have the query's words; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
   on a mode change and every 15 s while playing (`ResumeSaver`): the account's last session as
   this phone sees it, local or the remote device it mirrors (after a transfer it follows the
