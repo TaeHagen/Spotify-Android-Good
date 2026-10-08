@@ -7,6 +7,7 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRouting
 import android.media.AudioTrack
+import android.media.PlaybackParams
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -55,6 +56,8 @@ class AudioSinkBridge(context: Context) {
     @Volatile private var track: AudioTrack? = null
     @Volatile private var started = false
     @Volatile private var preferredDevice: AudioDeviceInfo? = null
+    /** Playback speed (podcasts), pitch kept; also applied to tracks created later. */
+    @Volatile private var speed = 1f
     @Volatile private var trackVolume = 1f
     @Volatile private var duckVolume = 1f
     @Volatile private var fadeVolume = 1f
@@ -168,6 +171,28 @@ class AudioSinkBridge(context: Context) {
         synchronized(lock) { track?.preferredDevice = device }
     }
 
+    /**
+     * Playback speed (podcasts, 0.5..3.5) with the pitch kept: the track consumes PCM faster or
+     * slower, and the blocking [write] throttles the decoder to it, so librespot's position stays
+     * media time. Applied immediately (also to the audio already buffered) and to future tracks
+     * (a track recreated after a dead object or a route change keeps it). Any thread.
+     */
+    fun setPlaybackSpeed(value: Float) {
+        if (value == speed) return
+        speed = value
+        synchronized(lock) { track?.let(::applySpeed) }
+    }
+
+    private fun applySpeed(t: AudioTrack) {
+        try {
+            t.playbackParams = PlaybackParams().setSpeed(speed).setPitch(1f)
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "Playback speed $speed not supported", e)
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "Playback speed not applied", e)
+        }
+    }
+
     fun routedDevice(): AudioDeviceInfo? = track?.routedDevice
 
     /**
@@ -260,6 +285,7 @@ class AudioSinkBridge(context: Context) {
             .build()
         t.preferredDevice = preferredDevice
         t.setVolume(effectiveGain())
+        if (speed != 1f) applySpeed(t)
         t.addOnRoutingChangedListener(routingListener, android.os.Handler(android.os.Looper.getMainLooper()))
         return t
     }

@@ -475,7 +475,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 
 | method | args |
 |---|---|
-| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?,"local":true?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual. `local` (an explicit pull to this phone, e.g. a media-session resume): with a network and a visible session it plays here even while another device is active (taking its session over, like a transfer to this phone); otherwise routed as usual |
+| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?,"local":true?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual. `local` (an explicit pull to this phone, e.g. a media-session resume): with a network and a visible session it plays here even while another device is active (taking its session over, like a transfer to this phone); otherwise routed as usual. Modes absent mean off on this phone (Spirc and the offline queue reset them) but are kept by a remote device, so the app names them: a load naming no modes gets the current playback's (`PlayerController.withCurrentModes`, §9.4) |
 | `player.play` / `player.pause` / `player.togglePlay` | `{}` |
 | `player.next` / `player.prev` | `{}` |
 | `player.seek` | `{"positionMs":0}` |
@@ -484,6 +484,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 | `player.setRepeat` | `{"mode":"off|context|track"}` |
 | `player.setVolume` | `{"volume":0..65535,"fromSystem":false}` |
 | `player.setAudioOutput` | `{"type":"speaker|bluetooth|line_out|car|unknown","name":"…"}` (local only; reported to Connect) |
+| `player.setSpeed` | `{"speed":0.5..3.5}` (the app's podcast speed; it sends 1 for music and while another device plays). The app's sink plays at that speed (AudioTrack `PlaybackParams`, pitch kept), the decoder is throttled by it, so the player's position stays media time. Stored and applied to every later Spirc: the Spirc reports it as `playback_speed` while playing (other clients and the snapshot extrapolate at the real rate) and swallows the player's position corrections that match that extrapolation (the player expects 1x, they came every second or two, each a state put); the offline queue extrapolates with it. A device receiving a transfer from here gets no speed (Connect has no speed command). Invalid outside the range |
 | `player.applySettings` | `EngineSettings` subset (`bitrate`, `normalize`, `normalizePregain`, `gapless`), applied to the running Player (§4.3) |
 | `queue.add` | `{"uri":"spotify:track:…"}` — on this device at most 80 tracks can be queued (Connect's next-tracks window); a further add fails with `UNAVAILABLE` "The queue is full" |
 | `queue.remove` | `{"uid":"…"}` |
@@ -705,7 +706,9 @@ For a remote active device, smart shuffle is not supported (the command reports
 * **Remote playback in the app**: `PlaybackSnapshot.source == "remote"` is built from the
   cluster's `player_state` (position extrapolated with `session.time_delta()`); the
   MediaSession switches to `DeviceInfo(PLAYBACK_TYPE_REMOTE)` so hardware volume keys
-  control the remote device; the notification says "Playing on <device>".
+  control the remote device; the notification says "Playing on <device>". The stored session
+  (§9.4) follows the mirrored session, so when that device leaves and nothing is active, Play
+  on the phone continues what it played (Spotify resumes the account's last session).
 * **Audio output reporting**: Kotlin reports the current local output (speaker /
   Bluetooth "<name>" / wired / USB / car) with `player.setAudioOutput`.
 * **Reconnect restore**: when the engine rebuilds Session + Spirc (network switch, lost AP
@@ -919,6 +922,23 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   play) is merged into it, or waits ≤ 3 s for the activation, and is dropped if the load failed.
   Plain track-list contexts (`spotify:web-api`) are never resumed or loaded as a context.
   Auto browse/search/voice wait the same way.
+* Podcast speed (`PodcastSpeed`, Spotify's 0.5× – 3.5×): one global speed for every episode,
+  remembered across restarts (a DataStore of its own). It applies to an episode played here
+  (offline queue included) and is 1× for music and while another device plays. Each change of the
+  effective speed goes to the sink (`AudioSinkBridge.setPlaybackSpeed`, AudioTrack
+  `PlaybackParams`, pitch kept, also for tracks recreated later) and the engine
+  (`player.setSpeed`, §6.2). Now Playing has a speed menu next to the episode controls (hidden
+  while another device plays); the session player advertises `COMMAND_SET_SPEED_AND_PITCH` for
+  local episodes (Auto, Wear and other controllers may change it) and reports the chosen speed in
+  its playback parameters. The notification has no speed button (Media3's default provider has
+  none). The switch at an episode's end follows the snapshot, so the first moments of the next
+  item may still play at the episode's speed.
+* Modes of a load (`PlayerController.withCurrentModes`): a load that names no shuffle / repeat
+  (a row tap, a Play button, Auto's picks, radio) keeps those of the playback it replaces, here
+  or on the active device (modes just toggled included); smart shuffle only for a load of the
+  same context, any other gets a plain shuffle. A Shuffle button names shuffle (no smart
+  shuffle, repeat kept); the stored session names all of them. With nothing loaded nothing is
+  kept.
 * Pending Connect target (§8): an in-app `player.load` that plays (`PlayerController.play`,
   radio) takes `DevicesRepository.consumePendingTarget()` as `deviceId` when no device is
   active. Media-session loads (`SpotifyPlayer.handleSetMediaItems`: Auto, Assistant, watches,
@@ -946,10 +966,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
-  on a mode change and every 15 s while playing, from local snapshots only (`ResumeSaver`):
-  when playback leaves the phone (transfer, takeover, the engine's reset) it is saved once more
-  at that moment and then stays frozen; logging out clears it, through the same writer, so a
-  save in progress never lands after the clear. Every resume of it (resumption, Tap to
+  on a mode change and every 15 s while playing (`ResumeSaver`): the account's last session as
+  this phone sees it, local or the remote device it mirrors (after a transfer it follows the
+  speaker). When nothing is active any more (the device left, e.g. switched off; the engine's
+  reset) it is saved once more at that moment, extrapolated, and then stays frozen, so Play here
+  continues what the speaker played; logging out clears it, through the same writer, so a save
+  in progress never lands after the clear. Every resume of it (resumption, Tap to
   resume, "play something", the Play fallback) loads with its modes, since a load without
   them resets both to off (the Media3 resume item carries them as request extras). Offline the
   load asks for a plain shuffle instead of smart shuffle. States from older versions read with
@@ -995,6 +1017,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
   0.2 → restore (a duck keeps focus; a granted request clears the duck). Request failure → pause.
+  A pause made on purpose meanwhile — by the user (app, notification, Bluetooth, Assistant,
+  Auto), the sleep timer or a refused background start — cancels the pending resume
+  (`PlayerController.onDeliberatePause`), so the GAIN does not undo it.
 * `BecomingNoisyReceiver`: registered while local playback plays, loads or awaits a focus resume
   (`NoisyRules`: also while the sink is stopped by a focus pause or the stall watchdog), never for
   remote playback → `player.pause`; a noisy event also cancels a pending focus resume, so a later
@@ -1306,7 +1331,7 @@ follow), Liked Songs, saved albums/artists/podcasts, follow artists, search (all
 recent searches), home feed, album/artist/playlist/show/episode pages, podcast resume
 points (this phone's progress, kept on the phone and not synced to other devices; Spotify's
 when its web API provides them, §6.5), lyrics (synced),
-radio, share links, deep links, downloads (track/album/playlist/liked/podcast, Wi-Fi only
+podcast playback speed (0.5×–3.5×, on this phone), radio, share links, deep links, downloads (track/album/playlist/liked/podcast, Wi-Fi only
 option, storage management, auto-sync), offline mode, sleep timer, explicit-content
 filter, system equalizer, settings, adaptive layouts, accessibility (content
 descriptions, touch targets, TalkBack-friendly controls).

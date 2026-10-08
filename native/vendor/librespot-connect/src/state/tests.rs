@@ -3,6 +3,7 @@
 
 use crate::{
     AudioOutputKind, ConnectConfig, SnapshotPlayStatus, TrackProvider,
+    model::SpircPlayStatus,
     core::{Session, SessionConfig, SpotifyId, SpotifyUri, dealer::protocol::Request},
     protocol::{
         connect::AudioOutputDeviceType, context::Context, context_page::ContextPage,
@@ -2259,4 +2260,31 @@ fn spirc_is_send_and_sync(
         task.await;
         drop(spirc);
     });
+}
+
+#[test]
+fn the_playback_speed_is_reported_while_playing() {
+    let (_rt, mut state) = state(3);
+    let playing = SpircPlayStatus::Playing { nominal_start_time: 0, preloading_of_next_track_triggered: false };
+    let paused = SpircPlayStatus::Paused { position_ms: 0, preloading_of_next_track_triggered: false };
+    state.set_status(&playing);
+    assert_eq!(state.player().playback_speed, 1.);
+
+    assert!(state.set_playback_speed(1.5));
+    assert!(!state.set_playback_speed(1.5));
+    state.set_status(&playing);
+    assert_eq!(state.player().playback_speed, 1.5);
+    // the position extrapolates at that speed
+    state.update_position(10_000, 100_000);
+    assert_eq!(state.extrapolated_position(102_000), 13_000);
+
+    state.set_status(&paused);
+    assert_eq!(state.player().playback_speed, 0.);
+    assert_eq!(state.extrapolated_position(102_000), 10_000);
+
+    // back to normal speed
+    assert!(state.set_playback_speed(1.0));
+    assert_eq!(state.playing_speed(), 1.);
+    state.set_status(&playing);
+    assert_eq!(state.player().playback_speed, 1.);
 }

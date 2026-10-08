@@ -13,13 +13,17 @@ import kotlinx.coroutines.flow.transformLatest
 
 /**
  * What [PlaybackService] writes to the [ResumeStore], in order (one collector, so a save never
- * lands after the clear that follows it):
- * * the local session (this phone plays or has it loaded) on every relevant change — track,
- *   status, position, modes — and every `intervalMs` while it plays;
- * * once playback leaves the phone (a transfer, another device taking over, the engine's reset),
- *   one last save of the session that was playing at that moment, and then nothing: the stored
- *   session stays frozen (remote or empty snapshots never update it, and the periodic save of the
- *   last local snapshot stops instead of extrapolating it further);
+ * lands after the clear that follows it). The stored session is the account's last session as
+ * this phone saw it, like Spotify resumes it:
+ * * the session playing or loaded here, or on the remote device this phone mirrors, on every
+ *   relevant change — track, status, position, modes — and every `intervalMs` while it plays.
+ *   After a transfer to a speaker it follows the speaker, so when that device goes away (switched
+ *   off: nothing is active any more) Play here continues what it played, not what played here
+ *   before the transfer;
+ * * once nothing is active any more (the device left, the engine's reset), one last save of the
+ *   session that was playing at that moment, extrapolated to then, and then nothing: the stored
+ *   session stays frozen (the periodic save of the last snapshot stops instead of extrapolating
+ *   it further);
  * * a clear on logout (after having been logged in), and no saves while logged out.
  */
 internal object ResumeSaver {
@@ -29,12 +33,12 @@ internal object ResumeSaver {
     }
 
     private data class Input(
-        /** The local session to save; null when playback is not on this phone, or logged out. */
-        val local: PlaybackSnapshot?,
+        /** The session to save (local or mirrored); null when nothing is active, or logged out. */
+        val session: PlaybackSnapshot?,
         val loggedIn: Boolean,
         /** Logged out after having been logged in: forget the stored session. */
         val loggedOut: Boolean,
-        /** The local session that played until this input (playback just left the phone). */
+        /** The session that played until this input (nothing is active any more). */
         val handedOver: PlaybackSnapshot?,
     )
 
@@ -45,30 +49,30 @@ internal object ResumeSaver {
         intervalMs: Long,
         now: () -> Long = System::currentTimeMillis,
     ): Flow<Action> = combine(snapshots, loggedIn.distinctUntilChanged()) { s, li -> s to li }
-        .scan(Input(local = null, loggedIn = false, loggedOut = false, handedOver = null)) { prev, (s, li) ->
-            val local = s.takeIf { li && it.source == PlaybackSource.LOCAL && it.track != null }
+        .scan(Input(session = null, loggedIn = false, loggedOut = false, handedOver = null)) { prev, (s, li) ->
+            val session = s.takeIf { li && it.source != PlaybackSource.NONE && it.track != null }
             Input(
-                local = local,
+                session = session,
                 loggedIn = li,
                 loggedOut = !li && (prev.loggedIn || prev.loggedOut),
-                handedOver = prev.local?.takeIf { local == null && li && it.isPlaying },
+                handedOver = prev.session?.takeIf { session == null && li && it.isPlaying },
             )
         }
         .drop(1)
         .distinctUntilChanged { a, b ->
-            a.loggedOut == b.loggedOut && a.handedOver == b.handedOver && sameSession(a.local, b.local)
+            a.loggedOut == b.loggedOut && a.handedOver == b.handedOver && sameSession(a.session, b.session)
         }
         .transformLatest { input ->
             fun stateOf(s: PlaybackSnapshot) = ResumeState.from(s, s.positionAt(now()))
-            val local = input.local
+            val session = input.session
             when {
                 input.loggedOut -> emit(Action.Clear)
-                local != null -> {
-                    stateOf(local)?.let { emit(Action.Save(it)) }
-                    if (local.isPlaying) {
+                session != null -> {
+                    stateOf(session)?.let { emit(Action.Save(it)) }
+                    if (session.isPlaying) {
                         while (true) {
                             delay(intervalMs)
-                            stateOf(local)?.let { emit(Action.Save(it)) }
+                            stateOf(session)?.let { emit(Action.Save(it)) }
                         }
                     }
                 }
@@ -77,7 +81,7 @@ internal object ResumeSaver {
         }
         .distinctUntilChanged()
 
-    /** The parts of a local snapshot the stored session depends on (a change saves at once). */
+    /** The parts of a snapshot the stored session depends on (a change saves at once). */
     private fun sameSession(a: PlaybackSnapshot?, b: PlaybackSnapshot?): Boolean {
         if (a == null || b == null) return a == null && b == null
         return a.track?.uri == b.track?.uri && a.track?.provider == b.track?.provider &&

@@ -160,6 +160,8 @@ class PlaybackService : MediaLibraryService() {
             playerError = ::currentPlayerError,
             onRetry = ::retryAfterError,
             onCommand = ::ensurePlaybackHolder,
+            podcastSpeed = { graph.podcastSpeed.speed.value },
+            onSpeed = graph.podcastSpeed::set,
         )
 
         val provider = PlaybackNotificationProvider(this).apply { setSmallIcon(R.drawable.ic_notification) }
@@ -397,6 +399,7 @@ class PlaybackService : MediaLibraryService() {
                 // Inputs of the player error.
                 graph.engine.state.map { },
                 graph.player.failure.map { },
+                graph.podcastSpeed.speed.map { },
             ).collect {
                 player.refresh()
                 // Runs on most wake-ups (engine and snapshot events): a cheap check of the

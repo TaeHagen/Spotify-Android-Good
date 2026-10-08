@@ -150,6 +150,14 @@ class PlayerController internal constructor(
      */
     @Volatile var onPlaybackRequested: (() -> Unit)? = null
 
+    /**
+     * Invoked (on the calling thread) for a pause made on purpose: by the user (app, media
+     * session, Bluetooth, Assistant), the sleep timer or a refused background start. A pending
+     * audio-focus resume must not undo it ([PlaybackCoordinator] cancels it). Not for the pause of
+     * a transient focus loss itself, nor for headphones unplugged (which cancels on its own).
+     */
+    @Volatile var onDeliberatePause: (() -> Unit)? = null
+
     /** Message source for [errors]; replaced with the resource-backed one by [PlaybackCoordinator]. */
     @Volatile var errorMessages: PlaybackErrorMessages = PlaybackErrorMessages.Fallback
 
@@ -255,14 +263,22 @@ class PlayerController internal constructor(
         resumeAsync(user)
     }
 
-    /** [user]: false for pauses the app sends by itself (focus loss, unplugged, refused start). */
-    fun pause(user: Boolean = true) {
-        pauseAsync(user)
+    /**
+     * [user]: false for pauses the app sends by itself (focus loss, unplugged, refused start).
+     * [deliberate]: a pending focus resume is cancelled ([onDeliberatePause]).
+     */
+    fun pause(user: Boolean = true, deliberate: Boolean = user) {
+        pauseAsync(user, deliberate)
     }
 
     fun togglePlayPause() {
         userCommand()
-        if (snapshot.value.isPlayingOrLoading()) pauseLike("player.togglePlay") else sendResuming("player.togglePlay")
+        if (snapshot.value.isPlayingOrLoading()) {
+            onDeliberatePause?.invoke()
+            pauseLike("player.togglePlay")
+        } else {
+            sendResuming("player.togglePlay")
+        }
     }
 
     fun next() {
@@ -408,8 +424,9 @@ class PlayerController internal constructor(
         return sendResuming("player.play")
     }
 
-    internal fun pauseAsync(user: Boolean = true): Deferred<Boolean> {
+    internal fun pauseAsync(user: Boolean = true, deliberate: Boolean = user): Deferred<Boolean> {
         if (user) userCommand()
+        if (deliberate) onDeliberatePause?.invoke()
         return pauseLike("player.pause")
     }
 
@@ -611,7 +628,7 @@ class PlayerController internal constructor(
 
     /** `player.load`, rewritten for the offline queue whenever the engine cannot stream ([OfflineLoads]). */
     private suspend fun load(request: PlayRequest, toPendingTarget: Boolean) {
-        val prepared = prepare(withLoadableContext(request))
+        val prepared = prepare(withLoadableContext(keepingModes(request)))
         val target = if (toPendingTarget) pendingTargetFor(prepared, prepared.request.play) else null
         call("player.load", loadArgs(prepared.request, deviceId = target))
     }
@@ -619,13 +636,19 @@ class PlayerController internal constructor(
     /** [load] of a queued `player.load` [command], with a play merged in until the last moment. */
     private suspend fun sendLoad(command: Command) {
         val initial = synchronized(lock) { checkNotNull(command.request) }
-        val prepared = prepare(withLoadableContext(initial))
+        val prepared = prepare(withLoadableContext(keepingModes(initial)))
         val play = synchronized(lock) {
             command.sent = true
             checkNotNull(command.request).play
         }
         val target = if (command.toPendingTarget) pendingTargetFor(prepared, play) else null
         call("player.load", loadArgs(prepared.request.copy(play = play), deviceId = target, local = command.onThisPhone))
+    }
+
+    /** [withCurrentModes] of the playback the load replaces, with the modes just toggled. */
+    private fun keepingModes(request: PlayRequest): PlayRequest {
+        val s = snapshot.value
+        return withCurrentModes(request, s, pendingShuffle.validOr(s.shuffleMode), pendingRepeat.validOr(s.repeat))
     }
 
     /**
@@ -977,6 +1000,38 @@ class PlayerController internal constructor(
                 val state = last() ?: throw e
                 call("player.load", loadArgs(prepare(state.toPlayRequest()), local = true))
             }
+        }
+
+        /**
+         * The modes a load does not name, from the playback it replaces ([current], here or on the
+         * active device; [shuffle] and [repeat] its current, or just toggled, modes): a load that
+         * names none keeps them, on every target. The engine would otherwise turn them off on this
+         * phone (Spirc resets shuffle and repeat on a load without options, so would the offline
+         * queue), while a remote device keeps its own: tapping a track must not switch the user's
+         * shuffle or repeat off. Smart shuffle belongs to its context's suggestions: kept only for
+         * a load of the same context, any other gets a plain shuffle. A load naming only shuffle
+         * (a Shuffle button) gets no smart shuffle; one naming smart shuffle shuffles. With
+         * nothing loaded there is nothing to keep (also a play sent to the pending target).
+         */
+        fun withCurrentModes(
+            request: PlayRequest,
+            current: PlaybackSnapshot,
+            shuffle: ShuffleMode,
+            repeat: RepeatMode,
+        ): PlayRequest {
+            if (current.source == PlaybackSource.NONE || current.track == null) return request
+            var r = request
+            r = when {
+                r.shuffle == null && r.smartShuffle == null -> {
+                    val sameContext = r.contextUri != null && r.contextUri == current.context?.uri
+                    r.copy(shuffle = shuffle != ShuffleMode.OFF, smartShuffle = shuffle == ShuffleMode.SMART && sameContext)
+                }
+                r.smartShuffle == null -> r.copy(smartShuffle = false)
+                r.shuffle == null -> r.copy(shuffle = r.smartShuffle == true || shuffle != ShuffleMode.OFF)
+                else -> r
+            }
+            if (r.repeat == null) r = r.copy(repeat = repeat)
+            return r
         }
 
         /**

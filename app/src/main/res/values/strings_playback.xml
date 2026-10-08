@@ -30,6 +30,9 @@
     <string name="playback_presence_text">Other devices can play music on this phone</string>
     <string name="playback_presence_stop">Stop</string>
 
+    <!-- Podcast playback speed (Now Playing; spoken with the value, e.g. "Playback speed, 1.5×") -->
+    <string name="playback_speed">Playback speed</string>
+
     <!-- Errors shown in snackbars -->
     <string name="playback_error_not_active_device">Nothing is playing. Pick something to play first.</string>
     <string name="playback_error_network">Can\'t reach Spotify. Check your connection.</string>

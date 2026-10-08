@@ -70,6 +70,18 @@ pub(crate) fn yield_to_active_device() {
     }
 }
 
+/// The speed the app's sink plays at (see `connect::set_speed`): the queue's positions follow it.
+pub(crate) fn set_speed(speed: f64) {
+    let active = {
+        let mut q = QUEUE.lock();
+        q.set_speed(speed, now_ms());
+        q.active
+    };
+    if active {
+        hub::publish();
+    }
+}
+
 /// The queue's snapshot while it owns the session (active and not given way, see [`yields`]).
 pub(crate) fn snapshot(device: ActiveDeviceRef, volume: u16) -> Option<PlaybackSnapshot> {
     let online = engine::is_online();
