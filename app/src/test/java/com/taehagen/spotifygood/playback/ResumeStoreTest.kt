@@ -247,4 +247,21 @@ class ResumeStoreTest {
         val single = state.copy(trackUri = t(7), contextUri = null, trackUris = List(41) { t(7) })
         assertEquals(listOf(t(7)), single.toPlayRequest().trackUris)
     }
+
+    @Test
+    fun anEpisodeSessionResumesInOrderWithRepeatOff() {
+        val state = ResumeState(
+            contextUri = "spotify:show:x", trackUri = "spotify:episode:y", positionMs = 60_000, title = null, artist = null,
+            album = null, artworkUrl = null, durationMs = null, isEpisode = true,
+            shuffle = true, smartShuffle = false, repeat = RepeatMode.TRACK,
+        )
+        val request = state.toPlayRequest()
+        assertEquals(false, request.shuffle)
+        assertEquals(false, request.smartShuffle)
+        assertEquals(RepeatMode.OFF, request.repeat)
+        // A music session keeps its modes.
+        val music = state.copy(contextUri = "spotify:playlist:p", trackUri = "spotify:track:1", isEpisode = false).toPlayRequest()
+        assertEquals(true, music.shuffle)
+        assertEquals(RepeatMode.TRACK, music.repeat)
+    }
 }

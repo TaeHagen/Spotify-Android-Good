@@ -475,7 +475,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 
 | method | args |
 |---|---|
-| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?,"local":true?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual. `local` (an explicit pull to this phone, e.g. a media-session resume): with a network and a visible session it plays here even while another device is active (taking its session over, like a transfer to this phone); otherwise routed as usual. Modes absent mean off on this phone (Spirc and the offline queue reset them) but are kept by a remote device, so the app names them: a load naming no modes gets the current playback's (`PlayerController.withCurrentModes`, §9.4) |
+| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?,"local":true?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual. `local` (an explicit pull to this phone, e.g. a media-session resume): with a network and a visible session it plays here even while another device is active (taking its session over, like a transfer to this phone); otherwise routed as usual. Modes absent mean off on this phone (Spirc and the offline queue reset them) but are kept by a remote device, so the app names them: a load naming no modes gets the current playback's (`PlayerController.withCurrentModes`, §9.4), a podcast load (a show, an episode, Your Episodes, or a start item that is an episode) names them off |
 | `player.play` / `player.pause` / `player.togglePlay` | `{}` |
 | `player.next` / `player.prev` | `{}` |
 | `player.seek` | `{"positionMs":0}` |
@@ -938,7 +938,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   or on the active device (modes just toggled included); smart shuffle only for a load of the
   same context, any other gets a plain shuffle. A Shuffle button names shuffle (no smart
   shuffle, repeat kept); the stored session names all of them. With nothing loaded nothing is
-  kept.
+  kept. Podcasts play in order with repeat off, as on Spotify (Now Playing, the notification and
+  Auto show no shuffle or repeat for episodes): a podcast load (a show, an episode or Your
+  Episodes as context, or an episode as start item) names the modes it leaves open off, also
+  for a remote device, and a stored episode session resumes with them off. A music load
+  replacing an episode keeps the modes of the last music playback (none seen: off on this
+  phone). Radio turns an inherited repeat-one into repeat off.
 * Pending Connect target (§8): an in-app `player.load` that plays (`PlayerController.play`,
   radio) takes `DevicesRepository.consumePendingTarget()` as `deviceId` when no device is
   active. Media-session loads (`SpotifyPlayer.handleSetMediaItems`: Auto, Assistant, watches,
