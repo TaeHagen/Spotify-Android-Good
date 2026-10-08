@@ -533,25 +533,42 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
     }
 
     /**
-     * Resolves a voice request ("play X on SpotifyGood") into the items to play; empty when
-     * nothing matches. The user's own collections come first, by name ([VoiceMatch]), honouring
-     * the `MediaStore.EXTRA_MEDIA_FOCUS` hint and the names in the `EXTRA_MEDIA_*` extras: the
-     * downloaded ones and Liked Songs, then (online) Library's playlists, albums, artists and
-     * podcasts. The same or loosely the same name wins over the catalog's search (the user's own,
-     * maybe private, "Road Trip" over a stranger's), a name that only starts so when the search
-     * has nothing. Offline only the downloads count: their collections, then the downloaded songs
-     * and episodes by title, artist, album or show.
+     * A voice "play X" request, from either entry (the media session and the
+     * `MEDIA_PLAY_FROM_SEARCH` activity: [VoiceRequest]): what it plays, "play something", or
+     * no match (Not found; offline Not available offline).
      */
-    suspend fun resolveVoiceQuery(query: String, extras: Bundle?): List<MediaItem> {
+    suspend fun resolveVoice(request: VoiceRequest): VoiceOutcome {
+        if (request.isBlank) return VoiceOutcome.PlaySomething
+        val items = try {
+            resolveVoiceQuery(request)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Voice request failed", e)
+            emptyList()
+        }
+        return VoiceOutcome.of(items, isOffline())
+    }
+
+    /**
+     * The items a voice request plays; empty when nothing matches. The user's own collections
+     * come first, by name ([VoiceMatch]), honouring the focus and the names the assistant split
+     * out ([VoiceRequest.names]): the downloaded ones and Liked Songs, then (online) Library's
+     * playlists, albums, artists and podcasts. The same or loosely the same name wins over the
+     * catalog's search (the user's own, maybe private, "Road Trip" over a stranger's), a name
+     * that only starts so when the search has nothing. Offline only the downloads count: their
+     * collections, then the downloaded songs and episodes by title, artist, album or show.
+     */
+    private suspend fun resolveVoiceQuery(request: VoiceRequest): List<MediaItem> {
         val offline = isOffline()
-        val focus = extras?.getString(MediaStore.EXTRA_MEDIA_FOCUS)
-        val kinds = VoiceMatch.kindsFor(focus)
-        val named = voiceNames(extras)
+        val query = request.query
+        val kinds = request.kinds
+        val named = request.names
         val local = if (kinds.any { it != VoiceMatch.Kind.SONG }) ownCollection(query, kinds, named, offline) else null
         if (local != null && local.strength >= VoiceMatch.Strength.LOOSE) local.candidate.value()?.let { return listOf(it) }
         if (!offline) {
             val found = try {
-                catalogVoiceQuery(query, focus)
+                catalogVoiceQuery(request.text, request.focus)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -563,17 +580,6 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         local?.candidate?.value()?.let { return listOf(it) }
         // Offline, or the search had nothing (or failed): the downloaded songs and episodes.
         return downloadedVoiceMatches(query, kinds, named)
-    }
-
-    /** The names a voice request's extras give per kind (`EXTRA_MEDIA_PLAYLIST`, `_ALBUM`, `_ARTIST`, `_TITLE`). */
-    private fun voiceNames(extras: Bundle?): Map<VoiceMatch.Kind, String> = buildMap {
-        fun put(kind: VoiceMatch.Kind, key: String) {
-            extras?.getString(key)?.takeIf { it.isNotBlank() }?.let { put(kind, it) }
-        }
-        put(VoiceMatch.Kind.PLAYLIST, MediaStore.EXTRA_MEDIA_PLAYLIST)
-        put(VoiceMatch.Kind.ALBUM, MediaStore.EXTRA_MEDIA_ALBUM)
-        put(VoiceMatch.Kind.ARTIST, MediaStore.EXTRA_MEDIA_ARTIST)
-        put(VoiceMatch.Kind.SONG, MediaStore.EXTRA_MEDIA_TITLE)
     }
 
     /**
