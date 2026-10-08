@@ -9,6 +9,7 @@
 //! Lock order: `EMIT` may be held while the leaf locks (`HUB`, offline queue, metadata caches)
 //! are taken briefly; no code takes `EMIT` while holding a leaf lock.
 
+use super::args::LoadArgs;
 use super::devices::{self, ThisDevice};
 use super::{metadata, offline, player_events, restore, snapshot};
 use crate::error::{AppError, ErrorCode};
@@ -63,11 +64,24 @@ pub(crate) struct HubState {
     /// The offline queue's window ended and Spirc loads its context (see `offline::hand_back`):
     /// until Spirc has its track, the queue's last view is shown.
     pub handing_back: Option<HandingBack>,
+    /// A user load sent to the attached Spirc that hasn't played yet (the Spirc fetches its
+    /// context, its activation's empty snapshot isn't "nothing loaded"): a push meanwhile starts
+    /// that load on the target. Gone once the Spirc has a track, the load failed, or it went
+    /// inactive.
+    pub loading: Option<LocalLoad>,
     /// A start of this layer failed on the attached Spirc, which goes inactive (its disconnect is
     /// on its way, see [`on_local_load_failed`]): its empty active snapshots read inactive until
     /// an inactive one or one with a track arrives (a play meanwhile gets `NOT_ACTIVE_DEVICE`, a
     /// load activates it again).
     pub deactivating: bool,
+}
+
+/// See [`HubState::loading`].
+#[derive(Debug, Clone)]
+pub(crate) struct LocalLoad {
+    pub generation: u64,
+    pub at: Instant,
+    pub args: LoadArgs,
 }
 
 /// See [`HubState::handing_back`].
@@ -211,6 +225,32 @@ pub(crate) fn forget_hand_back() {
     HUB.lock().handing_back = None;
 }
 
+/// A user load (`args`) was sent to the attached Spirc (see [`HubState::loading`]).
+pub(crate) fn set_loading(args: &LoadArgs) {
+    let mut hub = HUB.lock();
+    if let Some(generation) = hub.link.as_ref().map(|l| l.generation) {
+        hub.loading = Some(LocalLoad { generation, at: Instant::now(), args: args.clone() });
+    }
+}
+
+/// The user load on its way to the attached Spirc, if any (for as long as a restore would be).
+pub(crate) fn local_load() -> Option<LoadArgs> {
+    let hub = HUB.lock();
+    local_load_in(&hub, hub.link.as_ref().map(|l| l.generation), Instant::now()).cloned()
+}
+
+fn local_load_in(hub: &HubState, link: Option<u64>, now: Instant) -> Option<&LoadArgs> {
+    hub.loading
+        .as_ref()
+        .filter(|l| link == Some(l.generation) && now.saturating_duration_since(l.at) < restore::RESTORING_MAX)
+        .map(|l| &l.args)
+}
+
+/// The user load went elsewhere (pushed to another device).
+pub(crate) fn forget_local_load() {
+    HUB.lock().loading = None;
+}
+
 /// The Spirc `generation` (if attached) and its latest snapshot.
 pub(crate) fn link_snapshot(generation: u64) -> Option<(Arc<Spirc>, ConnectSnapshot)> {
     let hub = HUB.lock();
@@ -269,7 +309,7 @@ fn local_active_empty_in(hub: &HubState, link: Option<u64>, now: Instant) -> boo
     let empty = hub.snapshot.as_ref().is_some_and(|s| {
         s.is_active && s.track.is_none() && s.status == librespot_connect::SnapshotPlayStatus::Stopped
     });
-    empty && !activating(hub, link, now) && !starting(hub, link, now)
+    empty && !activating(hub, link, now) && !starting(hub, link, now) && local_load_in(hub, link, now).is_none()
 }
 
 pub(crate) fn cluster() -> Option<Arc<Cluster>> {
@@ -309,6 +349,7 @@ pub(crate) fn forget_previous_link(hub: &mut HubState) {
     hub.last_active = None;
     hub.restoring = None;
     hub.handing_back = None;
+    hub.loading = None;
     hub.deactivating = false;
 }
 
@@ -322,6 +363,7 @@ pub(crate) fn detach_state(hub: &mut HubState, generation: u64, online: bool) {
         hub.activation = None;
         hub.remote_activation = None;
         hub.handing_back = None;
+        hub.loading = None;
         hub.deactivating = false;
     }
     if hub.link.is_none() && !online {
@@ -393,6 +435,7 @@ pub(crate) fn detach_all() {
         hub.activation = None;
         hub.remote_activation = None;
         hub.handing_back = None;
+        hub.loading = None;
         hub.deactivating = false;
         released
     };
@@ -511,13 +554,16 @@ pub(crate) fn apply_snapshot(hub: &mut HubState, mut snap: ConnectSnapshot, sess
     }
     if snap.is_active && snap.track.is_some() {
         hub.last_active = Some(LastActive { snap: snap.clone(), ended_at_ms: None });
-        // A restore being applied, or a hand-back, took.
+        // A restore being applied, a hand-back or a load took (the Spirc publishes nothing while
+        // it fetches a load's context).
         hub.restoring = None;
         hub.handing_back = None;
+        hub.loading = None;
     } else if !snap.is_active {
         if was_active {
-            // Taken over or stopped before the hand-back took.
+            // Taken over or stopped before the hand-back or the load took.
             hub.handing_back = None;
+            hub.loading = None;
         }
         if was_active && !session_invalid {
             // Deliberately inactive (taken over, user stop) before a restore being applied took.
@@ -561,6 +607,7 @@ fn on_spirc_error(err: SpircCommandError) {
         return;
     }
     if !err.remote && err.command == "load" {
+        HUB.lock().loading = None;
         on_local_load_failed();
     }
     use librespot_core::error::ErrorKind;
@@ -983,6 +1030,26 @@ mod hub_tests {
         };
         assert_eq!(local_load_failed_in(&mut hub, 3), Some(LoadFailed { deactivated: false, orphaned: false }));
         assert!(activating_or_active(&hub));
+    }
+
+    #[test]
+    fn a_load_fetching_its_context_isnt_nothing_loaded() {
+        let now = Instant::now();
+        let loading = || Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default() });
+        // the activation's empty snapshot while the load fetches its context (past the grace)
+        let mut hub = HubState { snapshot: Some(empty_active()), loading: loading(), ..Default::default() };
+        assert!(local_load_in(&hub, Some(3), now + ACTIVATION_GRACE).is_some());
+        assert!(!local_active_empty_in(&hub, Some(3), now + ACTIVATION_GRACE));
+        // another Spirc's, or past the bound
+        assert!(local_active_empty_in(&hub, Some(4), now));
+        assert!(local_active_empty_in(&hub, Some(3), now + restore::RESTORING_MAX));
+        // it played
+        apply_snapshot(&mut hub, playing_track(), false, 0);
+        assert!(hub.loading.is_none());
+        // taken over before it played
+        let mut hub = HubState { snapshot: Some(empty_active()), loading: loading(), ..Default::default() };
+        apply_snapshot(&mut hub, ConnectSnapshot::default(), false, 0);
+        assert!(hub.loading.is_none());
     }
 
     #[test]
