@@ -837,6 +837,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   package so the official Spotify app cannot intercept. Exchange at
   `https://accounts.spotify.com/api/token` with OkHttp. The access token goes to
   `session.start {accessToken}`; the refresh token is stored encrypted as a fallback.
+* The login Custom Tabs open in the app's own task, above `MainActivity`, which is `singleTop`:
+  leaving to read an emailed code or a 2FA app and coming back through the launcher icon
+  brings the task to the front with the login page still on top (a `singleTask` relaunch
+  cleared it, and the half-done login was lost). Every request from outside (the
+  `spotifygood://auth` redirect, `spotify:` / open.spotify.com links, shares, voice search)
+  arrives through `LinkActivity` (no UI, no history), which forwards it as a launcher intent
+  carrying the request with `CLEAR_TOP | SINGLE_TOP` to the existing `MainActivity`: the
+  redirect closes the tab, and a task a link created still has the launcher's root intent.
 * Alternative login: "Use another device" → `session.zeroconfLogin` (mDNS, MulticastLock
   only while that screen is visible: hiding the screen cancels it).
 * A finished login (`LoginState.Success`) goes back to the options as soon as the engine
