@@ -8,6 +8,7 @@ import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.util.Log
+import com.taehagen.spotifygood.model.ConnectDevice
 import com.taehagen.spotifygood.model.DeviceType
 import com.taehagen.spotifygood.nativebridge.NativeRpc
 import kotlinx.coroutines.CoroutineScope
@@ -50,21 +51,52 @@ data class LocalDeviceInfo(
 @Serializable
 internal data class LocalLoginResult(val deviceId: String)
 
-/** A Spotify Connect receiver found on the LAN that is not yet in the account's cluster. */
+/** How a LAN device is signed in to the account. */
+sealed interface LocalEndpoint {
+    /** The interface index for a link-local IPv6 host (an address string can't carry the zone). */
+    val scopeId: Int?
+
+    /** The address the device was found at (no zone), to match one device's two services. */
+    val host: String
+
+    /** A Spotify Connect ZeroConf service: `connect.localLogin` at [url]. */
+    data class ZeroConf(val url: String, override val host: String, override val scopeId: Int? = null) : LocalEndpoint
+
+    /**
+     * A Google Cast device (`_googlecast._tcp`): `connect.castLogin` at [host]:[port]. [castId] is
+     * its TXT `id` (stable per device, unlike its name).
+     */
+    data class Cast(
+        override val host: String,
+        val port: Int,
+        val castId: String,
+        override val scopeId: Int? = null,
+    ) : LocalEndpoint
+}
+
+/** A Spotify Connect receiver or Google Cast device found on the LAN, not yet in the account's cluster. */
 data class LocalConnectDevice(
+    /** ZeroConf: its getInfo `deviceID`. Cast: the Connect id it will register as ([CastServices.connectDeviceId]). */
     val deviceId: String,
     val name: String,
     val type: DeviceType,
-    val url: String,
+    val endpoint: LocalEndpoint,
     val isGroup: Boolean = false,
     val brand: String? = null,
     val model: String? = null,
-    /** Interface index for a link-local IPv6 [url] (a URL can't carry the zone); null otherwise. */
-    val scopeId: Int? = null,
-)
+) {
+    /** Unique in the LAN list: one soundbar can be a ZeroConf and a Cast device at once. */
+    val key: String
+        get() = when (endpoint) {
+            is LocalEndpoint.ZeroConf -> deviceId
+            is LocalEndpoint.Cast -> "cast:${endpoint.castId}"
+        }
+
+    val isCast: Boolean get() = endpoint is LocalEndpoint.Cast
+}
 
 /** Where to reach a resolved ZeroConf service: its URL, plus the interface for link-local IPv6. */
-internal data class ServiceTarget(val url: String, val scopeId: Int?)
+internal data class ServiceTarget(val url: String, val scopeId: Int?, val host: String = "")
 
 /** Pure address handling for resolved services (JVM-testable). */
 internal object ServiceAddress {
@@ -129,26 +161,127 @@ internal object ServiceAddress {
      */
     fun target(host: InetAddress, port: Int, cpath: String?, lanInterfaceIndex: () -> Int?): ServiceTarget? {
         if (port !in 1..65535) return null
-        val raw = host.hostAddress ?: return null
+        val (raw, scopeId) = hostAndScope(host, lanInterfaceIndex) ?: return null
+        // URLs can't carry an IPv6 zone (fe80::1%wlan0); it travels as scopeId instead.
+        val address = if (host is Inet6Address) "[$raw]" else raw
+        return ServiceTarget("http://$address:$port${path(cpath)}", scopeId, raw)
+    }
+
+    /**
+     * [host] as an address literal without a zone, plus the interface a link-local IPv6 host needs
+     * (its own scope id, else [lanInterfaceIndex]); null when such a host has no interface.
+     */
+    fun hostAndScope(host: InetAddress, lanInterfaceIndex: () -> Int?): Pair<String, Int?>? {
+        val raw = host.hostAddress?.substringBefore('%') ?: return null
         val scopeId = if (host is Inet6Address && host.isLinkLocalAddress) {
             host.scopeId.takeIf { it > 0 } ?: lanInterfaceIndex()?.takeIf { it > 0 } ?: return null
         } else {
             null
         }
-        // URLs can't carry an IPv6 zone (fe80::1%wlan0); it travels as scopeId instead.
-        val address = if (host is Inet6Address) "[${raw.substringBefore('%')}]" else raw
-        return ServiceTarget("http://$address:$port${path(cpath)}", scopeId)
+        return raw to scopeId
+    }
+}
+
+/** The TXT record of a `_googlecast._tcp` service. */
+internal data class CastRecord(
+    /** `fn`: the name the user gave the device. */
+    val friendlyName: String,
+    /** `md`: the model ("Nest Audio", "Chromecast", "Google Cast Group"). */
+    val model: String?,
+    /** `id`: the device's Cast id. */
+    val id: String?,
+    /** `ca`: the capability bit mask. */
+    val capabilities: Int?,
+)
+
+/**
+ * Pure handling of Google Cast services (JVM-testable): TXT parsing, the Connect id a Cast
+ * device gets, and which LAN entries to show next to the account's cluster.
+ */
+internal object CastServices {
+    /** The `md` of a Cast speaker group. */
+    const val GROUP_MODEL = "Google Cast Group"
+    private const val CAPABILITY_VIDEO_OUT = 1
+    private const val CAPABILITY_MULTIZONE_GROUP = 32
+
+    /** Parses the TXT [attributes] (keys case-insensitive); null without a friendly name. */
+    fun parse(attributes: Map<String, ByteArray?>): CastRecord? {
+        fun value(key: String): String? = attributes.entries
+            .firstOrNull { it.key.equals(key, ignoreCase = true) }
+            ?.value?.toString(Charsets.UTF_8)?.trim()?.takeIf { it.isNotEmpty() }
+        val name = value("fn") ?: return null
+        return CastRecord(name, value("md"), value("id"), value("ca")?.toIntOrNull())
+    }
+
+    fun isGroup(record: CastRecord): Boolean =
+        record.model.equals(GROUP_MODEL, ignoreCase = true) ||
+            ((record.capabilities ?: 0) and CAPABILITY_MULTIZONE_GROUP) != 0
+
+    /** A device with video out (a TV, Chromecast) or a speaker. */
+    fun deviceType(record: CastRecord): DeviceType =
+        if (((record.capabilities ?: 0) and CAPABILITY_VIDEO_OUT) != 0) DeviceType.TV else DeviceType.SPEAKER
+
+    /**
+     * The Connect device id of a Cast device: the MD5 of its friendly name in lowercase hex, as
+     * Rust `cast_client::connect_device_id` computes it (the id the Spotify receiver is given).
+     */
+    fun connectDeviceId(friendlyName: String): String =
+        java.security.MessageDigest.getInstance("MD5")
+            .digest(friendlyName.trim().toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    /** The LAN entry for a Cast service at [host]:[port]. */
+    fun device(record: CastRecord, serviceName: String, host: String, port: Int, scopeId: Int?): LocalConnectDevice {
+        val group = isGroup(record)
+        return LocalConnectDevice(
+            deviceId = connectDeviceId(record.friendlyName),
+            name = record.friendlyName,
+            type = deviceType(record),
+            endpoint = LocalEndpoint.Cast(host, port, record.id ?: serviceName, scopeId),
+            isGroup = group,
+            model = record.model.takeUnless { group },
+        )
+    }
+
+    private fun sameName(a: String, b: String) = a.trim().equals(b.trim(), ignoreCase = true)
+
+    /**
+     * The LAN entries worth showing: none already in the account's cluster ([cluster]), and no Cast
+     * entry for a device that is also found as a ZeroConf device (one soundbar can advertise both;
+     * its ZeroConf login is native, so that one stays). Ids differ between the two, so a Cast entry
+     * matches by Connect id, by name, or (not for a group, which is hosted by one of its members)
+     * by address.
+     */
+    fun visible(found: List<LocalConnectDevice>, cluster: List<ConnectDevice>): List<LocalConnectDevice> {
+        val clusterIds = cluster.map { it.id }.toSet()
+        val clusterIdsLower = clusterIds.map { it.lowercase() }.toSet()
+        val zeroconf = found.filter { !it.isCast }
+        return found.filter { device ->
+            when (device.endpoint) {
+                is LocalEndpoint.ZeroConf -> device.deviceId !in clusterIds
+                is LocalEndpoint.Cast -> {
+                    val inCluster = device.deviceId.lowercase() in clusterIdsLower || cluster.any { sameName(it.name, device.name) }
+                    val twin = zeroconf.any { z ->
+                        z.deviceId.equals(device.deviceId, ignoreCase = true) ||
+                            sameName(z.name, device.name) ||
+                            (!device.isGroup && z.endpoint.host.isNotEmpty() && z.endpoint.host == device.endpoint.host)
+                    }
+                    !inCluster && !twin
+                }
+            }
+        }
     }
 }
 
 /**
- * Browses the local network for Spotify Connect receivers (`_spotify-connect._tcp`) and probes
- * each with `connect.localInfo`, so the user can log one into their account (the "send" side,
- * docs/ARCHITECTURE.md §8).
+ * Browses the local network for Spotify Connect receivers (`_spotify-connect._tcp`, probed with
+ * `connect.localInfo`) and Google Cast devices (`_googlecast._tcp`, read from their TXT record),
+ * so the user can sign one in to their account (the "send" side, docs/ARCHITECTURE.md §8).
  *
  * Battery: browsing runs ONLY between [start] and [pause]/[stop] (the devices sheet drives this
- * while it is open and STARTED). A Wi-Fi [WifiManager.MulticastLock] is held only while browsing.
- * mDNS lives entirely here (`NsdManager`); Rust only ever gets a URL.
+ * while it is open and STARTED). Both service types are browsed by the same run, under one Wi-Fi
+ * [WifiManager.MulticastLock] held only while browsing, and below API 34 they share the one
+ * resolve slot. mDNS lives entirely here (`NsdManager`); Rust only ever gets an address.
  *
  * Results survive a [pause] (a brief trip to the background): the next [start] shows them at once
  * and drops the ones the new browse doesn't confirm within [CARRY_OVER_GRACE_MS]. [stop] and
@@ -176,11 +309,20 @@ class LocalDeviceDiscovery(
     private val lock = Any()
     private val _devices = MutableStateFlow<List<LocalConnectDevice>>(emptyList())
 
-    /** Receivers found, deduped by deviceId, excluding ones already in the cluster. */
+    /**
+     * Devices found, one entry per [LocalConnectDevice.key]; ZeroConf devices already in the
+     * cluster are left out. [CastServices.visible] does the rest of the dedupe for display.
+     */
     val devices: StateFlow<List<LocalConnectDevice>> = _devices.asStateFlow()
 
     private val _discovering = MutableStateFlow(false)
     val discovering: StateFlow<Boolean> = _discovering.asStateFlow()
+
+    /** The two browsed service types. */
+    private enum class Kind(val serviceType: String) {
+        ZEROCONF("_spotify-connect._tcp"),
+        CAST("_googlecast._tcp"),
+    }
 
     // ---- guarded by `lock` ----
     private var session: Session? = null
@@ -198,25 +340,29 @@ class LocalDeviceDiscovery(
     /** Timers for legacy resolves (they may outlive a session); idle unless a resolve is pending. */
     private val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private class PendingResolve(val session: Any, val info: NsdServiceInfo, val attempt: Int)
+    private class PendingResolve(val session: Any, val kind: Kind, val info: NsdServiceInfo, val attempt: Int)
 
-    /** One browse run: its coroutine scope, NSD listener and bookkeeping. */
+    /** One browse run: its coroutine scope, NSD listeners and bookkeeping. */
     private inner class Session {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        var listener: NsdManager.DiscoveryListener? = null
-        /** deviceId → device, in discovery order (the published list). */
-        val byDeviceId = LinkedHashMap<String, LocalConnectDevice>()
-        /** Carried over from before a pause and not yet seen by this browse. */
+        /** The browses that are running (one per [Kind]; a failed start drops its entry). */
+        val listeners = HashMap<Kind, NsdManager.DiscoveryListener>()
+        /** device key → device, in discovery order (the published list). */
+        val byKey = LinkedHashMap<String, LocalConnectDevice>()
+        /** Keys carried over from before a pause and not yet seen by this browse. */
         val unconfirmed = HashSet<String>()
-        /** serviceName → deviceId once probed (a repeated update is ignored). */
+        /** service key ([serviceKey]) → device key once probed (a repeated ZeroConf update is ignored). */
         val probed = HashMap<String, String>()
-        /** serviceNames with a probe in flight. */
+        /** Service keys with a probe in flight. */
         val probing = HashSet<String>()
         /** The latest update that arrived while its service was being probed (run if that fails). */
         val pendingProbe = HashMap<String, Pair<NsdServiceInfo, List<InetAddress>>>()
-        /** API 34+: serviceName → registered info callback, to unregister on loss/stop. */
+        /** API 34+: service key → registered info callback, to unregister on loss/stop. */
         val infoCallbacks = HashMap<String, Any>()
     }
+
+    /** A service name is unique per type only (a soundbar may use one name for both). */
+    private fun serviceKey(kind: Kind, serviceName: String) = "${kind.name}/$serviceName"
 
     /** Starts browsing if not already running. Idempotent. */
     fun start() {
@@ -224,53 +370,56 @@ class LocalDeviceDiscovery(
             Log.w(TAG, "NsdManager unavailable; local discovery disabled")
             return
         }
-        val (s, listener) = synchronized(lock) {
+        val (s, listeners) = synchronized(lock) {
             if (session != null) return
             val s = Session()
             session = s
             // Keep what a paused run found, until this run confirms or drops it.
             for (device in _devices.value) {
-                s.byDeviceId[device.deviceId] = device
-                s.unconfirmed += device.deviceId
+                s.byKey[device.key] = device
+                s.unconfirmed += device.key
             }
-            val listener = discoveryListener(s)
-            s.listener = listener
-            s to listener
+            Kind.entries.forEach { kind -> s.listeners[kind] = discoveryListener(s, kind) }
+            s to s.listeners.toMap()
         }
         if (s.unconfirmed.isNotEmpty()) {
             s.scope.launch {
                 delay(CARRY_OVER_GRACE_MS)
                 synchronized(lock) {
                     if (!isCurrent(s)) return@synchronized
-                    s.unconfirmed.forEach { s.byDeviceId.remove(it) }
+                    s.unconfirmed.forEach { s.byKey.remove(it) }
                     s.unconfirmed.clear()
-                    _devices.value = s.byDeviceId.values.toList()
+                    _devices.value = s.byKey.values.toList()
                 }
             }
         }
         acquireLock()
-        try {
-            manager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
-            _discovering.value = true
-        } catch (e: RuntimeException) {
-            Log.w(TAG, "discoverServices failed", e)
-            pause()
+        var started = 0
+        for ((kind, listener) in listeners) {
+            try {
+                manager.discoverServices(kind.serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
+                started++
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "discoverServices ${kind.serviceType} failed", e)
+                synchronized(lock) { s.listeners.remove(kind) }
+            }
         }
+        if (started > 0) _discovering.value = true else pause()
     }
 
     /** Stops browsing and releases the multicast lock, keeping the results. Idempotent. */
     fun pause() {
-        val s = synchronized(lock) {
+        val (s, listeners) = synchronized(lock) {
             val s = session ?: return
             session = null
             // Queued legacy resolves of this run are dropped; one already in flight keeps the
             // platform's slot until its callback (or the watchdog) frees it.
             legacyQueue.removeAll { it.session === s }
-            s
+            s to s.listeners.values.toList()
         }
         _discovering.value = false
         val manager = nsdManager
-        s.listener?.let { listener -> runCatching { manager?.stopServiceDiscovery(listener) } }
+        listeners.forEach { listener -> runCatching { manager?.stopServiceDiscovery(listener) } }
         if (Build.VERSION.SDK_INT >= 34) {
             synchronized(lock) { s.infoCallbacks.values.toList() }.forEach { cb ->
                 runCatching { manager?.unregisterServiceInfoCallback(cb as NsdManager.ServiceInfoCallback) }
@@ -290,7 +439,7 @@ class LocalDeviceDiscovery(
     fun clear() {
         synchronized(lock) {
             session?.let { s ->
-                s.byDeviceId.clear()
+                s.byKey.clear()
                 s.unconfirmed.clear()
                 s.probed.clear()
                 s.pendingProbe.clear()
@@ -300,18 +449,31 @@ class LocalDeviceDiscovery(
     }
 
     /**
-     * Logs [device] into this account via `connect.localLogin`. Returns the Connect device id to
-     * transfer to. Throws NativeException on failure.
+     * Signs [device] in to this account: `connect.localLogin` for a ZeroConf device,
+     * `connect.castLogin` for a Google Cast device. Returns the Connect device id to transfer to.
+     * Throws NativeException on failure.
      */
     suspend fun login(device: LocalConnectDevice): String {
-        val result: LocalLoginResult = rpc.call(
-            "connect.localLogin",
-            buildJsonObject {
-                put("url", device.url)
-                put("deviceId", device.deviceId)
-                putScope(device.scopeId)
-            },
-        )
+        val result: LocalLoginResult = when (val endpoint = device.endpoint) {
+            is LocalEndpoint.ZeroConf -> rpc.call(
+                "connect.localLogin",
+                buildJsonObject {
+                    put("url", endpoint.url)
+                    put("deviceId", device.deviceId)
+                    putScope(endpoint.scopeId)
+                },
+            )
+            is LocalEndpoint.Cast -> rpc.call(
+                "connect.castLogin",
+                buildJsonObject {
+                    put("host", endpoint.host)
+                    put("port", endpoint.port)
+                    put("name", device.name)
+                    put("isGroup", device.isGroup)
+                    putScope(endpoint.scopeId)
+                },
+            )
+        }
         return result.deviceId
     }
 
@@ -319,10 +481,16 @@ class LocalDeviceDiscovery(
         if (scopeId != null) put("scopeId", scopeId)
     }
 
-    private fun discoveryListener(s: Session) = object : NsdManager.DiscoveryListener {
+    private fun discoveryListener(s: Session, kind: Kind) = object : NsdManager.DiscoveryListener {
         override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-            Log.w(TAG, "start discovery failed: $errorCode")
-            if (isCurrent(s)) pause()
+            Log.w(TAG, "start discovery of $serviceType failed: $errorCode")
+            // The other browse may still run; with none left, stop (and release the lock).
+            val noneLeft = synchronized(lock) {
+                if (!isCurrent(s)) return
+                if (s.listeners[kind] === this) s.listeners.remove(kind)
+                s.listeners.isEmpty()
+            }
+            if (noneLeft) pause()
         }
 
         override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
@@ -335,37 +503,50 @@ class LocalDeviceDiscovery(
 
         override fun onServiceFound(serviceInfo: NsdServiceInfo) {
             if (!isCurrent(s)) return
-            if (Build.VERSION.SDK_INT >= 34) registerInfoCallback(s, serviceInfo) else enqueueResolve(s, serviceInfo, attempt = 0)
+            if (Build.VERSION.SDK_INT >= 34) {
+                registerInfoCallback(s, kind, serviceInfo)
+            } else {
+                enqueueResolve(s, kind, serviceInfo, attempt = 0)
+            }
         }
 
         override fun onServiceLost(serviceInfo: NsdServiceInfo) {
-            removeService(s, serviceInfo.serviceName)
+            removeService(s, kind, serviceInfo.serviceName)
+        }
+    }
+
+    /** A service resolved (either API): probe a ZeroConf device, read a Cast device's TXT. */
+    private fun resolved(s: Session, kind: Kind, info: NsdServiceInfo, addresses: List<InetAddress>) {
+        when (kind) {
+            Kind.ZEROCONF -> probe(s, info, addresses)
+            Kind.CAST -> publishCast(s, info, addresses)
         }
     }
 
     // --- API 34+: service-info callback (unchanged behaviour) --------------------------------------
 
-    private fun registerInfoCallback(s: Session, serviceInfo: NsdServiceInfo) {
+    private fun registerInfoCallback(s: Session, kind: Kind, serviceInfo: NsdServiceInfo) {
         if (Build.VERSION.SDK_INT < 34) return
         val name = serviceInfo.serviceName
+        val key = serviceKey(kind, name)
         val callback = object : NsdManager.ServiceInfoCallback {
             override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
                 Log.w(TAG, "info callback registration failed: $errorCode")
             }
 
             override fun onServiceUpdated(info: NsdServiceInfo) {
-                probe(s, info, info.hostAddresses)
+                resolved(s, kind, info, info.hostAddresses)
             }
 
             override fun onServiceLost() {
-                removeService(s, name)
+                removeService(s, kind, name)
             }
 
             override fun onServiceInfoCallbackUnregistered() = Unit
         }
         synchronized(lock) {
-            if (!isCurrent(s) || s.infoCallbacks.containsKey(name)) return
-            s.infoCallbacks[name] = callback
+            if (!isCurrent(s) || s.infoCallbacks.containsKey(key)) return
+            s.infoCallbacks[key] = callback
         }
         val manager = nsdManager ?: return
         val registered = runCatching { manager.registerServiceInfoCallback(serviceInfo, Executor { it.run() }, callback) }
@@ -375,21 +556,22 @@ class LocalDeviceDiscovery(
         // its unregister then failed ("not registered") and nobody else would ever unregister.
         // Re-check after our own register, and undo it if this session or entry is gone.
         val stale = synchronized(lock) {
-            val current = session === s && s.infoCallbacks[name] === callback
-            if (!registered && s.infoCallbacks[name] === callback) s.infoCallbacks.remove(name) // allow a retry
+            val current = session === s && s.infoCallbacks[key] === callback
+            if (!registered && s.infoCallbacks[key] === callback) s.infoCallbacks.remove(key) // allow a retry
             registered && !current
         }
         if (stale) runCatching { manager.unregisterServiceInfoCallback(callback) }
     }
 
-    // --- API < 34: one resolve at a time, across sessions -----------------------------------------
+    // --- API < 34: one resolve at a time, across sessions and service types ----------------------
 
-    private fun enqueueResolve(s: Session, serviceInfo: NsdServiceInfo, attempt: Int) {
+    private fun enqueueResolve(s: Session, kind: Kind, serviceInfo: NsdServiceInfo, attempt: Int) {
         synchronized(lock) {
             val name = serviceInfo.serviceName
-            if (!isCurrent(s) || s.probed.containsKey(name)) return
-            if (legacyQueue.any { it.session === s && it.info.serviceName == name }) return
-            legacyQueue.add(PendingResolve(s, serviceInfo, attempt))
+            // A resolved ZeroConf service is done; a Cast one is resolved again on a new find.
+            if (!isCurrent(s) || (kind == Kind.ZEROCONF && s.probed.containsKey(serviceKey(kind, name)))) return
+            if (legacyQueue.any { it.session === s && it.kind == kind && it.info.serviceName == name }) return
+            legacyQueue.add(PendingResolve(s, kind, serviceInfo, attempt))
         }
         drainLegacy()
     }
@@ -434,7 +616,7 @@ class LocalDeviceDiscovery(
                 val s = synchronized(lock) { session?.takeIf { it === pending.session } }
                 @Suppress("DEPRECATION")
                 val host = serviceInfo.host
-                if (s != null) probe(s, serviceInfo, listOfNotNull(host))
+                if (s != null) resolved(s, pending.kind, serviceInfo, listOfNotNull(host))
                 drainLegacy()
             }
         }
@@ -468,7 +650,7 @@ class LocalDeviceDiscovery(
         }
         s.scope.launch {
             delay(RESOLVE_RETRY_DELAY_MS * (pending.attempt + 1))
-            enqueueResolve(s, pending.info, pending.attempt + 1)
+            enqueueResolve(s, pending.kind, pending.info, pending.attempt + 1)
         }
     }
 
@@ -476,6 +658,7 @@ class LocalDeviceDiscovery(
 
     private fun probe(s: Session, serviceInfo: NsdServiceInfo, addresses: List<InetAddress>) {
         val name = serviceInfo.serviceName
+        val key = serviceKey(Kind.ZEROCONF, name)
         val cpath = runCatching { serviceInfo.attributes }.getOrNull()?.let(ServiceAddress::cPath)
         val targets = ServiceAddress.candidates(addresses)
             .mapNotNull { ServiceAddress.target(it, serviceInfo.port, cpath, ::lanInterfaceIndex) }
@@ -484,10 +667,10 @@ class LocalDeviceDiscovery(
             return
         }
         synchronized(lock) {
-            if (!isCurrent(s) || s.probed.containsKey(name)) return
-            if (!s.probing.add(name)) {
+            if (!isCurrent(s) || s.probed.containsKey(key)) return
+            if (!s.probing.add(key)) {
                 // A probe with older addresses is running: keep this update for when it fails.
-                s.pendingProbe[name] = serviceInfo to addresses
+                s.pendingProbe[key] = serviceInfo to addresses
                 return
             }
         }
@@ -509,56 +692,87 @@ class LocalDeviceDiscovery(
                         Log.d(TAG, "localInfo failed for ${target.url}: ${e.message}")
                         continue
                     }
-                    publish(s, name, info, target)
+                    publish(s, key, info, target)
                     break
                 }
             } finally {
                 val pending = synchronized(lock) {
-                    s.probing.remove(name)
-                    s.pendingProbe.remove(name)?.takeIf { session === s && !s.probed.containsKey(name) }
+                    s.probing.remove(key)
+                    s.pendingProbe.remove(key)?.takeIf { session === s && !s.probed.containsKey(key) }
                 }
                 if (pending != null) probe(s, pending.first, pending.second)
             }
         }
     }
 
-    private fun publish(s: Session, serviceName: String, info: LocalDeviceInfo, target: ServiceTarget) {
+    private fun publish(s: Session, serviceKey: String, info: LocalDeviceInfo, target: ServiceTarget) {
         if (info.deviceId.isBlank()) return
         val device = LocalConnectDevice(
             deviceId = info.deviceId,
             name = info.remoteName.ifBlank { info.model ?: info.deviceId },
             type = deviceType(info.deviceType),
-            url = target.url,
+            endpoint = LocalEndpoint.ZeroConf(target.url, target.host, target.scopeId),
             isGroup = info.isGroup,
             brand = info.brand,
             model = info.model,
-            scopeId = target.scopeId,
         )
         val inCluster = info.deviceId in clusterDeviceIds()
         synchronized(lock) {
             if (!isCurrent(s)) return
-            s.probed[serviceName] = info.deviceId
-            s.unconfirmed.remove(info.deviceId)
+            s.probed[serviceKey] = device.key
+            s.unconfirmed.remove(device.key)
             // Drop devices that are already in the cluster list; dedupe by deviceId.
-            if (inCluster) s.byDeviceId.remove(info.deviceId) else s.byDeviceId[info.deviceId] = device
-            _devices.value = s.byDeviceId.values.toList()
+            if (inCluster) s.byKey.remove(device.key) else s.byKey[device.key] = device
+            _devices.value = s.byKey.values.toList()
         }
     }
 
-    private fun removeService(s: Session, serviceName: String) {
+    /**
+     * A Cast service resolved or updated: its TXT record says everything the list needs, so there
+     * is no probe (nothing connects to the device until the user taps it). Re-published on every
+     * update, so a renamed or moved device stays current.
+     */
+    private fun publishCast(s: Session, serviceInfo: NsdServiceInfo, addresses: List<InetAddress>) {
+        val name = serviceInfo.serviceName
+        val record = runCatching { serviceInfo.attributes }.getOrNull()?.let(CastServices::parse) ?: run {
+            Log.d(TAG, "no friendly name for Cast service $name")
+            return
+        }
+        val port = serviceInfo.port.takeIf { it in 1..65535 } ?: return
+        val (host, scopeId) = ServiceAddress.candidates(addresses)
+            .firstNotNullOfOrNull { ServiceAddress.hostAndScope(it, ::lanInterfaceIndex) }
+            ?: run {
+                Log.d(TAG, "no usable address for Cast service $name yet")
+                return
+            }
+        val device = CastServices.device(record, name, host, port, scopeId)
+        synchronized(lock) {
+            if (!isCurrent(s)) return
+            val key = serviceKey(Kind.CAST, name)
+            s.probed.put(key, device.key)?.takeIf { it != device.key }?.let { old ->
+                if (old !in s.probed.values) s.byKey.remove(old)
+            }
+            s.unconfirmed.remove(device.key)
+            s.byKey[device.key] = device
+            _devices.value = s.byKey.values.toList()
+        }
+    }
+
+    private fun removeService(s: Session, kind: Kind, serviceName: String) {
+        val key = serviceKey(kind, serviceName)
         synchronized(lock) {
             if (!isCurrent(s)) return
             if (Build.VERSION.SDK_INT >= 34) {
-                (s.infoCallbacks.remove(serviceName) as? NsdManager.ServiceInfoCallback)?.let { cb ->
+                (s.infoCallbacks.remove(key) as? NsdManager.ServiceInfoCallback)?.let { cb ->
                     runCatching { nsdManager?.unregisterServiceInfoCallback(cb) }
                 }
             }
-            legacyQueue.removeAll { it.session === s && it.info.serviceName == serviceName }
-            s.pendingProbe.remove(serviceName)
-            val deviceId = s.probed.remove(serviceName)
+            legacyQueue.removeAll { it.session === s && it.kind == kind && it.info.serviceName == serviceName }
+            s.pendingProbe.remove(key)
+            val deviceKey = s.probed.remove(key)
             // Another service (a second interface) may still announce the same device.
-            if (deviceId != null && deviceId !in s.probed.values) s.byDeviceId.remove(deviceId)
-            _devices.value = s.byDeviceId.values.toList()
+            if (deviceKey != null && deviceKey !in s.probed.values) s.byKey.remove(deviceKey)
+            _devices.value = s.byKey.values.toList()
         }
     }
 
@@ -618,7 +832,6 @@ class LocalDeviceDiscovery(
     internal companion object {
         private const val TAG = "LocalDiscovery"
         private const val LOCK_TAG = "spotifygood:localconnect"
-        private const val SERVICE_TYPE = "_spotify-connect._tcp"
         /** Results kept across a pause are dropped if a new browse doesn't confirm them by then. */
         const val CARRY_OVER_GRACE_MS = 12_000L
         /** A legacy resolve without a callback by then frees the queue. */

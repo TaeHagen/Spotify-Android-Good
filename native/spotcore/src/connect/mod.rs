@@ -853,6 +853,12 @@ pub(crate) fn find_cluster_device(device_id: &str) -> Option<String> {
         .cloned()
 }
 
+/// The `(id, name)` of every device in the cluster. Used by the Cast client to recognise a
+/// receiver that joined under an id other than the one it was given.
+pub(crate) fn cluster_device_names() -> Vec<(String, String)> {
+    hub::cluster().map(|c| c.device.iter().map(|(id, d)| (id.clone(), d.name.clone())).collect()).unwrap_or_default()
+}
+
 /// Woken on every cluster update (a new device joining pushes a cluster update to us).
 pub(crate) fn cluster_changed() -> &'static tokio::sync::Notify {
     &hub::CLUSTER_CHANGED

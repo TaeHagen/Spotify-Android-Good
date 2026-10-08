@@ -1,14 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Spotify Connect local-network discovery (docs/ARCHITECTURE.md §8). -->
+<!-- Spotify Connect and Google Cast local-network discovery (docs/ARCHITECTURE.md §8). -->
 <resources>
     <string name="local_connect_section">Other devices on your network</string>
     <string name="local_connect_searching">Looking for devices…</string>
     <string name="local_connect_connecting">Connecting…</string>
     <string name="local_connect_subtitle">Tap to connect</string>
+    <string name="local_connect_cast_subtitle">Google Cast</string>
+    <string name="local_connect_cast_subtitle_model">Google Cast · %1$s</string>
     <string name="local_connect_ready">%1$s is now in your Spotify Connect devices. Start something, then pick it here to play it there.</string>
     <string name="local_connect_login_failed">Couldn\'t connect to %1$s</string>
     <string name="local_connect_added">%1$s is now in your Spotify Connect devices.</string>
     <string name="local_connect_login_failed_offline">Go online to add %1$s.</string>
     <string name="local_connect_login_failed_network">Couldn\'t reach %1$s. Check your Wi‑Fi.</string>
-    <string name="local_connect_hint">Speakers and receivers signed out of your account appear here while they’re on this Wi‑Fi network.</string>
+    <string name="local_connect_hint">Speakers, receivers and Google Cast devices signed out of your account appear here while they’re on this Wi‑Fi network.</string>
 </resources>

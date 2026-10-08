@@ -17,7 +17,9 @@ over JNI). Requires a Spotify Premium account.
     keys. With nothing playing, picking a device makes the next play start there.
     Speakers on the local network that are not signed in to the account (librespot and
     spotifyd boxes, Connect speakers) are discovered and can be signed in from the device
-    sheet;
+    sheet. So are Google Cast speakers and TVs (Nest, Chromecast, Google TV, soundbars with
+    Chromecast built-in): the app starts Spotify on them and signs them in itself, without the
+    Cast SDK or Google Play services;
   - receive: the phone shows up as a Connect device and can be switched to. Receiving while
     the app is closed needs the "Stay available for Spotify Connect" setting. The phone is
     only listed as a Connect target while it can actually play.
@@ -86,6 +88,11 @@ Tests: `./gradlew :app:testDebugUnitTest` and `cd native && cargo test -p spotco
 - Signing in a local-network speaker uses the Spotify Connect ZeroConf protocol as
   implemented by librespot. It is tested against librespot's own server code, not against
   commercial speakers.
+- Google Cast support is implemented from the Cast protocol as open-source Cast clients use it
+  (launching Spotify's Cast receiver and signing it in with an access token for the receiver's
+  client id). It is tested against a fake receiver, not against real Cast hardware, and the
+  receiver may refuse the token the app obtains for it; the device then shows an error and can
+  still be started from the official Spotify app or Google Assistant.
 - The app was developed without a device or a Spotify account: the JVM and Rust test
   suites run offline (with fakes for the CDN and the ZeroConf server), and nothing has yet
   been run against Spotify's live services.

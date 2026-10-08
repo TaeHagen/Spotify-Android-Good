@@ -489,7 +489,7 @@ private fun DevicesList(
             item(key = "connect:empty") {
                 EmptyState(
                     title = stringResource(R.string.player_devices_none),
-                    // Only devices signed in to the account are listed (no local network discovery).
+                    // Only devices signed in to the account are listed here; LAN speakers and Cast devices follow.
                     message = stringResource(R.string.player_devices_tip_account),
                     icon = Icons.Rounded.Devices,
                     modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
@@ -519,7 +519,7 @@ private fun DevicesList(
                 )
             }
         }
-        // Spotify Connect receivers on the local network that aren't in the account yet (§8).
+        // Spotify Connect receivers and Google Cast devices on the local network, not in the account yet (§8).
         item(key = "local") { LocalDevicesSection(localDevices, transferring = state.transferringId != null) }
         item(key = "hint") {
             Text(

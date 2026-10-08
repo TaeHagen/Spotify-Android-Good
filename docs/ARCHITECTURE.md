@@ -65,7 +65,7 @@ app/src/main/java/com/taehagen/spotifygood/
                   AudioFocusController.kt BecomingNoisyReceiver.kt OutputRouteManager.kt
                   VolumeSync.kt LibraryTree.kt SessionCommands.kt SleepTimer.kt ResumeStore.kt
                   ArtworkProvider.kt (content:// artwork for Auto/notification)
-  connect/        DevicesRepository.kt
+  connect/        DevicesRepository.kt LocalDeviceDiscovery.kt (ZeroConf + Google Cast LAN discovery)
   data/           CatalogRepository.kt LibraryRepository.kt SearchRepository.kt HomeRepository.kt
                   LyricsRepository.kt PlaylistEditor.kt ResponseCache.kt
   data/db/        AppDatabase.kt Entities.kt Daos.kt
@@ -496,6 +496,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
+| `connect.castLogin` | `{"host":"192.168.1.30","port"?:8009,"name":"…","isGroup"?:false,"scopeId"?:n}` → `{"deviceId":"…"}` (Google Cast: launches Spotify's Cast receiver on the device at `host:port` and signs it in to this account, see §8; `name` is the device's friendly name, TXT `fn`; the returned id is the Connect device id to `connect.transfer` to) |
 
 `scopeId` is the interface index for a link-local IPv6 host (`fe80::/10`), which a URL cannot
 carry; such a host is connected through that interface and rejected (`INVALID_ARGUMENT`) without
@@ -508,6 +509,14 @@ Key material (the device's DH public key, client id) never crosses the JNI bound
 for the `addUser` call. `connect.localInfo`/`connect.localLogin` are routed by `rpc.rs` to the
 `zeroconf_client` module (a `connect.local` prefix match ahead of the generic `connect.` route),
 not to the `connect` playback module. `connect.localLogin` requires an online session.
+`connect.castLogin` is routed the same way to `cast_client` (a `connect.cast` prefix match). It
+requires an online session; `host` is an IP address literal that passes the same local-network
+allowlist (with `scopeId` for a link-local IPv6 host). Its errors use the same codes and the app
+the same messages as `connect.localLogin`: `NOT_CONNECTED` without a session, `NETWORK` when the
+device can't be reached or sends nothing within a step's timeout, `UNAVAILABLE` when it answers but
+refuses (LAUNCH_ERROR, `addUserError`, a malformed frame, no answer from the Spotify app),
+`INVALID_ARGUMENT` for an address outside the allowlist. The access token sent to the device never
+crosses the JNI boundary and is never logged.
 
 ### 6.3 Catalog (Spotify internal APIs, JSON shaped for the UI)
 
@@ -808,6 +817,50 @@ For a remote active device, smart shuffle is not supported (the command reports
     `connect.transfer`. Only local-network hosts (loopback / private / link-local / `.local`) over
     plain HTTP are accepted; all timeouts are bounded. mDNS browsing is Kotlin's `NsdManager`, so
     Rust only ever sees the URL.
+* **Google Cast devices (the "send" side for Cast speakers and TVs)**: Nest speakers, Chromecast,
+  Google TV and soundbars with Chromecast built-in advertise `_googlecast._tcp`, not
+  `_spotify-connect._tcp`, and join the account's cluster only once a sender has launched
+  Spotify's Cast receiver app (`CC32E753`) on them and signed it in. The app does this itself,
+  without the Cast SDK or Play services (it works on phones without GMS).
+  * **Kotlin (`LocalDeviceDiscovery`)** browses `_googlecast._tcp` in the same run as
+    `_spotify-connect._tcp`: same sheet-driven start / pause / stop, same `MulticastLock`, same
+    API 34+ service-info callbacks, and below API 34 the same one-resolve-at-a-time queue (the
+    platform's slot is shared by both types). A Cast service is not probed: its TXT record gives
+    `fn` (friendly name), `md` (model; "Google Cast Group" for a group), `id` (its Cast id, the
+    entry's key) and `ca` (capabilities: video out → TV icon). Its Connect id is
+    `md5(fn)` in lowercase hex (`CastServices.connectDeviceId`, the id the receiver is given, see
+    below). `CastServices.visible` hides an entry that is already in the cluster (that id, or a
+    cluster device with the same name) or that is the Cast side of a device also found as a
+    ZeroConf device (same id, same name, or, except for a group, which runs on one of its members,
+    the same address): the ZeroConf login is the device's native one. Cast rows say "Google Cast".
+  * **Rust (`cast_client/`)**, `connect.castLogin`: TLS to `host:port` (8009; a group announces
+    its own port) with rustls/ring. Cast devices present self-signed certificates, so this
+    connector, and only it, accepts any certificate (the handshake signature is still checked
+    against the presented key when webpki can parse the certificate); every other connection keeps
+    normal verification. Cast v2 frames are a 4-byte big-endian length (≤ 64 KiB) and a
+    hand-written protobuf `CastMessage`. The exchange: CONNECT `receiver-0`
+    (`urn:x-cast:com.google.cast.tp.connection`); LAUNCH `CC32E753` on
+    `urn:x-cast:com.google.cast.receiver` and wait for a RECEIVER_STATUS listing it with a
+    `transportId` (LAUNCH_ERROR fails); CONNECT to the transport; on
+    `urn:x-cast:com.spotify.chromecast.secure.v1` send `getInfo {remoteName: fn, deviceID: md5(fn),
+    deviceAPI_isGroup}` (the receiver's identity, as open-source Cast senders send it; never this
+    phone's id, which the receiver would register under) and read `getInfoResponse` (`clientID`,
+    `deviceID`); send `addUser {blob: <access token>, tokenType: "accesstoken"}` and wait for
+    `addUserResponse` (`addUserError` is a refusal). PINGs on `urn:x-cast:com.google.cast.tp.heartbeat`
+    are answered with PONG throughout, also while the token is minted. The token must be issued for
+    the receiver's `clientID`; it is minted on the live session, first with spclient
+    `POST /device-auth/v1/refresh {"clientId","deviceId"}` (what open-source Cast senders use), then,
+    if that fails or the receiver refuses it, with a keymaster token request
+    (`hm://keymaster/token/authenticated`, the receiver's client id, scopes `streaming,
+    user-read-playback-state, user-modify-playback-state, user-read-private`) sent directly over
+    Mercury, not through librespot's `TokenProvider` (whose cache is keyed by scope only). Bounds:
+    TCP connect 5 s, TLS handshake 5 s, launch 15 s, getInfo 10 s, each token 10 s, addUser 15 s, the
+    whole exchange 60 s. A step that times out is `NETWORK` if the device sent nothing meanwhile,
+    else `UNAVAILABLE`. The socket is closed right after (TLS close_notify, no CLOSE message: a
+    "requested by sender" close lets an idle receiver stop itself); no heartbeat or task outlives
+    the call. Then, as for `connect.localLogin`, the engine waits up to 10 s for the device to appear
+    in the cluster (the reported `deviceID`, `md5(fn)`, or a new device with that name) and returns
+    its id; Kotlin transfers to it, or keeps it as the pending target when nothing plays.
 
 ## 9. Android app
 
@@ -1154,10 +1207,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   over), the engine stops or logs out, or the user picks "Automatic". "More devices…" opens the
   system output switcher via `androidx.mediarouter.app.SystemOutputSwitcherDialogController
   .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — lists Bluetooth and
-  other system audio outputs not yet connected (the app does not cast). Never use `setCommunicationDevice` for media.
+  other system audio outputs not yet connected (the system switcher does not cast for this app:
+  Google Cast devices are signed in from the sheet's local-network section instead, §8). Never use
+  `setCommunicationDevice` for media.
 * Device sheet (one UI for everything, like Spotify's): **This phone** (with current output
   name + icon and local output choices), then **Spotify Connect devices**, then
-  "More devices…". Selecting a Connect device → `connect.transfer`. With nothing playing
+  "More devices…", then **Other devices on your network**: ZeroConf speakers and Google Cast
+  devices not yet in the account (§8; a tap signs one in, then transfers). Selecting a Connect
+  device → `connect.transfer`. With nothing playing
   anywhere and no session to resume, the picked device becomes the pending target
   (`DevicesRepository.pendingTarget`): the next in-app play goes there (`player.load
   {deviceId}`), the standard Connect "send" (§8). It is used once, expires 10 minutes after the
@@ -1434,7 +1491,8 @@ error while ONLINE: after the next reconnect).
 Login (OAuth, other-device), Premium gate, logout, background play, notification &
 lock-screen controls, Bluetooth/headset buttons, Android Auto, playback resumption,
 audio focus & ducking, becoming-noisy pause, output switching (speaker/BT/wired/USB +
-system switcher), Connect send (device list, transfer, remote control incl. volume keys)
+system switcher), Connect send (device list, transfer, remote control incl. volume keys, signing
+in local-network ZeroConf speakers and Google Cast devices)
 and receive (phone as Connect device), shuffle, smart shuffle with suggestions, repeat
 all/one, queue (view, add, remove, reorder, clear, jump), autoplay, gapless,
 normalisation, streaming quality, playlists (view, create, edit, reorder, delete,
