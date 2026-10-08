@@ -71,6 +71,9 @@ internal class SpotifyPlayer(
      * sent: the service then holds its engine holder (a pause or stop does not start anything).
      */
     private val onCommand: () -> Unit = {},
+    /** The chosen podcast speed ([PodcastSpeed]); controllers may change it ([onSpeed]). */
+    private val podcastSpeed: () -> Float = { PodcastSpeeds.NORMAL },
+    private val onSpeed: (Float) -> Unit = {},
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
 
     private val context = context.applicationContext
@@ -139,6 +142,8 @@ internal class SpotifyPlayer(
             .addIf(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM, hasItem && r.canSkipPrev)
             .addIf(COMMAND_SET_SHUFFLE_MODE, hasItem && r.canToggleShuffle)
             .addIf(COMMAND_SET_REPEAT_MODE, hasItem && r.canToggleRepeat)
+            // Podcasts played here: Auto, Wear and other controllers may change the speed.
+            .addIf(COMMAND_SET_SPEED_AND_PITCH, hasItem && PodcastSpeeds.appliesTo(s))
             .addIf(COMMAND_SET_DEVICE_VOLUME_WITH_FLAGS, remoteVolumeSupported)
             .addIf(COMMAND_ADJUST_DEVICE_VOLUME_WITH_FLAGS, remoteVolumeSupported)
             .build()
@@ -178,7 +183,8 @@ internal class SpotifyPlayer(
 
         if (hasItem) {
             val loading = s.status == PlaybackStatus.LOADING
-            val speed = s.playbackSpeed.toFloat().takeIf { it > 0f } ?: 1f
+            // An episode here shows the chosen speed (also while paused, when the engine reports 0).
+            val speed = if (PodcastSpeeds.appliesTo(s)) podcastSpeed() else s.playbackSpeed.toFloat().takeIf { it > 0f } ?: 1f
             builder.setCurrentMediaItemIndex(w.currentIndex)
                 .setPlaybackState(if (loading) STATE_BUFFERING else STATE_READY)
                 .setIsLoading(loading)
@@ -368,6 +374,12 @@ internal class SpotifyPlayer(
         // the pending Connect target nor on another active device: in a car, a speaker at home
         // would be wrong (and the stored session must not overwrite what it plays now).
         return trackLoad(controller.playAsync(withModes, toPendingTarget = false, onThisPhone = true))
+    }
+
+    /** A controller's speed for the podcast speed (pitch is always kept). */
+    override fun handleSetPlaybackParameters(playbackParameters: PlaybackParameters): ListenableFuture<*> {
+        onSpeed(playbackParameters.speed)
+        return Futures.immediateVoidFuture()
     }
 
     override fun handleAddMediaItems(index: Int, mediaItems: List<MediaItem>): ListenableFuture<*> {

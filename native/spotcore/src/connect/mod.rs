@@ -27,7 +27,10 @@ use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::RepeatMode;
 use crate::rpc::{ok, parse_args, to_value};
 use crate::engine;
-use args::{AudioOutputArgs, EnabledArgs, LoadArgs, MoveArgs, RepeatArgs, SeekArgs, TransferArgs, UidArgs, UriArgs, VolumeArgs};
+use args::{
+    AudioOutputArgs, EnabledArgs, LoadArgs, MoveArgs, RepeatArgs, SeekArgs, SpeedArgs, TransferArgs, UidArgs, UriArgs,
+    VolumeArgs,
+};
 use librespot_core::dealer::protocol::TransferOptions;
 use librespot_core::spclient::TransferRequest;
 use librespot_playback::mixer::Mixer;
@@ -91,6 +94,7 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
         "player.setRepeat" => control(Ctl::Repeat(parse_args::<RepeatArgs>(args)?.mode)).await,
         "player.setVolume" => set_volume(parse_args(args)?),
         "player.setAudioOutput" => set_audio_output(parse_args(args)?),
+        "player.setSpeed" => set_speed(parse_args::<SpeedArgs>(args)?.validate()?),
         "player.applySettings" => engine::apply_player_settings(args),
         "queue.add" => control(Ctl::QueueAdd(parse_args::<UriArgs>(args)?.uri)).await,
         "queue.remove" => control(Ctl::QueueRemove(parse_args::<UidArgs>(args)?.uid)).await,
@@ -505,6 +509,21 @@ fn set_volume(args: VolumeArgs) -> AppResult<Value> {
         Target::Remote(device) => remote::set_volume(&device, volume),
     }
     hub::publish();
+    ok()
+}
+
+/// `player.setSpeed`: the speed the app's sink plays at (podcasts; the app sends 1 for music). The
+/// Spirc reports it as the playback speed while playing (also every later Spirc, see
+/// `hub::attach`) and the offline queue extrapolates with it, so positions here and on the other
+/// clients follow the real rate.
+fn set_speed(speed: f64) -> AppResult<Value> {
+    hub::HUB.lock().playback_speed = Some(speed);
+    if let Some(spirc) = hub::spirc() {
+        if let Err(e) = spirc.set_playback_speed(speed) {
+            log::debug!("playback speed not reported: {e}");
+        }
+    }
+    offline::set_speed(speed);
     ok()
 }
 

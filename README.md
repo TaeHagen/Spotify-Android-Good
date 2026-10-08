@@ -22,7 +22,8 @@ over JNI). Requires a Spotify Premium account.
     the app is closed needs the "Stay available for Spotify Connect" setting. The phone is
     only listed as a Connect target while it can actually play.
 - **Play modes:** shuffle, smart shuffle (suggestions mixed into the context), repeat all,
-  repeat one, autoplay, radio.
+  repeat one, autoplay, radio, podcast playback speed (0.5× to 3.5×, one speed for all
+  episodes, on this phone).
 - **Queue:** view, add, remove, reorder, clear, jump.
 - **Library:** playlists (create, rename, edit, reorder, delete, follow), Liked Songs, saved
   albums, artists and podcasts, follow artists.

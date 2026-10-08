@@ -161,6 +161,9 @@ pub(crate) struct OfflineQueue {
     user_queued: Vec<usize>,
     /// The driver: a visible online session is up, the window's end hands back to Spirc.
     hand_back: bool,
+    /// The speed the app's sink plays at, in thousandths (podcasts; see `connect::set_speed`):
+    /// positions extrapolate with it. Kept across loads and resets.
+    speed_milli: u64,
 }
 
 /// Playback the Player is already doing (Spirc's, on a downloaded track) that the queue takes
@@ -222,6 +225,7 @@ impl Default for OfflineQueue {
             outside: Vec::new(),
             user_queued: Vec::new(),
             hand_back: false,
+            speed_milli: 1000,
         }
     }
 }
@@ -315,10 +319,23 @@ impl OfflineQueue {
         }
     }
 
-    /// Position extrapolated to `now_ms`.
+    /// The speed the sink plays at (see `speed_milli`); the position is re-anchored at `now_ms`.
+    pub fn set_speed(&mut self, speed: f64, now_ms: i64) {
+        let milli = (speed * 1000.0).round().clamp(1.0, 10_000.0) as u64;
+        if milli == self.speed_milli {
+            return;
+        }
+        if self.status == PlaybackStatus::Playing {
+            self.position_ms = self.position_at(now_ms);
+            self.position_ts = now_ms;
+        }
+        self.speed_milli = milli;
+    }
+
+    /// Position extrapolated to `now_ms` (at the playback speed).
     pub fn position_at(&self, now_ms: i64) -> u64 {
         if self.status == PlaybackStatus::Playing {
-            let elapsed = (now_ms - self.position_ts).max(0) as u64;
+            let elapsed = (now_ms - self.position_ts).max(0) as u64 * self.speed_milli / 1000;
             let p = self.position_ms + elapsed;
             if self.duration_ms > 0 { p.min(self.duration_ms) } else { p }
         } else {
@@ -393,6 +410,7 @@ impl OfflineQueue {
             pending_loads: self.pending_loads,
             last_request: self.last_request,
             ended_request: self.ended_request,
+            speed_milli: self.speed_milli,
             ..Default::default()
         };
         self.pos = self.order.iter().position(|&i| i == start).unwrap_or(0);
@@ -750,7 +768,8 @@ impl OfflineQueue {
         let next_queue_id = self.next_queue_id;
         let pending_loads = self.pending_loads;
         let (last_request, ended_request) = (self.last_request, self.ended_request);
-        *self = OfflineQueue { next_queue_id, pending_loads, last_request, ended_request, ..Default::default() };
+        let speed_milli = self.speed_milli;
+        *self = OfflineQueue { next_queue_id, pending_loads, last_request, ended_request, speed_milli, ..Default::default() };
     }
 
     fn own(&self, id: u64) -> bool {
@@ -969,7 +988,7 @@ impl OfflineQueue {
             status: self.status,
             position_ms: self.position_ms,
             position_timestamp_ms: self.position_ts,
-            playback_speed: if playing { 1.0 } else { 0.0 },
+            playback_speed: if playing { self.speed_milli as f64 / 1000.0 } else { 0.0 },
             duration_ms: self.duration_ms,
             context: self.context_uri.as_ref().map(|u| PlaybackContext {
                 uri: u.clone(),
@@ -1727,6 +1746,24 @@ mod tests {
         let out = q.on_event(Event::RequestId(9), 0);
         assert!(out.changed);
         assert!(!q.active);
+    }
+
+    #[test]
+    fn positions_follow_the_playback_speed() {
+        let mut q = OfflineQueue::default();
+        q.load(spec(2, 0, false, RepeatMode::Off), 1000);
+        q.on_event(Event::RequestId(1), 1000);
+        q.on_event(Event::TrackChanged { uri: "spotify:track:0".into(), duration_ms: 600_000 }, 1000);
+        q.on_event(Event::Playing { id: 1, position_ms: 0 }, 1000);
+        // 4 s at normal speed, then 1.5x from there (re-anchored, no jump)
+        q.set_speed(1.5, 5000);
+        assert_eq!(q.position_at(5000), 4000);
+        assert_eq!(q.position_at(7000), 7000);
+        let s = q.snapshot(dev(), 0);
+        assert_eq!(s.playback_speed, 1.5);
+        // a later load keeps it
+        q.load(spec(2, 1, false, RepeatMode::Off), 8000);
+        assert_eq!(q.speed_milli, 1500);
     }
 
     #[test]

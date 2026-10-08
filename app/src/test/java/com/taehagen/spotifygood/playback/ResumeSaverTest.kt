@@ -68,32 +68,68 @@ class ResumeSaverTest {
     }
 
     @Test
-    fun theStoredSessionFreezesWhenPlaybackLeavesThePhone() = runTest {
-        for (left in listOf(
-            // A transfer, or another device taking over.
-            PlaybackSnapshot(
-                source = PlaybackSource.REMOTE,
-                status = PlaybackStatus.PLAYING,
-                activeDevice = ActiveDeviceRef("tv", "TV"),
-                track = PlaybackTrack(uri = "spotify:track:remote"),
-            ),
-            // The engine's reset / the Spirc letting go.
-            PlaybackSnapshot.EMPTY,
-        )) {
-            val run = Run(this, playing(), loggedIn = true, interval, base)
-            advanceTimeBy(5_000)
-            runCurrent()
-            run.snapshots.value = left
-            runCurrent()
-            // One last save at the hand-over (5 s later than the start), then nothing.
-            assertEquals(listOf(10_000L, 15_000L), run.saves().map { it.positionMs })
-            advanceTimeBy(interval * 4)
-            runCurrent()
-            run.snapshots.value = left.copy(positionMs = 99_000)
-            runCurrent()
-            assertEquals(2, run.saves().size)
-            assertTrue(run.saves().all { it.trackUri == "spotify:track:t" })
-        }
+    fun theStoredSessionFreezesWhenNothingIsActiveAnyMore() = runTest {
+        // The engine's reset / the Spirc letting go with nothing else active.
+        val run = Run(this, playing(), loggedIn = true, interval, base)
+        advanceTimeBy(5_000)
+        runCurrent()
+        run.snapshots.value = PlaybackSnapshot.EMPTY
+        runCurrent()
+        // One last save at that moment (5 s later than the start), then nothing.
+        assertEquals(listOf(10_000L, 15_000L), run.saves().map { it.positionMs })
+        advanceTimeBy(interval * 4)
+        runCurrent()
+        run.snapshots.value = PlaybackSnapshot.EMPTY.copy(positionMs = 99_000)
+        runCurrent()
+        assertEquals(2, run.saves().size)
+        assertTrue(run.saves().all { it.trackUri == "spotify:track:t" })
+    }
+
+    private fun TestScope.speaker(positionMs: Long = 600_000) = PlaybackSnapshot(
+        source = PlaybackSource.REMOTE,
+        status = PlaybackStatus.PLAYING,
+        activeDevice = ActiveDeviceRef("speaker", "Living room"),
+        positionMs = positionMs,
+        positionTimestampMs = base + testScheduler.currentTime,
+        durationMs = 7_200_000,
+        context = PlaybackContext("spotify:show:s"),
+        track = PlaybackTrack(uri = "spotify:episode:e"),
+    )
+
+    @Test
+    fun afterATransferTheStoredSessionFollowsTheSpeakerUntilItLeaves() = runTest {
+        // A podcast plays here; at minute 10 it moves to the speaker.
+        val run = Run(this, playing(positionMs = 600_000), loggedIn = true, interval, base)
+        run.snapshots.value = speaker(positionMs = 600_000)
+        runCurrent()
+        // 40 minutes later the speaker is switched off: nothing is active any more.
+        advanceTimeBy(2_400_000)
+        runCurrent()
+        run.snapshots.value = PlaybackSnapshot.EMPTY
+        runCurrent()
+        val last = run.saves().last()
+        assertEquals("spotify:episode:e", last.trackUri)
+        assertEquals(3_000_000L, last.positionMs) // minute 50, not minute 10
+        val count = run.saves().size
+        advanceTimeBy(interval * 4)
+        runCurrent()
+        assertEquals(count, run.saves().size)
+    }
+
+    @Test
+    fun aPullBackOrAnotherDeviceTakesOverTheStoredSession() = runTest {
+        val run = Run(this, speaker(), loggedIn = true, interval, base)
+        // Pulled to this phone: the local session is what's stored from then on.
+        run.snapshots.value = playing(positionMs = 700_000)
+        runCurrent()
+        assertEquals("spotify:track:t", run.saves().last().trackUri)
+        // Another device takes over (the desktop): its session.
+        run.snapshots.value = speaker(positionMs = 5_000).copy(
+            activeDevice = ActiveDeviceRef("desk", "Desktop"),
+            track = PlaybackTrack(uri = "spotify:track:desk"),
+        )
+        runCurrent()
+        assertEquals("spotify:track:desk", run.saves().last().trackUri)
     }
 
     @Test
