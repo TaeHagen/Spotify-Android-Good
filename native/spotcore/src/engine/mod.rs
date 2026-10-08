@@ -16,7 +16,7 @@
 mod backoff;
 mod config;
 mod connector;
-mod explicit;
+pub(crate) mod explicit;
 pub(crate) mod player_host;
 mod state;
 mod supervisor;
@@ -575,7 +575,7 @@ fn apply_settings(new: EngineSettings) {
     if old.device_name != new.device_name {
         connect::on_engine_state_changed();
     }
-    if old.filter_explicit != new.filter_explicit {
+    if old.filter_explicit != new.filter_explicit || old.account_filter_explicit != new.account_filter_explicit {
         sync_explicit_filter();
     }
 }
@@ -588,10 +588,11 @@ static CATALOG_FILTER: parking_lot::Mutex<Option<bool>> = parking_lot::const_mut
 /// when its filter changed (it then skips a loaded explicit track), and drops cached catalog
 /// metadata computed with the other value. Cheap; idempotent.
 pub(crate) fn sync_explicit_filter() {
-    let filter = settings().filter_explicit;
+    let settings = settings();
+    let filter = settings.filter_explicit;
     let live = try_session().filter(|_| is_online());
     let live_changed = live.as_ref().and_then(|s| explicit::apply(s, filter));
-    let offline_changed = player_host::apply_explicit_filter_offline(filter);
+    let offline_changed = player_host::apply_explicit_filter_offline(&settings);
     let player_changed = if live.is_some() { live_changed } else { offline_changed };
     if let Some(on) = player_changed {
         log::info!("explicit filter {}", if on { "on" } else { "off" });

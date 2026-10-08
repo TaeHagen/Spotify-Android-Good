@@ -29,6 +29,9 @@ sealed interface LibraryEdit {
 
     /** Items of playlist [uri] were added, removed or moved (or it was renamed). */
     data class PlaylistEdited(val uri: String) : LibraryEdit
+
+    /** Pull-to-refresh: the library may have changed elsewhere (another device). */
+    data object Refreshed : LibraryEdit
 }
 
 /**
@@ -144,7 +147,7 @@ class LibraryRepository(
     /** Emits after any library mutation (lists can refresh). */
     val changes: SharedFlow<Unit> = _changes.asSharedFlow()
 
-    /** What the app changed, with the URIs (likes, playlist edits); not emitted for pull-to-refresh. */
+    /** What the app changed, with the URIs (likes, playlist edits); [LibraryEdit.Refreshed] for pull-to-refresh. */
     val edits: SharedFlow<LibraryEdit> = _edits.asSharedFlow()
 
     /**
@@ -157,6 +160,8 @@ class LibraryRepository(
         cache.invalidatePrefix(CacheKeys.LIBRARY_PREFIX)
         lookups.request(saved.recentKeys(MAX_REFRESH_LOOKUPS))
         _changes.emit(Unit)
+        // Downloaded Liked Songs and playlists follow what changed elsewhere.
+        _edits.tryEmit(LibraryEdit.Refreshed)
     }
 
     // ---- hooks for PlaylistEditor ------------------------------------------------------------------

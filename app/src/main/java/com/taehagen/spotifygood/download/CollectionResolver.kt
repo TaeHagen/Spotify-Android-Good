@@ -24,18 +24,19 @@ import kotlinx.serialization.json.put
 /**
  * Resolves downloadable collections to their item URIs with the catalog RPCs (docs §6.3), without
  * going through the UI-facing repositories (no caching: downloads always want fresh membership).
- * The catalog's `playable` includes the explicit filter, which downloads ignore: [filter] tells
- * which answers say nothing about explicit items ([DownloadRules.downloadVerdict]).
+ * The catalog's `playable` includes the explicit filter: [filter] tells which one may have
+ * applied to an answer ([DownloadRules.memberVerdict], [DownloadRules.rowVerdict]).
  */
 internal class CollectionResolver(private val rpc: NativeRpc, private val json: Json, private val filter: ExplicitFilterWatch) {
     /**
      * [metadataJson] is null when the source lists URIs only (Liked Songs) and for placeholders
      * (`playable:false` without a name: metadata failed or missing), so new rows get it later.
      * [unavailable]: the catalog resolved the item and reports it as not playable here (region,
-     * relinking included), so downloading it would fail. [checked]: the answer gave a verdict
-     * ([DownloadRules.downloadVerdict]); placeholders, URI-only members and explicit items while the
-     * explicit filter may have applied have none, and are never unavailable: `download.track` (which
-     * ignores the filter) decides when they are queued.
+     * relinking included; explicit items while the account's own filter is or may be on), so
+     * downloading it would fail. [checked]: the answer gave a verdict ([DownloadRules.memberVerdict]);
+     * placeholders, URI-only members and explicit items while only "Hide explicit content" may have
+     * applied have none, and are never unavailable: `download.track` (which ignores that setting)
+     * decides when they are queued.
      */
     data class Item(
         val uri: String,
@@ -67,7 +68,7 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
         CollectionType.ALBUM -> {
             val mark = filter.begin()
             val album = rpc.callOffMain<Album>("catalog.album", rpcArgs { put("uri", uri) })
-            val filtered = filter.mayFilter(mark)
+            val filtered = filter.filterAt(mark)
             // Tracks whose metadata failed are placeholders and the album is `partial`; tracks the
             // server has no data for (taken down) are dropped, which is a real change (docs §6.3).
             val complete = DownloadRules.listingComplete(album.tracks.size, album.partial)
@@ -80,7 +81,7 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
             // rolling window (new episodes are added, ones that fall out are removed).
             val mark = filter.begin()
             val show = rpc.callOffMain<Show>("catalog.show", rpcArgs { put("uri", uri); put("offset", 0); put("limit", MAX_SHOW_EPISODES) })
-            val filtered = filter.mayFilter(mark)
+            val filtered = filter.filterAt(mark)
             val complete = DownloadRules.listingComplete(show.episodes.size, show.partial)
             Resolved(
                 show.episodes.take(MAX_SHOW_EPISODES).map { episodeItem(it, json, filtered) }.distinctItems(),
@@ -142,11 +143,11 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
                     val mark = filter.begin()
                     if (isTrack) {
                         val fetched = fetchTracks(chunk)
-                        val filtered = filter.mayFilter(mark)
+                        val filtered = filter.filterAt(mark)
                         fetched.forEach { out[it.uri] = trackItem(it, json, filtered) }
                     } else {
                         val fetched = fetchEpisodes(chunk)
-                        val filtered = filter.mayFilter(mark)
+                        val filtered = filter.filterAt(mark)
                         fetched.forEach { out[it.uri] = episodeItem(it, json, filtered) }
                     }
                 } ?: break
@@ -166,22 +167,22 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
         tracks.chunked(CatalogRepository.METADATA_BATCH).forEach { chunk ->
             val mark = filter.begin()
             val fetched = fetchTracks(chunk)
-            val filtered = filter.mayFilter(mark)
+            val filtered = filter.filterAt(mark)
             fetched.forEach { out[it.uri] = json.encodeToString(Track.serializer(), it.stored(filtered)) }
         }
         episodes.filter { SpotifyUris.typeOf(it) == "episode" }.chunked(CatalogRepository.METADATA_BATCH).forEach { chunk ->
             val mark = filter.begin()
             val fetched = fetchEpisodes(chunk)
-            val filtered = filter.mayFilter(mark)
+            val filtered = filter.filterAt(mark)
             fetched.forEach { out[it.uri] = json.encodeToString(Episode.serializer(), it.stored(filtered)) }
         }
         return out
     }
 
     /**
-     * Whether tracks / episodes are playable here, for downloading them
-     * ([DownloadRules.downloadVerdict]): items the catalog did not return, and explicit ones while
-     * the explicit filter may have applied, are omitted (no verdict).
+     * Whether downloaded tracks / episodes are still playable here ([DownloadRules.rowVerdict]):
+     * items the catalog did not return, and explicit ones while an explicit filter may have
+     * applied, are omitted (no verdict).
      */
     suspend fun playability(uris: List<String>): Map<String, Boolean> {
         val out = HashMap<String, Boolean>()
@@ -189,14 +190,14 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
         tracks.chunked(CatalogRepository.METADATA_BATCH).forEach { chunk ->
             val mark = filter.begin()
             val fetched = fetchTracks(chunk)
-            val filtered = filter.mayFilter(mark)
-            fetched.forEach { t -> DownloadRules.downloadVerdict(t.playable, t.explicit, filtered, t.name.isNotEmpty())?.let { out[t.uri] = it } }
+            val filtered = filter.filterAt(mark)
+            fetched.forEach { t -> DownloadRules.rowVerdict(t.playable, t.explicit, filtered, t.name.isNotEmpty())?.let { out[t.uri] = it } }
         }
         episodes.filter { SpotifyUris.typeOf(it) == "episode" }.chunked(CatalogRepository.METADATA_BATCH).forEach { chunk ->
             val mark = filter.begin()
             val fetched = fetchEpisodes(chunk)
-            val filtered = filter.mayFilter(mark)
-            fetched.forEach { e -> DownloadRules.downloadVerdict(e.playable, e.explicit, filtered, e.name.isNotEmpty())?.let { out[e.uri] = it } }
+            val filtered = filter.filterAt(mark)
+            fetched.forEach { e -> DownloadRules.rowVerdict(e.playable, e.explicit, filtered, e.name.isNotEmpty())?.let { out[e.uri] = it } }
         }
         return out
     }
@@ -219,7 +220,7 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
         // Items never drop out of a playlist page (unresolved ones keep their slot), so a complete
         // listing has `total` entries.
         val complete = DownloadRules.listingComplete(items.size, partial, first.total)
-        val filtered = filter.mayFilter(mark)
+        val filtered = filter.filterAt(mark)
         val resolved = items.mapNotNull { item ->
             item.track?.let { trackItem(it, json, filtered) } ?: item.episode?.let { episodeItem(it, json, filtered) }
         }
@@ -244,29 +245,30 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
 
     companion object {
         /**
-         * A member from catalog metadata fetched while the explicit filter [filterMayApply] may have
-         * applied ([ExplicitFilterWatch.mayFilter]). A placeholder (no name: metadata failed or
-         * missing) carries no metadata, so a new row gets it later; it and an explicit member the
-         * filter may have greyed out get no verdict ([Item.checked]) and are never [Item.unavailable].
+         * A member from catalog metadata answered under [filter] ([ExplicitFilterWatch.filterAt]). A
+         * placeholder (no name: metadata failed or missing) carries no metadata, so a new row gets
+         * it later; it and an explicit member only "Hide explicit content" may have greyed out get
+         * no verdict ([Item.checked], [DownloadRules.memberVerdict]) and are never
+         * [Item.unavailable].
          */
-        internal fun trackItem(track: Track, json: Json, filterMayApply: Boolean = false): Item {
+        internal fun trackItem(track: Track, json: Json, filter: ExplicitFilterWatch.Filter = ExplicitFilterWatch.Filter.OFF): Item {
             val resolved = track.name.isNotEmpty()
-            val verdict = DownloadRules.downloadVerdict(track.playable, track.explicit, filterMayApply, resolved)
+            val verdict = DownloadRules.memberVerdict(track.playable, track.explicit, filter, resolved)
             return Item(
                 uri = track.uri,
-                metadataJson = if (resolved) json.encodeToString(Track.serializer(), track.stored(filterMayApply)) else null,
+                metadataJson = if (resolved) json.encodeToString(Track.serializer(), track.stored(filter)) else null,
                 unavailable = verdict == false,
                 checked = verdict != null,
             )
         }
 
         /** Like [trackItem]. */
-        internal fun episodeItem(episode: Episode, json: Json, filterMayApply: Boolean = false): Item {
+        internal fun episodeItem(episode: Episode, json: Json, filter: ExplicitFilterWatch.Filter = ExplicitFilterWatch.Filter.OFF): Item {
             val resolved = episode.name.isNotEmpty()
-            val verdict = DownloadRules.downloadVerdict(episode.playable, episode.explicit, filterMayApply, resolved)
+            val verdict = DownloadRules.memberVerdict(episode.playable, episode.explicit, filter, resolved)
             return Item(
                 uri = episode.uri,
-                metadataJson = if (resolved) json.encodeToString(Episode.serializer(), episode.stored(filterMayApply)) else null,
+                metadataJson = if (resolved) json.encodeToString(Episode.serializer(), episode.stored(filter)) else null,
                 unavailable = verdict == false,
                 checked = verdict != null,
             )
@@ -276,11 +278,11 @@ internal class CollectionResolver(private val rpc: NativeRpc, private val json: 
          * As stored with a download: without the explicit filter's `playable:false` (the Downloads
          * screens and playback apply the filter themselves, and it may be off by then).
          */
-        private fun Track.stored(filterMayApply: Boolean): Track =
-            if (DownloadRules.downloadVerdict(playable, explicit, filterMayApply) == null) copy(playable = true) else this
+        private fun Track.stored(filter: ExplicitFilterWatch.Filter): Track =
+            if (DownloadRules.rowVerdict(playable, explicit, filter) == null) copy(playable = true) else this
 
-        private fun Episode.stored(filterMayApply: Boolean): Episode =
-            if (DownloadRules.downloadVerdict(playable, explicit, filterMayApply) == null) copy(playable = true) else this
+        private fun Episode.stored(filter: ExplicitFilterWatch.Filter): Episode =
+            if (DownloadRules.rowVerdict(playable, explicit, filter) == null) copy(playable = true) else this
 
         private const val PAGE_SIZE = 100
         private const val URI_PAGE_SIZE = 500

@@ -56,6 +56,9 @@ data class FailedRepairRow(
     val recordJson: String?,
 )
 
+/** What the offline covers need of a completed download ([com.taehagen.spotifygood.download.OfflineCovers]). */
+data class CoverRow(val uri: String, val imagePath: String?, val metadataJson: String?, val recordJson: String?)
+
 /** Cover of a completed download. */
 data class UriImage(val uri: String, val imagePath: String)
 
@@ -256,6 +259,9 @@ interface DownloadDao {
             "WHERE uri = :uri AND state = 'completed' AND completedAt = :completedAt AND keyVersion = 0",
     )
     suspend fun resealKey(uri: String, completedAt: Long, key: ByteArray)
+
+    @Query("SELECT uri, imagePath, metadataJson, recordJson FROM downloads WHERE uri IN (:uris) AND state = 'completed'")
+    suspend fun coverRows(uris: List<String>): List<CoverRow>
 
     @Query("SELECT uri, imagePath FROM downloads WHERE state = 'completed' AND imagePath IS NOT NULL")
     suspend fun completedImages(): List<UriImage>

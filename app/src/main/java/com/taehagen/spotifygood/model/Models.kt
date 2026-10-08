@@ -564,6 +564,11 @@ data class EngineSettings(
     val offline: Boolean = false,
     /** "Hide explicit content": OR-ed natively into the account's own explicit filter. */
     val filterExplicit: Boolean = false,
+    /**
+     * The account's own explicit filter as last reported online (persisted): the offline session,
+     * which no server tells, applies it (docs §4.3).
+     */
+    val accountFilterExplicit: Boolean = false,
     /** Listed as a Spotify Connect target (Spirc runs); set by [com.taehagen.spotifygood.engine.SpotifyEngine]. */
     val connectVisible: Boolean = true,
 )
