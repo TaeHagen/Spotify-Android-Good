@@ -584,16 +584,21 @@ fn apply_settings(new: EngineSettings) {
 static CATALOG_FILTER: parking_lot::Mutex<Option<bool>> = parking_lot::const_mutex(None);
 
 /// Applies "Hide explicit content" ([`explicit`]) to the sessions the Player and the catalog use
-/// (the live one, and the offline one the Player plays with while not online), tells the Player
-/// when its filter changed (it then skips a loaded explicit track), and drops cached catalog
-/// metadata computed with the other value. Cheap; idempotent.
+/// (the live one; while not online the offline one and a connect attempt's, either of which the
+/// Player plays with), tells the Player when its filter changed (it then skips a loaded explicit
+/// track), and drops cached catalog metadata computed with the other value. Cheap; idempotent.
 pub(crate) fn sync_explicit_filter() {
     let settings = settings();
     let filter = settings.filter_explicit;
     let live = try_session().filter(|_| is_online());
     let live_changed = live.as_ref().and_then(|s| explicit::apply(s, filter));
     let offline_changed = player_host::apply_explicit_filter_offline(&settings);
-    let player_changed = if live.is_some() { live_changed } else { offline_changed };
+    let attempt = if live.is_none() { player_host::apply_explicit_filter_bound(filter) } else { None };
+    let player_changed = match (&live, attempt) {
+        (Some(_), _) => live_changed,
+        (None, Some(attempt_changed)) => attempt_changed,
+        (None, None) => offline_changed,
+    };
     if let Some(on) = player_changed {
         log::info!("explicit filter {}", if on { "on" } else { "off" });
         player_host::emit_explicit_filter(on);
