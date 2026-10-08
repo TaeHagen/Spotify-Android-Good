@@ -2378,22 +2378,23 @@ impl SpircTask {
                 self.connect_state.set_current_track_random()?;
             }
 
-            if self.context_resolver.has_next() {
-                self.connect_state.update_queue_revision()
-            } else {
-                self.connect_state.shuffle_new()?;
+            // SPOTIFYGOOD: shuffled with the pages there are, also while further pages resolve
+            // (the last one shuffles the whole context again, see ContextResolver::try_finish).
+            // The shuffle waited for them with empty next tracks, so the playback stopped when
+            // the song ended meanwhile (minutes on a flaky link, with the retries).
+            self.connect_state.shuffle_new()?;
+            if !self.context_resolver.has_next() {
                 self.add_autoplay_resolving_when_required();
             }
         } else if let Some(track) = start_outside {
             self.connect_state.set_track(track);
+            // SPOTIFYGOOD: played before the context, with the next tracks of the pages there
+            // are; with further pages to come it is placed in the context once its page is there
+            // (ConnectState::place_current_track_when_resolved). The next tracks stayed empty
+            // until the last page, so the playback stopped when the song ended meanwhile.
+            self.connect_state.reset_playback_to_position(None)?;
             if pages_pending {
-                // placed once the pages are there (try_finish looks it up while the fill up
-                // index is 0), the fill up waits for it
-                self.connect_state.reset_context(ResetContext::DefaultIndex);
-                self.connect_state.update_queue_revision()
-            } else {
-                // not in the context: played before it
-                self.connect_state.reset_playback_to_position(None)?;
+                self.connect_state.place_current_track_when_resolved();
             }
             self.add_autoplay_resolving_when_required();
         } else {

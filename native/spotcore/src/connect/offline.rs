@@ -4,13 +4,17 @@
 
 use super::args::LoadArgs;
 use super::offline_queue::{
-    select_downloaded, Action, Adoption, Elsewhere, Event, Handover, LoadSpec, OfflineQueue, MAX_NEXT,
+    select_downloaded, Action, Adoption, Continuation, Elsewhere, Event, HandBack, Handover, LoadSpec, OfflineQueue,
+    MAX_NEXT,
 };
 use super::{hub, now_ms, player_events, uri, Ctl};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{ActiveDeviceRef, OfflineTrackRecord, PlaybackSnapshot, RepeatMode};
 use crate::{engine, events, offline as downloads};
-use librespot_connect::{ConnectSnapshot, SnapshotPlayStatus, SnapshotTrack};
+use librespot_connect::{
+    ConnectSnapshot, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack, SnapshotPlayStatus,
+    TrackProvider,
+};
 use librespot_core::SpotifyUri;
 use librespot_playback::player::PlayerEvent;
 use librespot_protocol::connect::Cluster;
@@ -76,10 +80,11 @@ pub(crate) fn handover(max_next: usize) -> Option<Handover> {
 
 /// What the queue takes over from this device's Spirc playback when the session goes away (see
 /// [`take_over`]): the current track and the visible tracks around it in play order (user queue
-/// and suggestions included), up to the first one that isn't downloaded on either side (the
-/// queue ends there; nothing is kept for the reconnect), the position at `now_ms`, the repeat
-/// mode and whether it plays. `None` unless this device is active with a downloaded current
-/// track that isn't stopped.
+/// and suggestions included, one pass of the context: with repeat-all the queue's own repeat
+/// wraps it, see `restore::one_pass`), up to the first one that isn't downloaded on either side
+/// (the queue ends there), the position at `now_ms`, the repeat mode and whether it plays, and
+/// where the context goes on after the window (see [`continuation`]). `None` unless this device
+/// is active with a downloaded current track that isn't stopped.
 pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, now_ms: i64) -> Option<Adoption> {
     if !s.is_active {
         return None;
@@ -92,13 +97,14 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
         SnapshotPlayStatus::Stopped => return None,
     };
     let current = s.track.as_ref().filter(|t| !t.hidden && downloaded(&t.uri))?;
-    let visible = |t: &&SnapshotTrack| !t.hidden && t.uri != uri::DELIMITER_URI;
-    let mut uris: Vec<String> =
-        s.prev_tracks.iter().rev().filter(visible).take_while(|t| downloaded(&t.uri)).map(|t| t.uri.clone()).collect();
-    uris.reverse();
-    let start = uris.len();
-    uris.push(current.uri.clone());
-    uris.extend(s.next_tracks.iter().filter(visible).take_while(|t| downloaded(&t.uri)).take(MAX_NEXT).map(|t| t.uri.clone()));
+    let mut next = 0;
+    let pass = super::restore::one_pass(s, current, |t, is_next| {
+        next += usize::from(is_next);
+        downloaded(&t.uri) && next <= MAX_NEXT
+    });
+    // Tracks that aren't the context's (the user queue, suggestions): a push of the queue to
+    // another device can't start the context there.
+    let outside = pass.tracks.iter().enumerate().filter(|(_, t)| t.provider != TrackProvider::Context).map(|(i, _)| i).collect();
     let repeat = if s.repeat_track {
         RepeatMode::Track
     } else if s.repeat_context {
@@ -108,8 +114,9 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
     };
     Some(Adoption {
         context_uri: Some(s.context_uri.clone()).filter(|c| !c.is_empty()),
-        uris,
-        start,
+        uris: pass.tracks.iter().map(|t| t.uri.clone()).collect(),
+        start: pass.start,
+        outside,
         position_ms: super::restore::position_now(s, now_ms).max(0) as u64,
         duration_ms: s.duration_ms.max(0) as u64,
         playing,
@@ -117,7 +124,101 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
         repeat,
         repeat_context: s.repeat_context,
         shuffle: s.shuffle || s.smart_shuffle,
+        continuation: pass.ended_at.and_then(|i| continuation(s, i)),
     })
+}
+
+/// Where the context of `s` goes on after a handed-over window that ends at its next track `from`
+/// (not downloaded, or the size cap): Spirc continues there when the session is back (see
+/// `HandBack`). At the first context track from there, before the context's end: suggestions are
+/// skipped (with smart shuffle on Spirc adds new ones), the user queue's tracks are queued again
+/// (they come after that first track then). `None` for a context that can't be loaded again.
+fn continuation(s: &ConnectSnapshot, from: usize) -> Option<Continuation> {
+    if !uri::is_resolvable_context(&s.context_uri) {
+        return None;
+    }
+    let mut queued = Vec::new();
+    for t in &s.next_tracks[from..] {
+        if t.uri == uri::DELIMITER_URI {
+            // The context's end (repeat-all wraps there, else autoplay follows).
+            return None;
+        }
+        if t.hidden {
+            continue;
+        }
+        match t.provider {
+            TrackProvider::Context => {
+                let (context_uri, start_uri) = (s.context_uri.clone(), t.uri.clone());
+                return Some(Continuation { context_uri, start_uri, smart_shuffle: s.smart_shuffle, queued });
+            }
+            TrackProvider::Queue => queued.push(t.uri.clone()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The end of a handed-over window while a visible session is up: Spirc goes on with the
+/// context at the first track after the window (its request id then takes the Player from the
+/// queue). The queue's track is stopped first (a skip may have ended the window while it
+/// played), and the queue's view stays shown until Spirc has its track (see
+/// `hub::set_handing_back`); a failed load makes this phone inactive (`hub`). If it can't be sent
+/// the window goes on as without a continuation.
+fn hand_back(back: HandBack) -> AppResult<()> {
+    let view = QUEUE.lock().snapshot(hub::this_device_ref(), hub::mixer_volume());
+    let sent = (|| {
+        let spirc = hub::spirc().ok_or_else(AppError::not_connected)?;
+        let options = Options {
+            shuffle: back.shuffle || back.smart_shuffle,
+            repeat: back.repeat_context,
+            repeat_track: back.repeat_track,
+            smart_shuffle: back.smart_shuffle,
+        };
+        let request = LoadRequest::from_context_uri(
+            back.context_uri.clone(),
+            LoadRequestOptions {
+                start_playing: back.play,
+                seek_to: 0,
+                playing_track: Some(PlayingTrack::Uri(back.start_uri.clone())),
+                context_options: Some(LoadContextOptions::Options(options)),
+            },
+        );
+        hub::set_handing_back(view);
+        if let Some(player) = engine::player_host::player() {
+            player.stop();
+        }
+        super::local::sent(spirc.activate())?;
+        super::local::sent(spirc.load(request))?;
+        for uri in &back.queued {
+            if let Err(e) = super::local::queue_add(&spirc, uri) {
+                log::warn!("hand-back: {e}, the rest of the queue is dropped");
+                break;
+            }
+        }
+        Ok::<(), AppError>(())
+    })();
+    match sent {
+        Ok(()) => {
+            log::info!("online again: the context goes on in Spirc");
+            Ok(())
+        }
+        Err(e) => {
+            log::info!("the context couldn't go back to Spirc ({e}), the downloads go on");
+            hub::forget_hand_back();
+            let action = QUEUE.lock().hand_back_failed(false, now_ms());
+            apply(action)
+        }
+    }
+}
+
+/// A visible online session is up, and no other device is active (that one's session isn't
+/// taken away): the end of a handed-over window hands back to Spirc.
+fn hand_back_allowed() -> bool {
+    let me = hub::me();
+    engine::is_online()
+        && engine::network_available()
+        && hub::spirc().is_some()
+        && hub::active_device_id().is_none_or(|id| id == me)
 }
 
 /// The session of the Spirc `generation` goes away without a network (or offline mode was turned
@@ -185,6 +286,9 @@ pub(crate) fn stop() {
 }
 
 fn apply(action: Action) -> AppResult<()> {
+    if let Action::HandBack(back) = action {
+        return hand_back(back);
+    }
     let is_load = matches!(action, Action::Load { .. });
     let result = apply_to_player(action);
     if is_load && result.is_err() {
@@ -210,6 +314,7 @@ fn apply_to_player(action: Action) -> AppResult<()> {
         Action::Pause => player.pause(),
         Action::Seek(ms) => player.seek(ms),
         Action::Stop => player.stop(),
+        Action::HandBack(_) => {}
     }
     Ok(())
 }
@@ -362,6 +467,7 @@ pub(crate) async fn control(cmd: &Ctl) -> AppResult<()> {
         if !q.active {
             return Err(AppError::not_connected());
         }
+        q.set_hand_back(can_stream);
         match cmd {
             Ctl::Play => q.play(now),
             Ctl::Pause => q.pause(now),
@@ -449,7 +555,13 @@ fn feed(q: &mut OfflineQueue, event: &PlayerEvent, now_ms: i64) -> Option<super:
 }
 
 pub(crate) fn on_player_event(event: &PlayerEvent) {
-    let Some(outcome) = feed(&mut QUEUE.lock(), event, now_ms()) else { return };
+    let allowed = hand_back_allowed();
+    let outcome = {
+        let mut q = QUEUE.lock();
+        q.set_hand_back(allowed);
+        feed(&mut q, event, now_ms())
+    };
+    let Some(outcome) = outcome else { return };
     if let Some(action) = outcome.action {
         if let Err(e) = apply(action) {
             log::warn!("offline playback: {e}");
@@ -471,6 +583,7 @@ pub(crate) fn on_player_event(event: &PlayerEvent) {
 mod tests {
     use super::*;
     use crate::models::{AlbumRef, ArtistRef, Episode, ShowRef, Track};
+    use librespot_connect::SnapshotTrack;
 
     fn record(uri: &str, album: &str, artist: &str) -> OfflineTrackRecord {
         OfflineTrackRecord {
@@ -541,6 +654,8 @@ mod tests {
     fn downloaded_playback_is_handed_over_up_to_the_first_gap() {
         let downloaded = |u: &str| !u.ends_with('x');
         let mut s = playing(&["t:x", "t:1", "t:2"], "t:3", &["t:q1", "t:4", "t:5x", "t:6"]);
+        // without repeat-all a delimiter only separates the context from autoplay
+        s.repeat_context = false;
         s.next_tracks.insert(1, SnapshotTrack { hidden: true, ..st("t:hidden-x", librespot_connect::TrackProvider::Context) });
         s.next_tracks.insert(2, st(uri::DELIMITER_URI, librespot_connect::TrackProvider::Context));
         let a = handoff(&s, downloaded, 1_005_000).expect("handed over");
@@ -549,8 +664,10 @@ mod tests {
         assert_eq!(a.position_ms, 15_000, "where it is now");
         assert_eq!(a.duration_ms, 180_000);
         assert!(a.playing && !a.loading);
-        assert_eq!(a.repeat, RepeatMode::Context);
+        assert_eq!(a.repeat, RepeatMode::Off);
         assert_eq!(a.context_uri.as_deref(), Some("spotify:playlist:p"));
+        // the context goes on at the first track that isn't downloaded
+        assert_eq!(a.continuation.as_ref().map(|c| c.start_uri.as_str()), Some("t:5x"));
         // paused stays paused
         let paused = ConnectSnapshot { status: SnapshotPlayStatus::Paused, ..s.clone() };
         assert!(handoff(&paused, downloaded, 1_005_000).is_some_and(|a| !a.playing && a.position_ms == 10_000));
@@ -558,6 +675,77 @@ mod tests {
         assert!(handoff(&playing(&[], "t:3x", &["t:4"]), downloaded, 0).is_none());
         assert!(handoff(&ConnectSnapshot { status: SnapshotPlayStatus::Stopped, ..s.clone() }, downloaded, 0).is_none());
         assert!(handoff(&ConnectSnapshot { is_active: false, ..s }, downloaded, 0).is_none());
+    }
+
+    #[test]
+    fn repeat_all_hands_over_one_pass() {
+        use librespot_connect::TrackProvider::Context;
+        let all = |_: &str| true;
+        let delim = || SnapshotTrack { hidden: true, ..st(uri::DELIMITER_URI, Context) };
+        // the first pass: the next tracks wrap into the context again
+        let mut s = playing(&["t:1", "t:2"], "t:3", &[]);
+        s.next_tracks = vec![delim(), st("t:1", Context), st("t:2", Context), st("t:3", Context), delim(), st("t:1", Context)];
+        let a = handoff(&s, all, 1_000_000).expect("handed over");
+        assert_eq!((a.uris.as_slice(), a.start), (["t:1", "t:2", "t:3"].map(String::from).as_slice(), 2));
+        assert_eq!(a.continuation, None, "the queue's own repeat wraps");
+        // a later pass: the previous tracks hold the end of the last one
+        let mut s = playing(&[], "t:2", &[]);
+        s.prev_tracks = vec![st("t:3", Context), delim(), st("t:1", Context)];
+        s.next_tracks = vec![st("t:3", Context), delim(), st("t:1", Context), st("t:2", Context)];
+        let a = handoff(&s, all, 1_000_000).expect("handed over");
+        assert_eq!((a.uris.as_slice(), a.start), (["t:1", "t:2", "t:3"].map(String::from).as_slice(), 1));
+        // the wrap's delimiter out of sight: a uid seen already ends the pass
+        let mut s = playing(&["t:2"], "t:3", &[]);
+        s.next_tracks = vec![st("t:1", Context), st("t:2", Context), st("t:3", Context)];
+        let a = handoff(&s, all, 1_000_000).expect("handed over");
+        assert_eq!(a.uris, ["t:2", "t:3", "t:1"]);
+    }
+
+    #[test]
+    fn repeat_all_hands_over_the_whole_pass() {
+        use librespot_connect::TrackProvider::Context;
+        let delim = || SnapshotTrack { hidden: true, uid: String::new(), ..st(uri::DELIMITER_URI, Context) };
+        let t = |n: u32| st(&format!("t:{n}"), Context);
+        let names = |r: std::ops::RangeInclusive<u32>| r.map(|n| format!("t:{n}")).collect::<Vec<_>>();
+        // Spirc keeps 10 previous tracks: the start of the pass comes after the wrap's delimiter
+        let mut s = playing(&[], "t:18", &[]);
+        s.prev_tracks = (8..=17).map(t).collect();
+        s.next_tracks = [t(19), t(20), delim()].into_iter().chain((1..=20).map(t)).collect();
+        let a = handoff(&s, |_| true, 1_000_000).expect("handed over");
+        assert_eq!((a.uris.clone(), a.start), (names(1..=20), 17));
+        assert_eq!(a.continuation, None);
+        // ... up to a track that isn't downloaded
+        let a = handoff(&s, |u| u != "t:3", 1_000_000).expect("handed over");
+        assert_eq!(a.uris[..3], ["t:1", "t:2", "t:8"]);
+        assert_eq!(a.start, 12);
+    }
+
+    #[test]
+    fn the_context_goes_on_after_a_suggestion_or_a_queued_track() {
+        use librespot_connect::TrackProvider::{Context, Queue, Suggestion};
+        let downloaded = |u: &str| !u.ends_with('x');
+        // smart shuffle: the suggestion after the window isn't in the context, Spirc adds new ones
+        let mut s = playing(&[], "t:0", &[]);
+        s.repeat_context = false;
+        s.smart_shuffle = true;
+        s.next_tracks = vec![st("t:1", Context), st("t:sx", Suggestion), st("t:2", Context)];
+        let a = handoff(&s, downloaded, 0).expect("handed over");
+        assert_eq!(a.uris, ["t:0", "t:1"]);
+        let c = a.continuation.expect("continuation");
+        assert_eq!((c.start_uri.as_str(), c.smart_shuffle, c.queued.len()), ("t:2", true, 0));
+        // a queued track that isn't downloaded: queued again, the context after it
+        s.next_tracks = vec![st("t:qx", Queue), st("t:q2", Queue), st("t:1", Context)];
+        let a = handoff(&s, downloaded, 0).expect("handed over");
+        assert_eq!(a.uris, ["t:0"]);
+        let c = a.continuation.expect("continuation");
+        assert_eq!((c.start_uri.as_str(), c.queued.as_slice()), ("t:1", ["t:qx".to_string(), "t:q2".to_string()].as_slice()));
+        // the context's end before any of its tracks: none
+        s.next_tracks = vec![st("t:sx", Suggestion), st(uri::DELIMITER_URI, Context), st("t:auto", Context)];
+        assert_eq!(handoff(&s, downloaded, 0).expect("handed over").continuation, None);
+        // a context that can't be loaded again: none
+        s.context_uri = "spotify:web-api".into();
+        s.next_tracks = vec![st("t:1x", Context)];
+        assert_eq!(handoff(&s, downloaded, 0).expect("handed over").continuation, None);
     }
 
     #[test]

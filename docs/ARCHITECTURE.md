@@ -306,9 +306,18 @@ of anything else fails with `UNAVAILABLE` "Not available offline".
 this device plays (or paused) a downloaded track through Spirc, the OfflineController takes that
 playback over as it is, before anything pauses the Player (a track that ended meanwhile moves
 on to the next one): the track keeps playing without a reload, with the
-visible tracks around it in play order (user queue included) up to the first one on either side
-that isn't downloaded (the queue ends there), the position, repeat mode, shuffle flag and play
-state. No restore point is kept for that session; when it is back, the queue plays on as above.
+visible tracks around it in play order (user queue included, one pass of the context with
+repeat-all, its start that Spirc no longer lists as previous tracks in front: the queue's own
+repeat wraps it) up to the first one on either side that isn't downloaded (the queue ends
+there), the position, repeat mode, shuffle flag and play state. No restore point is kept for
+that session; when it is back, the queue plays on as above, and when it reaches the end of the
+handed-over window (stops or would wrap) with a visible session up and no other device active,
+it hands back to Spirc: the queue's track stops, and the context loads at its first track after
+the window (suggestions skipped, smart shuffle adds new ones; the user queue's tracks there are
+queued again and play after that first track), with its options as now, unless the user changed
+the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
+stays shown (loading), so the notification and the media session stay; a failed load makes
+this phone inactive (nothing plays, the app's own resume is the fallback).
 A streamed current track is frozen for the reconnect as before (§8), and so is any playback
 when the session dies while the network is up (the reconnect follows within seconds).
 The OfflineController notices a Player whose thread died: the queue stops where it was (so its
@@ -352,7 +361,7 @@ start that is not downloaded move on to the next download. Smart shuffle is not 
 | `devices` | `DeviceList` |
 | `queueMetadata` | `{"tracks":[Track…],"episodes":[Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri). Filled / fetched for the current track, the next 50 (the Media3 queue window) and the last 10 prev |
 | `download` | `DownloadProgress` |
-| `error` | `{"code","message","context":"playback|connect|session|…"}` user-visible, transient |
+| `error` | `{"code","message","context":"playback|connect|session|…"}` user-visible, transient (a failed start of playback by this phone's own Spirc, a load or a play with nothing to play, is `playback`; commands from other devices that failed here and other Connect failures are `connect`) |
 | `log` | not used (logs go to logcat via android_logger, tag `spotcore`) |
 
 ```jsonc
@@ -405,7 +414,12 @@ off), and once online until the new Spirc's first cluster says which device is a
 `player.load`, `connect.transfer` and the control / queue commands first wait (≤ 10 s; controls
 don't wait while offline playback runs), so a command right after a cold start, a reconnect or
 becoming visible isn't routed offline or as "nothing is active". Right after a local load or
-restore activated this device, commands go to it although its state doesn't say active yet.
+restore activated this device, commands go to it although its state doesn't say active yet (and
+the `playback` snapshot doesn't show another device's playback meanwhile), and
+right after a play was sent to another device (a load for the pending target, a transfer that
+started a session there) they follow it there until a cluster names the active device (≤ 10 s).
+A play / toggle on this device while it is active with nothing loaded (a load failed after its
+activation) fails `NOT_ACTIVE_DEVICE`, so the app's own resume loads its session.
 A pending reconnect restore (§8) is this device's session: a play / pause decides whether it
 comes back playing, other controls wait for it and then act on the restored session, a load
 replaces it only once the load goes through, a transfer to another device hands it over (and
@@ -439,7 +453,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 
 | method | args |
 |---|---|
-| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual |
+| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?,"local":true?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual. `local` (an explicit pull to this phone, e.g. a media-session resume): with a network and a visible session it plays here even while another device is active (taking its session over, like a transfer to this phone); otherwise routed as usual |
 | `player.play` / `player.pause` / `player.togglePlay` | `{}` |
 | `player.next` / `player.prev` | `{}` |
 | `player.seek` | `{"positionMs":0}` |
@@ -454,7 +468,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
-| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs","shuffle"?,"smartShuffle"?,"repeat"?}?}` (self = pull, other = push). When no device is active, `resume` (the app's last session, with its modes; smart shuffle becomes a plain shuffle on another device) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE` (Kotlin then keeps the device as the pending target for the next play, see §8). Pushing offline playback hands over its tracks (in play order), current position and repeat mode, and keeps it paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as the visible track window in play order) |
+| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs","shuffle"?,"smartShuffle"?,"repeat"?,"trackUris"?:["…"]}?}` (`trackUris`: the session as a track list, when its current track wasn't a context track; played from `trackUri` on instead of the context) (self = pull, other = push). When no device is active, or this phone is active with nothing loaded (a failed load) and nothing on its way, `resume` (the app's last session, with its modes; smart shuffle becomes a plain shuffle on another device) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE` (Kotlin then keeps the device as the pending target for the next play, see §8). Pushing offline playback whose current track is a track of a context that can be loaded again hands over that context at the track (position, shuffle, repeat; its user queue added after it), other offline playback its tracks (in play order), current position and repeat mode; either is kept paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as one pass of the visible tracks in play order) |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
@@ -539,8 +553,9 @@ Calls without `seq` apply unconditionally.
 
 `OfflineTrackRecord`:
 `{"uri","playedUri","fileId","format","keyHex","path","sizeBytes","normalisation":{"trackGainDb","trackPeak","albumGainDb","albumPeak"},"track":Track|"episode":Episode,"imagePath":"…"}`.
-Kotlin persists it in Room (key encrypted with the Keystore key) and sends the decrypted
-records to `offline.setIndex` as soon as the engine starts, whatever the session state (the
+Kotlin persists it in Room (key sealed with the downloads' data key, §9.7) and sends the decrypted
+records to `offline.setIndex` as soon as the engine starts (building the snapshot costs one
+Keystore operation, not one per download), whatever the session state (the
 index needs no session; downloads must play while the session is still connecting, e.g. behind
 a captive portal), retrying until it went through. Natively, a `player.load` while the session
 is not online, or without a network (also while the session still reads Online), waits (at
@@ -661,10 +676,15 @@ For a remote active device, smart shuffle is not supported (the command reports
   (the user asked for it here). Until the restored session is active with its track, the
   restore point stays (shown as the paused placeholder, also over the Spirc's empty activation
   snapshot; commands queue behind the restore): a connection lost meanwhile freezes it again, a
-  play / pause meanwhile is recorded on it too, and a failed restore load drops it. A queued or suggested current
+  play / pause meanwhile is recorded on it too, and a failed restore load drops it and makes
+  this phone inactive right away (shown and routed so before the Spirc's own inactive state
+  arrives): a play then gets `NOT_ACTIVE_DEVICE` and the app's own resume loads its stored
+  session (`"local": true`, activating this phone again). A queued or suggested current
   track keeps its context (the track is requeued, restarts, and gets repeat-one back; a full
-  queue loses its tail, not the track); handed to another device it goes as the visible track
-  window in play order instead. An explicit `player.load` (local, remote or offline) or running
+  queue loses its tail, not the track; with no context track before it, the context loads with
+  the track played in front of it); handed to another device it goes as one pass of the visible
+  tracks in play order instead. A context that can't be loaded again (a plain track list) is
+  restored as one pass of its visible tracks (with repeat-all Spirc lists the next passes too). An explicit `player.load` (local, remote or offline) or running
   offline playback replaces the restore point; a dropped restore point stops the paused track
   nobody owns anymore.
 * **Local-network discovery (the "send" side)**: speakers and receivers on the LAN that are not
@@ -760,7 +780,7 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * A finished login (`LoginState.Success`) goes back to the options as soon as the engine
   reports logged out (logout, rejected credentials).
 * `CredentialStore`: AES-256-GCM key in AndroidKeyStore; ciphertext in
-  `noBackupFilesDir/credentials.bin`. Also encrypts per-download audio keys. The key is only
+  `noBackupFilesDir/credentials.bin`. Also seals the downloads' data key (§9.7). The key is only
   replaced when it is permanently invalid (`KeyPermanentlyInvalidatedException`, a corrupted or
   missing key); transient Keystore failures are retried and then reported as
   `KeystoreUnavailableException` without deleting anything.
@@ -781,7 +801,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   set-media-items (Auto/Assistant/resumption), device volume only when remote (relative
   steps accumulate from the last sent target for 2 s), seek back/forward 15 s for episodes.
   Handlers complete once the next snapshot arrives (≤ 2 s); set-media-items only once a snapshot
-  shows a track or remote playback, or the start failed (≤ 15 s after the load went through), so
+  shows a local track (never another device's remote snapshot, which a cold pull passes
+  through), or the start failed (≤ 15 s after the load went through), so
   Media3's BUFFERING placeholder, and with it the notification and the foreground, lasts over a
   cold session's trackless snapshots (engine start, Spirc activation before the context resolved).
   With an empty timeline Media3 drops the notification and the foreground, so the service does
@@ -894,7 +915,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `OnRoutingChangedListener`, and listens with `AudioDeviceCallback` (registered only
   while the engine runs).
 * User selection → `AudioSinkBridge.setPreferredDevice(AudioDeviceInfo?)` (`null` =
-  system default; best effort — verify with `routedDevice()`). "More devices…" opens the
+  system default; best effort — verify with `routedDevice()`). A pick is temporary, like the
+  system switcher's (`OutputPick`): it lasts until that device goes away, a new external output
+  connects (Bluetooth, wired, USB, hearing aid, car, HDMI not present at the pick: it takes
+  over), the engine stops or logs out, or the user picks "Automatic". "More devices…" opens the
   system output switcher via `androidx.mediarouter.app.SystemOutputSwitcherDialogController
   .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — lists Bluetooth and
   other system audio outputs not yet connected (the app does not cast). Never use `setCommunicationDevice` for media.
@@ -977,7 +1001,18 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   downloads that still own their file (failed by re-validation or the key check) and are playable
   again; `download.track` reuses the file.
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
-  `noBackupFilesDir/offline/images/<imageIdHex>.jpg`. CDN chunks start at 2 MiB and adapt between 1 and
+  `noBackupFilesDir/offline/images/<imageIdHex>.jpg`.
+* Audio keys (`KeyVault`, envelope encryption): one random AES-256 data key in
+  `noBackupFilesDir/offline/datakey.bin`, sealed with the `CredentialStore` Keystore key, unsealed
+  once per process and kept in memory; each download's key is sealed with it in software (AES-GCM,
+  the row's URI as associated data; `keyVersion` 1). A cold start's index snapshot therefore costs
+  one TEE operation instead of one per download, so the first `offline.setIndex` lands well within
+  the native 8 s wait. Keys from before (`keyVersion` 0, sealed with the Keystore key itself) are
+  opened with the Keystore once and re-sealed in the background (only while the row is the same
+  completed download; resumable at the next start). A busy Keystore never replaces the data key
+  (rows wait for `registerLate`); a data key that can no longer be unsealed fails its rows at once
+  (marked failed, fetched again) and the next finished download creates a new one. "Remove all" and
+  logout delete it with the downloads. CDN chunks start at 2 MiB and adapt between 1 and
   4 MiB, streamed with a 20 s stall timeout; the first frame validates the key. Settings shows usage and "Remove all";
   usage counts every row that still owns a finished file (also ones marked failed later), each
   shared file once.

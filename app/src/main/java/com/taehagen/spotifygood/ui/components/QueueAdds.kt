@@ -2,6 +2,7 @@ package com.taehagen.spotifygood.ui.components
 
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.playback.OfflineMembers
 
 // Pure "add to queue" bookkeeping (JVM-testable).
 
@@ -35,3 +36,11 @@ internal fun queueAddOutcome(requested: Int, added: Int, error: NativeErrorInfo?
     isQueueFull(error) -> QueueAddOutcome.QueueFull(added, requested)
     else -> QueueAddOutcome.Stopped(added, requested, error)
 }
+
+/**
+ * What "Add to queue" of a collection adds while the session can't stream: its downloaded
+ * [members] in collection order, without [skipped] ones (explicit while filtered). An item that
+ * isn't downloaded would be refused by the offline queue and stop the batch there.
+ */
+internal fun offlineQueueUris(members: OfflineMembers?, skipped: Set<String> = emptySet()): List<String> =
+    members?.order.orEmpty().filter { it in members!!.downloaded && it !in skipped }.distinct()

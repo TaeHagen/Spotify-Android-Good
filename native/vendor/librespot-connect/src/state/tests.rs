@@ -1631,8 +1631,8 @@ fn a_transient_resolve_failure_is_retried_a_few_times() {
     }
 }
 
-/// what handle_load does for a start uri that isn't in the context (yet): it plays outside the
-/// context, the fill up waits
+/// what handle_load does for a start uri that isn't in the context yet (further pages are to
+/// come): it plays outside the context, with the next tracks of the pages there are
 fn play_outside_the_context(state: &mut ConnectState, uri: String, shuffle: bool) {
     let track = state
         .context_to_provided_track(
@@ -1650,8 +1650,10 @@ fn play_outside_the_context(state: &mut ConnectState, uri: String, shuffle: bool
     state.set_track(track);
     if shuffle {
         state.set_shuffle(true);
+        state.shuffle_new().unwrap();
     } else {
-        state.reset_context(ResetContext::DefaultIndex);
+        state.reset_playback_to_position(None).unwrap();
+        state.place_current_track_when_resolved();
     }
 }
 
@@ -1664,7 +1666,8 @@ fn a_start_track_on_a_further_page_is_placed_when_the_page_arrives() {
         // an artist: the start track is on an album page, resolved after the load
         let (rt, mut state) = state(10);
         play_outside_the_context(&mut state, start.clone(), shuffle);
-        assert!(state.next_tracks().is_empty());
+        // the tracks there are follow it meanwhile
+        assert_eq!(state.next_tracks().len(), 10);
 
         let mut resolver = resolver(&rt);
         resolver.add(ResolveContext::from_uri(
@@ -1758,6 +1761,86 @@ fn only_a_resolved_complete_context_is_the_current_one() {
         .unwrap();
     assert!(state.is_current_context(CONTEXT_URI));
     assert!(!state.reset_context(ResetContext::WhenDifferent(CONTEXT_URI)));
+}
+
+#[test]
+fn a_start_track_on_a_further_page_has_next_tracks_meanwhile() {
+    use crate::context_resolver::{ContextAction, ResolveContext};
+
+    let start = track_uri(15, 0);
+    let pages = |rt: &tokio::runtime::Runtime| {
+        let mut resolver = resolver(rt);
+        for page in ["spotify:album:1", "spotify:album:2"] {
+            resolver.add(ResolveContext::from_uri(
+                page,
+                "",
+                ContextType::Default,
+                ContextAction::Append,
+            ));
+        }
+        resolver
+    };
+    let page = |range| Context {
+        uri: Some(CONTEXT_URI.to_string()),
+        pages: vec![default_page(range)],
+        ..Default::default()
+    };
+
+    // its page is the first of two: placed right then, not after the last page
+    let (rt, mut state) = state(10);
+    play_outside_the_context(&mut state, start.clone(), false);
+    assert_eq!(next_uids(&state), uids(0..10));
+    let mut resolver = pages(&rt);
+    resolver
+        .apply_next_context(&mut state, page(10..20))
+        .unwrap();
+    assert!(
+        !resolver.try_finish(&mut state, &mut None),
+        "not the last page"
+    );
+    assert_eq!(state.current_track(|t| t.uri.clone()), start);
+    assert_eq!(next_uids(&state), uids(16..20));
+    resolver.remove_used_and_invalid();
+    resolver
+        .apply_next_context(&mut state, page(20..30))
+        .unwrap();
+    assert!(resolver.try_finish(&mut state, &mut None));
+    assert_eq!(next_uids(&state), uids(16..30));
+
+    // the song ends before its page is there: the playback goes on with the tracks there are,
+    // and the page doesn't pull it back
+    let (rt, mut state) = self::state(10);
+    play_outside_the_context(&mut state, start.clone(), false);
+    assert!(state.next_track().unwrap().is_some(), "not stopped");
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid0");
+    let mut resolver = pages(&rt);
+    resolver
+        .apply_next_context(&mut state, page(10..20))
+        .unwrap();
+    resolver.remove_used_and_invalid();
+    resolver
+        .apply_next_context(&mut state, page(20..30))
+        .unwrap();
+    assert!(resolver.try_finish(&mut state, &mut None));
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid0");
+    assert_eq!(next_uids(&state), uids(1..30));
+
+    // shuffled: with the tracks there are meanwhile, all of them once the pages are there
+    let (rt, mut state) = self::state(10);
+    play_outside_the_context(&mut state, start.clone(), true);
+    assert_eq!(state.next_tracks().len(), 10);
+    assert!(state.next_track().unwrap().is_some(), "not stopped");
+    let mut resolver = pages(&rt);
+    resolver
+        .apply_next_context(&mut state, page(10..20))
+        .unwrap();
+    resolver.remove_used_and_invalid();
+    resolver
+        .apply_next_context(&mut state, page(20..30))
+        .unwrap();
+    assert!(resolver.try_finish(&mut state, &mut None));
+    assert!(state.default_context_shuffled());
+    assert_eq!(state.next_tracks().len(), 29);
 }
 
 /// compile time check: the engine spawns the task and shares the handle between threads

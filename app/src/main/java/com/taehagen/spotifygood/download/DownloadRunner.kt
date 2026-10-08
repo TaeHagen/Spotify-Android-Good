@@ -9,7 +9,6 @@ import android.text.format.Formatter
 import android.util.Log
 import androidx.room.withTransaction
 import com.taehagen.spotifygood.R
-import com.taehagen.spotifygood.auth.CredentialStore
 import com.taehagen.spotifygood.auth.KeystoreUnavailableException
 import com.taehagen.spotifygood.data.callWith
 import com.taehagen.spotifygood.data.db.AppDatabase
@@ -122,12 +121,12 @@ internal class DownloadRunner(
     private val events: NativeEvents,
     private val engine: SpotifyEngine,
     private val settings: SettingsRepository,
-    private val credentialStore: CredentialStore,
     private val storage: DownloadStorage,
     private val notifications: DownloadNotifications,
     private val keys: KeyCache,
     private val commitLock: Mutex,
     private val index: OfflineIndexSync,
+    private val vault: KeyVault,
 ) {
     private val dao = database.downloads()
     private val json: Json = rpc.json
@@ -417,22 +416,23 @@ internal class DownloadRunner(
     }
 
     /**
-     * Encrypts an audio key with the Keystore, waiting out a short outage (1, 2, 4, 8 s between
-     * tries) so that a finished download is stored without a new `download.track`. Throws
-     * [KeystoreUnavailableException] when the Keystore stays unavailable.
+     * Seals an audio key with the downloads' data key ([KeyVault]: software; only the first seal of
+     * the process needs the Keystore, to unseal or create the data key), waiting out a short Keystore
+     * outage (1, 2, 4, 8 s between tries) so that a finished download is stored without a new
+     * `download.track`. Throws [KeystoreUnavailableException] when the Keystore stays unavailable.
      */
-    private suspend fun sealKey(plain: ByteArray): ByteArray {
+    private suspend fun sealKey(plain: ByteArray, uri: String): ByteArray {
         var delayMs = SEAL_RETRY_MS
         repeat(SEAL_ATTEMPTS - 1) {
             try {
-                return withContext(Dispatchers.IO) { credentialStore.encrypt(plain) }
+                return withContext(Dispatchers.IO) { vault.seal(plain, uri) }
             } catch (e: KeystoreUnavailableException) {
                 Log.w(TAG, "Keystore unavailable while sealing a key, retrying in $delayMs ms")
                 delay(delayMs)
                 delayMs *= 2
             }
         }
-        return withContext(Dispatchers.IO) { credentialStore.encrypt(plain) }
+        return withContext(Dispatchers.IO) { vault.seal(plain, uri) }
     }
 
     /**
@@ -510,7 +510,7 @@ internal class DownloadRunner(
      */
     private suspend fun commit(item: DownloadEntity, record: OfflineTrackRecord, quality: Int): Boolean {
         val keyHex = record.keyHex.lowercase()
-        val encryptedKey = sealKey(Hex.decode(keyHex))
+        val encryptedKey = sealKey(Hex.decode(keyHex), item.uri)
         val recordJson = json.encodeToString(OfflineTrackRecord.serializer(), record.copy(keyHex = ""))
         val metadataJson = record.track?.let { json.encodeToString(Track.serializer(), it) }
             ?: record.episode?.let { json.encodeToString(Episode.serializer(), it) }
@@ -529,6 +529,7 @@ internal class DownloadRunner(
                         fileId = record.fileId,
                         format = record.format,
                         encryptedKey = encryptedKey,
+                        keyVersion = 1,
                         path = record.path,
                         sizeBytes = record.sizeBytes,
                         bytesDone = record.sizeBytes,

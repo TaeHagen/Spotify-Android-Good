@@ -4,7 +4,8 @@
 //!
 //! States (see `HubState`): **pending** (`reconnect` holds the frozen state, shown paused) →
 //! **restoring** (activate + load sent to the new Spirc, `activation` set until its snapshot is
-//! active) → done; or **abandoned** (`clear`: skipped, replaced, stopped).
+//! active) → done; or **abandoned** (`clear`: skipped, replaced, stopped; or its load failed,
+//! see `hub::on_local_load_failed`: the app's own resume is the fallback then).
 //!
 //! * The engine calls `prepare_reconnect` before tearing the old Spirc down (or right after it
 //!   died): the last active snapshot is frozen and the Player paused.
@@ -38,6 +39,7 @@ use librespot_connect::{
     ConnectSnapshot, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack, SnapshotPlayStatus,
     SnapshotTrack, Spirc, TrackProvider as SpircProvider,
 };
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// The new Spirc's first cluster normally comes well within this (its dealer start and the
@@ -200,38 +202,112 @@ pub(crate) fn plan(f: &Frozen, start_playing: bool) -> Option<Plan> {
     // playlist isn't. Repeat-one comes after the skip, which would turn it off.
     let anchor = s.prev_tracks.iter().rev().filter(visible).find(|t| t.provider == SpircProvider::Context);
     if resolvable && matches!(current.provider, SpircProvider::Queue | SpircProvider::Suggestion) {
-        if let Some(anchor) = anchor {
-            let o = Options { repeat_track: false, ..options_of(s) };
-            let request =
-                LoadRequest::from_context_uri(s.context_uri.clone(), options(PlayingTrack::Uri(anchor.uri.clone()), false, 0, o));
-            let mut requeue = vec![current.uri.clone()];
-            requeue.extend(queued);
-            requeue.truncate(QUEUE_MAX);
-            return Some(Plan {
-                request,
-                queued: requeue,
-                then_next: true,
-                then_repeat_track: s.repeat_track,
-                then_play: start_playing,
-            });
-        }
+        let Some(anchor) = anchor else {
+            // Nothing of the context played before it: the context with the track in front
+            // (Spirc plays a start track that isn't in the context before it).
+            let request = LoadRequest::from_context_uri(
+                s.context_uri.clone(),
+                options(PlayingTrack::Uri(current.uri.clone()), start_playing, seek_to, options_of(s)),
+            );
+            return Some(Plan { request, queued, then_next: false, then_repeat_track: false, then_play: false });
+        };
+        let o = Options { repeat_track: false, ..options_of(s) };
+        let request =
+            LoadRequest::from_context_uri(s.context_uri.clone(), options(PlayingTrack::Uri(anchor.uri.clone()), false, 0, o));
+        let mut requeue = vec![current.uri.clone()];
+        requeue.extend(queued);
+        requeue.truncate(QUEUE_MAX);
+        return Some(Plan { request, queued: requeue, then_next: true, then_repeat_track: s.repeat_track, then_play: start_playing });
     }
-    // Plain track lists (or nothing to anchor the context at): rebuild the visible window.
-    let is_ctx = |t: &&SnapshotTrack| matches!(t.provider, SpircProvider::Context | SpircProvider::Autoplay);
-    let prev: Vec<String> = s.prev_tracks.iter().filter(visible).filter(is_ctx).map(|t| t.uri.clone()).collect();
-    let next = s.next_tracks.iter().filter(visible).filter(is_ctx).map(|t| t.uri.clone());
-    let index = prev.len() as u32;
-    let mut tracks = prev;
-    tracks.push(current.uri.clone());
-    tracks.extend(next);
+    // A context that can't be loaded again (a plain track list) or autoplay: one pass of the
+    // visible tracks (the user queue is queued again after it).
+    let is_ctx = |t: &SnapshotTrack| matches!(t.provider, SpircProvider::Context | SpircProvider::Autoplay);
+    let pass = one_pass(s, current, |_, _| true);
+    let index = pass.tracks[..pass.start].iter().filter(|t| is_ctx(t)).count() as u32;
+    let tracks: Vec<String> = pass
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| *i == pass.start || is_ctx(t))
+        .map(|(_, t)| t.uri.clone())
+        .collect();
     let request = LoadRequest::from_tracks(tracks, options(PlayingTrack::Index(index), start_playing, seek_to, options_of(s)));
     Some(Plan { request, queued, then_next: false, then_repeat_track: false, then_play: false })
 }
 
+/// One pass of a snapshot's context around its current track (see [`one_pass`]).
+pub(crate) struct Pass<'a> {
+    /// In play order; `tracks[start]` is the current track.
+    pub tracks: Vec<&'a SnapshotTrack>,
+    pub start: usize,
+    /// The next track `take` refused before the context's end (its index in `next_tracks`).
+    pub ended_at: Option<usize>,
+}
+
+/// The visible tracks around `s`'s current track in play order, one pass of its context. With
+/// repeat-all the next tracks go on past the context's end (a delimiter, then the context
+/// again), and so do the previous ones after a wrap: the previous side stops at the wrap, the
+/// next side goes on into the next pass up to a track seen already, and those tracks (the start
+/// of this pass that Spirc no longer keeps as previous tracks) go in front. A uid seen already
+/// ends a side too (a later pass whose delimiter is out of sight). Hidden entries and other
+/// delimiters are skipped. A track `take(track, next)` refuses ends its side (`next`: the next
+/// side).
+pub(crate) fn one_pass<'a>(
+    s: &'a ConnectSnapshot,
+    current: &'a SnapshotTrack,
+    mut take: impl FnMut(&SnapshotTrack, bool) -> bool,
+) -> Pass<'a> {
+    let wraps = |t: &SnapshotTrack| s.repeat_context && t.uri == uri::DELIMITER_URI;
+    let skipped = |t: &SnapshotTrack| t.hidden || t.uri == uri::DELIMITER_URI;
+    let mut seen: HashSet<&'a str> = HashSet::new();
+    let mut first_time = |t: &'a SnapshotTrack| t.uid.is_empty() || seen.insert(t.uid.as_str());
+    first_time(current);
+    let mut tracks = Vec::new();
+    for t in s.prev_tracks.iter().rev() {
+        if wraps(t) {
+            break;
+        }
+        if skipped(t) {
+            continue;
+        }
+        if !take(t, false) || !first_time(t) {
+            break;
+        }
+        tracks.push(t);
+    }
+    tracks.reverse();
+    let prev = tracks.len();
+    tracks.push(current);
+    let (mut head, mut wrapped, mut ended_at) = (Vec::new(), false, None);
+    for (i, t) in s.next_tracks.iter().enumerate() {
+        if wraps(t) {
+            if wrapped {
+                break;
+            }
+            wrapped = true;
+            continue;
+        }
+        if skipped(t) {
+            continue;
+        }
+        if !first_time(t) {
+            break;
+        }
+        if !take(t, true) {
+            ended_at = (!wrapped).then_some(i);
+            break;
+        }
+        if wrapped { head.push(t) } else { tracks.push(t) }
+    }
+    let start = head.len() + prev;
+    head.extend(tracks);
+    Pass { tracks: head, start, ended_at }
+}
+
 /// The frozen session as a `player.load` (for another device: context, track, position, options).
 /// A queued or suggested track isn't part of the context (the target would start the context's
-/// first track at its position): then, like a plain track list, the visible window in play order
-/// (previous tracks, the current one, the user queue and the next tracks).
+/// first track at its position): then, like a plain track list, one pass of the visible tracks in
+/// play order (previous tracks, the current one, the user queue and the next tracks).
 pub(crate) fn load_args(f: &Frozen, play: bool) -> Option<LoadArgs> {
     let s = &f.snap;
     let current = s.track.as_ref().filter(|t| !t.hidden)?;
@@ -252,11 +328,13 @@ pub(crate) fn load_args(f: &Frozen, play: bool) -> Option<LoadArgs> {
     if uri::is_resolvable_context(&s.context_uri) && current.provider == SpircProvider::Context {
         return Some(LoadArgs { context_uri: Some(s.context_uri.clone()), start_uri: Some(current.uri.clone()), ..base });
     }
-    let mut tracks: Vec<String> = s.prev_tracks.iter().filter(visible).map(|t| t.uri.clone()).collect();
-    let start_index = tracks.len() as u32;
-    tracks.push(current.uri.clone());
-    tracks.extend(s.next_tracks.iter().filter(visible).take(HANDOVER_NEXT).map(|t| t.uri.clone()));
-    Some(LoadArgs { track_uris: Some(tracks), start_index: Some(start_index), shuffle: Some(false), ..base })
+    let mut next = 0;
+    let pass = one_pass(s, current, |_, is_next| {
+        next += usize::from(is_next);
+        next <= HANDOVER_NEXT
+    });
+    let tracks = pass.tracks.iter().map(|t| t.uri.clone()).collect();
+    Some(LoadArgs { track_uris: Some(tracks), start_index: Some(pass.start as u32), shuffle: Some(false), ..base })
 }
 
 /// Whether the attached Spirc still runs (and with that controls the Player it played on).
@@ -330,6 +408,19 @@ pub(crate) struct Taken {
     pub frozen: Frozen,
     /// Its restore was being applied to the attached Spirc (see [`Restoring`]).
     pub applying: bool,
+}
+
+/// The attached Spirc `generation` reported a failed load of this phone: if the restore was being
+/// applied to it, the restore point goes (the app's own resume loads its stored session instead,
+/// see `hub::on_local_load_failed`). Returns whether it did.
+pub(crate) fn load_failed_in(hub: &mut HubState, generation: u64) -> bool {
+    if !hub.restoring.as_ref().is_some_and(|r| r.generation == generation) {
+        return false;
+    }
+    log::warn!("the restore's load failed, not restoring");
+    hub.restoring = None;
+    hub.last_active = None;
+    true
 }
 
 /// The pending restore point, or the one being applied, without touching it: a transfer of this
@@ -976,12 +1067,60 @@ mod tests {
         assert_eq!(p.queued.len(), QUEUE_MAX);
         assert_eq!(p.queued[0], "spotify:track:cur");
         assert_eq!(p.queued[QUEUE_MAX - 1], format!("spotify:track:q{}", QUEUE_MAX - 2));
-        // without a track before it there is nothing to anchor the context at: the track list
+        // nothing of the context played before it: the context, the track played in front of it
         let mut s = snap("spotify:playlist:x", SpircProvider::Queue);
         s.prev_tracks.clear();
         let p = plan(&freeze(s, 1_000_000, Instant::now()), true).expect("plan");
-        assert!(format!("{:?}", p.request).contains("Tracks("));
+        assert!(format!("{:?}", p.request).contains("Uri(\"spotify:playlist:x\")"));
+        assert!(matches!(p.request.playing_track, Some(PlayingTrack::Uri(ref u)) if u == "spotify:track:cur"));
+        assert!(p.request.start_playing && p.request.seek_to == 10_000);
         assert!(!p.then_next);
+    }
+
+    fn uris(p: &Plan) -> String {
+        format!("{:?}", p.request)
+    }
+
+    #[test]
+    fn a_track_list_is_restored_as_one_pass() {
+        use SpircProvider::Context as C;
+        let delim = || SnapshotTrack { hidden: true, ..st(uri::DELIMITER_URI, "", C) };
+        let t = |n: u32| st(&format!("spotify:track:{n}"), &format!("u{n}"), C);
+        let list = |r: std::ops::RangeInclusive<u32>| r.map(|n| format!("spotify:track:{n}")).collect::<Vec<_>>();
+        // repeat-all: the next tracks wrap into the list again
+        let mut s = snap("spotify:web-api", C);
+        s.repeat_context = true;
+        s.prev_tracks = vec![t(1), t(2)];
+        s.track = Some(t(3));
+        s.next_tracks = vec![delim(), t(1), t(2), t(3), delim(), t(1)];
+        let f = freeze(s.clone(), 1_000_000, Instant::now());
+        let p = plan(&f, true).expect("plan");
+        assert!(uris(&p).contains(&format!("Tracks({:?})", list(1..=3))), "{}", uris(&p));
+        assert!(matches!(p.request.playing_track, Some(PlayingTrack::Index(2))));
+        let a = load_args(&f, true).expect("load");
+        assert_eq!((a.track_uris, a.start_index), (Some(list(1..=3)), Some(2)));
+        // the wrap's delimiter scrolled out of the previous tracks: a uid seen already ends them
+        s.prev_tracks = vec![t(2), t(3), t(1), t(2)];
+        s.next_tracks = vec![];
+        let p = plan(&freeze(s.clone(), 1_000_000, Instant::now()), true).expect("plan");
+        assert!(uris(&p).contains(&format!("Tracks({:?})", list(1..=3))), "{}", uris(&p));
+        // one track on repeat-all: once
+        s.prev_tracks = vec![t(1), delim(), t(1), delim()];
+        s.track = Some(t(1));
+        s.next_tracks = vec![delim(), t(1), delim(), t(1)];
+        let a = load_args(&freeze(s.clone(), 1_000_000, Instant::now()), true).expect("load");
+        assert_eq!((a.track_uris, a.start_index), (Some(list(1..=1)), Some(0)));
+        // the start of the pass that Spirc no longer keeps as previous tracks comes in front
+        s.prev_tracks = (8..=17).map(t).collect();
+        s.track = Some(t(18));
+        s.next_tracks = [t(19), t(20), delim()].into_iter().chain((1..=20).map(t)).collect();
+        let a = load_args(&freeze(s.clone(), 1_000_000, Instant::now()), true).expect("load");
+        assert_eq!((a.track_uris, a.start_index), (Some(list(1..=20)), Some(17)));
+        // without repeat-all a delimiter only separates the list from autoplay
+        let mut s = snap("spotify:web-api", C);
+        s.next_tracks = vec![t(4), delim(), st("spotify:track:auto", "a", SpircProvider::Autoplay)];
+        let p = plan(&freeze(s, 1_000_000, Instant::now()), true).expect("plan");
+        assert!(uris(&p).contains("\"spotify:track:4\", \"spotify:track:auto\""), "{}", uris(&p));
     }
 
     #[test]
@@ -1113,6 +1252,18 @@ mod tests {
         assert!(hub.restoring.is_none());
         freeze_restore_point(&mut hub, 1_010_000, frozen.since + Duration::from_secs(10));
         assert_eq!(hub.reconnect.as_ref().expect("frozen").position_ms, 20_000);
+    }
+
+    #[test]
+    fn a_failed_restore_load_drops_the_restore_point() {
+        let (mut hub, frozen) = restoring_hub();
+        assert!(!load_failed_in(&mut hub, 8), "another Spirc's restore");
+        assert!(hub.restoring.is_some());
+        assert!(load_failed_in(&mut hub, 7));
+        assert!(hub.reconnect.is_none() && hub.restoring.is_none());
+        // nothing comes back on a later reconnect (the app's own resume loads the session)
+        freeze_restore_point(&mut hub, 1_010_000, frozen.since + Duration::from_secs(10));
+        assert!(hub.reconnect.is_none());
     }
 
     #[test]

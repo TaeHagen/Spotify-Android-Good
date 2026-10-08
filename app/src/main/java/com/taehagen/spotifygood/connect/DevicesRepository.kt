@@ -18,7 +18,9 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 
 /**
@@ -32,7 +34,10 @@ class DevicesRepository(
     private val rpc: NativeRpc,
     events: NativeEvents,
     private val lastSession: suspend () -> ResumeState? = { null },
-    /** Monotonic clock (ms, counting deep sleep) for the pending target's expiry. */
+    /**
+     * Clock of the pending target's expiry (ms, counting deep sleep). Coroutine delays don't count
+     * deep sleep, so the expiry timer waits in short chunks and checks this clock each time.
+     */
     clock: () -> Long = SystemClock::elapsedRealtime,
 ) {
     private val _devices = MutableStateFlow(events.devices.value)
@@ -46,8 +51,8 @@ class DevicesRepository(
      * The Connect device picked while nothing played anywhere (and there was no session to
      * resume): the next in-app play goes there (`player.load {deviceId}`, see
      * [consumePendingTarget]). Cleared once any device is active, when this phone is picked, on
-     * logout, once used, and [PendingTarget.TTL_MS] after it was picked (a pick made long ago
-     * must not take over a play).
+     * logout, once used, when its device left the account's device list, and
+     * [PendingTarget.TTL_MS] after it was picked (a pick made long ago must not take over a play).
      */
     val pendingTarget: StateFlow<String?> = pending.value
 
@@ -62,20 +67,33 @@ class DevicesRepository(
             events.devices.collect {
                 _devices.value = it
                 if (activeIn(it)) pending.clear()
+                // The picked device left the account's devices (a list of only this phone, while
+                // reconnecting or hidden, says nothing about it).
+                pending.value.value?.let { target -> if (it.others.isNotEmpty() && !listed(target, it)) pending.clear() }
+                expirePendingTarget()
             }
         }
         scope.launch { events.playback.collect { if (activeIn(it)) pending.clear() } }
         scope.launch {
-            // Expiry; consume() checks it too, in case this timer ran late (Doze, a frozen process).
+            // Expiry. The delay doesn't count deep sleep, so it waits in short chunks and checks
+            // the clock each time; consume() and expirePendingTarget() check it too.
             pending.value.collectLatest { target ->
                 if (target == null) return@collectLatest
-                while (!pending.expire(target)) delay(pending.remainingMs().coerceAtLeast(1))
+                while (!pending.expire(target)) delay(pending.remainingMs().coerceIn(1, EXPIRY_CHECK_MS))
             }
         }
     }
 
-    /** The pending target for the next play, cleared (it is used once); null once expired. */
-    fun consumePendingTarget(): String? = pending.consume()
+    /**
+     * The pending target for the next play, cleared (it is used once); null once expired, or when
+     * its device isn't listed any more (the banner doesn't show it then either).
+     */
+    fun consumePendingTarget(): String? = pending.consume()?.takeIf { listed(it, _devices.value) }
+
+    /** Clears an expired pending target now (the app came to the foreground after a sleep). */
+    fun expirePendingTarget() {
+        pending.value.value?.let(pending::expire)
+    }
 
     /** Forgets the pending target (logout). */
     fun clearPendingTarget() {
@@ -123,6 +141,16 @@ class DevicesRepository(
     }
 
     internal companion object {
+        /** The longest wait of the expiry timer between two looks at the clock. */
+        const val EXPIRY_CHECK_MS = 15_000L
+
+        /**
+         * [id] is a listed Connect device other than this phone, with a name: the same rule as the
+         * UI's pending target name (the banner shows it only then).
+         */
+        fun listed(id: String, list: DeviceList): Boolean =
+            list.devices.any { it.id == id && !it.isThisDevice && it.name.isNotBlank() }
+
         /** The pending target a failed transfer leaves (see [pendingTarget]), or null. */
         fun pendingAfterFailure(code: String, deviceId: String, isThisDevice: Boolean, args: JsonObject): String? =
             deviceId.takeIf { code == NativeErrorCode.NOT_ACTIVE_DEVICE && !isThisDevice && args["resume"] == null }
@@ -137,15 +165,22 @@ class DevicesRepository(
             put("deviceId", deviceId)
             put("play", play)
             if (resume != null && resume.trackUri.isNotBlank()) {
+                // The same load as a local resume (ResumeState.toPlayRequest): the track-list form
+                // plays its list in the saved order, the context form its context.
+                val load = resume.resumeLoad
+                val list = load.trackUris?.filter { it.isNotBlank() }?.takeIf { it.isNotEmpty() }
                 putJsonObject("resume") {
-                    resume.contextUri?.takeIf { it.isNotBlank() && it != resume.trackUri }?.let { put("contextUri", it) }
+                    if (list == null) {
+                        resume.contextUri?.takeIf { it.isNotBlank() && it != resume.trackUri }?.let { put("contextUri", it) }
+                    }
                     put("trackUri", resume.trackUri)
                     put("positionMs", resume.positionMs.coerceAtLeast(0))
                     // The session's modes; the engine plays smart shuffle as a plain shuffle on
                     // another device.
-                    put("shuffle", resume.shuffle || resume.smartShuffle)
-                    put("smartShuffle", resume.smartShuffle)
-                    put("repeat", PlaybackModes.wire(resume.repeat))
+                    put("shuffle", load.shuffle || load.smartShuffle)
+                    put("smartShuffle", load.smartShuffle)
+                    put("repeat", PlaybackModes.wire(load.repeat))
+                    list?.let { uris -> putJsonArray("trackUris") { uris.forEach { add(it) } } }
                 }
             }
         }

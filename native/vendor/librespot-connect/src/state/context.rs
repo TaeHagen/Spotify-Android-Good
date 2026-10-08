@@ -200,6 +200,9 @@ impl ConnectState {
     // SPOTIFYGOOD: returns whether the context was reset completely (handle_load drops the
     // resolves and the transfer still pending for the previous context then)
     pub fn reset_context(&mut self, mut reset_as: ResetContext) -> bool {
+        // SPOTIFYGOOD: see place_current_track_when_resolved
+        self.place_current_track = false;
+
         if matches!(reset_as, ResetContext::WhenDifferent(ctx) if self.different_context_uri(ctx)) {
             reset_as = ResetContext::Completely
         }
@@ -786,7 +789,45 @@ impl ConnectState {
             }
         }
 
-        self.append_page(page, ty)
+        self.append_page(page, ty)?;
+
+        if matches!(ty, ContextType::Default) {
+            self.place_current_track_if_there()?;
+        }
+        Ok(())
+    }
+
+    // SPOTIFYGOOD: Spirc's load of a start track that is on a further page (an album track of an
+    // artist): it plays outside the context, with the next tracks of the pages that are there
+    // (they were empty until the last page, the playback stopped when the song ended
+    // meanwhile), and is placed in the context once its page is there
+    /// The current track plays outside the default context until a page with it is there, it is
+    /// placed in the context then (unless another track plays by then)
+    pub fn place_current_track_when_resolved(&mut self) {
+        self.place_current_track = true;
+    }
+
+    /// No page with the current track is to come (see place_current_track_when_resolved)
+    pub fn forget_current_track_placement(&mut self) {
+        self.place_current_track = false;
+    }
+
+    fn place_current_track_if_there(&mut self) -> Result<(), Error> {
+        if !self.place_current_track {
+            return Ok(());
+        }
+        let uri = self.current_track(|t| t.uri.clone());
+        let position = self
+            .get_context(ContextType::Default)
+            .ok()
+            .and_then(|ctx| ctx.tracks.iter().position(|t| t.uri == uri));
+        let Some(position) = position else {
+            return Ok(());
+        };
+
+        self.place_current_track = false;
+        // the context goes on after it, the tracks before it are the prev tracks
+        self.reset_playback_to_position(Some(position))
     }
 
     // SPOTIFYGOOD: see fill_context_from_page, update_context appends its further pages with it

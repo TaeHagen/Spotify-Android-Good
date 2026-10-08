@@ -270,4 +270,5 @@
     <string name="shell_settings_licenses_summary">librespot and the other projects this app is built on</string>
     <string name="shell_licenses_intro">SpotifyGood is built on these open-source projects. Thank you to their authors.</string>
     <string name="shell_settings_disclaimer">SpotifyGood is an unofficial client. It is not affiliated with, endorsed or sponsored by Spotify AB. Spotify is a trademark of Spotify AB. Playback uses librespot, an open-source implementation of Spotify\'s protocols, and requires a Spotify Premium account.</string>
+    <string name="shell_msg_queue_nothing_downloaded">None of it is downloaded, so it can\'t be queued offline.</string>
 </resources>

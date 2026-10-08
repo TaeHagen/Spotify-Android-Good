@@ -28,6 +28,34 @@ pub(crate) enum Action {
     Pause,
     Seek(u32),
     Stop,
+    /// Hand the playback back to Spirc (see [`HandBack`]).
+    HandBack(HandBack),
+}
+
+/// Where handed-over playback continues in its context once its downloaded window ends (the
+/// first track after it isn't downloaded): recorded at the handoff, see [`OfflineQueue::adopt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Continuation {
+    pub context_uri: String,
+    pub start_uri: String,
+    pub smart_shuffle: bool,
+    /// The user queue's tracks after the window (queued again).
+    pub queued: Vec<String>,
+}
+
+/// Spirc loads the context at the continuation (online again): the end of the handed-over window
+/// was reached while a visible session is up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HandBack {
+    pub context_uri: String,
+    pub start_uri: String,
+    pub play: bool,
+    pub shuffle: bool,
+    pub smart_shuffle: bool,
+    pub repeat_context: bool,
+    pub repeat_track: bool,
+    /// Added to Spirc's queue after the load.
+    pub queued: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +153,12 @@ pub(crate) struct OfflineQueue {
     last_request: Option<u64>,
     /// ... and its track ended while nobody (no active queue) handled the end.
     ended_request: Option<u64>,
+    /// See [`Continuation`] (kept until a load or a shuffle toggle changes the window).
+    continuation: Option<Continuation>,
+    /// Items that aren't tracks of `context_uri` (see [`Adoption::outside`]).
+    outside: Vec<usize>,
+    /// The driver: a visible online session is up, the window's end hands back to Spirc.
+    hand_back: bool,
 }
 
 /// Playback the Player is already doing (Spirc's, on a downloaded track) that the queue takes
@@ -135,6 +169,8 @@ pub(crate) struct Adoption {
     /// In play order; `uris[start]` is the track the Player has loaded.
     pub uris: Vec<String>,
     pub start: usize,
+    /// Indices of `uris` that aren't tracks of the context (the user queue's, suggestions).
+    pub outside: Vec<usize>,
     pub position_ms: u64,
     pub duration_ms: u64,
     /// It plays, or loads to play.
@@ -145,6 +181,8 @@ pub(crate) struct Adoption {
     /// Repeat context is on (also under repeat-track).
     pub repeat_context: bool,
     pub shuffle: bool,
+    /// Where the context continues after the window (see [`Continuation`]).
+    pub continuation: Option<Continuation>,
 }
 
 impl Default for OfflineQueue {
@@ -175,6 +213,9 @@ impl Default for OfflineQueue {
             takeover_mark: None,
             last_request: None,
             ended_request: None,
+            continuation: None,
+            outside: Vec::new(),
+            hand_back: false,
         }
     }
 }
@@ -390,10 +431,41 @@ impl OfflineQueue {
             return self.begin_load(uri, play, 0, now_ms);
         }
         let from = if self.order.is_empty() { None } else { Some(self.pos) };
-        match self.next_context_pos(from) {
+        let next = self.next_context_pos(from);
+        // The end of a handed-over window (it would stop, or wrap): online, Spirc goes on with the
+        // context there.
+        let window_end = next.is_none_or(|p| from.is_some_and(|f| p <= f));
+        if let Some(c) = self.continuation.as_ref().filter(|_| self.hand_back && window_end) {
+            let back = HandBack {
+                context_uri: c.context_uri.clone(),
+                start_uri: c.start_uri.clone(),
+                play,
+                shuffle: self.shuffle,
+                smart_shuffle: c.smart_shuffle,
+                repeat_context: self.repeat_context,
+                repeat_track: self.repeat == RepeatMode::Track,
+                queued: c.queued.clone(),
+            };
+            self.status = PlaybackStatus::Loading;
+            self.play_intent = play;
+            return Action::HandBack(back);
+        }
+        match next {
             Some(p) => self.play_context_pos(p, play, now_ms),
             None => self.stop_at_end(),
         }
+    }
+
+    /// Whether the end of a handed-over window hands back to Spirc (see [`Continuation`]).
+    pub fn set_hand_back(&mut self, allowed: bool) {
+        self.hand_back = allowed;
+    }
+
+    /// The hand-back couldn't be sent: the window goes on (wraps) or stops as without one.
+    pub fn hand_back_failed(&mut self, auto: bool, now_ms: i64) -> Action {
+        self.continuation = None;
+        let play = self.play_intent;
+        self.advance(auto, play, now_ms)
     }
 
     pub fn play(&mut self, now_ms: i64) -> Option<Action> {
@@ -475,6 +547,8 @@ impl OfflineQueue {
 
     /// Enables (new seed, current item first) or disables (original order) shuffle.
     pub fn set_shuffle(&mut self, enabled: bool, seed: u64) {
+        // Another order: the window no longer ends where its context continues.
+        self.continuation = None;
         if self.items.is_empty() {
             self.shuffle = enabled;
             return;
@@ -642,6 +716,8 @@ impl OfflineQueue {
         }
         // Already in play order: shown as shuffled, a toggle reshuffles or keeps this order.
         self.shuffle = a.shuffle;
+        self.continuation = a.continuation;
+        self.outside = a.outside;
         let Some(request) = request else { return Some(load) };
         self.pending_loads = self.pending_loads.saturating_sub(1);
         self.own_request = Some(request);
@@ -828,11 +904,29 @@ impl OfflineQueue {
     }
 
     /// What to hand over to another device: the current item followed by up to `max_next` next
-    /// items, and the position at `now_ms` (the snapshot only carries the last anchor).
+    /// items, the position at `now_ms` (the snapshot only carries the last anchor), and the
+    /// context at the current item when it is one of its tracks.
     pub fn handover(&self, now_ms: i64, max_next: usize) -> Handover {
         let mut uris: Vec<String> = self.current_uri().map(str::to_string).into_iter().collect();
         uris.extend(self.next_tracks().into_iter().take(max_next).map(|t| t.uri));
-        Handover { uris, position_ms: self.position_at(now_ms), repeat: self.repeat, playing: self.is_playing() }
+        let context = match &self.current {
+            Some(Current::Context(i)) if !self.outside.contains(i) => self
+                .context_uri
+                .as_ref()
+                .filter(|c| uri::is_resolvable_context(c))
+                .zip(self.items.get(*i))
+                .map(|(context_uri, item)| ContextStart { context_uri: context_uri.clone(), track_uri: item.uri.clone() }),
+            _ => None,
+        };
+        Handover {
+            uris,
+            position_ms: self.position_at(now_ms),
+            repeat: self.repeat,
+            playing: self.is_playing(),
+            context,
+            shuffle: self.shuffle,
+            queued: self.queue.iter().map(|q| q.uri.clone()).collect(),
+        }
     }
 
     /// The snapshot (bare tracks; metadata is filled by the caller). Positions are reported as
@@ -889,6 +983,19 @@ pub(crate) struct Handover {
     pub position_ms: u64,
     pub repeat: RepeatMode,
     pub playing: bool,
+    /// The queue's context at its current item, when that is a track of a context that can be
+    /// loaded again (the target plays the whole context, not just the downloads).
+    pub context: Option<ContextStart>,
+    pub shuffle: bool,
+    /// The user queue (after the current item).
+    pub queued: Vec<String>,
+}
+
+/// See [`Handover::context`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextStart {
+    pub context_uri: String,
+    pub track_uri: String,
 }
 
 /// The downloaded subset of a request and where it starts.
@@ -1332,11 +1439,83 @@ mod tests {
         assert!(q.snapshot(dev(), 0).next_tracks.is_empty());
     }
 
+    #[test]
+    fn the_end_of_a_handed_over_window_goes_back_to_spirc_when_online() {
+        let continuation = Continuation {
+            context_uri: "spotify:playlist:p".into(),
+            start_uri: "spotify:track:gap".into(),
+            smart_shuffle: false,
+            queued: vec!["spotify:track:q".into()],
+        };
+        for repeat_context in [false, true] {
+            let mut q = OfflineQueue::default();
+            q.on_event(Event::RequestId(7), 0);
+            q.adopt(Adoption { continuation: Some(continuation.clone()), repeat_context, ..adoption(2, 1) }, 0);
+            // offline: it stops (or wraps) at the end as before
+            let out = q.on_event(Event::EndOfTrack(7), 1_000);
+            if repeat_context {
+                assert_eq!(load_uri(&out.action).as_deref(), Some("spotify:track:0"));
+            } else {
+                assert_eq!(out.action, Some(Action::Stop));
+            }
+            // online and visible: the context goes on in Spirc at the first track after the window
+            let mut q = OfflineQueue::default();
+            q.on_event(Event::RequestId(7), 0);
+            q.adopt(Adoption { continuation: Some(continuation.clone()), repeat_context, ..adoption(2, 1) }, 0);
+            q.set_hand_back(true);
+            let out = q.on_event(Event::EndOfTrack(7), 1_000);
+            let Some(Action::HandBack(back)) = out.action else { panic!("hand back: {:?}", out.action) };
+            assert_eq!((back.context_uri.as_str(), back.start_uri.as_str()), ("spotify:playlist:p", "spotify:track:gap"));
+            assert!(back.play);
+            assert_eq!(back.repeat_context, repeat_context);
+            assert_eq!(back.queued, ["spotify:track:q"], "the user queue after the window");
+            // it couldn't be sent: as without one
+            let action = q.hand_back_failed(true, 1_000);
+            assert!(matches!(action, Action::Stop | Action::Load { .. }));
+        }
+        // not before the window's end, and not after a shuffle toggle
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.adopt(Adoption { continuation: Some(continuation), ..adoption(3, 0) }, 0);
+        q.set_hand_back(true);
+        assert_eq!(load_uri(&q.on_event(Event::EndOfTrack(7), 0).action).as_deref(), Some("spotify:track:1"));
+        q.set_shuffle(true, 1);
+        q.set_shuffle(false, 1);
+        q.on_event(Event::RequestId(8), 0);
+        q.on_event(Event::Playing { id: 8, position_ms: 0 }, 0);
+        assert!(!matches!(q.next(0), Some(Action::HandBack(_))));
+    }
+
+    #[test]
+    fn a_handover_names_the_context_at_a_track_of_it() {
+        let context = |h: &Handover| h.context.as_ref().map(|c| (c.context_uri.clone(), c.track_uri.clone()));
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.adopt(Adoption { shuffle: true, ..adoption(3, 1) }, 0);
+        q.add_to_queue("spotify:track:q".into());
+        let h = q.handover(0, 50);
+        assert_eq!(context(&h), Some(("spotify:playlist:p".into(), "spotify:track:1".into())));
+        assert!(h.shuffle);
+        assert_eq!(h.queued, ["spotify:track:q"]);
+        assert_eq!(h.uris, ["spotify:track:1", "spotify:track:q", "spotify:track:2"], "the window as before");
+        // the current track came from the user queue or suggestions: not a track of the context
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.adopt(Adoption { outside: vec![1], ..adoption(3, 1) }, 0);
+        assert_eq!(context(&q.handover(0, 50)), None);
+        // a context that can't be loaded again
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.adopt(Adoption { context_uri: Some("spotify:web-api".into()), ..adoption(3, 1) }, 0);
+        assert_eq!(context(&q.handover(0, 50)), None);
+    }
+
     fn adoption(n: usize, start: usize) -> Adoption {
         Adoption {
             context_uri: Some("spotify:playlist:p".into()),
             uris: uris(n),
             start,
+            outside: Vec::new(),
             position_ms: 42_000,
             duration_ms: 200_000,
             playing: true,
@@ -1344,6 +1523,7 @@ mod tests {
             repeat: RepeatMode::Off,
             repeat_context: false,
             shuffle: false,
+            continuation: None,
         }
     }
 

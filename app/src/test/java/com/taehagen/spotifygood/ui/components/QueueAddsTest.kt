@@ -2,6 +2,7 @@ package com.taehagen.spotifygood.ui.components
 
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.playback.OfflineMembers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -35,5 +36,23 @@ class QueueAddsTest {
     fun otherFailuresKeepTheirReason() {
         assertEquals(QueueAddOutcome.Stopped(added = 3, requested = 15, error = network), queueAddOutcome(15, 3, network))
         assertEquals(QueueAddOutcome.Stopped(added = 0, requested = 5, error = network), queueAddOutcome(5, 0, network))
+    }
+
+    @Test
+    fun offlineAQueuedPlaylistIsItsDownloadedMembersInOrder() {
+        val members = OfflineMembers(order = listOf("a", "b", "c", "d"), downloaded = setOf("d", "a", "c"))
+        assertEquals(listOf("a", "c", "d"), offlineQueueUris(members))
+        assertEquals("explicit ones while filtered", listOf("a", "d"), offlineQueueUris(members, skipped = setOf("c")))
+        assertEquals(emptyList<String>(), offlineQueueUris(null))
+    }
+
+    @Test
+    fun aPartlyDownloadedAlbumQueuesEveryDownloadedTrack() {
+        // Track 3 is missing: the other 11 are queued, not just 1-2 (the offline queue refuses 3).
+        val order = (1..12).map { "spotify:track:$it" }
+        val members = OfflineMembers(order, downloaded = (order - "spotify:track:3").toSet())
+        val queued = offlineQueueUris(members)
+        assertEquals(11, queued.size)
+        assertEquals(order - "spotify:track:3", queued)
     }
 }

@@ -106,9 +106,15 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
     }
 }
 
+/// The active device per the cluster, or the one a play was just sent to (see
+/// `hub::remote_activating`).
+fn active_device() -> Option<String> {
+    hub::active_device_id().or_else(hub::remote_activating)
+}
+
 fn decide(kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     let me = hub::me();
-    let active = hub::active_device_id();
+    let active = active_device();
     let input = RouteInput {
         online: engine::is_online(),
         network: engine::network_available(),
@@ -217,6 +223,14 @@ fn spirc() -> AppResult<std::sync::Arc<librespot_connect::Spirc>> {
     hub::spirc().ok_or_else(AppError::not_connected)
 }
 
+/// An explicit pull to this phone (`LoadArgs::local`, e.g. a media-session resume): with a
+/// network and a visible session it plays here whatever another device does, taking its
+/// session over like a transfer to this phone. Otherwise (no network, offline, hidden) the load
+/// is routed as usual.
+fn explicit_local(local: bool, online: bool, network: bool, spirc: bool, local_active: bool) -> Option<Target> {
+    (local && online && network && spirc).then_some(Target::Local { activate: !local_active })
+}
+
 /// The device a load names, unless it is this phone (see `LoadArgs::device_id`).
 fn load_target(args: &LoadArgs, me: &str) -> Option<String> {
     args.device_id.as_deref().map(str::trim).filter(|d| !d.is_empty() && *d != me).map(str::to_string)
@@ -233,13 +247,26 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
     await_ready(CommandKind::Load, false).await;
     // Without a network downloads play offline, also while the session still reads online.
     let downloaded = (!engine::is_online() || !engine::network_available()) && offline::has_downloaded(&args);
-    match decide(CommandKind::Load, downloaded)? {
+    let local = explicit_local(
+        args.local,
+        engine::is_online(),
+        engine::network_available(),
+        hub::spirc().is_some(),
+        hub::local_active_or_activating(),
+    );
+    let target = match local {
+        Some(target) => target,
+        None => decide(CommandKind::Load, downloaded)?,
+    };
+    match target {
         Target::Local { activate } => {
             let spirc = spirc()?;
             let request = local::load_request(&args)?;
             restore::clear();
-            // The offline queue hands the Player over to Spirc.
+            // The offline queue hands the Player over to Spirc (and a hand-back on its way is
+            // replaced: its failure must not make this phone inactive).
             offline::stop();
+            hub::forget_hand_back();
             if activate {
                 local::sent(spirc.activate())?;
                 // Commands that arrive before the Spirc reports itself active go to it.
@@ -277,6 +304,8 @@ async fn load_on(device: &str, args: &LoadArgs) -> AppResult<Value> {
         return Err(AppError::not_connected());
     }
     remote::send(device, remote::play(args, &uri::random_command_id())).await.map_err(remote::remote_error)?;
+    // Commands right after it follow it there (the cluster naming it comes later).
+    hub::set_remote_activating(device);
     restore::clear();
     offline::stop();
     ok()
@@ -319,6 +348,11 @@ async fn control(mut cmd: Ctl) -> AppResult<Value> {
     }
     await_ready(cmd.kind(), true).await;
     match decide(cmd.kind(), false)? {
+        // Active with nothing loaded (a load failed after its activation): nothing to play there,
+        // the app's own resume loads its session instead.
+        Target::Local { activate: false } if matches!(cmd, Ctl::Play | Ctl::Toggle) && hub::local_active_empty() => {
+            return Err(nothing_active());
+        }
         Target::Local { activate } => local_control(&cmd, activate)?,
         Target::Remote(device) => remote_control(&cmd, &device).await.map_err(remote::remote_error)?,
         Target::Offline => offline::control(&cmd).await?,
@@ -475,18 +509,34 @@ fn set_audio_output(args: AudioOutputArgs) -> AppResult<Value> {
     ok()
 }
 
-/// The `play` of an offline queue handed over to another device: its items in play order (so no
-/// shuffle on the target), its repeat mode, paused unless it played.
-fn handover_load(h: offline_queue::Handover, play: bool) -> LoadArgs {
-    LoadArgs {
-        track_uris: Some(h.uris),
-        start_index: Some(0),
-        position_ms: h.position_ms,
-        shuffle: Some(false),
-        repeat: Some(h.repeat),
-        play,
-        ..Default::default()
+/// The commands handing an offline queue over to another device: its context at its current
+/// track when that is a track of one that can be loaded again (the whole context plays there, the
+/// user queue is added after it), else its items in play order (so no shuffle on the target);
+/// its repeat mode and position, paused unless it played (Spirc-based targets start playing
+/// whatever `initially_paused` says).
+fn handover_bodies(h: offline_queue::Handover, play: bool) -> Vec<Value> {
+    let base = LoadArgs { position_ms: h.position_ms, repeat: Some(h.repeat), play, ..Default::default() };
+    let (load, queued) = match h.context {
+        Some(c) => (
+            LoadArgs { context_uri: Some(c.context_uri), start_uri: Some(c.track_uri), shuffle: Some(h.shuffle), ..base },
+            h.queued,
+        ),
+        None => (LoadArgs { track_uris: Some(h.uris), start_index: Some(0), shuffle: Some(false), ..base }, Vec::new()),
+    };
+    let mut bodies = vec![remote::play(&load, &uri::random_command_id())];
+    bodies.extend(queued.iter().map(|u| remote::add_to_queue(u, &uri::random_command_id())));
+    if !play {
+        bodies.push(remote::simple("pause", &uri::random_command_id()));
     }
+    bodies
+}
+
+/// Whether a push to another device starts a session there (a connect-state `play` of the
+/// frozen or the given session) instead of transferring this phone's: a restore is still being
+/// applied here, or there is no session to transfer (nothing active, or this phone active with
+/// nothing loaded and nothing on its way).
+fn push_starts_session(applying: bool, local_session: bool, other_active: bool) -> bool {
+    applying || (!local_session && !other_active)
 }
 
 fn nothing_active() -> AppError {
@@ -523,12 +573,12 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
         // Online but hidden from Spotify Connect: no cluster to tell what is active.
         return Err(route::hidden());
     }
-    let other_active = hub::active_device_id().is_some_and(|id| id != me);
+    let other_active = active_device().is_some_and(|id| id != me);
     // A paused or finished offline queue gives way to a device that took over (see `route`).
     let offline_owns = offline::is_active() && !offline::yields();
     if args.device_id == me {
         let spirc = spirc()?;
-        if hub::local_active_or_activating() {
+        if hub::local_active_or_activating() && !hub::local_active_empty() {
             if args.play {
                 local::sent(spirc.play())?;
             }
@@ -572,23 +622,18 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
 /// The push of `transfer` to another device.
 async fn push(args: &TransferArgs, other_active: bool, offline_owns: bool, frozen: Option<&restore::Taken>) -> AppResult<()> {
     if offline_owns {
-        // The offline queue has no Connect state to transfer: hand its tracks over as a play
-        // command, then stop locally.
+        // The offline queue has no Connect state to transfer: hand it over as a play command,
+        // then stop locally.
         if let Some(handover) = offline::handover(50).filter(|h| !h.uris.is_empty()) {
             let playing = args.play && handover.playing;
-            let load = handover_load(handover, playing);
-            let mut bodies = vec![remote::play(&load, &uri::random_command_id())];
-            if !playing {
-                // Spirc-based targets start playing whatever `initially_paused` says.
-                bodies.push(remote::simple("pause", &uri::random_command_id()));
-            }
-            remote::send_all(&args.device_id, bodies).await.map_err(remote::remote_error)?;
+            remote::send_all(&args.device_id, handover_bodies(handover, playing)).await.map_err(remote::remote_error)?;
             offline::stop();
             return Ok(());
         }
     }
     let applying = frozen.is_some_and(|t| t.applying);
-    if applying || (!hub::local_active_or_activating() && !other_active) {
+    let local_session = hub::local_active_or_activating() && !hub::local_active_empty();
+    if push_starts_session(applying, local_session, other_active) {
         // Nothing to transfer (or a restore still being applied here): start the frozen (or the
         // given) session on the target.
         let resume = frozen
@@ -599,6 +644,7 @@ async fn push(args: &TransferArgs, other_active: bool, offline_owns: bool, froze
         remote::send(&args.device_id, remote::play(&resume, &uri::random_command_id()))
             .await
             .map_err(remote::remote_error)?;
+        hub::set_remote_activating(&args.device_id);
         return Ok(());
     }
     remote::transfer(&args.device_id, args.play).await.map_err(remote::remote_error)
@@ -812,13 +858,54 @@ mod tests {
             position_ms: 42_000,
             repeat: RepeatMode::Track,
             playing: false,
+            context: None,
+            shuffle: true,
+            queued: vec!["spotify:track:b".into()],
         };
-        let load = handover_load(h, false);
-        let body = remote::play(&load, "id").to_string();
+        let bodies = handover_bodies(h, false);
+        assert_eq!(bodies.len(), 2, "play, pause (the queue is in the list)");
+        let body = bodies[0].to_string();
         assert!(body.contains("\"shuffling_context\":false"), "{body}");
         assert!(body.contains("\"repeating_track\":true"), "{body}");
         assert!(body.contains("\"initially_paused\":true"), "{body}");
         assert!(body.contains("42000"), "{body}");
+        assert!(bodies[1].to_string().contains("pause"));
+    }
+
+    #[test]
+    fn an_offline_queue_of_a_context_is_handed_over_as_that_context() {
+        let h = offline_queue::Handover {
+            uris: vec!["spotify:track:a".into(), "spotify:track:q".into()],
+            position_ms: 42_000,
+            repeat: RepeatMode::Context,
+            playing: true,
+            context: Some(offline_queue::ContextStart {
+                context_uri: "spotify:playlist:p".into(),
+                track_uri: "spotify:track:a".into(),
+            }),
+            shuffle: true,
+            queued: vec!["spotify:track:q".into()],
+        };
+        let bodies = handover_bodies(h, true);
+        let body = bodies[0].to_string();
+        assert!(body.contains("spotify:playlist:p") && body.contains("spotify:track:a"), "{body}");
+        assert!(!body.contains("spotify:track:q"), "{body}");
+        assert!(body.contains("\"shuffling_context\":true") && body.contains("\"repeating_context\":true"), "{body}");
+        assert!(body.contains("42000"), "{body}");
+        // the user queue after it, playing
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].to_string().contains("add_to_queue") && bodies[1].to_string().contains("spotify:track:q"));
+    }
+
+    #[test]
+    fn a_push_from_a_phone_with_nothing_loaded_starts_the_session_there() {
+        // active with nothing loaded (a failed load) or nothing active: the given session
+        assert!(push_starts_session(false, false, false));
+        // a session here, or another device's: transferred
+        assert!(!push_starts_session(false, true, false));
+        assert!(!push_starts_session(false, false, true));
+        // a restore still being applied here: started there
+        assert!(push_starts_session(true, true, false));
     }
 
     #[test]
@@ -845,6 +932,18 @@ mod tests {
         assert!(!stopped_with_track(Some(&ConnectSnapshot { is_active: false, ..halted.clone() })));
         assert!(!stopped_with_track(Some(&ConnectSnapshot { track: None, ..halted })));
         assert!(!stopped_with_track(None));
+    }
+
+    #[test]
+    fn an_explicit_pull_plays_here() {
+        // another device active, this one not yet: activated here
+        assert_eq!(explicit_local(true, true, true, true, false), Some(Target::Local { activate: true }));
+        assert_eq!(explicit_local(true, true, true, true, true), Some(Target::Local { activate: false }));
+        // no network, offline, hidden, or not asked for: routed as usual
+        assert_eq!(explicit_local(true, true, false, true, false), None);
+        assert_eq!(explicit_local(true, false, true, true, false), None);
+        assert_eq!(explicit_local(true, true, true, false, false), None);
+        assert_eq!(explicit_local(false, true, true, true, false), None);
     }
 
     #[test]
