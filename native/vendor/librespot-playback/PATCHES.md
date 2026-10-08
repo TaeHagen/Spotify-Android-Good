@@ -78,6 +78,13 @@ impl Player {
     pub fn set_normalisation(&self, settings: NormalisationSettings);
     pub fn set_gapless(&self, gapless: bool);
     pub fn set_playback_speed(&self, speed: f64);   // the sink's speed; not finite or <= 0 => 1
+    pub fn last_decoded(&self) -> Option<DecodedPosition>;  // without a command, see below
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedPosition {
+    pub track_id: SpotifyUri,
+    pub position_ms: u32,               // the last packet decoded (or the position of a load / seek)
+    pub at: Instant,                    // when
 }
 // src/decoder/mod.rs
 pub enum DecoderError {
@@ -138,9 +145,10 @@ arm), which needed no change.
 | `PlayerCommand::SetPlaybackSpeed`, `Player::set_playback_speed`, `PlayerInternal::playback_speed`, `handle_set_playback_speed`, `nominal_start_time`, `lags_behind`, `valid_playback_speed` | The playback's line (`reported_nominal_start_time`) is in media time at the playback speed: `now - position / speed` at load-and-play, resume (`paused_to_playing(speed)`) and after a correction, and the playing track's line is re-based at its position when the speed changes. The packet loop reports a correction when the stream lags 1 s of media behind that line (`lags_behind`); being ahead (the sink's buffer) still isn't reported, and the skipped-packet check is unchanged. At 1x both are the stock computations. |
 | `handle_command_seek` | After the wait for the data (`preload_data_before_playback`) the line is `None`, so the first packet reports its position (`PositionCorrection`) and starts the line there. Stock started the line after the wait, so the `Seeked` position (sent before it) stayed ahead of the audio by the wait. |
 | `src/decoder/mod.rs`, `src/decoder/symphonia_decoder.rs` | `DecoderError::Stalled`, `is_stall`, `from_io`: an `io::ErrorKind::TimedOut` from symphonia (`next_packet`, and `seek` through `From<symphonia::Error>`) is a stall; every other error is the stock `SymphoniaDecoder(String)`. |
-| `STREAM_STALL_MAX`, `StreamStall`, `StallAction`, `stall_action`, `PlayerInternal::stream_stall`, packet loop, `handle_play`, `handle_pause` | A stalled read of the playing track keeps it Playing: the line is cleared (the first packet after the stall reports its position), and the next read re-seeks the decoder to the position played first (its reader may have stopped in the middle of a page). A seek that times out is another attempt. Each attempt waits in the read again, which asks again for a range whose request failed, and commands are handled between attempts. After `STREAM_STALL_MAX` (60 s, as long as the engine keeps the session up for a device that streams from its buffer) it pauses at the position played (a `Paused` event). A pause stops the waiting; a resume waits anew, still re-seeked. A session that is gone and every other decoder error send `EndOfTrack` as stock. |
+| `STREAM_STALL_MAX`, `StreamStall`, `StallAction`, `stall_action`, `PlayerInternal::stream_stall`, `wait_for_stalled_data`, `STALL_WAIT_BYTES`, packet loop, `handle_play`, `handle_pause` | A stalled read of the playing track keeps it Playing: the line is cleared (the first packet after the stall reports its position). Each attempt waits for the data at the read position without the decoder (`StreamLoaderController::fetch_next_and_wait`, 16 KiB, which asks again for a range whose request failed): one wait of about `download_timeout`, with the commands handled between attempts. Once the data is there the decoder is re-seeked to the position played (its reader may have stopped in the middle of a page). The re-seek went first before: symphonia's Ogg seek bisects the whole file, and each of its probes past the data waited `download_timeout` again, 30-40 s for an attempt with every command waiting. The stall ends with a packet past the position it stalled at (not the one the re-seek decodes again), so `STREAM_STALL_MAX` (60 s, as long as the engine keeps the session up for a device that streams from its buffer) counts from its first timed-out read; then it pauses at the position played (a `Paused` event). A pause stops the waiting; a resume waits anew. A session that is gone and every other decoder error send `EndOfTrack` as stock. |
+| `DecodedPosition`, `SharedDecoded`, `Player::last_decoded`, `set_decoded` | The last packet decoded (track, position, when), written by the packet loop and at a load, seek and pause (also when `Player::load` / `Player::seek` are called, before the player thread gets to them), cleared at a stop. The engine reads it without a command (the player thread may be blocked in a read) to cap a restore point that Connect's extrapolation put past a stall. |
 | `handle_command_seek` (stall) | The line is cleared also when the wait for the data times out (the seek's error is returned after it), and the seek starts any stall afresh. |
-| `mod spotifygood_tests` (stall) | `stall_action` (retry, pause after the bound, skip a broken track or without a session) and the mapping of a timed-out read to `Stalled`. |
+| `mod spotifygood_tests` (stall) | `stall_action` (retry, pause after the bound, skip a broken track or without a session), a stall lasting across attempts until a packet past it (`StreamStall::again`, `after_packet`), the shared last packet, and the mapping of a timed-out read to `Stalled`. |
 | `mod spotifygood_tests` (speed) | A simulated packet loop: a stall at 2x is corrected at the first packet once it is 1 s of media behind (stock: never), a speed change from 2x to 0.5x (and back) keeps corrections working, the 1x line is the stock one. |
 | `lock_load_handles`, `LOAD_HANDLES_POISON_MSG` | Every `load_handles` lock (loader thread, `load_track`, `Drop`) ignores poisoning (`PoisonError::into_inner`) instead of `expect`, so no panic can become a double panic in `PlayerInternal::drop`. The constant is removed. |
 
@@ -177,9 +185,13 @@ arm), which needed no change.
   crate's item S).
 * **Stalls.** A streamed track whose data doesn't come stays Playing (the sink starves) for up
   to `STREAM_STALL_MAX`, then pauses at the position played; the engine's restore covers a
-  session that went away. Each attempt is one blocking read of at most `download_timeout`, so
-  without a network it makes one range request about every 8 s for a minute, and a paused
-  track makes none. Downloaded and cached files never time out.
+  session that went away, its restore point capped at `last_decoded` (Connect goes on
+  extrapolating through a stall). Each attempt is one wait for the data at the read position of
+  at most about `download_timeout`, without the decoder, so without a network it makes one
+  range request about every 8 s for a minute, a command waits for one attempt at most, and a
+  paused track makes none. Downloaded and cached files never time out.
+* **`last_decoded`** takes a lock the packet loop holds for a moment per packet; call it from
+  any thread, it never waits for the player thread.
 * **`set_normalisation`** applies from the next packet: the config and knee factor are updated,
   and the current track's gain is recomputed from its normalisation data. `normalisation_type:
   Auto` still follows `set_auto_normalise_as_album`.
