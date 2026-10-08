@@ -254,7 +254,7 @@ Explicit filter: `EngineSettings.filterExplicit` is OR-ed into the session's own
 and restored when the setting goes off). librespot reads that attribute everywhere: the Player
 refuses explicit tracks (Spirc skips them) and skips a loaded one when the filter turns on,
 the catalog returns them with `playable:false` (its cached metadata is dropped when the
-effective filter changes), and downloads refuse them. It is applied to the live session (when
+effective filter changes). Downloads ignore it: they are filtered when shown and played (§9.7). It is applied to the live session (when
 it is declared online and on every health tick, since Spirc can overwrite it) and to the
 offline session the Player uses while not online. `User.explicitFilter` stays the account's.
 
@@ -1035,6 +1035,23 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   writes (`download.fileId`, stored in `fileId`); garbage collection (when the queue is idle)
   keeps a `.part` while an unfinished row (pending, failed, cancelled) names it, so "Retry
   failed" resumes it, and deletes files and `.part`s no row names.
+* Explicit filter ("Hide explicit content", or the account's own): downloads are the user's
+  content, so the filter applies when they are shown and played (the Downloads screens dim
+  explicit entries, the Player refuses them, offline too), never to download rows. `download.track`
+  downloads explicit items whatever the filter. The catalog's `playable` includes the filter, so an
+  explicit item answered `playable:false` while the filter may have applied (`ExplicitFilterWatch`:
+  unless the effective filter was known off and applied by the engine from before the lookup until
+  after it) gets no verdict: re-validation leaves the download COMPLETED (re-validated at a later
+  sync), a failed download is not requeued for it, a member is neither recorded as not playable nor
+  taken out of that set (a new member is queued; `download.track` decides), and a collection with
+  such members is re-checked at the next sync. Catalog metadata stored with a row drops the filter's
+  `playable:false`. When the effective filter goes off (applied by the engine), every collection's
+  unavailable members become due for a re-check and the re-validation (failed downloads, unavailable
+  members, stale downloads) runs at once when online, else once online. Once per installation, the
+  downloads earlier versions failed for the filter are repaired: explicit downloads re-validation
+  marked no longer available are restored to COMPLETED (file and key were kept; registered with
+  `offline.add`, re-validated at the next sync), explicit downloads refused as not available are
+  queued again, and every collection's unavailable members are re-checked.
 * Downloads require Premium (they are always Premium here) and are wiped on logout.
 
 ### 9.8 Data layer
