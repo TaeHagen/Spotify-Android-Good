@@ -70,8 +70,9 @@ data class ResumeState(
      * `player.load` request that starts this session again (e.g. when no Connect device is active).
      * It always names the modes: a load without them resets shuffle and repeat to off. The
      * track-list form plays its list in the saved order (shuffle and smart shuffle off, like the
-     * engine's own hand-over of such a window). Offline, [PlayerController] turns smart shuffle
-     * into a plain shuffle ([OfflineLoads.withoutSmartShuffle]).
+     * engine's own hand-over of such a window). An episode session plays in order with repeat
+     * off, like every podcast load ([PlayerController.withCurrentModes]). Offline,
+     * [PlayerController] turns smart shuffle into a plain shuffle ([OfflineLoads.withoutSmartShuffle]).
      */
     fun toPlayRequest(): PlayRequest {
         val list = trackList
@@ -91,11 +92,12 @@ data class ResumeState(
     internal val resumeLoad: ResumeLoad
         get() {
             val list = trackList
+            val ordered = list != null || isEpisode
             return ResumeLoad(
                 trackUris = list,
-                shuffle = list == null && (shuffle || smartShuffle),
-                smartShuffle = list == null && smartShuffle,
-                repeat = repeat,
+                shuffle = !ordered && (shuffle || smartShuffle),
+                smartShuffle = !ordered && smartShuffle,
+                repeat = if (isEpisode) RepeatMode.OFF else repeat,
             )
         }
 

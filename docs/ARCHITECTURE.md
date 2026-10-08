@@ -476,7 +476,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 
 | method | args |
 |---|---|
-| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?,"local":true?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual. `local` (an explicit pull to this phone, e.g. a media-session resume): with a network and a visible session it plays here even while another device is active (taking its session over, like a transfer to this phone); otherwise routed as usual. Modes absent mean off on this phone (Spirc and the offline queue reset them) but are kept by a remote device, so the app names them: a load naming no modes gets the current playback's (`PlayerController.withCurrentModes`, §9.4) |
+| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?,"local":true?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual. `local` (an explicit pull to this phone, e.g. a media-session resume): with a network and a visible session it plays here even while another device is active (taking its session over, like a transfer to this phone); otherwise routed as usual. Modes absent mean off on this phone (Spirc and the offline queue reset them) but are kept by a remote device, so the app names them: a load naming no modes gets the current playback's (`PlayerController.withCurrentModes`, §9.4), a podcast load (a show, an episode, Your Episodes, or a start item that is an episode) names them off |
 | `player.play` / `player.pause` / `player.togglePlay` | `{}` |
 | `player.next` / `player.prev` | `{}` |
 | `player.seek` | `{"positionMs":0}` |
@@ -485,7 +485,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 | `player.setRepeat` | `{"mode":"off|context|track"}` |
 | `player.setVolume` | `{"volume":0..65535,"fromSystem":false}` |
 | `player.setAudioOutput` | `{"type":"speaker|bluetooth|line_out|car|unknown","name":"…"}` (local only; reported to Connect) |
-| `player.setSpeed` | `{"speed":0.5..3.5}` (the app's podcast speed; it sends 1 for music and while another device plays). The app's sink plays at that speed (AudioTrack `PlaybackParams`, pitch kept), the decoder is throttled by it, so the player's position stays media time. Stored and applied to every later Spirc: the Spirc reports it as `playback_speed` while playing (other clients and the snapshot extrapolate at the real rate) and every state put re-anchors the position at that speed, so above 1x the state's position follows the speed alone; the player's position corrections only arrive below 1x, and one that matches the extrapolation (within 500 ms) causes no state put. The offline queue extrapolates with it. A device receiving a transfer from here gets no speed (Connect has no speed command). Invalid outside the range |
+| `player.setSpeed` | `{"speed":0.5..3.5}` (the app's podcast speed as the sink plays it, never a speed the output refused; it sends 1 for music and while another device plays). The app's sink plays at that speed (AudioTrack `PlaybackParams`, pitch kept), the decoder is throttled by it, so the player's position stays media time. Stored and applied to every later Spirc: the Spirc reports it as `playback_speed` while playing (other clients and the snapshot extrapolate at the real rate) and every state put re-anchors the position at that speed, so above 1x the state's position follows the speed alone; the player's position corrections only arrive below 1x, and one that matches the extrapolation (within 500 ms) causes no state put. The offline queue extrapolates with it. A device receiving a transfer from here gets no speed (Connect has no speed command). Invalid outside the range |
 | `player.applySettings` | `EngineSettings` subset (`bitrate`, `normalize`, `normalizePregain`, `gapless`), applied to the running Player (§4.3) |
 | `queue.add` | `{"uri":"spotify:track:…"}` — on this device at most 80 tracks can be queued (Connect's next-tracks window); a further add fails with `UNAVAILABLE` "The queue is full" |
 | `queue.remove` | `{"uid":"…"}` |
@@ -954,11 +954,20 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   remembered across restarts (a DataStore of its own). It applies to an episode played here
   (offline queue included) and is 1× for music and while another device plays. Each change of the
   effective speed goes to the sink (`AudioSinkBridge.setPlaybackSpeed`, AudioTrack
-  `PlaybackParams`, pitch kept, also for tracks recreated later) and the engine
-  (`player.setSpeed`, §6.2). Now Playing has a speed menu next to the episode controls (hidden
-  while another device plays); the session player advertises `COMMAND_SET_SPEED_AND_PITCH` for
-  local episodes (Auto, Wear and other controllers may change it) and reports the chosen speed in
-  its playback parameters. The notification has no speed button (Media3's default provider has
+  `PlaybackParams`, pitch kept, also for tracks recreated later). The sink decides what plays:
+  AudioTrack refuses a speed it cannot time-stretch in its buffer (about the speed times the 1x
+  minimum, more on Bluetooth), so the track's capacity is sized for 3.5× (as ExoPlayer does)
+  while its fill level follows the speed (`setBufferSizeInFrames`, ~250 ms of wall-clock audio,
+  so pause and seek stay as quick), and a speed the output still refuses falls back to the
+  highest step it takes below it (`PodcastSpeeds.fallbacks`); a new track and a route change
+  check the chosen speed again. Only the speed the sink plays at goes to the engine
+  (`player.setSpeed`, §6.2), also when it changes by itself, so positions never extrapolate at a
+  speed the audio does not play. `PodcastSpeed.inEffect` is that speed (the chosen one stays,
+  and is tried again). Now Playing has a speed menu next to the episode controls (hidden
+  while another device plays) labelled with the speed in effect; when the output refused the
+  chosen one it says so and disables the steps known to be refused. The session player
+  advertises `COMMAND_SET_SPEED_AND_PITCH` for local episodes (Auto, Wear and other controllers
+  may change it) and reports the speed in effect in its playback parameters. The notification has no speed button (Media3's default provider has
   none). The switch at an episode's end follows the snapshot, so the first moments of the next
   item may still play at the episode's speed.
 * Modes of a load (`PlayerController.withCurrentModes`): a load that names no shuffle / repeat
@@ -966,7 +975,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   or on the active device (modes just toggled included); smart shuffle only for a load of the
   same context, any other gets a plain shuffle. A Shuffle button names shuffle (no smart
   shuffle, repeat kept); the stored session names all of them. With nothing loaded nothing is
-  kept.
+  kept. Podcasts play in order with repeat off, as on Spotify (Now Playing, the notification and
+  Auto show no shuffle or repeat for episodes): a podcast load (a show, an episode or Your
+  Episodes as context, or an episode as start item) names the modes it leaves open off, also
+  for a remote device, and a stored episode session resumes with them off. A music load
+  replacing an episode keeps the modes of the last music playback (none seen: off on this
+  phone). Radio turns an inherited repeat-one into repeat off.
 * Pending Connect target (§8): an in-app `player.load` that plays (`PlayerController.play`,
   radio) takes `DevicesRepository.consumePendingTarget()` as `deviceId` when no device is
   active. Media-session loads (`SpotifyPlayer.handleSetMediaItems`: Auto, Assistant, watches,
@@ -992,7 +1006,16 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   A queue clear stops bulk adds queued before it (silently: the user cleared); a load does not
   (Spirc and remote devices keep the user queue across loads).
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
-  Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
+  Downloads, Browse; Downloads first offline); search. The downloads come from the download
+  database alone (`OfflineTree`, `LibraryTree.pagedChildren`), a page at a time (Media3 paging:
+  only the rows of the page are read; an unpaged request gets the first 500): the Downloads tab is
+  grouped as the app's Downloads screen (Liked Songs and playlists, albums, podcasts with
+  something downloaded, browsable and playable as their context; then the songs and the episodes
+  downloaded on their own, newest first, a `dl|` row playing its own section), all marked
+  downloaded. A downloaded collection (Liked Songs, a playlist, album or show, from the tab or
+  Library) browsed offline, or when the catalog has nothing for it (no session, a failed or empty
+  answer, a cleared cache), lists its downloads in collection order as `ctx|` rows (the offline
+  load plays them in that order), without waiting for or starting the session; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
   on a mode change and every 15 s while playing (`ResumeSaver`): the account's last session as
   this phone sees it, local or the remote device it mirrors (after a transfer it follows the
@@ -1065,8 +1088,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   (t = now + (end − now) / 1.75), Android 12+ delivers at the window end unless woken earlier, and
   an early delivery arms the next stage until < 10 s remain (a handful of stages, within the
   allow-while-idle quota). A timer ending within 10 min while a remote device plays also holds the
-  wake lock from the start (honoured outside Doze). "End of track" arms the snapshot's track end and re-arms on every
-  snapshot. Disarmed on cancel, replace, finish and manual pause (end of track).
+  wake lock from the start (honoured outside Doze). "End of track" arms the snapshot's track end (the media time left
+  divided by the snapshot's speed: an episode at a podcast speed ends sooner or later in wall
+  time) and re-arms on every snapshot (a speed change publishes one). Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
 

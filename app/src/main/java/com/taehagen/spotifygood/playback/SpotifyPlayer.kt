@@ -59,7 +59,8 @@ internal class SpotifyPlayer(
     private val devices: DevicesRepository,
     private val volume: VolumeSync,
     private val audioSessionId: Int,
-    private val downloadedUris: () -> List<String>,
+    /** The downloads a `dl|` item of the browse tree plays with ([MediaIds.plan]), by its uri. */
+    private val downloadedQueue: (startUri: String) -> List<String>,
     /** Absolute path of the downloaded cover of a track / episode uri (offline artwork), if any. */
     private val downloadedImage: (String) -> String? = { null },
     /** The error to publish while nothing plays (logged out, Premium, failed start), see [PlayerErrors]. */
@@ -71,7 +72,7 @@ internal class SpotifyPlayer(
      * sent: the service then holds its engine holder (a pause or stop does not start anything).
      */
     private val onCommand: () -> Unit = {},
-    /** The chosen podcast speed ([PodcastSpeed]); controllers may change it ([onSpeed]). */
+    /** The podcast speed in effect ([PodcastSpeed.inEffect]); controllers may choose another ([onSpeed]). */
     private val podcastSpeed: () -> Float = { PodcastSpeeds.NORMAL },
     private val onSpeed: (Float) -> Unit = {},
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
@@ -183,7 +184,7 @@ internal class SpotifyPlayer(
 
         if (hasItem) {
             val loading = s.status == PlaybackStatus.LOADING
-            // An episode here shows the chosen speed (also while paused, when the engine reports 0).
+            // An episode here shows the speed it plays at (also while paused, when the engine reports 0).
             val speed = if (PodcastSpeeds.appliesTo(s)) podcastSpeed() else s.playbackSpeed.toFloat().takeIf { it > 0f } ?: 1f
             builder.setCurrentMediaItemIndex(w.currentIndex)
                 .setPlaybackState(if (loading) STATE_BUFFERING else STATE_READY)
@@ -356,7 +357,7 @@ internal class SpotifyPlayer(
 
     override fun handleSetMediaItems(mediaItems: List<MediaItem>, startIndex: Int, startPositionMs: Long): ListenableFuture<*> {
         onCommand()
-        val plan = MediaIds.plan(mediaItems.map { it.mediaId }, startIndex, downloadedUris)
+        val plan = MediaIds.plan(mediaItems.map { it.mediaId }, startIndex, downloadedQueue)
             ?: return Futures.immediateVoidFuture()
         val request = PlayRequest(
             contextUri = plan.contextUri,
