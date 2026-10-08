@@ -23,7 +23,15 @@ import kotlinx.serialization.json.put
  * A page the engine marks `partial` (some item metadata failed, docs §6.3) is shown but not cached as
  * fresh, and is refetched while on screen ([ResponseCache.resourceOf]).
  */
-class CatalogRepository(private val rpc: NativeRpc, private val cache: ResponseCache) {
+/**
+ * [progress]: learns Spotify's podcast played state from every fresh answer that carries it (show
+ * pages, episodes), once, where the answer arrives (docs §6.5).
+ */
+class CatalogRepository(
+    private val rpc: NativeRpc,
+    private val cache: ResponseCache,
+    private val progress: EpisodeProgressStore? = null,
+) {
     fun album(uri: String): Flow<Resource<Album>> =
         cache.liveOf(CacheKeys.album(uri), Album.serializer(), CacheKeys.TTL_ALBUM) {
             rpc.callOffMain<Album>("catalog.album", rpcArgs { put("uri", uri) }).let { CacheFill(it, it.partial) }
@@ -51,14 +59,18 @@ class CatalogRepository(private val rpc: NativeRpc, private val cache: ResponseC
     /**
      * The show's first page. Spotify's played state (resume points) only comes with a fresh answer:
      * cached copies (fresh within the TTL, or shown while revalidating / offline) carry none, so
-     * an old state can never stand for the current one (docs §6.5, [EpisodeProgressStore.merge]).
+     * an old state can never stand for the current one (docs §6.5, [EpisodeProgressStore.observe]).
      */
     fun show(uri: String): Flow<Resource<Show>> =
         cache.liveOf(CacheKeys.show(uri), Show.serializer(), CacheKeys.TTL_SHOW) { showPage(uri, 0).let { CacheFill(it, it.partial) } }
             .map { it.withoutCachedPlayedState() }
 
-    suspend fun showPage(uri: String, offset: Int, limit: Int = 50): Show =
-        rpc.callOffMain("catalog.show", rpcArgs { put("uri", uri); put("offset", offset); put("limit", limit) })
+    suspend fun showPage(uri: String, offset: Int, limit: Int = 50): Show {
+        val requestedAt = System.currentTimeMillis()
+        val page = rpc.callOffMain<Show>("catalog.show", rpcArgs { put("uri", uri); put("offset", offset); put("limit", limit) })
+        progress?.observe(page.episodes, requestedAt)
+        return page
+    }
 
     suspend fun tracks(uris: List<String>): List<Track> {
         if (uris.isEmpty()) return emptyList()
@@ -70,7 +82,9 @@ class CatalogRepository(private val rpc: NativeRpc, private val cache: ResponseC
     suspend fun episodes(uris: List<String>): List<Episode> {
         if (uris.isEmpty()) return emptyList()
         return uris.chunked(METADATA_BATCH).flatMap { chunk ->
+            val requestedAt = System.currentTimeMillis()
             rpc.callOffMain<EpisodesResult>("catalog.episodes", rpcArgs { putStrings("uris", chunk) }).episodes
+                .also { progress?.observe(it, requestedAt) }
         }
     }
 

@@ -322,8 +322,9 @@ of anything else fails with `UNAVAILABLE` "Not available offline".
 this device plays (or paused) a downloaded track through Spirc, the OfflineController takes that
 playback over as it is, before anything pauses the Player (a track that ended meanwhile moves
 on to the next one): the track keeps playing without a reload, with the
-visible tracks around it in play order (the user queue included also where it isn't downloaded:
-online it streams, offline the queue skips it; suggestions only if downloaded: the others are
+visible tracks around it in play order (the user queue included, as the queue's user queue
+again, before later adds and cleared with it, also where it isn't downloaded: online it streams,
+offline the queue skips it, without the load brake; suggestions only if downloaded: the others are
 skipped, not the window's end; one pass of the context with
 repeat-all, its start that Spirc no longer lists as previous tracks in front: the queue's own
 repeat wraps it) up to the first context track on either side that isn't downloaded (the queue
@@ -484,7 +485,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 | `player.setRepeat` | `{"mode":"off|context|track"}` |
 | `player.setVolume` | `{"volume":0..65535,"fromSystem":false}` |
 | `player.setAudioOutput` | `{"type":"speaker|bluetooth|line_out|car|unknown","name":"…"}` (local only; reported to Connect) |
-| `player.setSpeed` | `{"speed":0.5..3.5}` (the app's podcast speed as the sink plays it, never a speed the output refused; it sends 1 for music and while another device plays). The app's sink plays at that speed (AudioTrack `PlaybackParams`, pitch kept), the decoder is throttled by it, so the player's position stays media time. Stored and applied to every later Spirc: the Spirc reports it as `playback_speed` while playing (other clients and the snapshot extrapolate at the real rate) and swallows the player's position corrections that match that extrapolation (the player expects 1x, they came every second or two, each a state put); the offline queue extrapolates with it. A device receiving a transfer from here gets no speed (Connect has no speed command). Invalid outside the range |
+| `player.setSpeed` | `{"speed":0.5..3.5}` (the app's podcast speed as the sink plays it, never a speed the output refused; it sends 1 for music and while another device plays). The app's sink plays at that speed (AudioTrack `PlaybackParams`, pitch kept), the decoder is throttled by it, so the player's position stays media time. Stored and applied to every later Spirc: the Spirc reports it as `playback_speed` while playing (other clients and the snapshot extrapolate at the real rate) and every state put re-anchors the position at that speed, so above 1x the state's position follows the speed alone; the player's position corrections only arrive below 1x, and one that matches the extrapolation (within 500 ms) causes no state put. The offline queue extrapolates with it. A device receiving a transfer from here gets no speed (Connect has no speed command). Invalid outside the range |
 | `player.applySettings` | `EngineSettings` subset (`bitrate`, `normalize`, `normalizePregain`, `gapless`), applied to the running Player (§4.3) |
 | `queue.add` | `{"uri":"spotify:track:…"}` — on this device at most 80 tracks can be queued (Connect's next-tracks window); a further add fails with `UNAVAILABLE` "The queue is full" |
 | `queue.remove` | `{"uid":"…"}` |
@@ -621,19 +622,35 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
              (`queryPodcastEpisodes`, `getEpisodeOrChapter`, `catalog/played.rs`): best effort, only
              when the operation's hash is known (never triggers a hash discovery), at most 3 s, a
              failure leaves the fields out and never makes a page `partial`. Search results carry it
-             when Pathfinder sends it. Kotlin overlays the phone's own progress on top
-             (`EpisodeProgressStore`): local playback of an episode is recorded (on pause, on a change
-             of item, when playback leaves the phone, every 15 s while playing; within 30 s of the
-             end it is played), shown on show / episode pages, saved episodes and downloads, and a
-             play of an episode with no position resumes there (`PlayerController.episodeResume`).
-             Only a fresh answer counts as Spotify's current state: cached show pages (fresh hits,
-             copies shown while revalidating or offline) and download metadata carry no played state
-             (stripped when emitted / stored / decoded). The phone's progress wins unless a fresh
-             state differs from the one seen when it was recorded (the episode was played elsewhere
-             afterwards); then Spotify's point becomes the phone's resume point, so the downloads,
-             Android Auto and offline plays resume it too. A partly played fresh state is also kept
-             when the phone has none. Nothing is reported back to Spotify: progress made on this
-             phone, offline above all, is not synced to other devices.
+             when Pathfinder sends it. Kotlin keeps one resume point per episode
+             (`EpisodeProgressStore`) with the time it was learned: the wall time of this phone's
+             last save, or the request time of the fresh answer that brought Spotify's; the newest
+             wins.
+             * Local playback of an episode is saved on pause, on a change of item, when playback
+               leaves the phone and every 15 s while playing; within 30 s of the end it is played.
+             * Only a fresh answer carries Spotify's state: cached show pages (fresh hits, copies
+               shown while revalidating or offline) and download metadata are stripped (when
+               emitted / stored / decoded). Fresh answers are observed once, where they arrive
+               (`CatalogRepository.showPage` / `episodes`, `SearchRepository.search`); an answer
+               requested before the last one seen is ignored, so an older page can't undo a newer
+               one. Everything that shows an episode only overlays the point (no side effects).
+             * A fresh state is news only when it differs from the last one seen (nothing is
+               reported to Spotify, so otherwise its state lags this phone's progress); then it
+               replaces an older point (a not-started one keeps none). The first state seen after
+               an offline play only becomes the reference. A partly played state is kept when
+               nothing is.
+             * Connect: while another device plays an episode (this phone is its remote, or handed
+               it over), Spotify's next state for it is news; when this phone takes an episode over
+               (seen remote just before, or arriving far from the kept point), the next state (the
+               other device's, older than this phone's progress) only becomes the reference.
+             * Every play path resumes from the point: the app's pages (rows and the show's Play),
+               Downloads, search, Android Auto / Assistant / media browsers (their rows also carry
+               the completion status) via `PlayerController.episodeResume` for a play with no
+               position; auto-advance and next (Spirc, the offline queue) by one seek when local
+               playback arrives near the start of a partly played episode (the point isn't
+               overwritten before it lands).
+             Nothing is reported back to Spotify: progress made on this phone, offline above all,
+             is not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
               "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
@@ -739,7 +756,8 @@ For a remote active device, smart shuffle is not supported (the command reports
   context) is the restore point instead of the playback before it; its paused placeholder (which
   keeps the notification and the media foreground) is the load's start item, else the playback
   before it. A shuffled session comes back in its order (`Options.shuffle_order`: the previous
-  tracks stay, Up Next goes on as it was). While another device played, its playback stays shown
+  tracks stay, Up Next goes on as it was; a plain track list or autoplay, loaded as a list in
+  that order, keeps it by uri). While another device played, its playback stays shown
   across the reconnect until the new Spirc's first cluster (with a network, ≤ 60 s). An explicit `player.load` (local, remote or offline) or running
   offline playback replaces the restore point; a dropped restore point stops the paused track
   nobody owns anymore.
@@ -859,8 +877,13 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   cleared it, and the half-done login was lost). Every request from outside (the
   `spotifygood://auth` redirect, `spotify:` / open.spotify.com links, shares, voice search)
   arrives through `LinkActivity` (no UI, no history), which forwards it as a launcher intent
-  carrying the request with `CLEAR_TOP | SINGLE_TOP` to the existing `MainActivity`: the
-  redirect closes the tab, and a task a link created still has the launcher's root intent.
+  carrying the request with `NEW_TASK | CLEAR_TOP | SINGLE_TOP` to the existing `MainActivity`:
+  the redirect closes the tab, and a task a link created still has the launcher's root intent.
+  `LinkActivity` has an empty `taskAffinity`: it runs in the caller's task, or (a caller's
+  `NEW_TASK` start: Chrome, the Assistant) in a throwaway task of its own, and is never the root
+  of the app's task, which is always rooted by `MainActivity`. A root keeps the task's identity,
+  and an excluded-from-Recents trampoline root took the app out of Recents and got its task
+  trimmed. A relaunch of `LinkActivity` from history forwards no request.
 * Alternative login: "Use another device" → `session.zeroconfLogin` (mDNS, MulticastLock
   only while that screen is visible: hiding the screen cancels it).
 * A finished login (`LoginState.Success`) goes back to the options as soon as the engine
@@ -893,7 +916,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   steps with `player.next` through context / autoplay entries, ≤ 10, else is ignored).
   `invalidateState()` on every snapshot. Position via `PositionSupplier` from the
   snapshot (extrapolating). Media items carry title/artist/album/artworkUri
-  (`content://<app>.artwork/<urlhash>` served by `ArtworkProvider` from the Coil disk cache).
+  (`content://<app>.artwork/img?u=<url>` served by the exported `ArtworkProvider`): only https
+  images of Spotify's CDN hosts (`scdn.co`, `spotifycdn.com` and subdomains: from a downloaded
+  copy, the Coil disk cache or a fetch) and files in the offline images directory of a download
+  location (`DownloadLocations.imageDirs`: internal storage, every app-specific external files
+  dir such as an SD card, the legacy `filesDir/offline/images`; canonical-path containment). A
+  downloaded cover that is not there (a card removed) gets no uri, so the CDN url is used.
 * Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
   set-media-items (Auto/Assistant/resumption), device volume only when remote (relative
   steps accumulate from the last sent target for 2 s), seek back/forward 15 s for episodes.
@@ -1105,11 +1133,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   queued items one at a time with `download.track` (cancellation propagates to
   `nativeCancel`), stores records (encrypted key), updates `offline.add`, retries failures
   with backoff (max 3), stops gracefully on `onStopped`/timeout (Android 15 6 h limit),
-  re-enqueues itself if work remains. "Not enough storage" (under 200 MiB free at the download
-  location) reschedules instead of stopping for good; the hosts require storage not low only while
-  downloads go to internal storage (the constraint tracks internal storage). A chosen SD card that
-  is not mounted stops the run ("location not available") until it is back or another location is
-  chosen. Removing the item being downloaded stops it for good: the run waits for the removal to
+  re-enqueues itself if work remains. The download location and its space are checked before
+  the run brings a session up, and per item: under 200 MiB free on internal storage reschedules
+  (the hosts require storage not low only while downloads go to internal storage, the constraint
+  tracks internal storage); a chosen SD card that is not mounted ("location not available") or
+  full stops the run (no retries), and a mount, a change of location, the app coming back or
+  "Retry" schedule the queue again; nothing is scheduled while the chosen card is missing (the
+  Downloads screen and one notification say why). An account Spotify refuses (not Premium) stops
+  the run too instead of logging in again at every retry. Removing the item being downloaded stops it for good: the run waits for the removal to
   delete its row before it picks the next item (the cancelled item puts its row back into the queue
   first), and an item whose row is gone when it starts is skipped. Progress is persisted on a state change and every
   5 s (resume / crash recovery); live bytes reach the Downloads screens through the runner's
@@ -1172,7 +1203,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   completed file and cover, each copied to `<file>.tmp`, synced, read back and compared (SHA-256),
   renamed, then the rows and the offline index (`offline.add`, numbered) switched to the copy, then
   the original deleted. Every step is resumable: an interrupted move leaves the original in use or
-  both copies with the rows on one of them, and the next pass (start, mount, change) carries on.
+  both copies with the rows on one of them, and the next pass (start, mount, change) carries on;
+  the files copied before a stop (no space, an I/O error) are switched all the same. The cover
+  maps and the session artwork follow the moved covers at once.
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
 * A card that is removed or unmounted (the system's media broadcasts): its downloads stay COMPLETED
@@ -1317,7 +1350,13 @@ error while ONLINE: after the next reconnect).
   Add-to-playlist sheet, Create playlist dialog, Settings, Profile.
 * Mini player above the navigation bar (swipe/tap to expand, progress line, play/pause,
   device indicator).
-* Deep links: `https://open.spotify.com/{type}/{id}` and `spotify:{type}:{id}` intents.
+* Deep links: `https://open.spotify.com/{type}/{id}` and `spotify:{type}:{id}` intents. The
+  https links can't be verified for this app: from Android 12 they reach it only after the user
+  approves open.spotify.com in its "Open by default" settings. Settings › Links offers that
+  (`ACTION_APP_OPEN_BY_DEFAULT_SETTINGS`) while `DomainVerificationManager` reports the domain
+  neither selected nor verified, or link handling off (checked again on every resume); if the
+  Spotify app holds the domain, its "Open supported links" has to go off first. Shared links
+  always work.
 * Offline: banner + downloaded-only filtering when offline mode or no network.
 
 ## 10. Lifecycle & battery policy (summary)

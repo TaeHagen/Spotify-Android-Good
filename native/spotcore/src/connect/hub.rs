@@ -19,6 +19,7 @@ use librespot_connect::{ConnectSnapshot, Spirc, SpircCommandError};
 use librespot_core::Session;
 use librespot_protocol::connect::Cluster;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch, Notify};
@@ -91,9 +92,11 @@ pub(crate) struct LocalLoad {
     pub generation: u64,
     pub at: Instant,
     pub args: LoadArgs,
-    /// Loads sent before it that hadn't played or failed (an earlier user load, the restore's, a
-    /// hand-back's): their failures come first (the Spirc handles loads in order).
-    pub ahead: u32,
+    /// When the loads on their way were sent (local epoch ms), oldest first, this one last: the
+    /// ones before it are an earlier user load, the restore's or a hand-back's (`i64::MIN`: any
+    /// track settles them). The Spirc handles loads in order, so a failure or a take settles the
+    /// oldest (see [`load_settled`]).
+    pub unsettled: VecDeque<i64>,
 }
 
 /// See [`HubState::handing_back`].
@@ -243,32 +246,37 @@ pub(crate) fn set_loading(args: &LoadArgs) {
     let mut hub = HUB.lock();
     let link = hub.link.as_ref().map(|l| l.generation);
     let now = Instant::now();
-    let ahead = loads_ahead(&hub, link, now);
-    hub.loading = link.map(|generation| LocalLoad { generation, at: now, args: args.clone(), ahead });
+    let mut unsettled = loads_ahead(&hub, link, now);
+    unsettled.push_back(super::now_ms());
+    hub.loading = link.map(|generation| LocalLoad { generation, at: now, args: args.clone(), unsettled });
 }
 
-/// The loads sent to the attached Spirc (`link`) that haven't played or failed yet: the Spirc
-/// handles them before a new one.
-fn loads_ahead(hub: &HubState, link: Option<u64>, now: Instant) -> u32 {
+/// The loads sent to the attached Spirc (`link`) that haven't played or failed yet (see
+/// [`LocalLoad::unsettled`]): the Spirc handles them before a new one.
+fn loads_ahead(hub: &HubState, link: Option<u64>, now: Instant) -> VecDeque<i64> {
+    let starts = usize::from(restore_applying(hub.restoring.as_ref(), link, now))
+        + usize::from(handing_back_view(hub, link, now).is_some());
+    let mut ahead: VecDeque<i64> = std::iter::repeat_n(i64::MIN, starts).collect();
     let user = hub.loading.as_ref().filter(|l| link == Some(l.generation) && now.saturating_duration_since(l.at) < restore::RESTORING_MAX);
-    user.map_or(0, |l| l.ahead + 1)
-        + u32::from(restore_applying(hub.restoring.as_ref(), link, now))
-        + u32::from(handing_back_view(hub, link, now).is_some())
+    ahead.extend(user.iter().flat_map(|l| l.unsettled.iter().copied()));
+    ahead
 }
 
-/// A local load on the attached Spirc failed or took: one ahead of the user load on its way, or
-/// that one.
+/// The oldest local load on its way failed or took: once none is left, the user load did.
 fn load_settled(hub: &mut HubState) {
-    match hub.loading.as_mut() {
-        Some(l) if l.ahead > 0 => l.ahead -= 1,
-        _ => hub.loading = None,
+    if let Some(l) = hub.loading.as_mut() {
+        l.unsettled.pop_front();
+        if l.unsettled.is_empty() {
+            hub.loading = None;
+        }
     }
 }
 
-/// `snap` (active with a track) plays something else than `prev`: another context or track.
-fn playback_changed(prev: Option<&ConnectSnapshot>, snap: &ConnectSnapshot) -> bool {
-    let track = |s: &ConnectSnapshot| s.track.as_ref().map(|t| (t.uri.clone(), t.uid.clone()));
-    prev.is_none_or(|p| !p.is_active || p.context_uri != snap.context_uri || track(p) != track(snap))
+/// `snap` (active with a track) is the take of the oldest load on its way: a load starts its
+/// track anew, so the position is anchored after that load was sent (a republish, e.g. with a
+/// failed load's error, keeps the playback's older anchor).
+fn load_took(loading: Option<&LocalLoad>, snap: &ConnectSnapshot) -> bool {
+    loading.and_then(|l| l.unsettled.front()).is_some_and(|&sent| snap.position_timestamp_ms >= sent)
 }
 
 /// The user load on its way to the attached Spirc, if any (for as long as a restore would be).
@@ -600,10 +608,8 @@ pub(crate) fn apply_snapshot(hub: &mut HubState, mut snap: ConnectSnapshot, sess
         // A restore being applied or a hand-back took.
         hub.restoring = None;
         hub.handing_back = None;
-        // A load took when the playback changed (the Spirc publishes nothing while it fetches a
-        // load's context; the same playback again is a republish, e.g. with a failed load's
-        // error): the one ahead of the user load on its way, or that one.
-        if playback_changed(hub.snapshot.as_ref(), &snap) {
+        // (the Spirc publishes nothing while it fetches a load's context)
+        if load_took(hub.loading.as_ref(), &snap) {
             load_settled(hub);
         }
     } else if !snap.is_active {
@@ -1094,7 +1100,7 @@ mod hub_tests {
     #[test]
     fn a_load_fetching_its_context_isnt_nothing_loaded() {
         let now = Instant::now();
-        let loading = || Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default(), ahead: 0 });
+        let loading = || Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default(), unsettled: VecDeque::from([0]) });
         // the activation's empty snapshot while the load fetches its context (past the grace)
         let mut hub = HubState { snapshot: Some(empty_active()), loading: loading(), ..Default::default() };
         assert!(local_load_in(&hub, Some(3), now + ACTIVATION_GRACE).is_some());
@@ -1111,51 +1117,60 @@ mod hub_tests {
         assert!(hub.loading.is_none());
     }
 
-    fn track_snapshot(uri: &str) -> ConnectSnapshot {
+    /// A track snapshot of `uri`, its position anchored at `anchor` (local epoch ms).
+    fn track_snapshot(uri: &str, anchor: i64) -> ConnectSnapshot {
         let mut s = playing_track();
         if let Some(t) = s.track.as_mut() {
             t.uri = uri.into();
             t.uid = uri.into();
         }
+        s.position_timestamp_ms = anchor;
         s
     }
 
     #[test]
-    fn only_a_load_that_took_settles_the_newer_loads_marker() {
+    fn a_load_settles_when_its_track_starts() {
         let now = Instant::now();
-        let marker = |ahead| Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default(), ahead });
-        // A0 plays; load A is on its way, then B (one ahead of it)
+        let marker = |sent: &[i64]| Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default(), unsettled: sent.iter().copied().collect() });
+        // A0 plays (anchored at 1000); load A was sent at 2000, then B at 3000
         let mut hub = HubState::default();
-        apply_snapshot(&mut hub, track_snapshot("a0"), false, 0);
-        hub.loading = marker(1);
-        // A failed: A0 again (with the error) changes nothing, the error settles A
-        apply_snapshot(&mut hub, ConnectSnapshot { last_error: Some("load failed".into()), ..track_snapshot("a0") }, false, 0);
-        assert_eq!(hub.loading.as_ref().map(|l| l.ahead), Some(1));
+        apply_snapshot(&mut hub, track_snapshot("a0", 1000), false, 0);
+        hub.loading = marker(&[2000, 3000]);
+        // A failed: A0 again with the error (its old anchor) settles nothing, the error settles A
+        apply_snapshot(&mut hub, ConnectSnapshot { last_error: Some("load failed".into()), ..track_snapshot("a0", 1000) }, false, 0);
+        assert_eq!(hub.loading.as_ref().map(|l| l.unsettled.len()), Some(2));
         load_settled(&mut hub);
         assert!(local_load_in(&hub, Some(3), now).is_some(), "B is still on its way");
-        // B's track: B took
-        apply_snapshot(&mut hub, track_snapshot("b"), false, 0);
+        // B's track starts: B took
+        apply_snapshot(&mut hub, track_snapshot("b", 3500), false, 0);
         assert!(hub.loading.is_none());
-        // A took instead: its track settles A, B's marker stays until B's track
+        // A took instead: its start settles A, B's marker stays until B's start
         let mut hub = HubState::default();
-        apply_snapshot(&mut hub, track_snapshot("a0"), false, 0);
-        hub.loading = marker(1);
-        apply_snapshot(&mut hub, track_snapshot("a"), false, 0);
-        assert_eq!(hub.loading.as_ref().map(|l| l.ahead), Some(0));
-        apply_snapshot(&mut hub, track_snapshot("a"), false, 0);
+        apply_snapshot(&mut hub, track_snapshot("a0", 1000), false, 0);
+        hub.loading = marker(&[2000, 3000]);
+        apply_snapshot(&mut hub, track_snapshot("a", 2500), false, 0);
+        assert_eq!(hub.loading.as_ref().map(|l| l.unsettled.len()), Some(1));
+        apply_snapshot(&mut hub, track_snapshot("a", 2500), false, 0);
         assert!(hub.loading.is_some());
-        apply_snapshot(&mut hub, track_snapshot("b"), false, 0);
+        apply_snapshot(&mut hub, track_snapshot("b", 3500), false, 0);
+        assert!(hub.loading.is_none());
+        // a reload of the track that plays (the same context, uri and uid), or a double tap of it
+        let mut hub = HubState::default();
+        apply_snapshot(&mut hub, track_snapshot("x", 1000), false, 0);
+        hub.loading = marker(&[2000, 2100]);
+        apply_snapshot(&mut hub, track_snapshot("x", 2400), false, 0);
+        apply_snapshot(&mut hub, track_snapshot("x", 2600), false, 0);
         assert!(hub.loading.is_none());
     }
 
     #[test]
     fn a_failed_load_ahead_keeps_the_newer_loads_marker() {
         let now = Instant::now();
-        let load = |ahead| Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default(), ahead });
+        let load = |sent: &[i64]| Some(LocalLoad { generation: 3, at: now, args: LoadArgs::default(), unsettled: sent.iter().copied().collect() });
         // A on its way, B sent after it
-        let hub = HubState { loading: load(0), ..Default::default() };
-        assert_eq!(loads_ahead(&hub, Some(3), now), 1);
-        let mut hub = HubState { snapshot: Some(empty_active()), loading: load(1), ..Default::default() };
+        let hub = HubState { loading: load(&[2000]), ..Default::default() };
+        assert_eq!(loads_ahead(&hub, Some(3), now), [2000]);
+        let mut hub = HubState { snapshot: Some(empty_active()), loading: load(&[2000, 3000]), ..Default::default() };
         // A failed: B is still on its way
         load_settled(&mut hub);
         assert!(local_load_in(&hub, Some(3), now).is_some());
@@ -1165,6 +1180,7 @@ mod hub_tests {
         assert!(hub.loading.is_none());
         assert!(local_active_empty_in(&hub, Some(3), now + ACTIVATION_GRACE));
         // a restore being applied, or a hand-back, that a user load replaces: their loads are ahead
+        // (any track settles them)
         let frozen = restore::freeze(playing_track(), 0, now);
         let view = PlaybackSnapshot::default();
         let hub = HubState {
@@ -1172,8 +1188,8 @@ mod hub_tests {
             handing_back: Some(HandingBack { generation: 3, at: now, view }),
             ..Default::default()
         };
-        assert_eq!(loads_ahead(&hub, Some(3), now), 2);
-        assert_eq!(loads_ahead(&hub, Some(4), now), 0, "another Spirc's");
+        assert_eq!(loads_ahead(&hub, Some(3), now), [i64::MIN, i64::MIN]);
+        assert!(loads_ahead(&hub, Some(4), now).is_empty(), "another Spirc's");
     }
 
     #[test]

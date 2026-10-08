@@ -362,6 +362,120 @@ fn snapshot_fingerprint_ignores_reanchoring() {
     );
     state.queue_add_uri(&track_uri(1, 9)).unwrap();
     assert_ne!(before, state.snapshot_fingerprint(true, 0));
+
+    // at another speed (podcasts) the line of that speed, also with a millisecond rounded
+    for speed in [2., 0.5, 1.5] {
+        let (_rt, mut state) = self::state(3);
+        state.set_playback_speed(speed);
+        state.set_status(&playing());
+        state.update_position(1000, 50_000);
+        let before = state.snapshot_fingerprint(true, 0);
+        for at in [53_000, 53_333, 61_001, 90_000] {
+            state.update_position_in_relation(at);
+            assert_eq!(
+                before,
+                state.snapshot_fingerprint(true, 0),
+                "{speed}x at {at}"
+            );
+        }
+        // a jump is a change
+        let position = state.player().position_as_of_timestamp;
+        state.update_position(position as u32 + 1000, 90_000);
+        assert_ne!(before, state.snapshot_fingerprint(true, 0));
+    }
+}
+
+fn playing() -> SpircPlayStatus {
+    SpircPlayStatus::Playing {
+        nominal_start_time: 0,
+        preloading_of_next_track_triggered: false,
+    }
+}
+
+fn paused(position_ms: u32) -> SpircPlayStatus {
+    SpircPlayStatus::Paused {
+        position_ms,
+        preloading_of_next_track_triggered: false,
+    }
+}
+
+#[test]
+fn positions_follow_the_playback_speed_across_puts() {
+    for speed in [1.5, 0.5] {
+        // `ms` of wall time played at the speed
+        let at = |ms: i64| (ms as f64 * speed).round() as i64;
+        let (_rt, mut state) = state(3);
+        state.set_playback_speed(speed);
+        // plays from 10 s on at t0
+        let t0 = 1_000_000;
+        state.update_position(10_000, t0);
+        state.prepare_put(&playing(), t0);
+
+        // puts while it plays (a volume key, the device sheet, a queue add): each one anchors
+        // the position the playback reached
+        let mut t = t0;
+        for elapsed in [3_000, 5_000, 1_000, 11_000] {
+            t += elapsed;
+            state.prepare_put(&playing(), t);
+            assert_eq!(state.player().timestamp, t);
+            assert_eq!(
+                state.player().position_as_of_timestamp,
+                10_000 + at(t - t0),
+                "{speed}x"
+            );
+        }
+        // other clients (and the snapshot) extrapolating at the reported speed get there too
+        let real = |now: i64| 10_000 + at(now - t0);
+        assert_eq!(state.player().playback_speed, speed);
+        assert_eq!(state.extrapolated_position(t + 4_000), real(t + 4_000));
+        let snapshot = state.snapshot(SnapshotPlayStatus::Playing, 0, None);
+        assert_eq!(snapshot.playback_speed, speed);
+        assert_eq!(snapshot.position_ms + at(4_000), real(t + 4_000));
+        // and Spirc's own position
+        assert_eq!(state.playing_position(t + 4_000), real(t + 4_000));
+
+        // a pause: Spirc anchors the position it reached (handle_pause), it stays there
+        let pause_at = t + 6_000;
+        let position = state.playing_position(pause_at);
+        assert_eq!(position, real(pause_at));
+        state.update_position(position as u32, pause_at);
+        state.prepare_put(&paused(position as u32), pause_at + 20_000);
+        assert_eq!(state.player().playback_speed, 0.);
+        assert_eq!(state.extrapolated_position(pause_at + 20_000), position);
+        // a re-anchor while paused (handle_disconnect) doesn't move it either
+        state.update_position_in_relation(pause_at + 30_000);
+        assert_eq!(state.player().position_as_of_timestamp, position);
+
+        // resumed (handle_play): until the put the state's own speed is still 0, the snapshot
+        // and Spirc's position go on at the speed
+        let resume_at = pause_at + 40_000;
+        state.update_position(position as u32, resume_at);
+        let snapshot = state.snapshot(SnapshotPlayStatus::Playing, 0, None);
+        assert_eq!(snapshot.playback_speed, speed);
+        assert_eq!(
+            state.playing_position(resume_at + 2_000),
+            position + at(2_000)
+        );
+        state.prepare_put(&playing(), resume_at + 2_000);
+        assert_eq!(
+            state.player().position_as_of_timestamp,
+            position + at(2_000)
+        );
+
+        // a seek: anchored at the new position, on at the speed from there
+        let seek_at = resume_at + 5_000;
+        state.update_position(60_000, seek_at);
+        state.prepare_put(&playing(), seek_at + 8_000);
+        assert_eq!(state.player().position_as_of_timestamp, 60_000 + at(8_000));
+        assert_eq!(
+            state.extrapolated_position(seek_at + 10_000),
+            60_000 + at(10_000)
+        );
+        assert_eq!(
+            state.playing_position(seek_at + 10_000),
+            60_000 + at(10_000)
+        );
+    }
 }
 
 #[test]

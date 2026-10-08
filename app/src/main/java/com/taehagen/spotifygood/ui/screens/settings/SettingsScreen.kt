@@ -145,6 +145,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
+import androidx.compose.material.icons.rounded.Link
 
 /** Settings state and actions. Mutations run in the app scope so they finish after navigation. */
 /** Cache keys of catalog pages (album, artist, show, playlist pages, home) with track `playable` flags. */
@@ -277,6 +278,15 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
     val relocation by vm.relocation.collectAsStateWithLifecycle()
     val sleepTimer by vm.sleepTimer.collectAsStateWithLifecycle()
     var dialog by remember { mutableStateOf<SettingsDialog?>(null) }
+    // open.spotify.com links need the user's approval on Android 12+; checked again whenever the
+    // screen comes back (from the system's "Open by default" page).
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var linksNeedApproval by remember { mutableStateOf(false) }
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            linksNeedApproval = withContext(Dispatchers.IO) { SpotifyLinkApproval.needed(context) }
+        }
+    }
 
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
 
@@ -652,6 +662,18 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
             }
 
             // ---- About
+            if (linksNeedApproval) {
+                item(key = "h_links") { PrefHeader(stringResource(R.string.shell_settings_links)) }
+                item(key = "open_links") {
+                    PrefItem(
+                        title = stringResource(R.string.shell_settings_open_links),
+                        summary = stringResource(R.string.shell_settings_open_links_summary),
+                        icon = Icons.Rounded.Link,
+                        onClick = { SpotifyLinkApproval.openSettings(context) },
+                    )
+                }
+            }
+
             item(key = "h_about") { PrefHeader(stringResource(R.string.shell_settings_about)) }
             item(key = "version") {
                 PrefItem(

@@ -1614,13 +1614,15 @@ impl SpircTask {
             }
             PlayerEvent::Playing { position_ms, .. }
             | PlayerEvent::PositionCorrection { position_ms, .. } => {
-                // SPOTIFYGOOD: at another playback speed (podcasts) the player, which expects
-                // 1x, reports a correction every second or two. One that matches the position
-                // the state extrapolates at the real speed only keeps Spirc's own (1x) anchor
+                // SPOTIFYGOOD: below 1x (podcasts) the player, which expects 1x, reports a
+                // correction every second or two (above 1x none: it only corrects a playback that
+                // lags, the state then goes by the speed alone, see
+                // ConnectState::update_position_in_relation). One that matches the position the
+                // state extrapolates at the real speed only keeps Spirc's own (1x) anchor
                 // current: no state put (it was one every second or two, for all clients).
                 if correction && self.connect_state.playing_speed() != 1. {
                     let now = self.now_ms();
-                    let expected = self.connect_state.extrapolated_position(now);
+                    let expected = self.connect_state.playing_position(now);
                     if (expected - position_ms as i64).abs() < SPEED_CORRECTION_TOLERANCE_MS {
                         if let SpircPlayStatus::Playing {
                             ref mut nominal_start_time,
@@ -2160,7 +2162,14 @@ impl SpircTask {
             // update position if the track continued playing
             Some(position) if position > 0 => {
                 let time_since_position_update = timestamp - transfer_timestamp;
-                i64::from(position) + time_since_position_update
+                // SPOTIFYGOOD: at the speed it played at (a podcast on another device), it went
+                // on at 1x
+                let speed = transfer
+                    .playback
+                    .playback_speed
+                    .filter(|speed| speed.is_finite() && *speed > 0.)
+                    .unwrap_or(1.);
+                i64::from(position) + (time_since_position_update as f64 * speed).round() as i64
             }
             _ => 0,
         };
@@ -2208,9 +2217,12 @@ impl SpircTask {
         // after the inactive one below
         self.state_puts.cancel();
 
-        self.play_status = SpircPlayStatus::Stopped {};
+        // SPOTIFYGOOD: re-anchored at the speed of the status it had (set_status brings the
+        // state's speed up to date, see ConnectState::update_position_in_relation), then stopped
+        self.connect_state.set_status(&self.play_status);
         self.connect_state
             .update_position_in_relation(self.now_ms());
+        self.play_status = SpircPlayStatus::Stopped {};
         // SPOTIFYGOOD: become inactive (locally) even if the state update fails, it used to
         // return early and the device kept reporting itself as active. Each request is bounded
         // on its own (spclient retries without a timeout and waits out a 429's Retry-After);
@@ -2685,14 +2697,17 @@ impl SpircTask {
     fn handle_pause(&mut self) {
         match self.play_status {
             SpircPlayStatus::Playing {
-                nominal_start_time,
                 preloading_of_next_track_triggered,
+                ..
             } => {
                 // SPOTIFYGOOD: see Spirc::release_player
                 if self.owns_player() {
                     self.player.pause();
                 }
-                let position_ms = (self.now_ms() - nominal_start_time) as u32;
+                // SPOTIFYGOOD: at the playing speed (see ConnectState::playing_position), the 1x
+                // nominal start time put a playback at another speed (podcasts) elsewhere until
+                // the player's Paused event
+                let position_ms = self.playing_position();
                 self.connect_state
                     .update_position(position_ms, self.now_ms());
                 self.play_status = SpircPlayStatus::Paused {
@@ -2808,13 +2823,21 @@ impl SpircTask {
     // the new anchor; an active device puts the state once.
     fn handle_set_playback_speed(&mut self, speed: f64) {
         let now = self.now_ms();
-        let position = self.connect_state.extrapolated_position(now);
+        // SPOTIFYGOOD: at the speed it played at (the state's own may be outdated, see
+        // ConnectState::playing_position)
+        let position = self.playing_position();
         if !self.connect_state.set_playback_speed(speed) {
             return;
         }
-        if matches!(self.play_status, SpircPlayStatus::Playing { .. }) {
-            self.connect_state
-                .update_position(position.clamp(0, u32::MAX as i64) as u32, now);
+        if let SpircPlayStatus::Playing {
+            ref mut nominal_start_time,
+            ..
+        } = self.play_status
+        {
+            self.connect_state.update_position(position, now);
+            // SPOTIFYGOOD: Spirc's own anchor too, the player's position events are compared
+            // with it
+            *nominal_start_time = now - i64::from(position);
         }
         self.connect_state.set_status(&self.play_status);
         if self.connect_state.is_active() {
@@ -3305,10 +3328,16 @@ impl SpircTask {
             SpircPlayStatus::LoadingPlay { position_ms }
             | SpircPlayStatus::LoadingPause { position_ms }
             | SpircPlayStatus::Paused { position_ms, .. } => position_ms,
-            SpircPlayStatus::Playing {
-                nominal_start_time, ..
-            } => (self.now_ms() - nominal_start_time) as u32,
+            // SPOTIFYGOOD: see playing_position
+            SpircPlayStatus::Playing { .. } => self.playing_position(),
         }
+    }
+
+    // SPOTIFYGOOD: the position of the playback that plays, at the playing speed (see
+    // ConnectState::playing_position); the same as the 1x nominal start time at 1x
+    fn playing_position(&self) -> u32 {
+        let position = self.connect_state.playing_position(self.now_ms());
+        position.clamp(0, u32::MAX as i64) as u32
     }
 
     fn load_track(&mut self, start_playing: bool, position_ms: u32) -> Result<(), Error> {
@@ -3347,13 +3376,9 @@ impl SpircTask {
     }
 
     fn send_state_put(&mut self, put: StatePut, retry: usize) {
-        // like notify
-        self.connect_state.set_status(&self.play_status);
-        if self.connect_state.is_playing() {
-            self.connect_state
-                .update_position_in_relation(self.now_ms());
-        }
-        self.connect_state.set_now(self.now_ms() as u64);
+        // like notify (see ConnectState::prepare_put)
+        self.connect_state
+            .prepare_put(&self.play_status, self.now_ms());
 
         let request = self.connect_state.put_state_request(put.reason());
         let session = self.session.clone();
@@ -3404,14 +3429,10 @@ impl SpircTask {
     }
 
     async fn notify(&mut self) -> Result<(), Error> {
-        self.connect_state.set_status(&self.play_status);
-
-        if self.connect_state.is_playing() {
-            self.connect_state
-                .update_position_in_relation(self.now_ms());
-        }
-
-        self.connect_state.set_now(self.now_ms() as u64);
+        // SPOTIFYGOOD: factored out (ConnectState::prepare_put, also for send_state_put), the
+        // re-anchor follows the playback speed
+        self.connect_state
+            .prepare_put(&self.play_status, self.now_ms());
 
         let response = self.connect_state.send_state(&self.session).await?;
         // SPOTIFYGOOD: the response may contain the cluster

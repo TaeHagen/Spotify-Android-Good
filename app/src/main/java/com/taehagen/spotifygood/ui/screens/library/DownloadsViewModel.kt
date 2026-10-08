@@ -68,7 +68,7 @@ class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
         graph.episodeProgress.version,
     ) { items, collections, active, _ ->
         // Episodes show where they were left on this phone (docs §6.5).
-        buildDownloadsContent(items, collections, ::metadataOf, active).withEpisodes(graph.episodeProgress::merge)
+        buildDownloadsContent(items, collections, ::metadataOf, active).withEpisodes(graph.episodeProgress::overlay)
     }.distinctUntilChanged()
         .flowOn(Dispatchers.Default)
         .catch { emit(DownloadsContent()) }
