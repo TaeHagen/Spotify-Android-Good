@@ -2,9 +2,16 @@ package com.taehagen.spotifygood.playback
 
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackTrack
+import com.taehagen.spotifygood.model.TrackProvider
 
-/** One entry of the media session playlist window; [uid] is unique within the window. */
-internal data class WindowEntry(val uid: String, val track: PlaybackTrack)
+/**
+ * One entry of the media session playlist window. [uid] is the Media3 item uid, unique within the
+ * window (made up when Connect uids repeat or are missing); `queue.*` commands take
+ * [connectUid], the uid the engine knows (empty: none).
+ */
+internal data class WindowEntry(val uid: String, val track: PlaybackTrack) {
+    val connectUid: String get() = track.uid
+}
 
 /**
  * The part of the play queue exposed to Media3 controllers (docs/ARCHITECTURE.md §9.4): the last
@@ -16,9 +23,43 @@ internal data class QueueWindow(val entries: List<WindowEntry>, val currentIndex
     val isEmpty: Boolean get() = entries.isEmpty()
     val current: WindowEntry? get() = entries.getOrNull(currentIndex)
 
+    /** How a seek to the upcoming item [index] is sent ([seekPlan]). */
+    sealed interface Seek {
+        /** `queue.skipTo` with this Connect uid (a repeated uid finds its first, same, track). */
+        data class SkipTo(val uid: String) : Seek
+
+        /** No Connect uid: `player.next` this many times (only through context / autoplay entries). */
+        data class Next(val steps: Int) : Seek
+
+        data object Unsupported : Seek
+    }
+
+    fun seekPlan(index: Int): Seek {
+        val target = entries.getOrNull(index)
+        if (target == null || index <= currentIndex) return Seek.Unsupported
+        if (target.connectUid.isNotEmpty()) return Seek.SkipTo(target.connectUid)
+        // Plain steps never skip past (and drop) queued entries the user did not tap.
+        val through = entries.subList(currentIndex + 1, index + 1)
+        val plain = through.all { it.track.provider == TrackProvider.CONTEXT || it.track.provider == TrackProvider.AUTOPLAY }
+        return if (plain && index - currentIndex <= MAX_NEXT_STEPS) Seek.Next(index - currentIndex) else Seek.Unsupported
+    }
+
+    /** Connect uids to remove for the items [from] until [to] (upcoming only, each once). */
+    fun removeUids(from: Int, to: Int): List<String> =
+        (maxOf(from, currentIndex + 1) until minOf(to, entries.size))
+            .map { entries[it].connectUid }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
+    /** Connect uid of the upcoming item [index] to move, null when it has none. */
+    fun moveUid(index: Int): String? =
+        entries.getOrNull(index)?.takeIf { index > currentIndex }?.connectUid?.takeIf { it.isNotEmpty() }
+
     companion object {
         const val PREVIOUS = 10
         const val NEXT = 50
+        /** Longest run of `player.next` a seek without a Connect uid is sent as. */
+        const val MAX_NEXT_STEPS = 10
 
         val EMPTY = QueueWindow(emptyList(), -1)
 

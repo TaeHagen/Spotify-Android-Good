@@ -300,11 +300,16 @@ internal class SpotifyPlayer(
             COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM, COMMAND_SEEK_BACK, COMMAND_SEEK_FORWARD ->
                 track(controller.seekAsync(position))
             else -> {
-                val target = w.entries.getOrNull(mediaItemIndex) ?: return Futures.immediateVoidFuture()
+                if (w.entries.getOrNull(mediaItemIndex) == null) return Futures.immediateVoidFuture()
                 when {
                     mediaItemIndex == w.currentIndex -> track(controller.seekAsync(position))
                     mediaItemIndex > w.currentIndex -> {
-                        val ops = mutableListOf(controller.skipToAsync(target.uid))
+                        // The engine knows Connect uids only, never the window's unique ones.
+                        val ops = when (val plan = w.seekPlan(mediaItemIndex)) {
+                            is QueueWindow.Seek.SkipTo -> mutableListOf(controller.skipToAsync(plan.uid))
+                            is QueueWindow.Seek.Next -> MutableList(plan.steps) { controller.nextAsync() }
+                            QueueWindow.Seek.Unsupported -> return Futures.immediateVoidFuture()
+                        }
                         if (position > 0) ops += controller.seekAsync(position)
                         track(*ops.toTypedArray())
                     }
@@ -375,17 +380,15 @@ internal class SpotifyPlayer(
     override fun handleRemoveMediaItems(fromIndex: Int, toIndex: Int): ListenableFuture<*> {
         val w = queueWindow
         // Only upcoming entries can be removed from a Spotify queue.
-        val ops = (maxOf(fromIndex, w.currentIndex + 1) until toIndex)
-            .mapNotNull { w.entries.getOrNull(it)?.uid }
-            .map { controller.removeFromQueueAsync(it) }
+        val ops = w.removeUids(fromIndex, toIndex).map { controller.removeFromQueueAsync(it) }
         if (ops.isNotEmpty()) onCommand()
         return if (ops.isEmpty()) Futures.immediateVoidFuture() else track(*ops.toTypedArray())
     }
 
     override fun handleMoveMediaItems(fromIndex: Int, toIndex: Int, newIndex: Int): ListenableFuture<*> {
         val w = queueWindow
-        val uid = w.entries.getOrNull(fromIndex)?.uid
-        if (uid == null || toIndex - fromIndex != 1 || fromIndex <= w.currentIndex || newIndex <= w.currentIndex) {
+        val uid = w.moveUid(fromIndex)
+        if (uid == null || toIndex - fromIndex != 1 || newIndex <= w.currentIndex) {
             return Futures.immediateVoidFuture()
         }
         onCommand()

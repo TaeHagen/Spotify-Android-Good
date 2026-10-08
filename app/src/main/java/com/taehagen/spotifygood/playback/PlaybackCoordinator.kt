@@ -36,10 +36,12 @@ import kotlinx.coroutines.launch
 /**
  * Process-wide glue between the native audio sink and the Android audio policy
  * (docs/ARCHITECTURE.md §9.4–§9.6). It is the [AudioSinkBridge.Listener]:
- * * sink started (local audio audible) → request audio focus, register the becoming-noisy
- *   receiver, hold wake + Wi-Fi locks;
- * * sink stopped → release locks, unregister the receiver, abandon focus after
- *   [AudioFocusController.RESUME_WINDOW_MS] (or immediately on stop / remote playback / engine stop);
+ * * sink started (local audio audible) → request audio focus, hold wake + Wi-Fi locks;
+ * * sink stopped → release locks, abandon focus after [AudioFocusController.RESUME_WINDOW_MS] (or
+ *   immediately on stop / remote playback / engine stop);
+ * * the becoming-noisy receiver is registered while local playback plays, loads or awaits a focus
+ *   resume ([NoisyRules]), so a disconnect during a focus pause or a stall is not missed; a noisy
+ *   event pauses and cancels a pending focus resume;
  * * mixer volume → `STREAM_MUSIC` via [VolumeSync], which also observes the system volume while the
  *   engine runs;
  * * the system equalizer's audio-effect session is opened when local audio first starts and
@@ -86,7 +88,11 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
             override fun isPlayingLocally(): Boolean = sinkActive || graph.playback.snapshot.value.isLocallyActive()
         },
     )
-    private val noisy = BecomingNoisyReceiver(app) { graph.player.pause(user = false) }
+    private val noisy = BecomingNoisyReceiver(app) {
+        // The output went away: pause, and a pending focus resume must not undo it later.
+        focus.cancelPendingResume()
+        graph.player.pause(user = false)
+    }
     private val wakeLock = WakeLockManager(app, Looper.getMainLooper(), Clock.DEFAULT).apply { setEnabled(true) }
     private val wifiLock = WifiLockManager(app, Looper.getMainLooper(), Clock.DEFAULT).apply { setEnabled(true) }
 
@@ -123,6 +129,8 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
 
     private val abandonFocus = Runnable {
         if (!sinkActive && !graph.playback.snapshot.value.isLocallyActive()) focus.abandon()
+        // The focus-resume window is over.
+        updateNoisy()
     }
 
     private fun initOnMain() {
@@ -303,14 +311,15 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
         } else {
             focus.request()
         }
-        noisy.register()
+        updateNoisy()
         updateLocks()
         openEffectSession()
     }
 
     private fun onLocalAudioStopped() {
         if (sinkActive) return
-        noisy.unregister()
+        // Kept while playback is meant to go on (a focus pause, a stall): see [NoisyRules].
+        updateNoisy()
         updateLocks()
         main.removeCallbacks(abandonFocus)
         main.postDelayed(abandonFocus, AudioFocusController.RESUME_WINDOW_MS)
@@ -324,8 +333,8 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
             // Nothing will play locally soon: give focus back right away.
             main.removeCallbacks(abandonFocus)
             focus.abandon()
-            if (!sinkActive) noisy.unregister()
         }
+        updateNoisy()
         if (!s.isLocallyActive()) {
             // A new activation may try again (e.g. after "Tap to resume").
             refusedThisActivation = false
@@ -339,6 +348,7 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
         focusAfterForeground = false
         main.removeCallbacks(abandonFocus)
         focus.abandon()
+        // Nothing plays without the engine (its last snapshot may still read playing).
         noisy.unregister()
         updateLocks()
         closeEffectSession() // the AudioTrack is released with the engine
@@ -373,6 +383,15 @@ class PlaybackCoordinator private constructor(private val app: App) : AudioSinkB
             )
         } catch (e: RuntimeException) {
             Log.w(TAG, "Audio effect session broadcast failed", e)
+        }
+    }
+
+    /** The becoming-noisy receiver while [NoisyRules.wanted]. Main thread. */
+    private fun updateNoisy() {
+        if (NoisyRules.wanted(sinkActive, graph.playback.snapshot.value, focus.isWaitingForGain)) {
+            noisy.register()
+        } else {
+            noisy.unregister()
         }
     }
 

@@ -309,7 +309,8 @@ of anything else fails with `UNAVAILABLE` "Not available offline".
 this device plays (or paused) a downloaded track through Spirc, the OfflineController takes that
 playback over as it is, before anything pauses the Player (a track that ended meanwhile moves
 on to the next one): the track keeps playing without a reload, with the
-visible tracks around it in play order (user queue included, one pass of the context with
+visible tracks around it in play order (user queue included, suggestions only if downloaded:
+the others are skipped, not the window's end; one pass of the context with
 repeat-all, its start that Spirc no longer lists as previous tracks in front: the queue's own
 repeat wraps it) up to the first one on either side that isn't downloaded (the queue ends
 there; a full list of Spirc's, 80 next tracks, ends before its last one, where the context goes
@@ -317,7 +318,8 @@ on), the position, repeat mode, shuffle flag and play state. No restore point is
 that session; when it is back, the queue plays on as above, and when it reaches the end of the
 handed-over window (stops or would wrap) with a visible session up and no other device active,
 it hands back to Spirc: the queue's track stops, and the context loads at its first track after
-the window (with repeat-all and a pass that isn't all downloaded, at the context's start;
+the window (with repeat-all and a pass that isn't all downloaded or all listed, at the context's
+start;
 suggestions skipped, smart shuffle adds new ones; the user queue's tracks there are
 queued again and play after that first track), with its options as now, unless the user changed
 the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
@@ -473,7 +475,7 @@ own explicit filter (see §4.3); it can never turn the account's filter off.
 | `queue.move` | `{"uid":"…","toIndex":0}` — `toIndex` = final 0-based index in `nextTracks` (queued items come first; a queued item is clamped to the queue section) |
 | `queue.clear` | `{}` |
 | `queue.skipTo` | `{"uid":"…"}` |
-| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs","shuffle"?,"smartShuffle"?,"repeat"?,"trackUris"?:["…"]}?}` (`trackUris`: the session as a track list, when its current track wasn't a context track; played from `trackUri` on instead of the context) (self = pull, other = push). When no device is active, or this phone is active with nothing loaded (a failed load) and nothing on its way, `resume` (the app's last session, with its modes; smart shuffle becomes a plain shuffle on another device) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE` (Kotlin then keeps the device as the pending target for the next play, see §8). A push while a `player.load` here is still on its way (fetching its context) starts that load on the target, and this phone lets go of it. Pushing offline playback whose current track is a track of a context that can be loaded again hands over that context at the track (position, shuffle, repeat; its user queue, also the part adopted from Spirc, added after it in the background once this phone stopped), other offline playback its tracks (in play order), current position and repeat mode; either is kept paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as one pass of the visible tracks in play order) |
+| `connect.transfer` | `{"deviceId":"…","play":true?,"resume":{"contextUri"?,"trackUri","positionMs","shuffle"?,"smartShuffle"?,"repeat"?,"trackUris"?:["…"]}?}` (`trackUris`: the session as a track list, when its current track wasn't a context track; played from `trackUri` on instead of the context) (self = pull, other = push). When no device is active, or this phone is active with nothing loaded (a failed load) and nothing on its way, `resume` (the app's last session, with its modes; smart shuffle becomes a plain shuffle on another device) is started on the target instead: a local `player.load` for this phone, a connect-state `play` command for another device; without it `NOT_ACTIVE_DEVICE` (Kotlin then keeps the device as the pending target for the next play, see §8). A push while a `player.load` here is still on its way (fetching its context) starts that load on the target, and this phone lets go of it. A pull while the offline queue owns the session here plays that queue on; another device's session is taken only when that device actually plays (not one that sits paused as the account's active device). Pushing offline playback whose current track is a track of a context that can be loaded again hands over that context at the track (position, shuffle, repeat; its user queue, also the part adopted from Spirc, added after it in the background once this phone stopped), other offline playback its tracks (in play order), current position and repeat mode; either is kept paused if it was. With a reconnect restore pending (§8), a pull restores it here, playing as asked (`NOT_CONNECTED` without a session), and a push hands it over (a queued or suggested current track as one pass of the visible tracks in play order) |
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
@@ -703,7 +705,10 @@ For a remote active device, smart shuffle is not supported (the command reports
   queue loses its tail, not the track; with no context track before it, the context loads with
   the track played in front of it); handed to another device it goes as one pass of the visible
   tracks in play order instead. A context that can't be loaded again (a plain track list) is
-  restored as one pass of its visible tracks (with repeat-all Spirc lists the next passes too). An explicit `player.load` (local, remote or offline) or running
+  restored as one pass of its visible tracks (with repeat-all Spirc lists the next passes too).
+  A local `player.load` still on its way when the connection goes (the Spirc fetching its
+  context) is the restore point instead of the playback before it (no placeholder is shown for
+  it). An explicit `player.load` (local, remote or offline) or running
   offline playback replaces the restore point; a dropped restore point stops the paused track
   nobody owns anymore.
 * **Local-network discovery (the "send" side)**: speakers and receivers on the LAN that are not
@@ -834,8 +839,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 
 * `PlaybackService : MediaLibraryService`, `foregroundServiceType="mediaPlayback|connectedDevice"`.
   Session player = `SpotifyPlayer : SimpleBasePlayer(mainLooper)` built from
-  `PlaybackRepository.snapshot` (window: last 10 prev + current + next 50, uids from
-  Connect). `invalidateState()` on every snapshot. Position via `PositionSupplier` from the
+  `PlaybackRepository.snapshot` (window: last 10 prev + current + next 50; Media3 item uids
+  are the Connect uids made unique per window, since repeat-all repeats them and some entries
+  have none; queue commands send the Connect uid, never a made-up one: seek-to-item without one
+  steps with `player.next` through context / autoplay entries, ≤ 10, else is ignored).
+  `invalidateState()` on every snapshot. Position via `PositionSupplier` from the
   snapshot (extrapolating). Media items carry title/artist/album/artworkUri
   (`content://<app>.artwork/<urlhash>` served by `ArtworkProvider` from the Coil disk cache).
 * Commands: play/pause/prev/next/seek/seek-to-item (`queue.skipTo`), shuffle, repeat,
@@ -942,7 +950,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
   0.2 → restore (a duck keeps focus; a granted request clears the duck). Request failure → pause.
-* `BecomingNoisyReceiver`: registered only while playing locally → `player.pause`.
+* `BecomingNoisyReceiver`: registered while local playback plays, loads or awaits a focus resume
+  (`NoisyRules`: also while the sink is stopped by a focus pause or the stall watchdog), never for
+  remote playback → `player.pause`; a noisy event also cancels a pending focus resume, so a later
+  GAIN cannot restart playback on the speaker.
 * Wake locks: Media3 `WakeLockManager` + `WifiLockManager` `setStayAwake(true)` only while
   local status is playing/loading; false otherwise.
 * Sleep timer (`SleepTimer`): coroutine delays stop while the CPU sleeps (remote playback holds
