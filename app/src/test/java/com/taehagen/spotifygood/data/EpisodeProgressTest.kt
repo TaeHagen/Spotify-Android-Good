@@ -266,14 +266,19 @@ class EpisodeProgressStoreTest {
             track = PlaybackTrack(uri = uri, isEpisode = true),
         )
 
-    private fun EpisodeProgressStore.tracker(seeks: MutableList<Long> = mutableListOf()) = EpisodeProgressTracker(object : ResumeSink {
-        override fun record(uri: String, positionMs: Long, durationMs: Long) = this@tracker.record(uri, positionMs, durationMs)
-        override fun playedElsewhere(uri: String) = this@tracker.playedElsewhere(uri)
+    private fun EpisodeProgressStore.tracker(
+        seeks: MutableList<Long> = mutableListOf(),
+        lookups: MutableList<String> = mutableListOf(),
+    ) = EpisodeProgressTracker(object : ResumeSink {
+        override fun record(uri: String, positionMs: Long, durationMs: Long, elsewhere: Boolean) = this@tracker.record(uri, positionMs, durationMs, elsewhere)
         override fun continuedHere(uri: String) = this@tracker.continuedHere(uri)
         override fun resumeMs(uri: String) = this@tracker.resumeMs(uri)
         override fun pointMs(uri: String) = this@tracker.overlay(Episode(uri = uri, name = "")).resumePositionMs
         override fun seek(positionMs: Long) {
             seeks += positionMs
+        }
+        override fun lookUp(uri: String) {
+            lookups += uri
         }
     })
 
@@ -284,9 +289,10 @@ class EpisodeProgressStoreTest {
         store.record(EP, 1 * MIN, 2 * HOUR) // an earlier phone session (reference: not started)
         store.fresh(NOT_STARTED, at = 150)
         val tracker = store.tracker()
-        // The speaker plays E (this phone is its remote); Spotify's point becomes 50:00.
+        // The speaker plays E (this phone is its remote and follows it); Spotify's point becomes 50:00.
         now = 200
         tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, positionMs = 10 * MIN, at = 200), 200)
+        assertEquals("the phone keeps what it sees the speaker play", 10 * MIN, store.resumeMs(EP))
         // Transferred to this phone at 50:00, played on to 70:00 and paused.
         now = 1_000
         tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, positionMs = 50 * MIN, at = 1_000), 1_000)
@@ -301,6 +307,37 @@ class EpisodeProgressStoreTest {
         // Played further elsewhere afterwards: news.
         store.fresh(played(95), at = 5_000)
         assertEquals(95 * MIN, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun anEpisodePlayedOnASpeakerThisPhoneControlsIsKept() = runTest {
+        val (store, scope) = store()
+        store.fresh(NOT_STARTED, at = 50) // the show page: not started, nothing kept
+        val tracker = store.tracker()
+        now = 100
+        tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, positionMs = 1_000, at = 100), 100)
+        tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, positionMs = 1_000, at = 100), 100 + 30 * MIN) // the 15 s saves
+        tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, status = PlaybackStatus.PAUSED, positionMs = 30 * MIN, at = 200), 200)
+        assertEquals(30 * MIN, store.resumeMs(EP))
+        // Tapping it again (from the show page, Downloads, Auto) resumes 30:00 on the speaker.
+        assertEquals(30 * MIN, PlayerController.withEpisodeResume(PlayRequest(contextUri = SHOW, startUri = EP), store::resumeMs).positionMs)
+        // A librespot speaker reports nothing: a later "not started" answer doesn't wipe it ...
+        store.fresh(NOT_STARTED, at = 1_000)
+        assertEquals(30 * MIN, store.resumeMs(EP))
+        // ... a real later point does replace it.
+        store.fresh(played(45), at = 2_000)
+        assertEquals(45 * MIN, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun aRemoteRestartNearTheStartDoesNotReplaceAPointFurtherOn() = runTest {
+        val (store, scope) = store()
+        store.record(EP, 30 * MIN, 2 * HOUR)
+        val tracker = store.tracker()
+        tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, positionMs = 800, at = 100), 100)
+        assertEquals(30 * MIN, store.resumeMs(EP))
         scope.cancel()
     }
 
@@ -370,6 +407,121 @@ class EpisodeProgressStoreTest {
     }
 
     @Test
+    fun arrivingAtAnEpisodeWithNoPointLooksItUpFirst() = runTest {
+        val (store, scope) = store()
+        val seeks = mutableListOf<Long>()
+        val lookups = mutableListOf<String>()
+        val tracker = store.tracker(seeks, lookups)
+        // Auto-advance (or a show context load) into E, nothing known about it here.
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, positionMs = 300, at = 1_000), 1_000)
+        assertEquals(listOf(EP), lookups)
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, positionMs = 300, at = 1_000), 2_500)
+        assertNull("nothing saved while the lookup runs", store.resumeMs(EP))
+        // The lookup's fresh answer: Spotify has it at 30:00.
+        store.fresh(played(30), at = 1_000)
+        tracker.onLookedUp(EP, 3_000)
+        assertEquals(listOf(30 * MIN), seeks)
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, positionMs = 30 * MIN, at = 3_500), 3_500)
+        assertEquals(30 * MIN, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun aLookupThatBringsNothingLetsSavingResume() = runTest {
+        val (store, scope) = store()
+        val seeks = mutableListOf<Long>()
+        val tracker = store.tracker(seeks)
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, positionMs = 300, at = 1_000), 1_000)
+        tracker.onLookedUp(EP, 2_000) // not started on Spotify either
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, positionMs = 300, at = 1_000), 16_000)
+        assertTrue(seeks.isEmpty())
+        assertEquals(15_300L, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun aLookupAnsweringAfterTheUserMovedOnDoesNotSeek() = runTest {
+        val (store, scope) = store()
+        val seeks = mutableListOf<Long>()
+        val tracker = store.tracker(seeks)
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, positionMs = 300, at = 1_000), 1_000)
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, positionMs = 20 * MIN, at = 2_000), 2_000) // the user seeked
+        store.fresh(played(30), at = 1_000)
+        tracker.onLookedUp(EP, 3_000)
+        assertTrue(seeks.isEmpty())
+        scope.cancel()
+    }
+
+    // ---- lookups before a play ---------------------------------------------------------------
+
+    @Test
+    fun aPlayOfAnUnknownEpisodeLooksSpotifysPointUp() = runTest {
+        val (store, scope) = store()
+        var calls = 0
+        val lookUp: suspend (String) -> Unit = { uri ->
+            calls++
+            store.fresh(played(30), at = now, uri = uri)
+        }
+        // A Your Episodes tap: a track list starting at E, no position.
+        val request = PlayerController.withEpisodeResumeLookup(PlayRequest(trackUris = listOf(EP), startIndex = 0)) { uri ->
+            store.resumeOrLookUp(uri, online = { true }, lookUp)
+        }
+        assertEquals(30 * MIN, request.positionMs)
+        assertEquals(1, calls)
+        scope.cancel()
+    }
+
+    @Test
+    fun aLookupThatTimesOutPlaysFromTheStartWithinTheBound() = runTest {
+        val (store, scope) = store()
+        val started = testScheduler.currentTime
+        val position = store.resumeOrLookUp(EP, online = { true }) { kotlinx.coroutines.awaitCancellation() }
+        assertNull(position)
+        assertEquals(EpisodeProgressStore.LOOKUP_TIMEOUT_MS, testScheduler.currentTime - started)
+        scope.cancel()
+    }
+
+    @Test
+    fun noLookupWhenThePointIsKnownOfflineOrJustSeen() = runTest {
+        val (store, scope) = store()
+        var calls = 0
+        val lookUp: suspend (String) -> Unit = { calls++ }
+        store.record(EP, 20 * MIN, 2 * HOUR)
+        assertEquals(20 * MIN, store.resumeOrLookUp(EP, { true }, lookUp))
+        assertNull(store.resumeOrLookUp("spotify:episode:offline", { false }, lookUp))
+        store.fresh(NOT_STARTED, at = now, uri = "spotify:episode:seen") // a fresh page just said "not started"
+        assertNull(store.resumeOrLookUp("spotify:episode:seen", { true }, lookUp))
+        assertEquals(0, calls)
+        scope.cancel()
+    }
+
+    @Test
+    fun aPhoneSaveNewerThanTheLookupsRequestWins() = runTest {
+        val (store, scope) = store()
+        store.fresh(played(10), at = 100)
+        now = 5_000
+        store.record(EP, 40 * MIN, 2 * HOUR)
+        // A lookup requested before that save answers afterwards with a changed state.
+        store.fresh(played(25), at = 4_000)
+        assertEquals(40 * MIN, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun withoutAReferenceTheFurthestPointWins() = runTest {
+        val (store, scope) = store()
+        // Started here at 0 without knowing Spotify's point (a cached page, a failed lookup).
+        store.record(EP, 15_000, 2 * HOUR)
+        store.fresh(played(30), at = 2_000)
+        assertEquals(30 * MIN, store.resumeMs(EP))
+        // Played offline beyond Spotify's: the phone's stays.
+        store.record("spotify:episode:b", 50 * MIN, 2 * HOUR)
+        store.fresh(played(30), at = 3_000, uri = "spotify:episode:b")
+        assertEquals(50 * MIN, store.resumeMs("spotify:episode:b"))
+        scope.cancel()
+    }
+
+    @Test
     fun theAppsOwnLoadAtThePointIsNotSeekedAgain() = runTest {
         val (store, scope) = store()
         store.record(EP, 30 * MIN, 2 * HOUR)
@@ -385,11 +537,8 @@ class EpisodeProgressTrackerTest {
     private val recorded = mutableListOf<Triple<String, Long, Long>>()
     private val marks = mutableListOf<String>()
     private val tracker = EpisodeProgressTracker(object : ResumeSink {
-        override fun record(uri: String, positionMs: Long, durationMs: Long) {
+        override fun record(uri: String, positionMs: Long, durationMs: Long, elsewhere: Boolean) {
             recorded += Triple(uri, positionMs, durationMs)
-        }
-        override fun playedElsewhere(uri: String) {
-            marks += "elsewhere:$uri"
         }
         override fun continuedHere(uri: String) {
             marks += "here:$uri"
@@ -397,6 +546,7 @@ class EpisodeProgressTrackerTest {
         override fun resumeMs(uri: String): Long? = null
         override fun pointMs(uri: String): Long? = null
         override fun seek(positionMs: Long) = Unit
+        override fun lookUp(uri: String) = Unit
     })
 
     private fun snapshot(
@@ -417,10 +567,10 @@ class EpisodeProgressTrackerTest {
 
     @Test
     fun recordsWhilePlayingAndOnPause() {
-        tracker.onSnapshot(snapshot(positionMs = 3_000, at = 1_000), nowMs = 1_000)
-        tracker.onSnapshot(snapshot(positionMs = 3_000, at = 1_000), nowMs = 16_000) // the 15 s save
-        tracker.onSnapshot(snapshot(status = PlaybackStatus.PAUSED, positionMs = 23_000, at = 21_000), nowMs = 21_000)
-        assertEquals(listOf(Triple(EP, 3_000L, 2 * HOUR), Triple(EP, 18_000L, 2 * HOUR), Triple(EP, 23_000L, 2 * HOUR)), recorded)
+        tracker.onSnapshot(snapshot(positionMs = 10_000, at = 1_000), nowMs = 1_000)
+        tracker.onSnapshot(snapshot(positionMs = 10_000, at = 1_000), nowMs = 16_000) // the 15 s save
+        tracker.onSnapshot(snapshot(status = PlaybackStatus.PAUSED, positionMs = 30_000, at = 21_000), nowMs = 21_000)
+        assertEquals(listOf(Triple(EP, 10_000L, 2 * HOUR), Triple(EP, 25_000L, 2 * HOUR), Triple(EP, 30_000L, 2 * HOUR)), recorded)
         assertTrue(marks.isEmpty())
     }
 
@@ -441,23 +591,22 @@ class EpisodeProgressTrackerTest {
     }
 
     @Test
-    fun playbackLeavingThePhoneSavesTheEpisodeAndMarksIt() {
+    fun playbackLeavingThePhoneSavesTheEpisodeThenFollowsTheOtherDevice() {
         tracker.onSnapshot(snapshot(status = PlaybackStatus.PAUSED, positionMs = 4_000), nowMs = 0)
         recorded.clear()
-        tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, positionMs = 4_000), nowMs = 5_000)
-        assertEquals(listOf(Triple(EP, 4_000L, 2 * HOUR)), recorded)
-        assertEquals(listOf("elsewhere:$EP"), marks)
+        tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, status = PlaybackStatus.PAUSED, positionMs = 6_000), nowMs = 5_000)
+        assertEquals("the phone's own, then the speaker's", listOf(Triple(EP, 4_000L, 2 * HOUR), Triple(EP, 6_000L, 2 * HOUR)), recorded)
         recorded.clear()
-        tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, positionMs = 90_000), nowMs = 9_000)
-        assertTrue("a remote device's playback is not recorded here", recorded.isEmpty())
-        assertEquals("marked once", 1, marks.size)
+        tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, status = PlaybackStatus.PAUSED, positionMs = 90_000), nowMs = 9_000)
+        assertEquals(listOf(Triple(EP, 90_000L, 2 * HOUR)), recorded)
+        assertTrue(marks.isEmpty())
     }
 
     @Test
     fun takingAnEpisodeOverFromAnotherDeviceMarksIt() {
         tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, positionMs = 600_000), nowMs = 0)
         tracker.onSnapshot(snapshot(positionMs = 600_000, at = 1_000), nowMs = 1_000)
-        assertEquals(listOf("elsewhere:$EP", "here:$EP"), marks)
+        assertEquals(listOf("here:$EP"), marks)
     }
 
     @Test

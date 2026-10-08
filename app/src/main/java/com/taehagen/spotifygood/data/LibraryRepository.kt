@@ -55,6 +55,8 @@ class LibraryRepository(
     private val rpc: NativeRpc,
     private val cache: ResponseCache,
     private val online: StateFlow<Boolean>,
+    /** Learns Spotify's podcast played state carried by Your Episodes pages (docs §6.5). */
+    private val progress: EpisodeProgressStore? = null,
 ) {
     private val saved = SavedStateStore()
     private val lookups = CoalescingBatcher(scope, LOOKUP_WINDOW_MS, LOOKUP_BATCH, ::resolveSaved)
@@ -108,7 +110,9 @@ class LibraryRepository(
 
     suspend fun episodes(offset: Int, limit: Int = 50): Page<SavedEpisode> {
         val seq = saved.currentSeq()
+        val requestedAt = System.currentTimeMillis()
         val page = rpc.callOffMain<Page<SavedEpisode>>("library.episodes", pageArgs(offset, limit))
+        progress?.observe(page.items.map { it.episode }, requestedAt)
         saved.applyLookup(page.items.associate { it.episode.uri to true }, seq)
         return page
     }

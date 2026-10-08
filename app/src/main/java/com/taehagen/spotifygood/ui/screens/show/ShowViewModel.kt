@@ -319,8 +319,17 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         if (sort == EpisodeSort.OLDEST) loadMore()
     }
 
+    /**
+     * A row tap: the episode playing (here or on a Connect device) toggles, as the episode page's
+     * button does (reloading it at the row's point would restart a remote device's progress); any
+     * other starts at its resume point.
+     */
     fun playEpisode(episode: Episode) {
         if (episode.isPlaceholder || !episode.playable) return
+        if (currentPlayback().isCurrent(episode.uri)) {
+            graph.player.togglePlayPause()
+            return
+        }
         graph.player.play(PlayRequest(contextUri = uri, startUri = episode.uri, positionMs = episode.resumePosition()))
     }
 

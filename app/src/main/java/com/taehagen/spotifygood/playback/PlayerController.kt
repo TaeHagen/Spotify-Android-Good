@@ -185,6 +185,13 @@ class PlayerController internal constructor(
      */
     @Volatile var episodeResume: ((episodeUri: String) -> Long?)? = null
 
+    /**
+     * For a load of an episode whose resume point isn't known ([episodeResume] gave none): looks
+     * Spotify's up before the load is sent (bounded; `EpisodeProgressStore.resumeOrLookUp`).
+     * Installed by the app graph.
+     */
+    @Volatile var episodeResumeLookup: (suspend (episodeUri: String) -> Long?)? = null
+
     private class Command(
         val name: String,
         val conflateKey: String?,
@@ -656,7 +663,8 @@ class PlayerController internal constructor(
 
     /** [load] of a queued `player.load` [command], with a play merged in until the last moment. */
     private suspend fun sendLoad(command: Command) {
-        val initial = synchronized(lock) { checkNotNull(command.request) }
+        val queued = synchronized(lock) { checkNotNull(command.request) }
+        val initial = episodeResumeLookup?.let { withEpisodeResumeLookup(queued, it) } ?: queued
         val prepared = prepare(withLoadableContext(keepingModes(initial)))
         val play = synchronized(lock) {
             command.sent = true
@@ -950,6 +958,22 @@ class PlayerController internal constructor(
             if (!start.startsWith(EPISODE_PREFIX)) return request
             val position = resumeOf(start)?.takeIf { it > 0 } ?: return request
             return request.copy(positionMs = position)
+        }
+
+        /** [withEpisodeResume] with a suspending [resumeOf] (a lookup before the load). */
+        suspend fun withEpisodeResumeLookup(request: PlayRequest, resumeOf: suspend (String) -> Long?): PlayRequest {
+            val start = episodeStartOf(request) ?: return request
+            val position = resumeOf(start)?.takeIf { it > 0 } ?: return request
+            return request.copy(positionMs = position)
+        }
+
+        /** The episode [request] starts at when it names no position (null: none, or not an episode). */
+        private fun episodeStartOf(request: PlayRequest): String? {
+            if (request.positionMs > 0) return null
+            val start = request.startUri
+                ?: request.trackUris?.getOrNull(request.startIndex ?: 0)?.takeIf { request.startUid == null }
+                ?: request.contextUri?.takeIf { request.trackUris == null && request.startUid == null }
+            return start?.takeIf { it.startsWith(EPISODE_PREFIX) }
         }
 
         private const val EPISODE_PREFIX = "spotify:episode:"
