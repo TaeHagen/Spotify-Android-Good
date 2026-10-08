@@ -433,19 +433,40 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
             isPlayable = track.playable,
         )
 
-    private fun episodeItem(episode: Episode, contextUri: String?, group: String? = null, fallbackImages: List<Image> = emptyList()): MediaItem? =
-        playable(
-            mediaId = contextUri?.let { MediaIds.inContext(it, episode.uri) } ?: episode.uri,
-            title = episode.name,
-            subtitle = episode.show?.name,
-            artwork = artwork(episode.images.ifEmpty { episode.show?.images.orEmpty() }.ifEmpty { fallbackImages }),
+    /**
+     * An episode row, with its resume point as the car's completion status (docs §6.5). Playing it
+     * resumes there: the catalog / search answer that brought the episode already taught the store
+     * Spotify's point, and every play of an episode starts at the store's point.
+     */
+    private fun episodeItem(episode: Episode, contextUri: String?, group: String? = null, fallbackImages: List<Image> = emptyList()): MediaItem? {
+        val shown = graph.episodeProgress.overlay(episode)
+        return playable(
+            mediaId = contextUri?.let { MediaIds.inContext(it, shown.uri) } ?: shown.uri,
+            title = shown.name,
+            subtitle = shown.show?.name,
+            artwork = artwork(shown.images.ifEmpty { shown.show?.images.orEmpty() }.ifEmpty { fallbackImages }),
             mediaType = MediaMetadata.MEDIA_TYPE_PODCAST_EPISODE,
-            explicit = episode.explicit,
+            explicit = shown.explicit,
             group = group,
-            album = episode.show?.name,
-            durationMs = episode.durationMs.takeIf { it > 0 },
-            isPlayable = episode.playable,
+            album = shown.show?.name,
+            durationMs = shown.durationMs.takeIf { it > 0 },
+            extras = completionExtras(shown),
+            isPlayable = shown.playable,
         )
+    }
+
+    private fun completionExtras(episode: Episode): Bundle = Bundle().apply {
+        val position = episode.resumePositionMs ?: 0
+        when {
+            episode.fullyPlayed == true ->
+                putInt(MediaConstants.EXTRAS_KEY_COMPLETION_STATUS, MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_FULLY_PLAYED)
+            position > 0 && episode.durationMs > 0 -> {
+                putInt(MediaConstants.EXTRAS_KEY_COMPLETION_STATUS, MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_PARTIALLY_PLAYED)
+                putDouble(MediaConstants.EXTRAS_KEY_COMPLETION_PERCENTAGE, (position.toDouble() / episode.durationMs).coerceIn(0.0, 1.0))
+            }
+            else -> putInt(MediaConstants.EXTRAS_KEY_COMPLETION_STATUS, MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_NOT_PLAYED)
+        }
+    }
 
     /**
      * A track / episode row. Null for a uri-only placeholder (partial catalog page: its metadata

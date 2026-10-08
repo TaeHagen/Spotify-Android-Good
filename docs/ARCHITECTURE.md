@@ -622,19 +622,35 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
              (`queryPodcastEpisodes`, `getEpisodeOrChapter`, `catalog/played.rs`): best effort, only
              when the operation's hash is known (never triggers a hash discovery), at most 3 s, a
              failure leaves the fields out and never makes a page `partial`. Search results carry it
-             when Pathfinder sends it. Kotlin overlays the phone's own progress on top
-             (`EpisodeProgressStore`): local playback of an episode is recorded (on pause, on a change
-             of item, when playback leaves the phone, every 15 s while playing; within 30 s of the
-             end it is played), shown on show / episode pages, saved episodes and downloads, and a
-             play of an episode with no position resumes there (`PlayerController.episodeResume`).
-             Only a fresh answer counts as Spotify's current state: cached show pages (fresh hits,
-             copies shown while revalidating or offline) and download metadata carry no played state
-             (stripped when emitted / stored / decoded). The phone's progress wins unless a fresh
-             state differs from the one seen when it was recorded (the episode was played elsewhere
-             afterwards); then Spotify's point becomes the phone's resume point, so the downloads,
-             Android Auto and offline plays resume it too. A partly played fresh state is also kept
-             when the phone has none. Nothing is reported back to Spotify: progress made on this
-             phone, offline above all, is not synced to other devices.
+             when Pathfinder sends it. Kotlin keeps one resume point per episode
+             (`EpisodeProgressStore`) with the time it was learned: the wall time of this phone's
+             last save, or the request time of the fresh answer that brought Spotify's; the newest
+             wins.
+             * Local playback of an episode is saved on pause, on a change of item, when playback
+               leaves the phone and every 15 s while playing; within 30 s of the end it is played.
+             * Only a fresh answer carries Spotify's state: cached show pages (fresh hits, copies
+               shown while revalidating or offline) and download metadata are stripped (when
+               emitted / stored / decoded). Fresh answers are observed once, where they arrive
+               (`CatalogRepository.showPage` / `episodes`, `SearchRepository.search`); an answer
+               requested before the last one seen is ignored, so an older page can't undo a newer
+               one. Everything that shows an episode only overlays the point (no side effects).
+             * A fresh state is news only when it differs from the last one seen (nothing is
+               reported to Spotify, so otherwise its state lags this phone's progress); then it
+               replaces an older point (a not-started one keeps none). The first state seen after
+               an offline play only becomes the reference. A partly played state is kept when
+               nothing is.
+             * Connect: while another device plays an episode (this phone is its remote, or handed
+               it over), Spotify's next state for it is news; when this phone takes an episode over
+               (seen remote just before, or arriving far from the kept point), the next state (the
+               other device's, older than this phone's progress) only becomes the reference.
+             * Every play path resumes from the point: the app's pages (rows and the show's Play),
+               Downloads, search, Android Auto / Assistant / media browsers (their rows also carry
+               the completion status) via `PlayerController.episodeResume` for a play with no
+               position; auto-advance and next (Spirc, the offline queue) by one seek when local
+               playback arrives near the start of a partly played episode (the point isn't
+               overwritten before it lands).
+             Nothing is reported back to Spotify: progress made on this phone, offline above all,
+             is not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
               "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}

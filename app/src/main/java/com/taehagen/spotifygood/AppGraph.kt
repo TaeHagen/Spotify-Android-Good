@@ -97,7 +97,7 @@ class AppGraph(val app: Application) {
     /** Podcast progress made on this phone (docs §6.5); records local episode playback. */
     val episodeProgress: EpisodeProgressStore by lazy {
         EpisodeProgressStore(File(app.filesDir, "episode_progress.json"), appScope).also { store ->
-            appScope.launch { store.recordFrom(playback.snapshot) }
+            appScope.launch { store.recordFrom(playback.snapshot, seek = { player.seekTo(it) }) }
         }
     }
     val devices: DevicesRepository by lazy {
@@ -132,9 +132,9 @@ class AppGraph(val app: Application) {
     val playbackConnector: PlaybackServiceConnector by lazy { PlaybackServiceConnector(app) }
 
     val responseCache: ResponseCache by lazy { ResponseCache(database.responseCache(), json) }
-    val catalog: CatalogRepository by lazy { CatalogRepository(rpc, responseCache) }
+    val catalog: CatalogRepository by lazy { CatalogRepository(rpc, responseCache, episodeProgress) }
     val library: LibraryRepository by lazy { LibraryRepository(appScope, rpc, responseCache, engine.isOnline) }
-    val search: SearchRepository by lazy { SearchRepository(rpc, database.recentSearches()) }
+    val search: SearchRepository by lazy { SearchRepository(rpc, database.recentSearches(), episodeProgress) }
     val home: HomeRepository by lazy { HomeRepository(rpc, responseCache) }
     val lyrics: LyricsRepository by lazy { LyricsRepository(rpc) }
     val playlists: PlaylistEditor by lazy { PlaylistEditor(appScope, rpc, library, catalog) }

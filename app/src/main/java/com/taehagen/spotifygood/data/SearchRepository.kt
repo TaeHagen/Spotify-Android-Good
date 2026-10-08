@@ -36,13 +36,19 @@ sealed interface RecentSearch {
 }
 
 /** Search (native `catalog.search`) and the persisted recent-searches list (≤ 50 entries). */
-class SearchRepository(private val rpc: NativeRpc, private val dao: RecentSearchDao) {
+/** [progress]: learns Spotify's podcast played state carried by search results (docs §6.5). */
+class SearchRepository(
+    private val rpc: NativeRpc,
+    private val dao: RecentSearchDao,
+    private val progress: EpisodeProgressStore? = null,
+) {
     private val json get() = rpc.json
 
     suspend fun search(query: String, types: Set<SearchType> = SearchType.entries.toSet(), offset: Int = 0, limit: Int = 20): SearchResults {
         val q = query.trim()
         if (q.isEmpty() || types.isEmpty()) return SearchResults()
-        return rpc.callOffMain(
+        val requestedAt = System.currentTimeMillis()
+        return rpc.callOffMain<SearchResults>(
             "catalog.search",
             rpcArgs {
                 put("query", q)
@@ -51,7 +57,7 @@ class SearchRepository(private val rpc: NativeRpc, private val dao: RecentSearch
                 put("offset", offset)
                 put("limit", limit)
             },
-        )
+        ).also { progress?.observe(it.episodes, requestedAt) }
     }
 
     val recent: Flow<List<RecentSearch>> = dao.observe(RECENT_SHOWN)
