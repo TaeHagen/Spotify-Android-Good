@@ -1010,16 +1010,23 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   A queue clear stops bulk adds queued before it (silently: the user cleared); a load does not
   (Spirc and remote devices keep the user queue across loads).
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
-  Downloads, Browse; Downloads first offline); search. The downloads come from the download
-  database alone (`OfflineTree`, `LibraryTree.pagedChildren`), a page at a time (Media3 paging:
-  only the rows of the page are read; an unpaged request gets the first 500): the Downloads tab is
-  grouped as the app's Downloads screen (Liked Songs and playlists, albums, podcasts with
-  something downloaded, browsable and playable as their context; then the songs and the episodes
-  downloaded on their own, newest first, a `dl|` row playing its own section), all marked
-  downloaded. A downloaded collection (Liked Songs, a playlist, album or show, from the tab or
-  Library) browsed offline, or when the catalog has nothing for it (no session, a failed or empty
-  answer, a cleared cache), lists its downloads in collection order as `ctx|` rows (the offline
-  load plays them in that order), without waiting for or starting the session; `onPlaybackResumption` from `ResumeStore` (DataStore:
+  Downloads, Browse; Downloads first offline); search. Lists are read a window at a time
+  (`LibraryTree.pagedChildren`, `BrowsePaging`), as Media3 asks (page and page size): Library's
+  playlists, albums, artists and podcasts (the saved lists), Liked Songs (`library.tracks`, ≤ 500
+  a call), a playlist's or show's rows (the cached first page, then the further pages) and an
+  album's, and the downloads. One answer holds at most 200 rows (Media3 cuts a legacy browser's
+  result at 256 KB, and Android Auto does not page); when rows lie past an answer the browser
+  will not page to, it ends with a "More" row (`more|<offset>|<list>`) opening the rest, so every
+  row stays reachable. The composite parents (tabs, Home, Browse, an artist) stay bounded. The
+  downloads come from the download database alone (`OfflineTree`), only the rows of a window
+  read: the Downloads tab is grouped as the app's Downloads screen (Liked Songs and playlists,
+  albums, podcasts with something downloaded, browsable and playable as their context; then the
+  songs and the episodes downloaded on their own, newest first, a `dl|` row playing its own
+  section), all marked downloaded. A downloaded collection (Liked Songs, a playlist, album or
+  show, from the tab or Library) browsed offline lists its downloads in collection order as
+  `ctx|` rows (the offline load plays them in that order), without waiting for or starting the
+  session; online it lists the catalog's copy, all of it, and its downloads when the catalog has
+  nothing for it (no session, a failed or empty answer, a cleared cache); `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
   on a mode change and every 15 s while playing (`ResumeSaver`): the account's last session as
   this phone sees it, local or the remote device it mirrors (after a transfer it follows the

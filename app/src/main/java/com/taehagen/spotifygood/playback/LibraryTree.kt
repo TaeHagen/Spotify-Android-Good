@@ -87,7 +87,44 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
 
     // ---- children ---------------------------------------------------------------------------
 
-    suspend fun children(parentId: String, params: LibraryParams?): List<MediaItem>? = try {
+    /**
+     * Children of [parentId] as page [page] of [pageSize] ([BrowsePaging]). The lists (Library's,
+     * Liked Songs, a playlist's, album's or show's rows, the downloads) are read a window at a
+     * time, as Media3 asks, and end with a "More" row when the browser would not reach the rest
+     * (it does not page, or asked for more than a window). The composite parents (the tabs, Home,
+     * Browse, an artist) are [children].
+     */
+    suspend fun pagedChildren(parentId: String, page: Int, pageSize: Int, params: LibraryParams?): List<MediaItem>? {
+        val more = BrowsePaging.parseMore(parentId)
+        val listId = more?.parentId ?: parentId
+        val source = try {
+            sourceOf(listId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "List $listId failed", e)
+            return null
+        }
+        if (source == null) {
+            if (more != null) return null
+            val request = BrowsePaging.request(0, page, pageSize, window = Int.MAX_VALUE) ?: return emptyList()
+            return children(parentId, params)?.let { BrowsePaging.slice(it, request.from, request.count) }
+        }
+        val request = BrowsePaging.request(more?.offset ?: 0, page, pageSize) ?: return emptyList()
+        val rows = try {
+            source.load(request.from, request.count)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Rows ${request.from}+${request.count} of $listId failed", e)
+            return null
+        }
+        val moreAt = BrowsePaging.moreAt(request, rows.total)
+        return if (moreAt == null) rows.items else rows.items + moreItem(listId, moreAt)
+    }
+
+    /** Children of a composite parent (bounded: the tabs, Home, Browse, an artist's page). */
+    private suspend fun children(parentId: String, params: LibraryParams?): List<MediaItem>? = try {
         when (parentId) {
             ROOT -> tabs(params)
             ROOT_OFFLINE -> listOf(folder(DOWNLOADS, R.string.playback_tab_downloads, R.drawable.pb_ic_auto_downloads))
@@ -100,17 +137,8 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
                 folder(ARTISTS, R.string.playback_artists, mediaType = MediaMetadata.MEDIA_TYPE_FOLDER_ARTISTS),
                 folder(PODCASTS, R.string.playback_podcasts, mediaType = MediaMetadata.MEDIA_TYPE_FOLDER_PODCASTS),
             )
-            LIKED -> likedSongs()
-            PLAYLISTS -> graph.library.playlists().settle()?.flatPlaylists().orEmpty()
-                .mapNotNull { entry ->
-                    entry.uri?.let { contextItem(it, entry.name, entry.owner?.displayName ?: entry.owner?.username, entry.images, MediaMetadata.MEDIA_TYPE_PLAYLIST) }
-                }
-            ALBUMS -> graph.library.albums().settle().orEmpty().mapNotNull { albumItem(it.album) }
-            ARTISTS -> graph.library.artists().settle().orEmpty().mapNotNull { artistItem(it.artist) }
-            PODCASTS -> graph.library.shows().settle().orEmpty().mapNotNull { showItem(it.show) }
-            DOWNLOADS -> downloadsTab().page(0, MAX_ITEMS)
             BROWSE -> browse()
-            else -> contextChildren(parentId)
+            else -> artistChildren(parentId)
         }?.take(MAX_ITEMS)
     } catch (e: CancellationException) {
         throw e
@@ -130,86 +158,180 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         return (recent + sections).distinctBy { it.mediaId }
     }
 
-    private suspend fun likedSongs(): List<MediaItem> {
-        val likedUri = likedContextUri()
-        return graph.library.likedTracks(0, MAX_ITEMS).items.mapNotNull { saved -> trackItem(saved.track, likedUri) }
+    private suspend fun browse(): List<MediaItem> {
+        val recentTitle = context.getString(R.string.playback_recent_searches)
+        val recent = withTimeoutOrNull(LOOKUP_TIMEOUT_MS) { graph.search.recent.first() }.orEmpty()
+            .filterIsInstance<RecentSearch.Item>()
+            .mapNotNull { mediaRefItem(it.ref, recentTitle) }
+        val artistsTitle = context.getString(R.string.playback_artists)
+        val artists = graph.library.artists().settle().orEmpty().take(BROWSE_ARTISTS).mapNotNull { artistItem(it.artist, artistsTitle) }
+        return (recent + artists).distinctBy { it.mediaId }
     }
+
+    /** An artist's page: popular tracks and releases (bounded by the catalog). */
+    private suspend fun artistChildren(uri: String): List<MediaItem>? = when {
+        uri.startsWith("spotify:artist:") -> graph.catalog.artist(uri).settle()?.let { artist ->
+            val popular = context.getString(R.string.playback_popular)
+            val albums = context.getString(R.string.playback_albums)
+            artist.topTracks.mapNotNull { trackItem(it, uri, group = popular) } +
+                (artist.albums + artist.singles).mapNotNull { albumItem(it, albums) }
+        }
+        else -> null
+    }
+
+    // ---- lists, a window at a time ------------------------------------------------------------
+
+    /** Rows of a list: [items] from the start asked for (fewer at its end), and its size. */
+    private class Rows(val items: List<MediaItem>, val total: Int)
+
+    /** A list read a window at a time ([BrowsePaging]). */
+    private fun interface Source {
+        /** The rows [from] until `from + count`. */
+        suspend fun load(from: Int, count: Int): Rows
+    }
+
+    /** The list behind [listId]; null for a composite parent ([children]). */
+    private suspend fun sourceOf(listId: String): Source? = downloadsSource(listId) ?: catalogSource(listId)
+
+    /** A list in memory (a saved list, an album), its rows built a window at a time. */
+    private fun <T> listSource(list: List<T>, row: (T) -> MediaItem?): Source =
+        Source { from, count -> Rows(BrowsePaging.slice(list, from, count).mapNotNull(row), list.size) }
+
+    /** Library's lists, Liked Songs, a playlist's, album's or show's rows from the catalog; null for any other. */
+    private suspend fun catalogSource(listId: String): Source? = when {
+        listId == PLAYLISTS -> listSource(graph.library.playlists().settle()?.flatPlaylists().orEmpty()) { entry ->
+            entry.uri?.let { contextItem(it, entry.name, entry.owner?.displayName ?: entry.owner?.username, entry.images, MediaMetadata.MEDIA_TYPE_PLAYLIST) }
+        }
+        listId == ALBUMS -> listSource(graph.library.albums().settle().orEmpty()) { albumItem(it.album) }
+        listId == ARTISTS -> listSource(graph.library.artists().settle().orEmpty()) { artistItem(it.artist) }
+        listId == PODCASTS -> listSource(graph.library.shows().settle().orEmpty()) { showItem(it.show) }
+        listId == LIKED || OfflineLoads.kindOf(listId) == OfflineLoads.ContextKind.LIKED_SONGS -> likedSource()
+        listId.startsWith("spotify:playlist:") -> playlistSource(listId)
+        listId.startsWith("spotify:album:") -> graph.catalog.album(listId).settle()?.let { album ->
+            listSource(album.tracks) { trackItem(it, listId, fallbackImages = album.images) }
+        }
+        listId.startsWith("spotify:show:") -> showSource(listId)
+        else -> null
+    }
+
+    /** Liked Songs (`library.tracks`, newest first), [LIBRARY_PAGE] a call. */
+    private fun likedSource(): Source = Source { from, count ->
+        val likedUri = likedContextUri()
+        val fetched = BrowsePaging.fetchWindow(from, count, LIBRARY_PAGE) { offset, limit ->
+            graph.library.likedTracks(offset, limit).let { BrowsePaging.Fetched(it.items, it.total) }
+        }
+        Rows(fetched.items.mapNotNull { trackItem(it.track, likedUri) }, fetched.total)
+    }
+
+    /** A playlist's rows: the first page as cached (the app shows the same), the rest fetched. */
+    private suspend fun playlistSource(uri: String): Source? {
+        val first = graph.catalog.playlist(uri, MAX_ITEMS).settle() ?: return null
+        val total = maxOf(first.total, first.items.size)
+        return Source { from, count ->
+            val items = BrowsePaging.window(first.items, total, from, count, CATALOG_PAGE) { offset, limit ->
+                graph.catalog.playlistPage(uri, offset, limit).items
+            }
+            Rows(items.mapNotNull { item -> item.track?.let { trackItem(it, uri) } ?: item.episode?.let { episodeItem(it, uri) } }, total)
+        }
+    }
+
+    /** A show's episodes (newest first): the first page as cached, the rest fetched. */
+    private suspend fun showSource(uri: String): Source? {
+        val first = graph.catalog.show(uri).settle() ?: return null
+        val total = maxOf(first.total, first.episodes.size)
+        return Source { from, count ->
+            val episodes = BrowsePaging.window(first.episodes, total, from, count, CATALOG_PAGE) { offset, limit ->
+                graph.catalog.showPage(uri, offset, limit).episodes
+            }
+            Rows(episodes.mapNotNull { episodeItem(it, uri, fallbackImages = first.images) }, total)
+        }
+    }
+
+    /** The "More" row of [listId], from [offset] on ([BrowsePaging]). */
+    private fun moreItem(listId: String, offset: Int): MediaItem = MediaItem.Builder()
+        .setMediaId(BrowsePaging.moreId(listId, offset))
+        .setMediaMetadata(
+            MediaMetadata.Builder()
+                .setTitle(context.getString(R.string.playback_more))
+                .setIsBrowsable(true)
+                .setIsPlayable(false)
+                .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+                .build(),
+        )
+        .build()
 
     // ---- offline tree: the downloads ------------------------------------------------------------
-
-    /**
-     * Children of [parentId] as page [page] of [pageSize] (Media3 paging, [OfflineTree.range]).
-     * The Downloads tab, and a downloaded collection browsed offline (or one the catalog has
-     * nothing for), come from the download database a page at a time: only the rows of the page
-     * are read. Everything else is [children], paged.
-     */
-    suspend fun pagedChildren(parentId: String, page: Int, pageSize: Int, params: LibraryParams?): List<MediaItem>? {
-        val downloads = try {
-            downloadsList(parentId, params)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Log.w(TAG, "Downloads of $parentId failed", e)
-            null
-        }
-        downloads ?: return children(parentId, params)?.let { OfflineTree.page(it, page, pageSize) }
-        return try {
-            downloads.page(page, pageSize)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Log.w(TAG, "Downloads page of $parentId failed", e)
-            null
-        }
-    }
 
     /**
      * Whether [parentId] is browsed from the downloads alone now: offline, a downloaded
      * collection (the Downloads tab always is, [needsSession]). No session to wait for or start.
      */
-    suspend fun browsesDownloads(parentId: String): Boolean =
-        isOffline() && OfflineTree.mayBeCollection(parentId) && OfflineTree.collectionOf(parentId, downloadedCollections()) != null
+    suspend fun browsesDownloads(parentId: String): Boolean {
+        val listId = BrowsePaging.listIdOf(parentId)
+        return isOffline() && OfflineTree.mayBeCollection(listId) && OfflineTree.collectionOf(listId, downloadedCollections()) != null
+    }
 
-    /** The download-backed list of [parentId]; null when it is none (not the tab, not downloaded). */
-    private suspend fun downloadsList(parentId: String, params: LibraryParams?): PagedList? {
-        if (parentId == DOWNLOADS) return downloadsTab()
-        if (!OfflineTree.mayBeCollection(parentId)) return null
-        val collection = OfflineTree.collectionOf(parentId, downloadedCollections()) ?: return null
-        if (!isOffline()) {
-            // Online the catalog's copy comes first (all of it, in its current order); the
-            // downloads when it has nothing (no session, a failed or empty answer, a cleared cache).
-            children(parentId, params)?.takeIf { it.isNotEmpty() }?.let { return PagedList.of(it) }
+    /**
+     * The download-backed list of [listId]: the Downloads tab, or a downloaded collection. Offline
+     * that is its downloads; online the catalog's copy (all of it, a window at a time, in its current
+     * order), and its downloads when the catalog has nothing for it (no session, a failed or empty
+     * answer, a cleared cache). Null when it is neither.
+     */
+    private suspend fun downloadsSource(listId: String): Source? {
+        if (listId == DOWNLOADS) return downloadsTab()
+        if (!OfflineTree.mayBeCollection(listId)) return null
+        val collection = OfflineTree.collectionOf(listId, downloadedCollections()) ?: return null
+        val downloads = collectionSource(collection)
+        if (isOffline()) return downloads
+        val catalog = try {
+            catalogSource(listId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Catalog copy of $listId failed", e)
+            null
+        } ?: return downloads
+        return Source { from, count ->
+            val rows = try {
+                catalog.load(from, count)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Catalog rows of $listId failed, listing the downloads", e)
+                null
+            }
+            rows?.takeIf { it.total > 0 } ?: downloads.load(from, count)
         }
-        return collectionList(collection)
     }
 
     /** The Downloads tab, grouped as the app's Downloads screen ([OfflineTree.tab]). */
-    private suspend fun downloadsTab(): PagedList {
+    private suspend fun downloadsTab(): Source {
         val rows = OfflineTree.tab(downloadedCollections(), downloadedUris())
-        return PagedList(rows.size) { range ->
-            val page = rows.subList(range.first, range.last + 1)
+        return Source { from, count ->
+            val page = BrowsePaging.slice(rows, from, count)
             val stored = storedDownloads(page.mapNotNull { (it as? OfflineTree.Row.Item)?.uri })
             val filter = explicitFilter()
-            page.mapNotNull { row ->
+            val items = page.mapNotNull { row ->
                 val group = context.getString(sectionTitle(row.section))
                 when (row) {
                     is OfflineTree.Row.Collection -> downloadedCollectionItem(row.collection, group)
                     is OfflineTree.Row.Item -> stored[row.uri]?.let { downloadedItem(it, contextUri = null, group = group, filter = filter) }
                 }
             }
+            Rows(items, rows.size)
         }
     }
 
     /** The downloads of [collection] in collection order, as `ctx|` items (an offline load plays them in it). */
-    private suspend fun collectionList(collection: DownloadedCollection): PagedList {
+    private suspend fun collectionSource(collection: DownloadedCollection): Source {
         val uris = OfflineTree.playableItems(collection, downloadedUris())
         val ref = collection.ref
         val contextUri = if (ref.type == CollectionType.LIKED_SONGS) likedContextUri() ?: ref.uri else ref.uri
-        return PagedList(uris.size) { range ->
-            val page = uris.subList(range.first, range.last + 1)
+        return Source { from, count ->
+            val page = BrowsePaging.slice(uris, from, count)
             val stored = storedDownloads(page)
             val filter = explicitFilter()
-            page.mapNotNull { uri -> stored[uri]?.let { downloadedItem(it, contextUri, group = null, filter = filter) } }
+            Rows(page.mapNotNull { uri -> stored[uri]?.let { downloadedItem(it, contextUri, group = null, filter = filter) } }, uris.size)
         }
     }
 
@@ -306,54 +428,6 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         return settings.hideExplicit || accountExplicitFilter(graph.engine.user.value, settings.accountExplicitFilter)
     }
 
-    /** A list built a page at a time: [build] gets the indices of the page ([OfflineTree.range]). */
-    private class PagedList(
-        private val size: Int,
-        private val unpagedMax: Int = OfflineTree.UNPAGED_MAX,
-        private val build: suspend (IntRange) -> List<MediaItem>,
-    ) {
-        suspend fun page(page: Int, pageSize: Int): List<MediaItem> {
-            val range = OfflineTree.range(page, pageSize, size, unpagedMax)
-            return if (range.isEmpty()) emptyList() else build(range)
-        }
-
-        companion object {
-            /** A list already built (a catalog answer: its size is bounded). */
-            fun of(items: List<MediaItem>) = PagedList(items.size, Int.MAX_VALUE) { items.subList(it.first, it.last + 1) }
-        }
-    }
-
-    private suspend fun browse(): List<MediaItem> {
-        val recentTitle = context.getString(R.string.playback_recent_searches)
-        val recent = withTimeoutOrNull(LOOKUP_TIMEOUT_MS) { graph.search.recent.first() }.orEmpty()
-            .filterIsInstance<RecentSearch.Item>()
-            .mapNotNull { mediaRefItem(it.ref, recentTitle) }
-        val artistsTitle = context.getString(R.string.playback_artists)
-        val artists = graph.library.artists().settle().orEmpty().take(BROWSE_ARTISTS).mapNotNull { artistItem(it.artist, artistsTitle) }
-        return (recent + artists).distinctBy { it.mediaId }
-    }
-
-    /** Children of a Spotify context browsed by uri. */
-    private suspend fun contextChildren(uri: String): List<MediaItem>? = when {
-        uri.startsWith("spotify:playlist:") -> graph.catalog.playlist(uri, MAX_ITEMS).settle()?.items?.mapNotNull { item ->
-            item.track?.let { trackItem(it, uri) } ?: item.episode?.let { episodeItem(it, uri) }
-        }
-        uri.startsWith("spotify:album:") -> graph.catalog.album(uri).settle()?.let { album ->
-            album.tracks.mapNotNull { trackItem(it, uri, fallbackImages = album.images) }
-        }
-        uri.startsWith("spotify:artist:") -> graph.catalog.artist(uri).settle()?.let { artist ->
-            val popular = context.getString(R.string.playback_popular)
-            val albums = context.getString(R.string.playback_albums)
-            artist.topTracks.mapNotNull { trackItem(it, uri, group = popular) } +
-                (artist.albums + artist.singles).mapNotNull { albumItem(it, albums) }
-        }
-        uri.startsWith("spotify:show:") -> graph.catalog.show(uri).settle()?.let { show ->
-            show.episodes.mapNotNull { episodeItem(it, uri, fallbackImages = show.images) }
-        }
-        uri.endsWith(":collection") -> likedSongs()
-        else -> null
-    }
-
     // ---- items --------------------------------------------------------------------------------
 
     /** Single item lookup (`onGetItem`). */
@@ -369,7 +443,7 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
             ALBUMS -> folder(ALBUMS, R.string.playback_albums, mediaType = MediaMetadata.MEDIA_TYPE_FOLDER_ALBUMS)
             ARTISTS -> folder(ARTISTS, R.string.playback_artists, mediaType = MediaMetadata.MEDIA_TYPE_FOLDER_ARTISTS)
             PODCASTS -> folder(PODCASTS, R.string.playback_podcasts, mediaType = MediaMetadata.MEDIA_TYPE_FOLDER_PODCASTS)
-            else -> lookup(mediaId)
+            else -> BrowsePaging.parseMore(mediaId)?.let { moreItem(it.parentId, it.offset) } ?: lookup(mediaId)
         }
     } catch (e: CancellationException) {
         throw e
@@ -725,12 +799,12 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         fun isPlaceholder(name: String?): Boolean = name.isNullOrBlank()
 
         /** Whether the children of [parentId] come from the catalog (worth waiting for a starting session). */
-        fun needsSession(parentId: String): Boolean = parentId !in LOCAL_PARENTS
+        fun needsSession(parentId: String): Boolean = BrowsePaging.listIdOf(parentId) !in LOCAL_PARENTS
 
         private val LOCAL_PARENTS = setOf(ROOT, ROOT_OFFLINE, ROOT_RECENT, LIBRARY, DOWNLOADS)
 
         /** Whether [item] of [mediaId] looks it up in the catalog (the plain folders do not). */
-        fun itemNeedsSession(mediaId: String): Boolean = mediaId !in FOLDER_ITEMS
+        fun itemNeedsSession(mediaId: String): Boolean = mediaId !in FOLDER_ITEMS && BrowsePaging.parseMore(mediaId) == null
 
         private val FOLDER_ITEMS = setOf(
             ROOT, ROOT_OFFLINE, ROOT_RECENT, HOME, LIBRARY, DOWNLOADS, BROWSE, PLAYLISTS, ALBUMS, ARTISTS, PODCASTS,
@@ -746,6 +820,10 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
         private const val VOICE_LIMIT = 5
         private const val ARTWORK_PX = 300
         private const val LOOKUP_TIMEOUT_MS = 8_000L
+        /** Most rows of one `library.tracks` call (its limit). */
+        private const val LIBRARY_PAGE = 500
+        /** Rows of one further playlist / show page call. */
+        private const val CATALOG_PAGE = 100
         /** Longest wait for the first read of the completed downloads (all on a card not mounted: none). */
         private const val FIRST_READ_TIMEOUT_MS = 2_000L
         /** Uris per download-row query (SQLite's variable limit is 999 on older devices). */
