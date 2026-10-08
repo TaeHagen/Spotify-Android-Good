@@ -3,8 +3,8 @@
 
 use crate::{
     AudioOutputKind, ConnectConfig, SnapshotPlayStatus, TrackProvider,
-    model::SpircPlayStatus,
     core::{Session, SessionConfig, SpotifyId, SpotifyUri, dealer::protocol::Request},
+    model::SpircPlayStatus,
     protocol::{
         connect::AudioOutputDeviceType, context::Context, context_page::ContextPage,
         context_track::ContextTrack, player::ProvidedTrack,
@@ -2265,8 +2265,14 @@ fn spirc_is_send_and_sync(
 #[test]
 fn the_playback_speed_is_reported_while_playing() {
     let (_rt, mut state) = state(3);
-    let playing = SpircPlayStatus::Playing { nominal_start_time: 0, preloading_of_next_track_triggered: false };
-    let paused = SpircPlayStatus::Paused { position_ms: 0, preloading_of_next_track_triggered: false };
+    let playing = SpircPlayStatus::Playing {
+        nominal_start_time: 0,
+        preloading_of_next_track_triggered: false,
+    };
+    let paused = SpircPlayStatus::Paused {
+        position_ms: 0,
+        preloading_of_next_track_triggered: false,
+    };
     state.set_status(&playing);
     assert_eq!(state.player().playback_speed, 1.);
 
