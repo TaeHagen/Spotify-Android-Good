@@ -861,9 +861,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   load asks for a plain shuffle instead of smart shuffle. States from older versions read with
   the modes off. Only a track of its context is stored with the context; a queued, autoplay or
   suggested track (or a context that cannot be loaded again) is stored as a track list instead:
-  that track plus the visible next context / autoplay tracks in play order (≤ 50), resumed as a
-  `trackUris` load in that order (shuffle off), because loading the context would start its
-  first track at the saved position. The Media3 resume item carries the list in its extras.
+  that track plus the visible next context / autoplay tracks in play order (≤ 50), one pass
+  (repeat-all's repeated passes end the walk at the first uid seen again, like
+  `restore::one_pass`; lists stored with repeats are cut before the start track comes again),
+  resumed as a `trackUris` load in that order (shuffle off), because loading the context would
+  start its first track at the saved position. The Media3 resume item carries the list in its
+  extras.
 * Foreground: Media3 default (10 min after pause, then notification becomes dismissable).
   Local audio never plays without it: local audio starting in the background with no service
   (remote "play on this phone" during the idle grace or a download) starts the service with
