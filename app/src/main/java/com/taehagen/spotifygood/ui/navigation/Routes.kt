@@ -32,7 +32,9 @@ sealed interface Route {
 }
 
 /** Something the action sheet can act on. */
+@Serializable
 sealed interface MediaActionTarget {
+    @Serializable
     data class TrackTarget(
         val track: Track,
         /** Context the row was shown in (to "play from here"). */
@@ -44,11 +46,11 @@ sealed interface MediaActionTarget {
         /** Set when the row is a queue entry (enables "Remove from queue"). */
         val queueUid: String? = null,
     ) : MediaActionTarget
-    data class EpisodeTarget(val episode: Episode) : MediaActionTarget
-    data class AlbumTarget(val album: AlbumRef) : MediaActionTarget
-    data class ArtistTarget(val artist: ArtistRef) : MediaActionTarget
-    data class PlaylistTarget(val playlist: PlaylistRef, val isOwned: Boolean) : MediaActionTarget
-    data class ShowTarget(val show: ShowRef) : MediaActionTarget
+    @Serializable data class EpisodeTarget(val episode: Episode) : MediaActionTarget
+    @Serializable data class AlbumTarget(val album: AlbumRef) : MediaActionTarget
+    @Serializable data class ArtistTarget(val artist: ArtistRef) : MediaActionTarget
+    @Serializable data class PlaylistTarget(val playlist: PlaylistRef, val isOwned: Boolean) : MediaActionTarget
+    @Serializable data class ShowTarget(val show: ShowRef) : MediaActionTarget
 }
 
 /** App-wide navigation and overlay control, provided by the main scaffold. */

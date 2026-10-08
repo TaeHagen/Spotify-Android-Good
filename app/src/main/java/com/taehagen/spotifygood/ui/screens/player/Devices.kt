@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.ui.screens.player
 
 import android.content.Context
+import androidx.annotation.StringRes
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,6 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -74,6 +76,7 @@ import com.taehagen.spotifygood.playback.AudioOutput
 import com.taehagen.spotifygood.playback.OutputKind
 import com.taehagen.spotifygood.ui.appViewModel
 import com.taehagen.spotifygood.ui.components.EmptyState
+import com.taehagen.spotifygood.ui.components.SessionMessenger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -87,6 +90,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 @Immutable
@@ -156,6 +160,46 @@ internal sealed interface DevicesEvent {
     ) : DevicesEvent
 }
 
+/** A sheet message with its arguments, resolved where it is shown. */
+@Immutable
+internal data class SheetMessage(@StringRes val res: Int, val args: List<Any> = emptyList())
+
+/** What the devices sheet says for [this] result; null for a transfer that worked (the sheet closes). */
+internal fun DevicesEvent.message(): SheetMessage? = when (this) {
+    is DevicesEvent.TransferSucceeded -> null
+    is DevicesEvent.TransferFailed -> SheetMessage(
+        if (network) R.string.player_devices_transfer_failed_network else R.string.player_devices_transfer_failed,
+        listOf(deviceName),
+    )
+    is DevicesEvent.RefreshFailed -> SheetMessage(R.string.player_devices_refresh_failed)
+    // A transfer only moves what is playing; with nothing playing (and no saved session) a play
+    // would start on this phone, so say what does work.
+    is DevicesEvent.NothingToPlay -> when {
+        selected -> SheetMessage(R.string.player_devices_selected, listOf(deviceName))
+        isThisDevice -> SheetMessage(R.string.player_devices_nothing_to_play_here)
+        else -> SheetMessage(R.string.player_devices_nothing_to_play, listOf(deviceName))
+    }
+}
+
+/**
+ * The devices sheets on screen (by token). The ViewModels outlive them: a result for a sheet that
+ * is gone (dismissed while a transfer or LAN login ran, or between the compositions of a
+ * configuration change) is shown in the app's snackbar instead of being dropped.
+ */
+internal class ShownSheets {
+    private val shown: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    fun add(sheet: String) {
+        shown += sheet
+    }
+
+    fun remove(sheet: String) {
+        shown -= sheet
+    }
+
+    operator fun contains(sheet: String): Boolean = sheet in shown
+}
+
 /**
  * Counts the user's device choices (a transfer, a LAN device tapped, the pending target cleared),
  * so a slow LAN login can tell whether it is still the latest one before moving playback.
@@ -197,6 +241,8 @@ internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
     private val refreshing = MutableStateFlow(false)
     private val eventChannel = Channel<DevicesEvent>(Channel.BUFFERED)
     private val volumeThrottle = VolumeThrottle(viewModelScope) { graph.player.setVolume(it) }
+    private val shownSheets = ShownSheets()
+    private val messenger = SessionMessenger(graph.app)
 
     val events: Flow<DevicesEvent> = eventChannel.receiveAsFlow()
 
@@ -232,7 +278,7 @@ internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (userInitiated) eventChannel.trySend(DevicesEvent.RefreshFailed(sheet))
+                if (userInitiated) deliver(DevicesEvent.RefreshFailed(sheet))
             } finally {
                 refreshing.value = false
             }
@@ -247,17 +293,30 @@ internal class DevicesViewModel(graph: AppGraph) : ViewModel() {
             transferring.value = deviceId
             try {
                 devicesRepository.transferTo(deviceId)
-                eventChannel.trySend(DevicesEvent.TransferSucceeded(sheet))
+                deliver(DevicesEvent.TransferSucceeded(sheet))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 val isThisDevice = deviceId == state.value.thisDeviceId
                 // The repository keeps a device picked with nothing to play as the next play's target.
                 val selected = devicesRepository.pendingTarget.value == deviceId
-                eventChannel.trySend(transferFailureEvent(sheet, deviceName, isThisDevice, e, selected))
+                deliver(transferFailureEvent(sheet, deviceName, isThisDevice, e, selected))
             } finally {
                 transferring.value = null
             }
+        }
+    }
+
+    /** The sheet [sheet] is on screen (its results go to it) / went away (to the app's snackbar). */
+    fun sheetShown(sheet: String) = shownSheets.add(sheet)
+
+    fun sheetGone(sheet: String) = shownSheets.remove(sheet)
+
+    private fun deliver(event: DevicesEvent) {
+        if (event.sheet in shownSheets) {
+            eventChannel.trySend(event)
+        } else {
+            event.message()?.let { messenger.post(it.res, *it.args.toTypedArray()) }
         }
     }
 
@@ -283,28 +342,19 @@ internal fun DevicesSheetContent(onDismiss: () -> Unit) {
     val localDevices = rememberLocalDevices(sheetToken) { scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() } }
 
     LaunchedEffect(Unit) { viewModel.refresh(sheetToken, userInitiated = false) }
+    DisposableEffect(viewModel, sheetToken) {
+        viewModel.sheetShown(sheetToken)
+        onDispose { viewModel.sheetGone(sheetToken) }
+    }
     LaunchedEffect(viewModel, sheetToken) {
         viewModel.events.filter { it.sheet == sheetToken }.collect { event ->
             when (event) {
                 is DevicesEvent.TransferSucceeded -> scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() }
-                is DevicesEvent.TransferFailed -> {
-                    val message = context.getString(
-                        if (event.network) R.string.player_devices_transfer_failed_network else R.string.player_devices_transfer_failed,
-                        event.deviceName,
-                    )
-                    scope.launch { snackbar.showSnackbar(message) }
-                }
-                is DevicesEvent.RefreshFailed -> scope.launch { snackbar.showSnackbar(context.getString(R.string.player_devices_refresh_failed)) }
-                is DevicesEvent.NothingToPlay -> {
-                    // A transfer only moves what is playing; with nothing playing (and no saved
-                    // session) a play would start on this phone, so say what does work.
-                    val message = when {
-                        event.selected -> context.getString(R.string.player_devices_selected, event.deviceName)
-                        event.isThisDevice -> context.getString(R.string.player_devices_nothing_to_play_here)
-                        else -> context.getString(R.string.player_devices_nothing_to_play, event.deviceName)
+                is DevicesEvent.TransferFailed, is DevicesEvent.RefreshFailed, is DevicesEvent.NothingToPlay ->
+                    event.message()?.let { message ->
+                        val text = context.getString(message.res, *message.args.toTypedArray())
+                        scope.launch { snackbar.showSnackbar(text) }
                     }
-                    scope.launch { snackbar.showSnackbar(message) }
-                }
             }
         }
     }
