@@ -28,6 +28,25 @@ import kotlin.math.roundToInt
 // Pure helpers of the player UI (no Android framework calls; covered by JVM unit tests).
 
 // ---------------------------------------------------------------------------------------------
+// Like
+// ---------------------------------------------------------------------------------------------
+
+/** The heart's state: [liked] of item [uri]; null [liked] while unknown (the lookup is pending or failed). */
+@Immutable
+internal data class LikeState(val uri: String?, val liked: Boolean?) {
+    /**
+     * What a heart tap on [currentUri] acts on: the shown state when it is known and belongs to that
+     * item (right after a track change the heart may still show the previous one's), else null and
+     * the tap is ignored.
+     */
+    fun shownFor(currentUri: String?): Boolean? = if (currentUri != null && currentUri == uri) liked else null
+
+    companion object {
+        val NONE = LikeState(null, null)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Time
 // ---------------------------------------------------------------------------------------------
 

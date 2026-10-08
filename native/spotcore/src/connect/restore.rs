@@ -240,8 +240,14 @@ pub(crate) struct Pass<'a> {
     /// In play order; `tracks[start]` is the current track.
     pub tracks: Vec<&'a SnapshotTrack>,
     pub start: usize,
-    /// The next track `take` refused before the context's end (its index in `next_tracks`).
+    /// Where the context goes on after the tracks (an index in `next_tracks`): the next track
+    /// `take` refused, or with repeat-all, when `take` refused one past the wrap, the context's
+    /// start (the tracks don't hold the whole pass).
     pub ended_at: Option<usize>,
+    /// The next side took every listed track without reaching the context's end (a delimiter).
+    pub ran_out: bool,
+    /// The index in `next_tracks` of the last next track taken before the wrap.
+    pub last_next: Option<usize>,
 }
 
 /// The visible tracks around `s`'s current track in play order, one pass of its context. With
@@ -278,30 +284,40 @@ pub(crate) fn one_pass<'a>(
     tracks.reverse();
     let prev = tracks.len();
     tracks.push(current);
-    let (mut head, mut wrapped, mut ended_at) = (Vec::new(), false, None);
+    let (mut head, mut wrap, mut ended_at, mut last_next) = (Vec::new(), None, None, None);
+    let (mut ran_out, mut delimited) = (true, false);
     for (i, t) in s.next_tracks.iter().enumerate() {
         if wraps(t) {
-            if wrapped {
+            if wrap.is_some() {
+                ran_out = false;
                 break;
             }
-            wrapped = true;
+            wrap = Some(i);
             continue;
         }
+        delimited |= t.uri == uri::DELIMITER_URI;
         if skipped(t) {
             continue;
         }
         if !first_time(t) {
+            ran_out = false;
             break;
         }
         if !take(t, true) {
-            ended_at = (!wrapped).then_some(i);
+            ended_at = Some(wrap.map_or(i, |w| w + 1));
+            ran_out = false;
             break;
         }
-        if wrapped { head.push(t) } else { tracks.push(t) }
+        if wrap.is_some() {
+            head.push(t);
+        } else {
+            tracks.push(t);
+            last_next = Some(i);
+        }
     }
     let start = head.len() + prev;
     head.extend(tracks);
-    Pass { tracks: head, start, ended_at }
+    Pass { tracks: head, start, ended_at, ran_out: ran_out && wrap.is_none() && !delimited, last_next }
 }
 
 /// The frozen session as a `player.load` (for another device: context, track, position, options).

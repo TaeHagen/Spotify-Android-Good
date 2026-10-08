@@ -157,6 +157,8 @@ pub(crate) struct OfflineQueue {
     continuation: Option<Continuation>,
     /// Items that aren't tracks of `context_uri` (see [`Adoption::outside`]).
     outside: Vec<usize>,
+    /// ... of which these came from Spirc's user queue (see [`Adoption::user_queued`]).
+    user_queued: Vec<usize>,
     /// The driver: a visible online session is up, the window's end hands back to Spirc.
     hand_back: bool,
 }
@@ -171,6 +173,9 @@ pub(crate) struct Adoption {
     pub start: usize,
     /// Indices of `uris` that aren't tracks of the context (the user queue's, suggestions).
     pub outside: Vec<usize>,
+    /// ... of which these are the user queue's (queued again when the queue is pushed to
+    /// another device as its context).
+    pub user_queued: Vec<usize>,
     pub position_ms: u64,
     pub duration_ms: u64,
     /// It plays, or loads to play.
@@ -215,6 +220,7 @@ impl Default for OfflineQueue {
             ended_request: None,
             continuation: None,
             outside: Vec::new(),
+            user_queued: Vec::new(),
             hand_back: false,
         }
     }
@@ -718,6 +724,7 @@ impl OfflineQueue {
         self.shuffle = a.shuffle;
         self.continuation = a.continuation;
         self.outside = a.outside;
+        self.user_queued = a.user_queued;
         let Some(request) = request else { return Some(load) };
         self.pending_loads = self.pending_loads.saturating_sub(1);
         self.own_request = Some(request);
@@ -905,7 +912,7 @@ impl OfflineQueue {
 
     /// What to hand over to another device: the current item followed by up to `max_next` next
     /// items, the position at `now_ms` (the snapshot only carries the last anchor), and the
-    /// context at the current item when it is one of its tracks.
+    /// context at the current item when it is one of its tracks, with the user queue.
     pub fn handover(&self, now_ms: i64, max_next: usize) -> Handover {
         let mut uris: Vec<String> = self.current_uri().map(str::to_string).into_iter().collect();
         uris.extend(self.next_tracks().into_iter().take(max_next).map(|t| t.uri));
@@ -918,6 +925,7 @@ impl OfflineQueue {
                 .map(|(context_uri, item)| ContextStart { context_uri: context_uri.clone(), track_uri: item.uri.clone() }),
             _ => None,
         };
+        let queued = if context.is_some() { self.user_queue() } else { Vec::new() };
         Handover {
             uris,
             position_ms: self.position_at(now_ms),
@@ -925,8 +933,22 @@ impl OfflineQueue {
             playing: self.is_playing(),
             context,
             shuffle: self.shuffle,
-            queued: self.queue.iter().map(|q| q.uri.clone()).collect(),
+            queued,
         }
+    }
+
+    /// The user queue still ahead, in the order it plays: the entries queued here, then the
+    /// adopted ones of Spirc's after the current position (without wrapping), then the ones that
+    /// ended the handed-over window (see [`Continuation::queued`]); at most [`MAX_NEXT`].
+    fn user_queue(&self) -> Vec<String> {
+        let adopted = self
+            .order
+            .iter()
+            .skip(self.pos + 1)
+            .filter(|&&i| self.user_queued.contains(&i) && self.playable(i))
+            .map(|&i| self.items[i].uri.clone());
+        let after = self.continuation.iter().flat_map(|c| c.queued.iter().cloned());
+        self.queue.iter().map(|q| q.uri.clone()).chain(adopted).chain(after).take(MAX_NEXT).collect()
     }
 
     /// The snapshot (bare tracks; metadata is filled by the caller). Positions are reported as
@@ -1510,12 +1532,45 @@ mod tests {
         assert_eq!(context(&q.handover(0, 50)), None);
     }
 
+    #[test]
+    fn a_handover_as_the_context_keeps_the_adopted_user_queue() {
+        // Spirc's user queue: 2 adopted after the current track (3 is a suggestion), 9 ended
+        // the window; then one queued here
+        let continuation = Continuation {
+            context_uri: "spotify:playlist:p".into(),
+            start_uri: "spotify:track:8".into(),
+            smart_shuffle: false,
+            queued: vec!["spotify:track:9".into()],
+        };
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        let a = Adoption { outside: vec![2, 3], user_queued: vec![2], continuation: Some(continuation), ..adoption(5, 1) };
+        q.adopt(a, 0);
+        q.add_to_queue("spotify:track:here".into());
+        let h = q.handover(0, 50);
+        assert_eq!(h.context.as_ref().map(|c| c.track_uri.as_str()), Some("spotify:track:1"));
+        assert_eq!(h.queued, ["spotify:track:here", "spotify:track:2", "spotify:track:9"], "in the order they play");
+        // played past: not any more (the one queued here played first)
+        q.on_event(Event::EndOfTrack(7), 0);
+        q.on_event(Event::RequestId(8), 0);
+        q.on_event(Event::EndOfTrack(8), 0);
+        q.on_event(Event::RequestId(9), 0);
+        q.on_event(Event::EndOfTrack(9), 0);
+        q.on_event(Event::RequestId(10), 0);
+        assert_eq!(q.current_uri(), Some("spotify:track:3"));
+        assert_eq!(q.handover(0, 50).context, None, "a suggestion plays");
+        q.on_event(Event::EndOfTrack(10), 0);
+        assert_eq!(q.current_uri(), Some("spotify:track:4"));
+        assert_eq!(q.handover(0, 50).queued, ["spotify:track:9"]);
+    }
+
     fn adoption(n: usize, start: usize) -> Adoption {
         Adoption {
             context_uri: Some("spotify:playlist:p".into()),
             uris: uris(n),
             start,
             outside: Vec::new(),
+            user_queued: Vec::new(),
             position_ms: 42_000,
             duration_ms: 200_000,
             playing: true,

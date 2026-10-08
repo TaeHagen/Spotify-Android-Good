@@ -301,25 +301,29 @@ private fun ModeIcon(icon: ImageVector, active: Boolean, enabled: Boolean, spark
     }
 }
 
-/** Heart toggle (Liked Songs) with a small bounce when liked. */
+/**
+ * Heart toggle (Liked Songs) with a small bounce when liked. [liked] null (not known, e.g.
+ * the lookup failed offline) shows an empty heart, disabled: a tap must not act on a guess.
+ */
 @Composable
-internal fun LikeButton(liked: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true) {
+internal fun LikeButton(liked: Boolean?, onToggle: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true) {
     val accent = MaterialTheme.colorScheme.primary
+    val isLiked = liked == true
     val label = stringResource(R.string.player_like)
-    val state = stringResource(if (liked) R.string.player_like_state_on else R.string.player_like_state_off)
+    val state = stringResource(if (isLiked) R.string.player_like_state_on else R.string.player_like_state_off)
     val scale = remember { Animatable(1f) }
-    val previous = remember { booleanArrayOf(liked) }
-    LaunchedEffect(liked) {
-        if (liked && !previous[0]) {
+    val previous = remember { booleanArrayOf(isLiked) }
+    LaunchedEffect(isLiked) {
+        if (isLiked && !previous[0]) {
             scale.snapTo(0.7f)
             scale.animateTo(1f, spring(dampingRatio = 0.35f, stiffness = Spring.StiffnessMedium))
         }
-        previous[0] = liked
+        previous[0] = isLiked
     }
     IconToggleButton(
-        checked = liked,
+        checked = isLiked,
         onCheckedChange = { onToggle() },
-        enabled = enabled,
+        enabled = enabled && liked != null,
         modifier = modifier
             .size(48.dp)
             .semantics {
@@ -328,9 +332,9 @@ internal fun LikeButton(liked: Boolean, onToggle: () -> Unit, modifier: Modifier
             },
     ) {
         Icon(
-            imageVector = if (liked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
+            imageVector = if (isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
             contentDescription = null,
-            tint = if (liked) accent else LocalContentColor.current,
+            tint = if (isLiked) accent else LocalContentColor.current,
             modifier = Modifier.graphicsLayer {
                 scaleX = scale.value
                 scaleY = scale.value
