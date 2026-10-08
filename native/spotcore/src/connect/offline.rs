@@ -97,14 +97,25 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
         SnapshotPlayStatus::Stopped => return None,
     };
     let current = s.track.as_ref().filter(|t| !t.hidden && downloaded(&t.uri))?;
-    let mut next = 0;
-    let pass = super::restore::one_pass(s, current, |t, is_next| {
-        next += usize::from(is_next);
-        downloaded(&t.uri) && next <= MAX_NEXT
-    });
+    let pass = super::restore::one_pass(s, current, |t, _| downloaded(&t.uri));
+    let mut tracks = pass.tracks;
+    let mut goes_on = pass.ended_at.and_then(|i| continuation(s, i));
+    // Spirc lists at most MAX_NEXT next tracks (one less before a smart-shuffle pair): a full
+    // list that ran out before the context's end goes on past it, so the window ends before its
+    // last track and the context goes on there.
+    if pass.ended_at.is_none() && pass.ran_out && s.next_tracks.len() + 1 >= MAX_NEXT {
+        if let Some(c) = pass.last_next.and_then(|i| continuation(s, i)) {
+            tracks.pop();
+            goes_on = Some(c);
+        }
+    }
+    let indices = |provider: fn(&TrackProvider) -> bool| {
+        tracks.iter().enumerate().filter(|(_, t)| provider(&t.provider)).map(|(i, _)| i).collect::<Vec<_>>()
+    };
     // Tracks that aren't the context's (the user queue, suggestions): a push of the queue to
-    // another device can't start the context there.
-    let outside = pass.tracks.iter().enumerate().filter(|(_, t)| t.provider != TrackProvider::Context).map(|(i, _)| i).collect();
+    // another device can't start the context there, the user queue's are queued again there.
+    let outside = indices(|p| *p != TrackProvider::Context);
+    let user_queued = indices(|p| *p == TrackProvider::Queue);
     let repeat = if s.repeat_track {
         RepeatMode::Track
     } else if s.repeat_context {
@@ -114,9 +125,10 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
     };
     Some(Adoption {
         context_uri: Some(s.context_uri.clone()).filter(|c| !c.is_empty()),
-        uris: pass.tracks.iter().map(|t| t.uri.clone()).collect(),
+        uris: tracks.iter().map(|t| t.uri.clone()).collect(),
         start: pass.start,
         outside,
+        user_queued,
         position_ms: super::restore::position_now(s, now_ms).max(0) as u64,
         duration_ms: s.duration_ms.max(0) as u64,
         playing,
@@ -124,12 +136,13 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
         repeat,
         repeat_context: s.repeat_context,
         shuffle: s.shuffle || s.smart_shuffle,
-        continuation: pass.ended_at.and_then(|i| continuation(s, i)),
+        continuation: goes_on,
     })
 }
 
 /// Where the context of `s` goes on after a handed-over window that ends at its next track `from`
-/// (not downloaded, or the size cap): Spirc continues there when the session is back (see
+/// (not downloaded, the end of Spirc's full list, or with repeat-all the context's start when the
+/// window doesn't hold the whole pass): Spirc continues there when the session is back (see
 /// `HandBack`). At the first context track from there, before the context's end: suggestions are
 /// skipped (with smart shuffle on Spirc adds new ones), the user queue's tracks are queued again
 /// (they come after that first track then). `None` for a context that can't be loaded again.
@@ -714,10 +727,36 @@ mod tests {
         let a = handoff(&s, |_| true, 1_000_000).expect("handed over");
         assert_eq!((a.uris.clone(), a.start), (names(1..=20), 17));
         assert_eq!(a.continuation, None);
-        // ... up to a track that isn't downloaded
+        // ... up to a track that isn't downloaded: then the window doesn't hold the whole pass,
+        // the context goes on at its start
         let a = handoff(&s, |u| u != "t:3", 1_000_000).expect("handed over");
         assert_eq!(a.uris[..3], ["t:1", "t:2", "t:8"]);
         assert_eq!(a.start, 12);
+        assert_eq!(a.continuation.map(|c| c.start_uri).as_deref(), Some("t:1"));
+        let a = handoff(&s, |u| !["t:1", "t:2", "t:3", "t:4", "t:5"].contains(&u), 1_000_000).expect("handed over");
+        assert_eq!((a.uris.first().map(String::as_str), a.start), (Some("t:8"), 10));
+        assert_eq!(a.continuation.map(|c| c.start_uri).as_deref(), Some("t:1"));
+    }
+
+    #[test]
+    fn a_full_list_ends_the_window_before_its_last_track() {
+        use librespot_connect::TrackProvider::Context;
+        // Spirc lists 80 next tracks of a longer context, all downloaded: the context goes on at
+        // the last one (the window ends before it)
+        let mut s = playing(&[], "t:0", &[]);
+        s.repeat_context = false;
+        s.next_tracks = (1..=80).map(|n| st(&format!("t:{n}"), Context)).collect();
+        let a = handoff(&s, |_| true, 0).expect("handed over");
+        assert_eq!(a.uris.len(), 80, "the current track and 79 next");
+        assert_eq!(a.continuation.map(|c| c.start_uri).as_deref(), Some("t:80"));
+        // hidden entries in it too
+        s.next_tracks[79].hidden = true;
+        let a = handoff(&s, |_| true, 0).expect("handed over");
+        assert_eq!(a.continuation.map(|c| c.start_uri).as_deref(), Some("t:79"));
+        // a short list is all there is
+        s.next_tracks.truncate(5);
+        let a = handoff(&s, |_| true, 0).expect("handed over");
+        assert_eq!((a.uris.len(), a.continuation), (6, None));
     }
 
     #[test]
