@@ -861,10 +861,21 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   load asks for a plain shuffle instead of smart shuffle. States from older versions read with
   the modes off. Only a track of its context is stored with the context; a queued, autoplay or
   suggested track (or a context that cannot be loaded again) is stored as a track list instead:
-  that track plus the visible next context / autoplay tracks in play order (≤ 50), resumed as a
-  `trackUris` load in that order (shuffle off), because loading the context would start its
-  first track at the saved position. The Media3 resume item carries the list in its extras.
-* Foreground: Media3 default (10 min after pause, then notification becomes dismissable).
+  that track plus the visible next context / autoplay tracks in play order (≤ 50), one pass
+  (repeat-all's repeated passes end the walk at the first uid seen again, like
+  `restore::one_pass`; lists stored with repeats are cut before the start track comes again),
+  resumed as a `trackUris` load in that order (shuffle off), because loading the context would
+  start its first track at the saved position. The Media3 resume item carries the list in its
+  extras.
+* Foreground: Media3 default (10 min after pause, then notification becomes dismissable), bounded
+  in wall time: Media3's timer is a Handler (uptime), which does not advance while the phone
+  deep-sleeps between the session's keep-alive packets, so a screen-off pause could keep the
+  foreground and the engine up for hours. `PausedIdle` counts `elapsedRealtime` from the pause
+  (nothing playing or loading here or on the mirrored device, presence off) with an inexact
+  non-wakeup allow-while-idle `ELAPSED_REALTIME` alarm (delivered at the next wake-up after the
+  deadline; wake-up events re-check it too). At the deadline the service leaves the media
+  foreground (the paused notification stays, dismissable), releases its engine holders and stops
+  once unbound; nothing is paused. A playback command starts a new window.
   Local audio never plays without it: local audio starting in the background with no service
   (remote "play on this phone" during the idle grace or a download) starts the service with
   `startForegroundService` (focus waits for the foreground, also when a running service is not in
@@ -877,7 +888,7 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   playback command (play, load, seek, queue, modes, volume; a pause or stop does not count),
   a playback resumption for playback, voice "play", Tap to resume, our LOCAL_PLAYBACK start,
   the media foreground, or a local / mirrored snapshot, and released when the service is
-  destroyed. A browse-only bind (SysUI's resumption card at boot: root + recent; Bluetooth
+  destroyed or the paused lifetime ends (10 min of wall time, see Foreground). A browse-only bind (SysUI's resumption card at boot: root + recent; Bluetooth
   player discovery) never starts the engine; catalog browsing and search (Auto) hold a second
   `PLAYBACK` holder until 60 s after the browser's last such request.
 * **Opt-in Connect presence** (setting "Stay available for Spotify Connect", default off):
@@ -1110,7 +1121,7 @@ that failed before the session was ONLINE shows its error and runs again by itse
 |---|---|---|---|---|
 | App visible | Online | yes | none unless playing | none |
 | Playing locally | Online (or offline mode) | yes | mediaPlayback | wake + Wi-Fi |
-| Paused < 10 min | Online | yes | mediaPlayback (Media3 timeout) | none |
+| Paused < 10 min (wall time, `PausedIdle`) | Online | yes | mediaPlayback (Media3 timeout, bounded by an elapsed-realtime alarm) | none |
 | Paused ≥ 10 min, app background | hidden 20 s after release, stopped after 60 s | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |

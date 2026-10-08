@@ -11,6 +11,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.taehagen.spotifygood.model.PlaybackSnapshot
+import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.model.RepeatMode
 import com.taehagen.spotifygood.model.TrackProvider
 import kotlinx.coroutines.flow.first
@@ -51,7 +52,7 @@ data class ResumeState(
 ) {
     /** [trackUris] when usable (it starts with [trackUri]). */
     private val trackList: List<String>?
-        get() = trackUris?.takeIf { it.isNotEmpty() && it.first() == trackUri }
+        get() = trackUris?.takeIf { it.isNotEmpty() && it.first() == trackUri }?.let(::onePass)
 
     /**
      * The context to resume in; null for the track-list form, when there is none, it is just the
@@ -121,22 +122,51 @@ data class ResumeState(
                 shuffle = snapshot.shuffle || snapshot.smartShuffle,
                 smartShuffle = snapshot.smartShuffle,
                 repeat = snapshot.repeat,
-                trackUris = if (inContext) null else trackList(track.uri, snapshot),
+                trackUris = if (inContext) null else trackList(track, snapshot),
             )
         }
 
         /**
          * [current] and the visible next tracks that belong to the context or autoplay (not the
-         * user queue, smart-shuffle suggestions or unavailable entries), in play order.
+         * user queue, smart-shuffle suggestions or unavailable entries), in play order: one pass.
+         * With repeat-all Spirc fills the next tracks past the context's end with the context
+         * again (same uids; the delimiter between the passes is normally hidden already). Like the
+         * engine's `restore::one_pass`, the walk ends at the first uid seen already (queued and
+         * suggested entries count too) or at a second wrap, so the tracks after a wrap complete
+         * the pass up to the current track and each one is stored once. Spirc's repeat cycles
+         * that pass again after a resume.
          */
-        private fun trackList(current: String, snapshot: PlaybackSnapshot): List<String> {
-            val next = snapshot.nextTracks.asSequence()
-                .filter { it.provider == TrackProvider.CONTEXT || it.provider == TrackProvider.AUTOPLAY }
-                .map { it.uri }
-                .filter(::isPlayableItem)
-                .take(RESUME_TRACKS - 1)
-            return listOf(current) + next
+        private fun trackList(current: PlaybackTrack, snapshot: PlaybackSnapshot): List<String> {
+            val seen = HashSet<String>()
+            if (current.uid.isNotEmpty()) seen += current.uid
+            val repeating = snapshot.repeat == RepeatMode.CONTEXT
+            var wrapped = false
+            val list = mutableListOf(current.uri)
+            for (t in snapshot.nextTracks) {
+                if (list.size >= RESUME_TRACKS) break
+                if (t.uri.startsWith(DELIMITER)) {
+                    if (repeating && wrapped) break
+                    wrapped = wrapped || repeating
+                    continue
+                }
+                if (t.uid.isNotEmpty() && !seen.add(t.uid)) break
+                val ours = t.provider == TrackProvider.CONTEXT || t.provider == TrackProvider.AUTOPLAY
+                if (ours && isPlayableItem(t.uri)) list += t.uri
+            }
+            return list
         }
+
+        /**
+         * Repairs a list stored by an earlier version of [trackList], which kept the repeated
+         * passes: it ends before the start track comes again (a list that really holds its start
+         * track twice loses its tail, a rare case).
+         */
+        private fun onePass(list: List<String>): List<String> {
+            val again = list.subList(1, list.size).indexOf(list.first())
+            return if (again < 0) list else list.subList(0, again + 1)
+        }
+
+        private const val DELIMITER = "spotify:delimiter"
 
         private fun isPlayableItem(uri: String): Boolean =
             uri.startsWith("spotify:track:") || uri.startsWith("spotify:episode:")

@@ -1567,11 +1567,20 @@ fn a_failed_resolve_still_finishes_a_transfer() {
 fn a_failed_last_page_still_shuffles_a_load() {
     use crate::context_resolver::{ContextAction, ResolveContext};
 
-    // a shuffled load of a multi-page context: the shuffle waits for the further pages
-    let (rt, mut state) = state(20);
+    let seed = |state: &ConnectState| {
+        state
+            .get_context(ContextType::Default)
+            .unwrap()
+            .get_shuffle_seed()
+            .cloned()
+    };
+
+    // a shuffled load of a multi-page context (an artist): the first page is shuffled right away
+    let (rt, mut state) = state(10);
     state.set_shuffle(true);
-    state.clear_next_tracks();
     state.set_current_track(5).unwrap();
+    state.shuffle_new().unwrap();
+    let first_seed = seed(&state);
 
     let mut resolver = resolver(&rt);
     for page in ["spotify:album:1", "spotify:album:2"] {
@@ -1584,20 +1593,52 @@ fn a_failed_last_page_still_shuffles_a_load() {
     }
 
     // a failure that isn't the last of its kind changes nothing
+    let next = next_uids(&state);
     assert!(!resolver.finish_after_failure(&mut state, &mut None));
-    assert!(state.next_tracks().is_empty());
+    assert_eq!(next_uids(&state), next);
+
+    // the first album arrives (in its order at the end of the shuffled order)
+    let album = Context {
+        uri: Some(CONTEXT_URI.to_string()),
+        pages: vec![default_page(10..60)],
+        ..Default::default()
+    };
+    resolver.apply_next_context(&mut state, album).unwrap();
     resolver.remove_used_and_invalid();
 
-    // the last one: shuffled with the pages there are
+    // the last one fails for good: shuffled again with the pages there are
     assert!(resolver.finish_after_failure(&mut state, &mut None));
     assert!(state.default_context_shuffled());
+    assert_ne!(seed(&state), first_seed, "shuffled again");
     assert_eq!(state.current_track(|t| t.uid.clone()), "uid5");
-    let mut next = next_uids(&state);
-    next.sort();
-    let mut expected = uids(0..20);
+    let next = next_uids(&state);
+    let mut sorted = next.clone();
+    sorted.sort();
+    let mut expected = uids(0..60);
     expected.retain(|uid| uid != "uid5");
     expected.sort();
-    assert_eq!(next, expected);
+    assert_eq!(sorted, expected);
+    // the album isn't played in its order
+    let album_order = next
+        .iter()
+        .filter(|uid| uid_index(uid) >= 10)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_ne!(album_order, uids(10..60));
+
+    // a failed update of the context that plays shuffled keeps its order
+    let (rt, mut state) = self::state(10);
+    state.handle_shuffle(true).unwrap();
+    let before = (seed(&state), next_uids(&state));
+    let mut resolver = self::resolver(&rt);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Default,
+        ContextAction::Replace,
+    ));
+    assert!(resolver.finish_after_failure(&mut state, &mut None));
+    assert_eq!((seed(&state), next_uids(&state)), before);
 }
 
 #[test]
@@ -1841,6 +1882,173 @@ fn a_start_track_on_a_further_page_has_next_tracks_meanwhile() {
     assert!(resolver.try_finish(&mut state, &mut None));
     assert!(state.default_context_shuffled());
     assert_eq!(state.next_tracks().len(), 29);
+}
+
+#[test]
+fn a_transfer_goes_on_while_its_pages_resolve() {
+    use crate::{
+        context_resolver::{ContextAction, ResolveContext},
+        protocol::{
+            playback::Playback, queue::Queue, session::Session as PlayingSession,
+            transfer_state::TransferState,
+        },
+    };
+
+    // the transferred track is on the first page, and on a further one
+    for current in [2, 15] {
+        let (rt, mut state) = state(3);
+        state.reset_context(ResetContext::Completely);
+        let mut transfer = TransferState {
+            playback: MessageField::some(Playback {
+                current_track: MessageField::some(ContextTrack {
+                    uri: Some(track_uri(current, 0)),
+                    uid: Some(format!("uid{current}")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            current_session: MessageField::some(PlayingSession {
+                context: MessageField::some(Context {
+                    uri: Some(CONTEXT_URI.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            queue: MessageField::some(Queue {
+                tracks: vec![ContextTrack {
+                    uri: Some(track_uri(1, 9)),
+                    ..Default::default()
+                }],
+                is_playing_queue: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // what handle_transfer does before the context is resolved
+        let track = state.current_track_from_transfer(&transfer).unwrap();
+        state.set_track(track);
+        state.handle_initial_transfer(&mut transfer, Some(CONTEXT_URI.to_string()));
+        let mut transfer_state = Some(transfer);
+
+        // the context resolves: an artist, its top tracks and two album pages to come
+        let mut resolver = resolver(&rt);
+        resolver.add(ResolveContext::from_uri(
+            CONTEXT_URI,
+            "",
+            ContextType::Default,
+            ContextAction::Replace,
+        ));
+        let album_page = |n: usize| ContextPage {
+            page_url: Some(format!(
+                "hm://artistplaycontext/v1/page/spotify/album/{n}/km_artist"
+            )),
+            ..Default::default()
+        };
+        let artist = Context {
+            uri: Some(CONTEXT_URI.to_string()),
+            pages: vec![default_page(0..10), album_page(1), album_page(2)],
+            ..Default::default()
+        };
+        let remaining = resolver.apply_next_context(&mut state, artist).unwrap();
+        resolver.add_list(remaining.unwrap());
+        assert!(resolver.has_pending_pages(ContextType::Default));
+
+        // finished with the top tracks: the transferred queue, then the context
+        assert!(resolver.finish_transfer_early(&mut state, &mut transfer_state));
+        assert!(transfer_state.is_none());
+        assert!(
+            !resolver.try_finish(&mut state, &mut transfer_state),
+            "pages to come"
+        );
+        resolver.remove_used_and_invalid();
+        let current_uid = format!("uid{current}");
+        assert_eq!(state.current_track(|t| t.uid.clone()), current_uid);
+        assert!(state.next_tracks()[0].is_queue());
+        if current == 2 {
+            assert_eq!(next_uids(&state)[1..], uids(3..10));
+        } else {
+            // before the context until its page is there
+            assert_eq!(next_uids(&state)[1..], uids(0..10));
+        }
+
+        // the albums arrive: a track on one of them is placed then
+        let album = |range| Context {
+            uri: Some(CONTEXT_URI.to_string()),
+            pages: vec![default_page(range)],
+            ..Default::default()
+        };
+        resolver
+            .apply_next_context(&mut state, album(10..20))
+            .unwrap();
+        assert!(!resolver.try_finish(&mut state, &mut transfer_state));
+        resolver.remove_used_and_invalid();
+        resolver
+            .apply_next_context(&mut state, album(20..30))
+            .unwrap();
+        assert!(resolver.try_finish(&mut state, &mut transfer_state));
+        resolver.remove_used_and_invalid();
+
+        assert_eq!(state.current_track(|t| t.uid.clone()), current_uid);
+        assert!(state.next_tracks()[0].is_queue());
+        assert_eq!(next_uids(&state)[1..], uids(current + 1..30));
+
+        // and the song ending goes on with the queue, then the context
+        assert!(state.next_track().unwrap().is_some());
+        assert!(state.current_track(|t| t.is_queue()));
+        assert_eq!(next_uids(&state), uids(current + 1..30));
+    }
+
+    // the song ends before the albums arrive: the playback goes on, the albums don't pull it back
+    let (rt, mut state) = state(3);
+    state.reset_context(ResetContext::Completely);
+    let mut transfer = TransferState {
+        playback: MessageField::some(Playback {
+            current_track: MessageField::some(ContextTrack {
+                uri: Some(track_uri(15, 0)),
+                uid: Some("uid15".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let track = state.current_track_from_transfer(&transfer).unwrap();
+    state.set_track(track);
+    state.handle_initial_transfer(&mut transfer, Some(CONTEXT_URI.to_string()));
+    let mut transfer_state = Some(transfer);
+    let mut resolver = resolver(&rt);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Default,
+        ContextAction::Replace,
+    ));
+    let artist = Context {
+        uri: Some(CONTEXT_URI.to_string()),
+        pages: vec![
+            default_page(0..10),
+            ContextPage {
+                page_url: Some("hm://artistplaycontext/v1/page/spotify/album/1/km_artist".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let remaining = resolver.apply_next_context(&mut state, artist).unwrap();
+    resolver.add_list(remaining.unwrap());
+    assert!(resolver.finish_transfer_early(&mut state, &mut transfer_state));
+    resolver.remove_used_and_invalid();
+    assert!(state.next_track().unwrap().is_some(), "not stopped");
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid0");
+    let album = Context {
+        uri: Some(CONTEXT_URI.to_string()),
+        pages: vec![default_page(10..20)],
+        ..Default::default()
+    };
+    resolver.apply_next_context(&mut state, album).unwrap();
+    assert!(resolver.try_finish(&mut state, &mut transfer_state));
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid0");
+    assert_eq!(next_uids(&state), uids(1..20));
 }
 
 /// compile time check: the engine spawns the task and shares the handle between threads

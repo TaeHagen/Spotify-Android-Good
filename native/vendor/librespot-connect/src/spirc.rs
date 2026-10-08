@@ -1319,7 +1319,17 @@ impl SpircTask {
             }
         }
 
-        let update_state = if self
+        // SPOTIFYGOOD: a pending transfer goes on with the pages there are, see
+        // ContextResolver::finish_transfer_early
+        let transfer_finished = self
+            .context_resolver
+            .finish_transfer_early(&mut self.connect_state, &mut self.transfer_state);
+        if transfer_finished {
+            self.add_autoplay_resolving_when_required();
+            self.handle_next_tracks_changed();
+        }
+
+        let finished = if self
             .context_resolver
             .try_finish(&mut self.connect_state, &mut self.transfer_state)
         {
@@ -1341,7 +1351,7 @@ impl SpircTask {
         };
 
         self.context_resolver.remove_used_and_invalid();
-        update_state
+        transfer_finished || finished
     }
 
     // todo: is the time_delta still necessary?
