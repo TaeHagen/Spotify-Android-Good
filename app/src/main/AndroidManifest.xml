@@ -136,6 +136,11 @@
             android:name=".playback.SleepTimerAlarmReceiver"
             android:exported="false" />
 
+        <!-- Wall-clock bound of the playback service's paused lifetime; not exported -->
+        <receiver
+            android:name=".playback.PausedIdleAlarmReceiver"
+            android:exported="false" />
+
         <!-- Artwork for Android Auto / notification (content:// URIs) -->
         <provider
             android:name=".playback.ArtworkProvider"

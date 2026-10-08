@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
@@ -47,6 +48,7 @@ import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.engine.EngineHolder
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.model.PlaybackSource
+import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -64,6 +66,7 @@ import kotlinx.coroutines.guava.future
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.lang.ref.WeakReference
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 
@@ -79,7 +82,8 @@ import java.util.concurrent.ConcurrentHashMap
  * instead of leaving the foreground ([onUpdateNotificationAsync]).
  *
  * Holds the [HolderType.PLAYBACK] engine holder from the first playback command (or local /
- * mirrored playback, the media foreground, our own playback starts) to [onDestroy], never for a
+ * mirrored playback, the media foreground, our own playback starts) to [onDestroy] or the end of
+ * the paused lifetime (10 min of wall time paused, [PausedIdle]), never for a
  * browse-only bind: SysUI's resumption card and Bluetooth's player discovery bind at boot and get
  * the root and the stored session without the engine. Catalog browsing and search hold it while
  * the browser keeps browsing ([holdForBrowsing]).
@@ -97,6 +101,12 @@ class PlaybackService : MediaLibraryService() {
     /** Held while a browser reads catalog content (guarded by [holderLock]). */
     private var browseHolder: EngineHolder? = null
     private val holderLock = Any()
+    /** Wall-clock bound of the paused lifetime, see [PausedIdle]. */
+    private val pausedIdle = PausedIdle()
+    /** Main thread. */
+    private var armedIdleAt: Long? = null
+    /** The paused lifetime ended: no media foreground until playback is asked for again. */
+    @Volatile private var pausedIdleExpired = false
     private val releaseBrowseHolder = Runnable {
         synchronized(holderLock) {
             browseHolder?.release()
@@ -132,6 +142,7 @@ class PlaybackService : MediaLibraryService() {
     override fun onCreate() {
         super.onCreate()
         isRunning = true
+        current = WeakReference(this)
         graph = (application as App).graph
         coordinator = PlaybackCoordinator.install(this)
         resumeStore = graph.resumeStore
@@ -182,6 +193,7 @@ class PlaybackService : MediaLibraryService() {
         when (action.takeIf { internal }) {
             ACTION_START_PRESENCE -> {
                 if (isPresenceWanted()) presence.enable(showNow = !mediaForeground)
+                updatePausedIdle()
                 if (!presence.isEnabled && !mediaForeground && !player.isPlaying) stopSelf(startId)
             }
             ACTION_RESUME -> {
@@ -223,7 +235,9 @@ class PlaybackService : MediaLibraryService() {
     ): ListenableFuture<Void?> {
         // Mirroring a remote device whose media foreground was refused: keep the controls as a
         // normal notification instead of failing (and being told so) on every state change.
-        val foregroundRequired = startInForegroundRequired &&
+        // A play (from any controller) asks for the foreground again at once, inside its allowlist.
+        if (session.player.playWhenReady) pausedIdleExpired = false
+        val foregroundRequired = startInForegroundRequired && !pausedIdleExpired &&
             !(remoteForegroundRefused && graph.playback.snapshot.value.source == PlaybackSource.REMOTE)
         val idle = !foregroundRequired || session.player.currentTimeline.isEmpty
         if (presence.isEnabled && idle && (presence.isForeground || presence.showForeground())) {
@@ -261,7 +275,9 @@ class PlaybackService : MediaLibraryService() {
 
     override fun onDestroy() {
         isRunning = false
+        current = null
         mediaForeground = false
+        PausedIdleAlarm.cancel(this)
         main.removeCallbacks(foregroundDeadline)
         coordinator.closeEffectSession()
         presence.release()
@@ -279,10 +295,69 @@ class PlaybackService : MediaLibraryService() {
         super.onDestroy()
     }
 
+    // ---- paused lifetime ----------------------------------------------------------------------
+
+    /** Playing or loading (here or on the mirrored device), or Connect presence keeps it up. */
+    private fun isBusy(): Boolean {
+        val status = graph.playback.snapshot.value.status
+        return status == PlaybackStatus.PLAYING || status == PlaybackStatus.LOADING || presence.isEnabled
+    }
+
+    /**
+     * Arms (or cancels) the paused-idle alarm for the current state, and lets go once its wall
+     * time passed ([PausedIdle]). Main thread: state changes, the alarm, wake-up events.
+     */
+    private fun updatePausedIdle() {
+        if (!isRunning) return
+        val now = SystemClock.elapsedRealtime()
+        val busy = isBusy()
+        // Playing again: Media3's own foreground handling applies again.
+        if (busy) pausedIdleExpired = false
+        val at = pausedIdle.update(busy, now)
+        if (pausedIdle.isDue(busy, now)) {
+            letGoAfterPause()
+            return
+        }
+        if (at == armedIdleAt) return
+        armedIdleAt = at
+        if (at == null) PausedIdleAlarm.cancel(this) else PausedIdleAlarm.schedule(this, at)
+    }
+
+    /**
+     * Ten minutes of wall time after a pause: what Media3's (uptime) timeout means. The service
+     * leaves the media foreground (the paused notification stays, dismissable), the engine
+     * holders go (the engine stops after its idle grace unless the app is visible), and the
+     * service stops once no controller is bound. Nothing is paused: nothing plays (checked), and
+     * a pause could reach a remote device that started playing meanwhile. Media3's own timeout
+     * is left alone (disabling it would end its pause grace for good in this service).
+     */
+    private fun letGoAfterPause() {
+        pausedIdle.expire()
+        armedIdleAt = null
+        PausedIdleAlarm.cancel(this)
+        Log.i(TAG, "Paused for 10 minutes: leaving the foreground and releasing the engine")
+        pausedIdleExpired = true
+        triggerNotificationUpdate()
+        main.removeCallbacks(releaseBrowseHolder)
+        synchronized(holderLock) {
+            playbackHolder?.release()
+            playbackHolder = null
+            browseHolder?.release()
+            browseHolder = null
+        }
+        stopSelf()
+    }
+
     // ---- engine holders -----------------------------------------------------------------------
 
-    /** The service has playback work: hold the engine (and Connect) until [onDestroy]. Any thread. */
+    /**
+     * The service has playback work: hold the engine (and Connect) until [onDestroy] or until it
+     * stayed paused for the paused lifetime ([letGoAfterPause]), counted again from now. Any thread.
+     */
     private fun ensurePlaybackHolder() {
+        pausedIdleExpired = false
+        pausedIdle.restart(SystemClock.elapsedRealtime())
+        main.post(::updatePausedIdle)
         synchronized(holderLock) {
             if (playbackHolder == null && isRunning) playbackHolder = graph.engine.acquire(HolderType.PLAYBACK)
         }
@@ -320,7 +395,18 @@ class PlaybackService : MediaLibraryService() {
                 // Inputs of the player error.
                 graph.engine.state.map { },
                 graph.player.failure.map { },
-            ).collect { player.refresh() }
+            ).collect {
+                player.refresh()
+                // Runs on most wake-ups (engine and snapshot events): a cheap check of the
+                // paused-idle deadline besides its alarm.
+                if (pausedIdle.isDue(isBusy(), SystemClock.elapsedRealtime())) updatePausedIdle()
+            }
+        }
+        lifecycleScope.launch {
+            // Paused (or stopped) here or on the mirrored device: bound the paused lifetime.
+            playback.snapshot.map { it.status == PlaybackStatus.PLAYING || it.status == PlaybackStatus.LOADING }
+                .distinctUntilChanged()
+                .collect { updatePausedIdle() }
         }
         lifecycleScope.launch {
             graph.engine.awaitReady()
@@ -397,6 +483,7 @@ class PlaybackService : MediaLibraryService() {
                     } else if (presence.disable()) {
                         afterPresenceDisabled()
                     }
+                    updatePausedIdle()
                 }
         }
     }
@@ -919,6 +1006,13 @@ class PlaybackService : MediaLibraryService() {
         /** True between [onCreate] and [onDestroy]. */
         @Volatile var isRunning: Boolean = false
             private set
+
+        @Volatile private var current: WeakReference<PlaybackService>? = null
+
+        /** The paused-idle alarm fired ([PausedIdleAlarmReceiver], main thread). */
+        internal fun onPausedIdleAlarm() {
+            current?.get()?.updatePausedIdle()
+        }
 
         /** True while the presence notification is the foreground notification. */
         @Volatile var isPresenceForeground: Boolean = false
