@@ -688,7 +688,9 @@ For a remote active device, smart shuffle is not supported (the command reports
 * **Remote playback in the app**: `PlaybackSnapshot.source == "remote"` is built from the
   cluster's `player_state` (position extrapolated with `session.time_delta()`); the
   MediaSession switches to `DeviceInfo(PLAYBACK_TYPE_REMOTE)` so hardware volume keys
-  control the remote device; the notification says "Playing on <device>".
+  control the remote device; the notification says "Playing on <device>". The stored session
+  (§9.4) follows the mirrored session, so when that device leaves and nothing is active, Play
+  on the phone continues what it played (Spotify resumes the account's last session).
 * **Audio output reporting**: Kotlin reports the current local output (speaker /
   Bluetooth "<name>" / wired / USB / car) with `player.setAudioOutput`.
 * **Reconnect restore**: when the engine rebuilds Session + Spirc (network switch, lost AP
@@ -916,10 +918,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
 * `MediaLibrarySession.Callback`: browse tree for Android Auto (≤4 tabs: Home, Library,
   Downloads, Browse); search; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
-  on a mode change and every 15 s while playing, from local snapshots only (`ResumeSaver`):
-  when playback leaves the phone (transfer, takeover, the engine's reset) it is saved once more
-  at that moment and then stays frozen; logging out clears it, through the same writer, so a
-  save in progress never lands after the clear. Every resume of it (resumption, Tap to
+  on a mode change and every 15 s while playing (`ResumeSaver`): the account's last session as
+  this phone sees it, local or the remote device it mirrors (after a transfer it follows the
+  speaker). When nothing is active any more (the device left, e.g. switched off; the engine's
+  reset) it is saved once more at that moment, extrapolated, and then stays frozen, so Play here
+  continues what the speaker played; logging out clears it, through the same writer, so a save
+  in progress never lands after the clear. Every resume of it (resumption, Tap to
   resume, "play something", the Play fallback) loads with its modes, since a load without
   them resets both to off (the Media3 resume item carries them as request extras). Offline the
   load asks for a plain shuffle instead of smart shuffle. States from older versions read with
