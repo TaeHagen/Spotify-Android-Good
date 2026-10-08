@@ -195,7 +195,10 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   credentials still stored natively (possibly another account's) are dropped first, so the
   token is what logs in. A start with only `credentials` drops an earlier access token, so a
   rejection can't fall back on another account's token. When the account changes, the OAuth
-  token (`session.setOAuthToken`) and the username are dropped too. A supervisor that is
+  token (`session.setOAuthToken`) and the username are dropped too; a fresh token login, or
+  stored credentials of another user than the last one, also clear what this process holds of
+  the previous account (`connect::reset()`, the metadata cache, the catalog's per-account state
+  and filter), but not at the first start of a process (§9.2). A supervisor that is
   being stopped or replaced can't store or report credentials any more (login generation). When librespot produces new reusable credentials (taken from the
   Session after connect; the librespot `Cache` has no credentials location, so they are never
   written to disk in plaintext, and a `credentials.json` left by an older build is deleted),
@@ -750,6 +753,20 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   Android Auto); the session's full user replaces it once online (product, country, the account's
   explicit filter), logout and rejected credentials clear it. It is no online signal (`isOnline`).
 * Writes reusable credentials from `credentials` events to `CredentialStore`.
+* Rejected credentials (`BAD_CREDENTIALS`) only delete `credentials.bin` and show the login, so
+  the same user logs back in with everything in place. Every login compares its account with the
+  owner of the device's data (`AccountGuard`, §9.3): a token login once its reusable credentials
+  (canonical username) arrived, a zeroconf login before its credentials are stored, and a process
+  start whose stored credentials aren't the owner's (a login that ended before the wipe). Another
+  account gets a clean device before it is marked logged in: `AppGraph` removes the data part of
+  logout (downloads with the native index, the resume state, the response and image caches, the
+  DB with the recent searches, the pending device, the account's event replays; not the
+  settings, the credentials or the session), outside the lifecycle mutex, then the offline index
+  is pushed again (empty). A wipe that fails fails the login and is redone by the next one. A
+  re-login of the same account (case-insensitive) keeps everything. Natively, a fresh token login
+  or stored credentials of another user than the last one also reset this process's state of the
+  previous account (`connect::reset()`, the metadata cache, the catalog's per-account state and
+  filter), but not at the first start of a process.
 
 ### 9.3 Auth
 
@@ -784,10 +801,18 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   replaced when it is permanently invalid (`KeyPermanentlyInvalidatedException`, a corrupted or
   missing key); transient Keystore failures are retried and then reported as
   `KeystoreUnavailableException` without deleting anything.
+* The account that owns the device's data (downloads, caches, history, resume state) is kept
+  apart from the credentials, in plain `noBackupFilesDir/account_owner` (the username; it must
+  outlive rejected credentials and a lost Keystore key). Installs from before it record the
+  stored credentials' account at the first load. A login as another account than the owner,
+  e.g. on the login screen after Spotify rejected the stored credentials, starts from a clean
+  state: the previous account's data is removed first and only then is the new owner recorded
+  (§9.2). Logout forgets the owner only once its whole wipe succeeded.
 * Logout (with confirmation): stops the login flows and deletes the pending device code, then
   `session.logout`, credentials, downloads, the resume state, the response and image caches,
   the DB and the settings. Every step runs even if an earlier one failed; no new login reaches
-  the engine until the wipe is done.
+  the engine until the wipe is done. The account owner is forgotten last, only when every step
+  succeeded (otherwise a later login of another account wipes again).
 
 ### 9.4 Playback service
 

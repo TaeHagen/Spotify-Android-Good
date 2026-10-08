@@ -78,6 +78,14 @@ class NativeEvents(private val json: Json) {
         _session.value = SessionEvent()
         _playback.value = PlaybackSnapshot.EMPTY
         _devices.value = DeviceList()
+        resetAccountReplays()
+    }
+
+    /**
+     * Forgets the replayed events of the previous account (another account logs in). The live
+     * session, playback and device states stay: the engine republishes them for the new session.
+     */
+    fun resetAccountReplays() {
         _credentials.resetReplayCache()
         _queueMetadata.resetReplayCache()
     }
