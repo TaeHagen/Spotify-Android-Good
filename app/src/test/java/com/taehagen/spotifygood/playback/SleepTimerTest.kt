@@ -6,6 +6,8 @@ import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.nativebridge.NativeEvents
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.encodeToString
@@ -13,6 +15,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -181,6 +184,57 @@ class SleepTimerTest {
         // A late alarm after the cancel does nothing.
         h.timer.onWakeupAlarm()
         assertTrue(h.wakeups.holds.isEmpty())
+    }
+
+    private fun localEpisode(speed: Double, leftMs: Long) = PlaybackSnapshot(
+        source = PlaybackSource.LOCAL,
+        status = PlaybackStatus.PLAYING,
+        track = PlaybackTrack(uri = "spotify:episode:e", uid = "e1", isEpisode = true),
+        durationMs = 60 * 60_000L,
+        positionMs = 60 * 60_000L - leftMs,
+        playbackSpeed = speed,
+    )
+
+    @Test
+    fun endOfEpisodeFollowsThePodcastSpeed() = runTest {
+        val h = Harness(this)
+        // The fake clock is the test's virtual time: the fade and the pause run on it.
+        val start = currentTime
+        h.timer.clock = { h.now + currentTime - start }
+        val gains = mutableListOf<Float>()
+        h.timer.fader = { gains += it }
+        // 2x with 30 min of the episode left: it ends after 15 min of wall time.
+        h.snapshot(localEpisode(speed = 2.0, leftMs = 30 * 60_000L))
+        runCurrent()
+        h.timer.endOfTrack()
+        runCurrent()
+        val endsAt = h.now + 15 * 60_000L - SleepTimer.END_MARGIN_MS
+        assertEquals(endsAt, h.wakeups.scheduled.last())
+        advanceTimeBy(15 * 60_000L - SleepTimer.END_MARGIN_MS - SleepTimer.FADE_MS - 1_000)
+        assertFalse("no fade yet", gains.any { it < 1f })
+        assertFalse(h.calls.contains("player.pause"))
+        // The fade runs in the last 10 s before that end, and the pause comes at it.
+        advanceTimeBy(SleepTimer.FADE_MS / 2 + 1_000)
+        assertTrue("fading", gains.any { it < 1f })
+        assertFalse(h.calls.contains("player.pause"))
+        advanceTimeBy(SleepTimer.FADE_MS / 2 + 100)
+        runCurrent()
+        assertEquals(listOf("player.pause"), h.calls)
+    }
+
+    @Test
+    fun endOfEpisodeBelowNormalSpeedWaitsForTheEnd() = runTest {
+        val h = Harness(this)
+        // 0.8x with 40 min of the episode left: 50 min of wall time, not 40.
+        h.snapshot(localEpisode(speed = 0.8, leftMs = 40 * 60_000L))
+        runCurrent()
+        h.timer.endOfTrack()
+        runCurrent()
+        assertEquals(listOf(h.now + 50 * 60_000L - SleepTimer.END_MARGIN_MS), h.wakeups.scheduled)
+        // The speed changes: re-armed for the new rate (the engine publishes a snapshot for it).
+        h.snapshot(localEpisode(speed = 2.0, leftMs = 40 * 60_000L))
+        runCurrent()
+        assertEquals(h.now + 20 * 60_000L - SleepTimer.END_MARGIN_MS, h.wakeups.scheduled.last())
     }
 
     @Test

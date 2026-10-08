@@ -1051,8 +1051,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   (t = now + (end − now) / 1.75), Android 12+ delivers at the window end unless woken earlier, and
   an early delivery arms the next stage until < 10 s remain (a handful of stages, within the
   allow-while-idle quota). A timer ending within 10 min while a remote device plays also holds the
-  wake lock from the start (honoured outside Doze). "End of track" arms the snapshot's track end and re-arms on every
-  snapshot. Disarmed on cancel, replace, finish and manual pause (end of track).
+  wake lock from the start (honoured outside Doze). "End of track" arms the snapshot's track end (the media time left
+  divided by the snapshot's speed: an episode at a podcast speed ends sooner or later in wall
+  time) and re-arms on every snapshot (a speed change publishes one). Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
 
