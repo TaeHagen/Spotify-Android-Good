@@ -1579,9 +1579,6 @@ impl SpircTask {
             return Ok(());
         }
 
-        // SPOTIFYGOOD: see the Playing / PositionCorrection arm
-        let correction = matches!(event, PlayerEvent::PositionCorrection { .. });
-
         match event {
             PlayerEvent::EndOfTrack { .. } => {
                 let next_track = self
@@ -1614,16 +1611,21 @@ impl SpircTask {
             }
             PlayerEvent::Playing { position_ms, .. }
             | PlayerEvent::PositionCorrection { position_ms, .. } => {
-                // SPOTIFYGOOD: below 1x (podcasts) the player, which expects 1x, reports a
-                // correction every second or two (above 1x none: it only corrects a playback that
-                // lags, the state then goes by the speed alone, see
-                // ConnectState::update_position_in_relation). One that matches the position the
-                // state extrapolates at the real speed only keeps Spirc's own (1x) anchor
-                // current: no state put (it was one every second or two, for all clients).
-                if correction && self.connect_state.playing_speed() != 1. {
+                // SPOTIFYGOOD: at another playback speed (podcasts) the player measures its
+                // corrections against the line of that speed (Player::set_playback_speed): one
+                // comes after a stall (a read that blocks), and after a seek. A position (also
+                // the Playing event of a resume) that matches the position the state extrapolates
+                // at the real speed only keeps Spirc's own (1x) anchor current: no state put.
+                // Without the player's speed it reported one every second or two below 1x (each
+                // a put for all clients) and none above.
+                let speed = self.connect_state.playing_speed();
+                if speed != 1. && matches!(self.play_status, SpircPlayStatus::Playing { .. }) {
                     let now = self.now_ms();
-                    let expected = self.connect_state.playing_position(now);
-                    if (expected - position_ms as i64).abs() < SPEED_CORRECTION_TOLERANCE_MS {
+                    if self.connect_state.on_playing_line(
+                        position_ms,
+                        now,
+                        SPEED_CORRECTION_TOLERANCE_MS,
+                    ) {
                         if let SpircPlayStatus::Playing {
                             ref mut nominal_start_time,
                             ..
@@ -1641,7 +1643,11 @@ impl SpircTask {
                         ref mut nominal_start_time,
                         ..
                     } => {
-                        if (*nominal_start_time - new_nominal_start_time).abs() > 100 {
+                        // SPOTIFYGOOD: at another speed every position off the line of the speed
+                        // (see above) re-anchors: Spirc's 1x lines don't tell, a stall at 2x can
+                        // even come out on the same 1x line
+                        if speed != 1. || (*nominal_start_time - new_nominal_start_time).abs() > 100
+                        {
                             *nominal_start_time = new_nominal_start_time;
                             self.connect_state
                                 .update_position(position_ms, self.now_ms());

@@ -218,6 +218,52 @@ struct PlayerInternal {
     last_progress_update: Instant,
 
     local_file_lookup: Arc<LocalFileLookup>,
+
+    // SPOTIFYGOOD: see Player::set_playback_speed and nominal_start_time
+    playback_speed: f64,
+}
+
+// SPOTIFYGOOD: the line of a playback in media time. Stock assumed 1x: the nominal start time
+// (`reported_nominal_start_time`) was `now - position`, and a position correction was reported
+// when the stream fell 1 s behind that line. Above 1x the stream is always ahead of it, so a
+// stall (a blocking read of a streamed file) was never reported, and after a fast part a slower
+// speed kept the corrections away for long (Connect, the app's seek bar and resume points ran
+// ahead of the audio). The line now follows the speed the sink plays at: position =
+// (now - start) x speed. At 1x it is the stock line exactly.
+/// The nominal start time of a playback at `position` now, at `speed`
+fn nominal_start_time(now: Instant, position: Duration, speed: f64) -> Option<Instant> {
+    let wall = if speed == 1. {
+        position
+    } else {
+        position.div_f64(speed)
+    };
+    now.checked_sub(wall)
+}
+
+// SPOTIFYGOOD: see nominal_start_time
+/// Whether the stream at `position` lags 1 s or more behind the line of `nominal_start_time` at
+/// `speed` (being ahead is the sink's buffer, the audio is in time then)
+fn lags_behind(now: Instant, nominal_start_time: Instant, position: Duration, speed: f64) -> bool {
+    let Some(played) = now.checked_duration_since(nominal_start_time) else {
+        return false;
+    };
+    let expected = if speed == 1. {
+        played
+    } else {
+        played.mul_f64(speed)
+    };
+    expected
+        .checked_sub(position)
+        .is_some_and(|lag| lag >= Duration::from_secs(1))
+}
+
+// SPOTIFYGOOD: see Player::set_playback_speed
+fn valid_playback_speed(speed: f64) -> f64 {
+    if speed.is_finite() && speed > 0. {
+        speed.clamp(0.05, 20.)
+    } else {
+        1.
+    }
 }
 
 static PLAYER_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -266,6 +312,7 @@ enum PlayerCommand {
     SetBitrate(Bitrate),
     SetNormalisation(NormalisationSettings),
     SetGapless(bool),
+    SetPlaybackSpeed(f64),
 }
 
 #[derive(Debug, Clone)]
@@ -644,6 +691,9 @@ impl Player {
                 last_progress_update: Instant::now(),
 
                 local_file_lookup: Arc::new(local_file_lookup),
+
+                // SPOTIFYGOOD: see Player::set_playback_speed
+                playback_speed: 1.,
             };
 
             // While PlayerInternal is written as a future, it still contains blocking code.
@@ -819,6 +869,15 @@ impl Player {
     pub fn set_gapless(&self, gapless: bool) {
         self.command(PlayerCommand::SetGapless(gapless));
     }
+
+    // SPOTIFYGOOD: the speed the sink plays at (the app's podcast speed; 1 for music). The
+    // position corrections are measured against the line of that speed (see
+    // nominal_start_time); the playing track's line is re-based at its position when it
+    // changes. It changes nothing else: the sink applies the speed itself. Not finite or not
+    // positive counts as 1.
+    pub fn set_playback_speed(&self, speed: f64) {
+        self.command(PlayerCommand::SetPlaybackSpeed(speed));
+    }
 }
 
 impl Drop for Player {
@@ -992,7 +1051,8 @@ impl PlayerState {
         }
     }
 
-    fn paused_to_playing(&mut self) {
+    // SPOTIFYGOOD: `speed`, see nominal_start_time
+    fn paused_to_playing(&mut self, speed: f64) {
         use self::PlayerState::*;
         let new_state = mem::replace(self, Invalid);
         match new_state {
@@ -1021,8 +1081,12 @@ impl PlayerState {
                     duration_ms,
                     bytes_per_second,
                     stream_position_ms,
-                    reported_nominal_start_time: Instant::now()
-                        .checked_sub(Duration::from_millis(stream_position_ms as u64)),
+                    // SPOTIFYGOOD: on the line of the speed, see nominal_start_time
+                    reported_nominal_start_time: nominal_start_time(
+                        Instant::now(),
+                        Duration::from_millis(stream_position_ms as u64),
+                        speed,
+                    ),
                     suggested_to_preload_next_track,
                     is_explicit,
                 };
@@ -1737,6 +1801,8 @@ impl Future for PlayerInternal {
 
             if self.state.is_playing() {
                 self.ensure_sink_running();
+                // SPOTIFYGOOD: see nominal_start_time
+                let speed = self.playback_speed;
 
                 if let PlayerState::Playing {
                     ref track_id,
@@ -1787,26 +1853,26 @@ impl Future for PlayerInternal {
                                                             }
                                                         }
 
-                                                        if let Some(lag) = now
-                                                            .checked_duration_since(
-                                                                reported_nominal_start_time,
-                                                            )
-                                                        {
-                                                            if let Some(lag) =
-                                                                lag.checked_sub(new_stream_position)
-                                                            {
-                                                                notify |=
-                                                                    lag >= Duration::from_secs(1)
-                                                            }
-                                                        }
+                                                        // SPOTIFYGOOD: behind the line of the
+                                                        // speed (see nominal_start_time)
+                                                        notify |= lags_behind(
+                                                            now,
+                                                            reported_nominal_start_time,
+                                                            new_stream_position,
+                                                            speed,
+                                                        );
 
                                                         notify
                                                     }
                                                 };
 
                                             if notify_about_position {
-                                                *reported_nominal_start_time =
-                                                    now.checked_sub(new_stream_position);
+                                                // SPOTIFYGOOD: on the line of the speed
+                                                *reported_nominal_start_time = nominal_start_time(
+                                                    now,
+                                                    new_stream_position,
+                                                    speed,
+                                                );
                                                 self.send_event(PlayerEvent::PositionCorrection {
                                                     play_request_id,
                                                     track_id: track_id.clone(),
@@ -2013,7 +2079,7 @@ impl PlayerInternal {
             } => {
                 let track_id = track_id.clone();
 
-                self.state.paused_to_playing();
+                self.state.paused_to_playing(self.playback_speed);
                 self.send_event(PlayerEvent::Playing {
                     track_id,
                     play_request_id,
@@ -2207,6 +2273,29 @@ impl PlayerInternal {
 
     // SPOTIFYGOOD: apply new normalisation settings now. The limiter parameters are read from
     // the config for every packet; the knee factor and the current track's gain are recomputed.
+    // SPOTIFYGOOD: see Player::set_playback_speed. The playing track's line is re-based at its
+    // position: the line of the old speed is far off the stream after a while (behind it after a
+    // fast part, so a slower speed got no corrections for long).
+    fn handle_set_playback_speed(&mut self, speed: f64) {
+        let speed = valid_playback_speed(speed);
+        if speed == self.playback_speed {
+            return;
+        }
+        self.playback_speed = speed;
+        if let PlayerState::Playing {
+            stream_position_ms,
+            ref mut reported_nominal_start_time,
+            ..
+        } = self.state
+        {
+            *reported_nominal_start_time = nominal_start_time(
+                Instant::now(),
+                Duration::from_millis(stream_position_ms as u64),
+                speed,
+            );
+        }
+    }
+
     fn handle_set_normalisation(&mut self, settings: NormalisationSettings) {
         self.config.set_normalisation_settings(settings);
         self.normalisation_knee_factor = 1.0 / (8.0 * self.config.normalisation_knee_db);
@@ -2270,8 +2359,12 @@ impl PlayerInternal {
                 duration_ms: loaded_track.duration_ms,
                 bytes_per_second: loaded_track.bytes_per_second,
                 stream_position_ms: loaded_track.stream_position_ms,
-                reported_nominal_start_time: Instant::now()
-                    .checked_sub(Duration::from_millis(position_ms as u64)),
+                // SPOTIFYGOOD: on the line of the speed, see nominal_start_time
+                reported_nominal_start_time: nominal_start_time(
+                    Instant::now(),
+                    Duration::from_millis(position_ms as u64),
+                    self.playback_speed,
+                ),
                 suggested_to_preload_next_track: false,
                 is_explicit: loaded_track.is_explicit,
             };
@@ -2617,13 +2710,16 @@ impl PlayerInternal {
         // ensure we have a bit of a buffer of downloaded data
         self.preload_data_before_playback()?;
 
+        // SPOTIFYGOOD: no line until the first packet after the seek, which reports its
+        // position (a PositionCorrection) and starts the line there (see nominal_start_time).
+        // The line started after the wait for the data above, so the Seeked position, sent
+        // before it, stayed ahead of the audio by that wait (at every speed).
         if let PlayerState::Playing {
             ref mut reported_nominal_start_time,
             ..
         } = self.state
         {
-            *reported_nominal_start_time =
-                Instant::now().checked_sub(Duration::from_millis(position_ms as u64));
+            *reported_nominal_start_time = None;
         }
 
         Ok(())
@@ -2712,6 +2808,9 @@ impl PlayerInternal {
             PlayerCommand::SetNormalisation(settings) => self.handle_set_normalisation(settings),
 
             PlayerCommand::SetGapless(gapless) => self.config.gapless = gapless,
+
+            // SPOTIFYGOOD: see Player::set_playback_speed
+            PlayerCommand::SetPlaybackSpeed(speed) => self.handle_set_playback_speed(speed),
 
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => {
                 self.send_event(PlayerEvent::FilterExplicitContentChanged { filter });
@@ -2965,6 +3064,9 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::SetGapless(gapless) => {
                 f.debug_tuple("SetGapless").field(&gapless).finish()
             }
+            PlayerCommand::SetPlaybackSpeed(speed) => {
+                f.debug_tuple("SetPlaybackSpeed").field(&speed).finish()
+            }
         }
     }
 }
@@ -3106,5 +3208,172 @@ mod spotifygood_tests {
         let other_loader = std::thread::spawn(move || audio_key_brake().retries(now)).join().expect("join");
         assert_eq!(other_loader, 0, "another loader thread sees the cool-down");
         audio_key_brake().succeeded();
+    }
+
+    // SPOTIFYGOOD: see nominal_start_time
+    fn ms(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
+
+    /// The packet loop's position check over a simulated playback: the decoder delivers 20 ms
+    /// packets as the sink (playing at `speed`) takes them, a correction re-bases the line like
+    /// the loop does. `line_speed` is the speed the line is on (1 = stock).
+    struct Playback {
+        now: Instant,
+        position: Duration,
+        speed: f64,
+        line_speed: f64,
+        line: Option<Instant>,
+        corrections: usize,
+    }
+
+    impl Playback {
+        /// starts playing at `speed` (start_playback, paused_to_playing)
+        fn start(speed: f64, line_speed: f64) -> Self {
+            let now = Instant::now() + Duration::from_secs(3600);
+            Self {
+                now,
+                position: Duration::ZERO,
+                speed,
+                line_speed,
+                line: nominal_start_time(now, Duration::ZERO, line_speed),
+                corrections: 0,
+            }
+        }
+
+        /// the decoder runs ahead by `media_ms` (until the sink's buffer is full)
+        fn fill(&mut self, media_ms: u64) {
+            for _ in 0..media_ms / 20 {
+                self.packet(Duration::ZERO);
+            }
+        }
+
+        /// `wall_ms` of playback, the decoder held back by the sink
+        fn play(&mut self, wall_ms: u64) {
+            let end = self.now + ms(wall_ms);
+            while self.now < end {
+                self.packet(ms(20).div_f64(self.speed));
+            }
+        }
+
+        /// a read blocks for `wall_ms`: the audio stops, the decoder delivers nothing
+        fn stall(&mut self, wall_ms: u64) {
+            self.now += ms(wall_ms);
+        }
+
+        /// a speed change (handle_set_playback_speed): the line is re-based if `rebase`
+        fn set_speed(&mut self, speed: f64, rebase: bool) {
+            self.speed = speed;
+            self.line_speed = speed;
+            if rebase {
+                self.line = nominal_start_time(self.now, self.position, speed);
+            }
+        }
+
+        fn packet(&mut self, after: Duration) {
+            self.now += after;
+            self.position += ms(20);
+            let line = self.line.expect("a line");
+            if lags_behind(self.now, line, self.position, self.line_speed) {
+                self.line = nominal_start_time(self.now, self.position, self.line_speed);
+                self.corrections += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn a_stall_above_1x_is_corrected() {
+        // 2x, the decoder ahead by the sink's buffer (250 ms, 500 ms of media)
+        let mut p = Playback::start(2., 2.);
+        p.fill(500);
+        p.play(30_000);
+        assert_eq!(p.corrections, 0, "in time, ahead by the buffer");
+
+        // a read blocks for 1 s: 2 s of media, 1.5 s past the buffer, corrected at the first
+        // packet after it
+        p.stall(1_000);
+        p.play(20);
+        assert_eq!(p.corrections, 1);
+        p.play(30_000);
+        assert_eq!(p.corrections, 1, "on the line again");
+
+        // within 1 s of media nothing is reported (the buffer refilled meanwhile)
+        p.fill(500);
+        p.stall(700);
+        p.play(1_000);
+        assert_eq!(p.corrections, 1);
+        // a little more is
+        p.stall(400);
+        p.play(1_000);
+        assert_eq!(p.corrections, 2);
+
+        // stock (the 1x line): after 30 s at 2x the stream is 30 s ahead of it, a 3 s stall
+        // went unreported
+        let mut stock = Playback::start(2., 1.);
+        stock.fill(500);
+        stock.play(30_000);
+        stock.stall(3_000);
+        stock.play(10_000);
+        assert_eq!(stock.corrections, 0);
+        // at 1x the two are the same
+        let mut one = Playback::start(1., 1.);
+        one.fill(250);
+        one.play(10_000);
+        one.stall(1_500);
+        one.play(1_000);
+        assert_eq!(one.corrections, 1);
+    }
+
+    #[test]
+    fn corrections_go_on_after_a_speed_change() {
+        // 20 min at 2x, then 0.5x: a 3 s stall (1.5 s of media) is corrected
+        let mut p = Playback::start(2., 2.);
+        p.fill(500);
+        p.play(20 * 60_000);
+        p.set_speed(0.5, true);
+        p.play(60_000);
+        assert_eq!(p.corrections, 0);
+        p.stall(3_000);
+        p.play(1_000);
+        assert_eq!(p.corrections, 1);
+        // and back up to 2x
+        p.set_speed(2., true);
+        p.play(60_000);
+        p.stall(1_000);
+        p.play(1_000);
+        assert_eq!(p.corrections, 2);
+
+        // without the re-base the line of 2x stays 30 min ahead at 0.5x: nothing for long
+        let mut kept = Playback::start(2., 2.);
+        kept.fill(500);
+        kept.play(20 * 60_000);
+        kept.set_speed(0.5, false);
+        kept.play(60_000);
+        kept.stall(3_000);
+        kept.play(10_000);
+        assert_eq!(kept.corrections, 0);
+    }
+
+    #[test]
+    fn the_line_at_1x_is_the_stock_one() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        for position in [0, 1, 999, 1_000, 61_234] {
+            assert_eq!(
+                nominal_start_time(now, ms(position), 1.),
+                now.checked_sub(ms(position))
+            );
+        }
+        let start = now - ms(10_000);
+        assert!(!lags_behind(now, start, ms(9_001), 1.));
+        assert!(lags_behind(now, start, ms(9_000), 1.));
+        assert!(!lags_behind(now, start, ms(12_000), 1.), "ahead");
+        // a line in the future (just re-based): not behind
+        assert!(!lags_behind(start, now, ms(0), 2.));
+
+        assert_eq!(valid_playback_speed(1.5), 1.5);
+        for invalid in [0., -1., f64::NAN, f64::INFINITY] {
+            assert_eq!(valid_playback_speed(invalid), 1.);
+        }
+        assert_eq!(valid_playback_speed(1e9), 20.);
     }
 }
