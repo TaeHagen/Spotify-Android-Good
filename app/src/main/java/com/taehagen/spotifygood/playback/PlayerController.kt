@@ -628,7 +628,7 @@ class PlayerController internal constructor(
 
     /** `player.load`, rewritten for the offline queue whenever the engine cannot stream ([OfflineLoads]). */
     private suspend fun load(request: PlayRequest, toPendingTarget: Boolean) {
-        val prepared = prepare(withLoadableContext(request))
+        val prepared = prepare(withLoadableContext(keepingModes(request)))
         val target = if (toPendingTarget) pendingTargetFor(prepared, prepared.request.play) else null
         call("player.load", loadArgs(prepared.request, deviceId = target))
     }
@@ -636,13 +636,19 @@ class PlayerController internal constructor(
     /** [load] of a queued `player.load` [command], with a play merged in until the last moment. */
     private suspend fun sendLoad(command: Command) {
         val initial = synchronized(lock) { checkNotNull(command.request) }
-        val prepared = prepare(withLoadableContext(initial))
+        val prepared = prepare(withLoadableContext(keepingModes(initial)))
         val play = synchronized(lock) {
             command.sent = true
             checkNotNull(command.request).play
         }
         val target = if (command.toPendingTarget) pendingTargetFor(prepared, play) else null
         call("player.load", loadArgs(prepared.request.copy(play = play), deviceId = target, local = command.onThisPhone))
+    }
+
+    /** [withCurrentModes] of the playback the load replaces, with the modes just toggled. */
+    private fun keepingModes(request: PlayRequest): PlayRequest {
+        val s = snapshot.value
+        return withCurrentModes(request, s, pendingShuffle.validOr(s.shuffleMode), pendingRepeat.validOr(s.repeat))
     }
 
     /**
@@ -994,6 +1000,38 @@ class PlayerController internal constructor(
                 val state = last() ?: throw e
                 call("player.load", loadArgs(prepare(state.toPlayRequest()), local = true))
             }
+        }
+
+        /**
+         * The modes a load does not name, from the playback it replaces ([current], here or on the
+         * active device; [shuffle] and [repeat] its current, or just toggled, modes): a load that
+         * names none keeps them, on every target. The engine would otherwise turn them off on this
+         * phone (Spirc resets shuffle and repeat on a load without options, so would the offline
+         * queue), while a remote device keeps its own: tapping a track must not switch the user's
+         * shuffle or repeat off. Smart shuffle belongs to its context's suggestions: kept only for
+         * a load of the same context, any other gets a plain shuffle. A load naming only shuffle
+         * (a Shuffle button) gets no smart shuffle; one naming smart shuffle shuffles. With
+         * nothing loaded there is nothing to keep (also a play sent to the pending target).
+         */
+        fun withCurrentModes(
+            request: PlayRequest,
+            current: PlaybackSnapshot,
+            shuffle: ShuffleMode,
+            repeat: RepeatMode,
+        ): PlayRequest {
+            if (current.source == PlaybackSource.NONE || current.track == null) return request
+            var r = request
+            r = when {
+                r.shuffle == null && r.smartShuffle == null -> {
+                    val sameContext = r.contextUri != null && r.contextUri == current.context?.uri
+                    r.copy(shuffle = shuffle != ShuffleMode.OFF, smartShuffle = shuffle == ShuffleMode.SMART && sameContext)
+                }
+                r.smartShuffle == null -> r.copy(smartShuffle = false)
+                r.shuffle == null -> r.copy(shuffle = r.smartShuffle == true || shuffle != ShuffleMode.OFF)
+                else -> r
+            }
+            if (r.repeat == null) r = r.copy(repeat = repeat)
+            return r
         }
 
         /**

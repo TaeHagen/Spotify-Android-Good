@@ -469,7 +469,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 
 | method | args |
 |---|---|
-| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?,"local":true?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual. `local` (an explicit pull to this phone, e.g. a media-session resume): with a network and a visible session it plays here even while another device is active (taking its session over, like a transfer to this phone); otherwise routed as usual |
+| `player.load` | `{"contextUri":"…"?,"trackUris":["…"]?,"startUri":"…"?,"startIndex":0?,"startUid":"…"?,"positionMs":0,"shuffle":false?,"smartShuffle":false?,"repeat":"off|context|track"?,"play":true,"deviceId":"…"?,"local":true?}`. `deviceId` (a Connect device picked while nothing played): played on that device as a connect-state `play` command (the same body as a transfer's resume), whatever is active; absent or this phone: routed as usual. `local` (an explicit pull to this phone, e.g. a media-session resume): with a network and a visible session it plays here even while another device is active (taking its session over, like a transfer to this phone); otherwise routed as usual. Modes absent mean off on this phone (Spirc and the offline queue reset them) but are kept by a remote device, so the app names them: a load naming no modes gets the current playback's (`PlayerController.withCurrentModes`, §9.4) |
 | `player.play` / `player.pause` / `player.togglePlay` | `{}` |
 | `player.next` / `player.prev` | `{}` |
 | `player.seek` | `{"positionMs":0}` |
@@ -883,6 +883,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   play) is merged into it, or waits ≤ 3 s for the activation, and is dropped if the load failed.
   Plain track-list contexts (`spotify:web-api`) are never resumed or loaded as a context.
   Auto browse/search/voice wait the same way.
+* Modes of a load (`PlayerController.withCurrentModes`): a load that names no shuffle / repeat
+  (a row tap, a Play button, Auto's picks, radio) keeps those of the playback it replaces, here
+  or on the active device (modes just toggled included); smart shuffle only for a load of the
+  same context, any other gets a plain shuffle. A Shuffle button names shuffle (no smart
+  shuffle, repeat kept); the stored session names all of them. With nothing loaded nothing is
+  kept.
 * Pending Connect target (§8): an in-app `player.load` that plays (`PlayerController.play`,
   radio) takes `DevicesRepository.consumePendingTarget()` as `deviceId` when no device is
   active. Media-session loads (`SpotifyPlayer.handleSetMediaItems`: Auto, Assistant, watches,
