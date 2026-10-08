@@ -22,6 +22,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
+import coil3.intercept.Interceptor
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.db.RetryRow
 import com.taehagen.spotifygood.auth.CredentialStore
@@ -35,6 +36,8 @@ import com.taehagen.spotifygood.data.db.IndexRow
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.engine.SpotifyEngine
+import com.taehagen.spotifygood.engine.accountExplicitFilter
+import com.taehagen.spotifygood.engine.reportedOnline
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.model.OfflineTrackRecord
@@ -52,6 +55,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
@@ -137,6 +141,11 @@ data class DownloadActivity(
  *   deletes downloads. A collection whose sync keeps failing is retried with a growing backoff
  *   ([DownloadRules.nextSyncAt]). Members the catalog reports as not playable here are kept in the
  *   membership but not queued, and do not hold the collection status back.
+ * * The explicit filter never touches download rows (it applies when they are shown and played).
+ *   "Hide explicit content" never keeps an item from being downloaded; the account's own filter
+ *   keeps explicit ones from being queued ([ExplicitFilterWatch], [DownloadRules.memberVerdict],
+ *   [DownloadRules.rowVerdict]). When a filter goes off, what it may have hidden is looked up again
+ *   at once ([onExplicitFilterOff]).
  * * Removal deletes files, rows and the native offline index entries.
  * * The native offline index follows the database through numbered changes ([OfflineIndexSync]):
  *   every commit and removal takes its number under [mutex] with its database write.
@@ -167,7 +176,22 @@ class DownloadManager(
     private val mutex = Mutex()
     private val syncMutex = Mutex()
     private val keys = KeyCache()
-    private val resolver = CollectionResolver(rpc, json)
+
+    /** Which catalog answers say nothing about explicit items (the filter was or may have been on). */
+    private val explicitFilter = ExplicitFilterWatch()
+    private val resolver = CollectionResolver(rpc, json, explicitFilter)
+
+    /** When [requestSync] last asked each collection to sync (in memory). */
+    private val syncRequests = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** The app is in the foreground ([ProcessLifecycleOwner] started). */
+    @Volatile private var foreground = false
+
+    /** Downloaded covers for the image loader ([coverInterceptor]). */
+    private val covers = OfflineCovers()
+
+    /** The explicit filter went off while offline: look again at what it hid once online. */
+    @Volatile private var recheckWhenOnline = false
     private val index = OfflineIndexSync(rpc)
 
     internal val storage = DownloadStorage(appContext)
@@ -243,6 +267,12 @@ class DownloadManager(
         .flowOn(Dispatchers.Default)
         .shareIn(scope, SharingStarted.WhileSubscribed(STATES_STOP_TIMEOUT_MS, replayExpirationMillis = 0), replay = 1)
 
+    /**
+     * For the image loader: serves the downloaded cover for the CDN image URLs of completed
+     * downloads (and stands in for downloaded collections' images), offline too ([OfflineCovers]).
+     */
+    internal val coverInterceptor: Interceptor get() = covers.interceptor
+
     /** Live state of the downloader (current item, bytes, last stop reason). */
     val activity: StateFlow<DownloadActivity> get() = runner.activity
 
@@ -278,14 +308,23 @@ class DownloadManager(
         scope.launch {
             engine.isOnline.filter { it }.collect {
                 syncIfStale()
+                if (foreground) syncRemoteChanges()
+                if (recheckWhenOnline) {
+                    recheckWhenOnline = false
+                    if (!recheckAfterFilterOff()) recheckWhenOnline = true
+                }
                 // Work waiting out a backoff from an unreachable network starts now.
                 if (!runner.isRunning && dao.pendingCount() > 0) scheduleExecution(kick = true)
             }
         }
+        scope.launch { followCovers() }
+        scope.launch { watchExplicitFilter() }
+        scope.launch { repairExplicitFailures() }
         scope.launch(Dispatchers.Main) {
             // Back in the app: resume a queue that stopped (storage was full, retries ran out …).
             ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
                 override fun onStart(owner: LifecycleOwner) {
+                    foreground = true
                     scope.launch {
                         try {
                             if (!runner.isRunning && dao.pendingCount() > 0) scheduleExecution(kick = true)
@@ -294,7 +333,13 @@ class DownloadManager(
                         } catch (e: Exception) {
                             Log.w(TAG, "Resuming downloads failed", e)
                         }
+                        // Changes made on another device while the app was away (else once online).
+                        if (engine.isOnline.value) syncRemoteChanges()
                     }
+                }
+
+                override fun onStop(owner: LifecycleOwner) {
+                    foreground = false
                 }
             })
         }
@@ -580,36 +625,180 @@ class DownloadManager(
         repeat(LATE_KEY_ATTEMPTS) {
             delay(delayMs)
             delayMs *= 4
-            waiting = withContext(Dispatchers.IO) {
-                val (seq, rows) = mutex.withLock {
-                    index.next() to waiting.chunked(SQL_CHUNK).flatMap { dao.completedIndexRows(it) }
-                }
-                val stillBusy = ArrayList<String>()
-                val records = ArrayList<OfflineTrackRecord>()
-                val unreadable = ArrayList<IndexRow>()
-                var keystoreDown = false
-                for (row in rows) {
-                    ensureActive() // a newer push supersedes this one
-                    when (val result = offlineRecord(row, skipKeystore = keystoreDown)) {
-                        is RecordResult.Ready -> records += result.record
-                        RecordResult.Unreadable -> unreadable += row
-                        RecordResult.Missing -> Unit // the next push marks it
-                        RecordResult.KeystoreBusy -> {
-                            stillBusy += row.uri
-                            keystoreDown = true
-                        }
-                    }
-                }
-                index.add(records, seq)
-                val now = System.currentTimeMillis()
-                val error = appContext.getString(R.string.data_dl_error_key)
-                // Only the download that was read (not one removed and downloaded again meanwhile).
-                unreadable.forEach { row -> row.completedAt?.let { dao.markUnavailableIfUnchanged(row.uri, it, error, now) } }
-                stillBusy
+            val (seq, rows) = mutex.withLock {
+                index.next() to waiting.chunked(SQL_CHUNK).flatMap { dao.completedIndexRows(it) }
             }
+            waiting = registerRows(rows, seq)
             if (waiting.isEmpty()) return
         }
         Log.w(TAG, "${waiting.size} downloads stay out of the offline index until the next engine start (Keystore unavailable)")
+    }
+
+    /**
+     * Registers the completed [rows], read under [mutex] with change [seq], with `offline.add`.
+     * Returns the ones whose key the Keystore could not open right now; marks the ones whose key is
+     * unreadable for good failed. The Keystore is never called with the lock held.
+     */
+    private suspend fun registerRows(rows: List<IndexRow>, seq: Long): List<String> = withContext(Dispatchers.IO) {
+        val stillBusy = ArrayList<String>()
+        val records = ArrayList<OfflineTrackRecord>()
+        val unreadable = ArrayList<IndexRow>()
+        var keystoreDown = false
+        for (row in rows) {
+            ensureActive() // registerLate: a newer push supersedes this one
+            when (val result = offlineRecord(row, skipKeystore = keystoreDown)) {
+                is RecordResult.Ready -> records += result.record
+                RecordResult.Unreadable -> unreadable += row
+                RecordResult.Missing -> Unit // the next push marks it
+                RecordResult.KeystoreBusy -> {
+                    stillBusy += row.uri
+                    keystoreDown = true
+                }
+            }
+        }
+        index.add(records, seq)
+        val now = System.currentTimeMillis()
+        val error = appContext.getString(R.string.data_dl_error_key)
+        // Only the download that was read (not one removed and downloaded again meanwhile).
+        unreadable.forEach { row -> row.completedAt?.let { dao.markUnavailableIfUnchanged(row.uri, it, error, now) } }
+        stillBusy
+    }
+
+    // ---- offline covers ------------------------------------------------------------------------------
+
+    /**
+     * Keeps [covers] in step with the completed downloads and the downloaded collections. Each
+     * download's metadata is read once (memoised by URI); a download run that completes items one
+     * after another updates the maps once it settles.
+     */
+    private suspend fun followCovers() {
+        val known = HashMap<String, DownloadRules.CoverSource>()
+        combine(downloadedUris, collectionDao.observeAll()) { uris, collections -> uris to collections }
+            .collectLatest { (uris, collections) ->
+                delay(COVERS_SETTLE_MS)
+                try {
+                    val maps = withContext(Dispatchers.Default) {
+                        known.keys.retainAll(uris)
+                        val fresh = uris.filter { it !in known }
+                        fresh.chunked(SQL_CHUNK).flatMap { dao.coverRows(it) }.forEach { row ->
+                            known[row.uri] = DownloadRules.CoverSource(row.uri, row.imagePath, DownloadRules.coverUrls(json, row.metadataJson, row.recordJson))
+                        }
+                        // Not completed any more by the time it was read: looked at again next time.
+                        DownloadRules.offlineCoverMaps(known.values, collections.map { it.imageUrl to decodeItems(it.itemUrisJson) })
+                    }
+                    covers.update(maps)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Updating the offline covers failed", e)
+                }
+            }
+    }
+
+    // ---- explicit filter -----------------------------------------------------------------------------
+
+    /**
+     * Follows "Hide explicit content" and the account's own filter for [explicitFilter] (the
+     * catalog's `playable` includes both). When the effective filter goes off, what was looked up
+     * while it was on is looked up again within seconds ([onExplicitFilterOff]).
+     */
+    private suspend fun watchExplicitFilter() {
+        var settledFiltered: Boolean? = null
+        combine(settings.persisted, engine.user) { prefs, user ->
+            // Reported: as an online session reported it (unknown before); effective: else the
+            // value last reported (a start without a network).
+            ExplicitInputs(prefs.hideExplicit, user?.takeIf { it.reportedOnline }?.explicitFilter, accountExplicitFilter(user, prefs.accountExplicitFilter))
+        }
+            .distinctUntilChanged()
+            .collectLatest { inputs ->
+                explicitFilter.updateAccount(inputs.reportedAccount)
+                val generation = explicitFilter.updateApp(inputs.hide)
+                // The catalog answers with the new setting once the engine runs with it.
+                engine.awaitSettingsApplied(EXPLICIT_APPLY_TIMEOUT_MS) { it.filterExplicit == inputs.hide }
+                explicitFilter.settleApp(generation)
+                val filtered = inputs.hide || inputs.account
+                val before = settledFiltered
+                settledFiltered = filtered
+                if (before == true && !filtered) onExplicitFilterOff()
+            }
+    }
+
+    private data class ExplicitInputs(val hide: Boolean, val reportedAccount: Boolean?, val account: Boolean)
+
+    /**
+     * The explicit filter went off: collections' unavailable members are due for a re-check (also
+     * if this process ends first), and the re-validation runs now when online, else once online.
+     */
+    private suspend fun onExplicitFilterOff() {
+        try {
+            mutex.withLock { collectionDao.clearUnavailableChecked() }
+            if (settings.awaitLoaded().offlineMode || !engine.isOnline.value) {
+                recheckWhenOnline = true
+            } else if (!recheckAfterFilterOff()) {
+                recheckWhenOnline = true
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Re-checking downloads after the explicit filter went off failed", e)
+        }
+    }
+
+    /** [revalidate] without collection listings, after a sync that is running. */
+    private suspend fun recheckAfterFilterOff(): Boolean = try {
+        sync(wait = true, revalidateOnly = true)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Log.w(TAG, "Re-check after the explicit filter went off failed", e)
+        false
+    }
+
+    /**
+     * Once per installation: earlier versions applied "Hide explicit content" to downloads. Restores
+     * the explicit downloads re-validation failed as no longer playable (file and key were kept),
+     * queues the explicit ones the downloader refused, and makes every collection's unavailable
+     * members due for a re-check ([DownloadRules.explicitRepair]). Restored downloads are registered
+     * with the offline index at once, and re-validated at the next sync. Only once an online session
+     * reported the account without its own explicit filter: for a filtered account those downloads
+     * stay as they are (explicit items are not downloaded for it), and the repair waits.
+     */
+    private suspend fun repairExplicitFailures() {
+        try {
+            val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (withContext(Dispatchers.IO) { prefs.getInt(KEY_EXPLICIT_REPAIR, 0) } >= EXPLICIT_REPAIR_VERSION) return
+            engine.user.first { it != null && it.reportedOnline && !it.explicitFilter }
+            val unplayable = appContext.getString(R.string.data_dl_error_unplayable)
+            val unavailable = appContext.getString(R.string.data_dl_error_unavailable)
+            val (repair, restored, seq) = mutex.withLock {
+                val failed = dao.failedRepairRows(listOf(unplayable, unavailable))
+                val members = collectionDao.unavailableUrisJsons().flatMapTo(HashSet()) { decodeItems(it) }
+                val repair = DownloadRules.explicitRepair(
+                    failed.map { DownloadRules.RepairRow(it.uri, it.error, it.finished, DownloadRules.storedExplicit(json, it.metadataJson, it.recordJson)) },
+                    unplayable,
+                    unavailable,
+                    members,
+                )
+                database.withTransaction {
+                    repair.restore.chunked(SQL_CHUNK).forEach { dao.restoreCompleted(it) }
+                    repair.requeue.chunked(SQL_CHUNK).forEach { dao.requeueFailedOnly(it) }
+                    collectionDao.clearUnavailableChecked()
+                }
+                adjustUnavailableLocked(gone = emptySet(), playableAgain = repair.restore.toHashSet())
+                Triple(repair, repair.restore.chunked(SQL_CHUNK).flatMap { dao.completedIndexRows(it) }, index.next())
+            }
+            val busy = registerRows(restored, seq)
+            if (busy.isNotEmpty()) scope.launch { registerLate(busy) }
+            withContext(Dispatchers.IO) { prefs.edit().putInt(KEY_EXPLICIT_REPAIR, EXPLICIT_REPAIR_VERSION).commit() }
+            if (repair.restore.isNotEmpty() || repair.requeue.isNotEmpty()) {
+                Log.i(TAG, "Explicit filter repair: restored ${repair.restore.size} downloads, queued ${repair.requeue.size}")
+            }
+            if (repair.requeue.isNotEmpty()) scheduleExecution(kick = true)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Explicit filter repair failed; retried at the next start", e)
+        }
     }
 
     /**
@@ -625,14 +814,19 @@ class DownloadManager(
      * [syncCollections]; false when it could not run because the session did not come online. With
      * [onlyDue], collections whose next sync ([DownloadRules.nextSyncAt]) is still ahead are skipped.
      */
-    internal suspend fun sync(onlyDue: Boolean = false, only: Set<String>? = null, wait: Boolean = false): Boolean =
-        scope.detached { syncNow(onlyDue, only, wait) }
+    internal suspend fun sync(
+        onlyDue: Boolean = false,
+        only: Set<String>? = null,
+        wait: Boolean = false,
+        revalidateOnly: Boolean = false,
+    ): Boolean = scope.detached { syncNow(onlyDue, only, wait, revalidateOnly) }
 
     /**
-     * With [only], just those collections (no re-validation); with [wait], after a sync that is
-     * running instead of skipping (it may have listed them before the edit).
+     * With [only], just those collections (no re-validation); with [revalidateOnly], just the
+     * re-validation ([revalidate], no collection listings); with [wait], after a sync that is running
+     * instead of skipping (it may have listed them before the edit).
      */
-    private suspend fun syncNow(onlyDue: Boolean, only: Set<String>? = null, wait: Boolean = false): Boolean {
+    private suspend fun syncNow(onlyDue: Boolean, only: Set<String>? = null, wait: Boolean = false, revalidateOnly: Boolean = false): Boolean {
         if (wait) syncMutex.lock() else if (!syncMutex.tryLock()) return true // another sync is running
         try {
             if (settings.awaitLoaded().offlineMode) return true
@@ -654,6 +848,7 @@ class DownloadManager(
                 var added = 0
                 val removed = ArrayList<Removal>()
                 for (collection in all) {
+                    if (revalidateOnly) break
                     if (only != null && collection.uri !in only) continue
                     val type = CollectionType.fromWire(collection.type) ?: continue
                     if (onlyDue && DownloadRules.nextSyncAt(collection.lastSyncedAt, collection.lastAttemptAt, collection.syncFailures) > startedAt) continue
@@ -710,6 +905,8 @@ class DownloadManager(
             val targets = when (edit) {
                 is LibraryEdit.LikedTracks -> downloaded.filter { it.type == CollectionType.LIKED_SONGS.wire }.map { it.uri }
                 is LibraryEdit.PlaylistEdited -> downloaded.filter { it.uri == edit.uri }.map { it.uri }
+                // Pull-to-refresh: whatever changed elsewhere (no revision to tell).
+                LibraryEdit.Refreshed -> downloaded.filter { it.type in REMOTE_TYPES }.map { it.uri }
             }
             targets.forEach(editSyncs::offer)
         } catch (e: CancellationException) {
@@ -726,11 +923,54 @@ class DownloadManager(
                 mutex.withLock { collectionDao.markSyncDue(uris.toList()) }
                 return
             }
-            sync(only = uris, wait = true)
+            // Not online after all: due at the next sync instead of lost.
+            if (!sync(only = uris, wait = true)) mutex.withLock { collectionDao.markSyncDue(uris.toList()) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "Sync after a library edit failed", e)
+        }
+    }
+
+    /**
+     * A server page of [uri] was loaded (Liked Songs, a playlist with its [revision]): changes made
+     * on another device show up there first. A downloaded [uri] then syncs within seconds, like after
+     * an edit made here ([DownloadRules.syncRequestDue]: a playlist only when its revision is not the
+     * downloaded one; otherwise at most every few minutes).
+     */
+    suspend fun requestSync(uri: String, revision: String? = null) {
+        try {
+            val entity = collectionDao.get(uri) ?: return
+            val now = System.currentTimeMillis()
+            if (!DownloadRules.syncRequestDue(revision, entity.revision, syncRequests[uri], entity.lastAttemptAt, now)) return
+            syncRequests[uri] = now
+            editSyncs.offer(uri)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not ask $uri to sync", e)
+        }
+    }
+
+    /**
+     * In the foreground and online: re-lists the downloaded Liked Songs and playlists whose last sync
+     * is [DownloadRules.FOREGROUND_STALE_MS] old (they change on other devices; albums and shows keep
+     * the daily cadence), so opening the app picks up remote changes also when the session stayed
+     * online.
+     */
+    private suspend fun syncRemoteChanges() {
+        try {
+            if (settings.awaitLoaded().offlineMode) return
+            val now = System.currentTimeMillis()
+            val due = collectionDao.syncStates().filter {
+                it.type in REMOTE_TYPES &&
+                    DownloadRules.nextSyncAt(it.lastSyncedAt, it.lastAttemptAt, it.syncFailures, DownloadRules.FOREGROUND_STALE_MS) <= now
+            }.mapTo(HashSet()) { it.uri }
+            if (due.isNotEmpty()) sync(only = due)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Foreground sync failed", e)
         }
     }
 
@@ -887,9 +1127,11 @@ class DownloadManager(
 
     /**
      * Re-validates downloads older than 30 days (unplayable ones are marked failed, keeping their
-     * file) and queues failed downloads that still own their file and are playable again (a filter
-     * turned off, back in the home country; also a key that became unreadable): `download.track`
-     * reuses the file. Returns how many were queued.
+     * file) and queues failed downloads that still own their file and are playable again (back in the
+     * home country; also a key that became unreadable): `download.track` reuses the file. Explicit
+     * downloads the catalog reports unplayable while the explicit filter may have applied get no
+     * verdict ([CollectionResolver.playability]): they stay as they are, and stale ones are
+     * re-validated at a later sync. Returns how many were queued.
      */
     private suspend fun revalidate(): Int {
         val requeued = requeuePlayableAgain() + queueUnavailableAgain()
@@ -944,9 +1186,12 @@ class DownloadManager(
         } else {
             resolver.itemsBestEffort(recheck.members.toList(), COLLECTION_METADATA_TIMEOUT_MS)
         }
-        // Lookups that failed stay unknown: those collections are checked again at the next sync.
-        val checked = sets.filter { it.collection in recheck.collections && (it.members intersect recheck.members).all { m -> m in fetched } }
-        val again = fetched.values.filter { it.metadataJson != null && !it.unavailable }
+        // Lookups that failed, and answers without a verdict (an explicit member while the explicit
+        // filter may have applied), stay unknown: those collections are checked again at the next sync.
+        val checked = sets.filter {
+            it.collection in recheck.collections && (it.members intersect recheck.members).all { m -> fetched[m]?.checked == true }
+        }
+        val again = fetched.values.filter { it.checked && !it.unavailable }
         return mutex.withLock {
             // The lookup ran without the lock: re-read what the collections record now, before
             // adjustUnavailableLocked takes these members out of the sets.
@@ -1248,6 +1493,16 @@ class DownloadManager(
         private const val COUNTRY_TIMEOUT_MS = 10_000L
         private const val EDIT_SYNC_DELAY_MS = 5_000L
         private const val RESEAL_BATCH = 200
+        private const val COVERS_SETTLE_MS = 1_000L
+
+        /** Collections that change on other devices (likes, playlist edits). */
+        private val REMOTE_TYPES = setOf(CollectionType.LIKED_SONGS.wire, CollectionType.PLAYLIST.wire)
+
+        /** Longest wait for the engine to apply a changed explicit filter (as Settings waits). */
+        private const val EXPLICIT_APPLY_TIMEOUT_MS = 15_000L
+        private const val PREFS = "downloads"
+        private const val KEY_EXPLICIT_REPAIR = "explicitFilterRepair"
+        private const val EXPLICIT_REPAIR_VERSION = 1
         private const val JOB_BACKOFF_MS = 30_000L
         private const val WORK_BACKOFF_S = 30L
         private const val SYNC_BACKOFF_MIN = 15L

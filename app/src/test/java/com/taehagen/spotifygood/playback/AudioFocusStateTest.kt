@@ -107,4 +107,27 @@ class AudioFocusStateTest {
         state.onFocusChange(AudioManager.AUDIOFOCUS_GAIN)
         assertEquals(listOf("pause", "pause", "resume"), f.events)
     }
+
+    @Test
+    fun aNoisyEventDuringAFocusPauseCancelsTheResume() {
+        // A call (or a spoken navigation prompt over a podcast) pauses with a resume pending...
+        assertTrue(state.request())
+        state.onFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        assertTrue(state.isWaitingForGain)
+        // ...the earbuds go into their case (or the car is turned off): becoming noisy.
+        state.cancelPendingResume()
+        assertFalse(state.isWaitingForGain)
+        state.onFocusChange(AudioManager.AUDIOFOCUS_GAIN)
+        assertEquals("no resume on the speaker", listOf("pause"), f.events)
+    }
+
+    @Test
+    fun aNoisyEventWhileFocusIsDelayedCancelsTheResumeToo() {
+        f.result = AudioManager.AUDIOFOCUS_REQUEST_DELAYED
+        assertFalse(state.request())
+        assertTrue(state.isWaitingForGain)
+        state.cancelPendingResume()
+        state.onFocusChange(AudioManager.AUDIOFOCUS_GAIN)
+        assertEquals(listOf("pause"), f.events)
+    }
 }

@@ -793,6 +793,18 @@ impl ConnectState {
 
         if matches!(ty, ContextType::Default) {
             self.place_current_track_if_there()?;
+
+            // SPOTIFYGOOD: the next tracks go on with the new tracks right away. Only the last
+            // page filled up (try_finish), so a track that was the last one of the pages there
+            // were (top track 10, an album's last track or a single once placed, or with the
+            // wraps of repeat dropped) had empty next tracks until then, and the playback
+            // stopped when it ended.
+            if matches!(self.active_context, ContextType::Default)
+                && matches!(self.fill_up_context, ContextType::Default)
+            {
+                self.fill_up_next_tracks()?;
+                self.update_restrictions();
+            }
         }
         Ok(())
     }

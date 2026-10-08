@@ -190,6 +190,12 @@ class SpotifyEngine(
     }
 
     init {
+        // The account's explicit filter outlives the session: a start without a network (the
+        // offline Player, the lists, the downloads) still filters for a filtered account.
+        launchSafe("account-explicit-filter") {
+            combine(user, settings.persisted) { user, prefs -> accountExplicitFilterToPersist(user, prefs.accountExplicitFilter) }
+                .collect { value -> if (value != null) settings.update { it.copy(accountExplicitFilter = value) } }
+        }
         launchSafe("load-credentials") {
             try {
                 val loaded = try {

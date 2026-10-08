@@ -47,6 +47,18 @@ data class IndexRow(
     override fun hashCode() = uri.hashCode()
 }
 
+/** A failed download as the explicit-filter repair reads it ([finished]: file, key and record remain). */
+data class FailedRepairRow(
+    val uri: String,
+    val error: String?,
+    val finished: Boolean,
+    val metadataJson: String?,
+    val recordJson: String?,
+)
+
+/** What the offline covers need of a completed download ([com.taehagen.spotifygood.download.OfflineCovers]). */
+data class CoverRow(val uri: String, val imagePath: String?, val metadataJson: String?, val recordJson: String?)
+
 /** Cover of a completed download. */
 data class UriImage(val uri: String, val imagePath: String)
 
@@ -248,6 +260,9 @@ interface DownloadDao {
     )
     suspend fun resealKey(uri: String, completedAt: Long, key: ByteArray)
 
+    @Query("SELECT uri, imagePath, metadataJson, recordJson FROM downloads WHERE uri IN (:uris) AND state = 'completed'")
+    suspend fun coverRows(uris: List<String>): List<CoverRow>
+
     @Query("SELECT uri, imagePath FROM downloads WHERE state = 'completed' AND imagePath IS NOT NULL")
     suspend fun completedImages(): List<UriImage>
 
@@ -260,6 +275,23 @@ interface DownloadDao {
 
     @Query("UPDATE downloads SET state = 'failed', error = :error, lastValidatedAt = :at WHERE uri IN (:uris) AND state = 'completed'")
     suspend fun markUnavailable(uris: List<String>, error: String, at: Long)
+
+    @Query(
+        "SELECT uri, error, (path IS NOT NULL AND encryptedKey IS NOT NULL AND recordJson IS NOT NULL AND completedAt IS NOT NULL) AS finished, " +
+            "metadataJson, recordJson FROM downloads WHERE state = 'failed' AND error IN (:errors)",
+    )
+    suspend fun failedRepairRows(errors: List<String>): List<FailedRepairRow>
+
+    /**
+     * Undoes [markUnavailable] for [uris] (file, key and record were kept): COMPLETED again, and due
+     * for re-validation at the next sync.
+     */
+    @Query(
+        "UPDATE downloads SET state = 'completed', error = NULL, retryAt = NULL, lastValidatedAt = 0 " +
+            "WHERE uri IN (:uris) AND state = 'failed' AND path IS NOT NULL AND encryptedKey IS NOT NULL " +
+            "AND recordJson IS NOT NULL AND completedAt IS NOT NULL",
+    )
+    suspend fun restoreCompleted(uris: List<String>): Int
 
     /**
      * [markUnavailable] for one row, only while it is still the download completed at [completedAt]
@@ -310,6 +342,10 @@ interface DownloadCollectionDao {
 
     @Query("UPDATE download_collections SET unavailableCheckedAt = :at WHERE uri IN (:uris)")
     suspend fun markUnavailableChecked(uris: List<String>, at: Long)
+
+    /** Every collection's unavailable members are looked up again at the next sync. */
+    @Query("UPDATE download_collections SET unavailableCheckedAt = NULL")
+    suspend fun clearUnavailableChecked()
 
     /** JSON arrays of the members each downloaded collection records as not playable here. */
     @Query("SELECT unavailableUrisJson FROM download_collections")

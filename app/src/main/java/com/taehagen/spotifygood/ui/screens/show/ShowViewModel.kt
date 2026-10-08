@@ -16,6 +16,7 @@ import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadUi
 import com.taehagen.spotifygood.ui.screens.album.DetailViewModel
+import com.taehagen.spotifygood.ui.screens.album.awaitConnectingSession
 import com.taehagen.spotifygood.ui.screens.album.DownloadedPage
 import com.taehagen.spotifygood.ui.screens.album.appendDownloadedEpisodes
 import com.taehagen.spotifygood.ui.screens.album.downloadedPageFlow
@@ -114,7 +115,10 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         .distinctUntilChanged()
 
     val state: StateFlow<ShowUiState> = combine(
-        combine(header, list, ::Pair),
+        // Episodes show this phone's podcast progress where it is newer than Spotify's (docs §6.5).
+        combine(header, list, graph.episodeProgress.version) { header, page, _ ->
+            header to page.copy(episodes = page.episodes.map(graph.episodeProgress::merge))
+        },
         playbackInfo,
         graph.savedFlow(uri),
         graph.downloads.collectionUi(uri),
@@ -132,14 +136,15 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
     init {
         viewModelScope.launch {
             retryTrigger.collectLatest {
-                graph.catalog.show(uri)
+                loadOnceConnected { graph.catalog.show(uri) }
                     .catch { emit(Resource.Error(it)) }
                     .collect { onShow(it) }
             }
         }
-        // Session back ONLINE while the header or episodes come from the download: fetch the show
-        // again; its first page replaces the downloaded list (onShow) and paging resumes.
-        refetchWhenOnline(showingDownload = {
+        // Session ONLINE after the page failed, showed a stale copy, or while the header or
+        // episodes come from the download: fetch the show again; its first page replaces the
+        // downloaded list (onShow) and paging resumes.
+        reloadWhenOnline(header, showingDownload = {
             header.value.dataOrNull()?.downloadedCopy == true || list.value.fromDownloads
         })
     }
@@ -384,7 +389,10 @@ internal class EpisodeViewModel(graph: AppGraph, private val uri: String) : Deta
             .catch { emit(null) }
 
     val state: StateFlow<EpisodeUiState> = combine(
-        content,
+        // This phone's podcast progress where it is newer than Spotify's (docs §6.5).
+        combine(content, graph.episodeProgress.version) { load, _ ->
+            if (load is LoadState.Ready) load.copy(data = load.data.copy(episode = graph.episodeProgress.merge(load.data.episode))) else load
+        },
         playbackInfo,
         graph.savedFlow(uri),
         downloadState,
@@ -393,7 +401,16 @@ internal class EpisodeViewModel(graph: AppGraph, private val uri: String) : Deta
         EpisodeUiState(load, playback, saved, download, offline)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), EpisodeUiState())
 
+    init {
+        // Opened while the session connected and it failed (or showed the download): load again
+        // once the session is ONLINE.
+        reloadWhenOnline(content)
+    }
+
     private suspend fun load(): LoadState<EpisodeContent> = try {
+        // Opened while the session connects (a link, cold start): wait for it (bounded) instead of
+        // failing NOT_CONNECTED as "You're offline".
+        graph.awaitConnectingSession()
         val episode = graph.catalog.episode(uri)
         when {
             episode != null -> LoadState.Ready(toContent(episode))

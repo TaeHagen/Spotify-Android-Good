@@ -1,6 +1,7 @@
 //! `catalog.tracks`, `catalog.episodes`, `catalog.album`, `catalog.artist`, `catalog.show`.
 
 use super::metadata::{self, AlbumMeta, Fetched, ShowMeta};
+use super::played;
 use super::util::{parse_kind, UriKind};
 use crate::engine;
 use crate::error::{AppError, AppResult};
@@ -58,7 +59,9 @@ pub(crate) async fn episodes(args: Value) -> AppResult<Value> {
         return Err(AppError::invalid(format!("at most {MAX_URIS} uris")));
     }
     let session = engine::session()?;
-    let episodes = metadata::episodes(&session, &a.uris).await?;
+    let mut episodes = metadata::episodes(&session, &a.uris).await?;
+    // An episode page: Spotify's resume point (best effort, see `played`).
+    played::overlay_episodes(&session, &mut episodes).await;
     Ok(json!({ "episodes": episodes }))
 }
 
@@ -189,7 +192,10 @@ pub(crate) async fn show(args: Value) -> AppResult<Value> {
     let limit = a.limit.clamp(1, 200) as usize;
     let page: Vec<String> = episode_uris.iter().skip(a.offset as usize).take(limit).cloned().collect();
     let fetched = metadata::episode_lookup(&session, &page).await.map_err(metadata::page_error)?;
-    to_value(&show_page(&meta, episode_uris.len() as u32, a.offset, &page, &fetched))
+    let mut show = show_page(&meta, episode_uris.len() as u32, a.offset, &page, &fetched);
+    // Spotify's resume points (best effort, bounded; never makes the page partial).
+    played::overlay_show_page(&session, &uri, a.offset, &mut show.episodes).await;
+    to_value(&show)
 }
 
 /// One page of a show. An episode whose metadata request failed keeps its slot as a placeholder
