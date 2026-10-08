@@ -550,4 +550,28 @@ class PlayerControllerTest {
         assertEquals(listOf("player.play", "player.load"), h.methods().takeLast(2))
         assertEquals(expected, c.userCommands.value)
     }
+
+    @Test
+    fun pausesMadeOnPurposeCancelAPendingFocusResume() = runTest {
+        val h = Harness(this, Env(EngineReach.ONLINE))
+        var hooks = 0
+        h.controller.onDeliberatePause = { hooks++ }
+        // The user (app, media session, Bluetooth, Assistant): pause, stop, toggle while playing.
+        h.controller.pause()
+        h.controller.pauseAsync()
+        h.snapshot.value = PlaybackSnapshot(source = PlaybackSource.LOCAL, status = PlaybackStatus.PLAYING, track = PlaybackTrack(uri = t(1)))
+        h.controller.togglePlayPause()
+        assertEquals(3, hooks)
+        // The sleep timer and a refused background start: not the user's, but on purpose.
+        h.controller.pauseAsync(user = false, deliberate = true)
+        h.controller.pause(user = false, deliberate = true)
+        assertEquals(5, hooks)
+        // The focus pause itself (and headphones unplugged, which cancels on its own): no.
+        h.controller.pause(user = false)
+        // A toggle that resumes: no.
+        h.snapshot.value = h.snapshot.value.copy(status = PlaybackStatus.PAUSED)
+        h.controller.togglePlayPause()
+        runCurrent()
+        assertEquals(5, hooks)
+    }
 }

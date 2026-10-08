@@ -150,6 +150,14 @@ class PlayerController internal constructor(
      */
     @Volatile var onPlaybackRequested: (() -> Unit)? = null
 
+    /**
+     * Invoked (on the calling thread) for a pause made on purpose: by the user (app, media
+     * session, Bluetooth, Assistant), the sleep timer or a refused background start. A pending
+     * audio-focus resume must not undo it ([PlaybackCoordinator] cancels it). Not for the pause of
+     * a transient focus loss itself, nor for headphones unplugged (which cancels on its own).
+     */
+    @Volatile var onDeliberatePause: (() -> Unit)? = null
+
     /** Message source for [errors]; replaced with the resource-backed one by [PlaybackCoordinator]. */
     @Volatile var errorMessages: PlaybackErrorMessages = PlaybackErrorMessages.Fallback
 
@@ -255,14 +263,22 @@ class PlayerController internal constructor(
         resumeAsync(user)
     }
 
-    /** [user]: false for pauses the app sends by itself (focus loss, unplugged, refused start). */
-    fun pause(user: Boolean = true) {
-        pauseAsync(user)
+    /**
+     * [user]: false for pauses the app sends by itself (focus loss, unplugged, refused start).
+     * [deliberate]: a pending focus resume is cancelled ([onDeliberatePause]).
+     */
+    fun pause(user: Boolean = true, deliberate: Boolean = user) {
+        pauseAsync(user, deliberate)
     }
 
     fun togglePlayPause() {
         userCommand()
-        if (snapshot.value.isPlayingOrLoading()) pauseLike("player.togglePlay") else sendResuming("player.togglePlay")
+        if (snapshot.value.isPlayingOrLoading()) {
+            onDeliberatePause?.invoke()
+            pauseLike("player.togglePlay")
+        } else {
+            sendResuming("player.togglePlay")
+        }
     }
 
     fun next() {
@@ -408,8 +424,9 @@ class PlayerController internal constructor(
         return sendResuming("player.play")
     }
 
-    internal fun pauseAsync(user: Boolean = true): Deferred<Boolean> {
+    internal fun pauseAsync(user: Boolean = true, deliberate: Boolean = user): Deferred<Boolean> {
         if (user) userCommand()
+        if (deliberate) onDeliberatePause?.invoke()
         return pauseLike("player.pause")
     }
 

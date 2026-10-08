@@ -959,6 +959,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
   0.2 → restore (a duck keeps focus; a granted request clears the duck). Request failure → pause.
+  A pause made on purpose meanwhile — by the user (app, notification, Bluetooth, Assistant,
+  Auto), the sleep timer or a refused background start — cancels the pending resume
+  (`PlayerController.onDeliberatePause`), so the GAIN does not undo it.
 * `BecomingNoisyReceiver`: registered while local playback plays, loads or awaits a focus resume
   (`NoisyRules`: also while the sink is stopped by a focus pause or the stall watchdog), never for
   remote playback → `player.pause`; a noisy event also cancels a pending focus resume, so a later
