@@ -16,6 +16,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.State
@@ -45,6 +46,7 @@ import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
 import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.ui.appViewModel
+import com.taehagen.spotifygood.ui.components.SessionMessenger
 import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
@@ -108,6 +110,30 @@ internal sealed interface LocalConnectEvent {
     data class TransferFailed(override val sheet: String, val deviceName: String, val network: Boolean) : LocalConnectEvent
 }
 
+/** Whether [this] is shown as the section's error (else as its notice). */
+internal val LocalConnectEvent.isFailure: Boolean
+    get() = this is LocalConnectEvent.Failed || this is LocalConnectEvent.TransferFailed
+
+/** What the LAN section says for [this] result; null when the sheet just closes (connected). */
+internal fun LocalConnectEvent.message(): SheetMessage? = when (this) {
+    is LocalConnectEvent.Connected -> null
+    // The device is in the account now (listed under Connect devices): not a failure.
+    is LocalConnectEvent.Ready -> SheetMessage(if (selected) R.string.player_devices_selected else R.string.local_connect_ready, listOf(deviceName))
+    is LocalConnectEvent.Added -> SheetMessage(R.string.local_connect_added, listOf(deviceName))
+    is LocalConnectEvent.Failed -> SheetMessage(
+        when {
+            offline -> R.string.local_connect_login_failed_offline
+            network -> R.string.local_connect_login_failed_network
+            else -> R.string.local_connect_login_failed
+        },
+        listOf(deviceName),
+    )
+    is LocalConnectEvent.TransferFailed -> SheetMessage(
+        if (network) R.string.player_devices_transfer_failed_network else R.string.player_devices_transfer_failed,
+        listOf(deviceName),
+    )
+}
+
 /**
  * Logs a LAN device in ([login], returning its Connect id), then moves playback there
  * ([transfer], which starts the saved session when nothing is active). The two steps are judged
@@ -159,6 +185,8 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
     private val started = MutableStateFlow(false)
     private val connecting = MutableStateFlow<String?>(null)
     private val eventChannel = Channel<LocalConnectEvent>(Channel.BUFFERED)
+    private val shownSheets = ShownSheets()
+    private val messenger = SessionMessenger(graph.app)
     /** The sheet whose results [discovery] currently holds. */
     private var resultsSheet: String? = null
 
@@ -231,10 +259,23 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
                         DevicePicks.isLatest(pick) && devicesRepository.devices.value.activeDeviceId == activeBefore
                     },
                 )
-                eventChannel.trySend(event)
+                deliver(event)
             } finally {
                 connecting.value = null
             }
+        }
+    }
+
+    /** The sheet [sheet] is on screen (its results go to it) / went away (to the app's snackbar). */
+    fun sheetShown(sheet: String) = shownSheets.add(sheet)
+
+    fun sheetGone(sheet: String) = shownSheets.remove(sheet)
+
+    private fun deliver(event: LocalConnectEvent) {
+        if (event.sheet in shownSheets) {
+            eventChannel.trySend(event)
+        } else {
+            event.message()?.let { messenger.post(it.res, *it.args.toTypedArray()) }
         }
     }
 
@@ -285,34 +326,19 @@ internal fun rememberLocalDevices(sheet: String, onConnected: () -> Unit): Local
         viewModel.startDiscovery(sheet)
         onStopOrDispose { viewModel.stopDiscovery() }
     }
+    DisposableEffect(viewModel, sheet) {
+        viewModel.sheetShown(sheet)
+        onDispose { viewModel.sheetGone(sheet) }
+    }
 
     LaunchedEffect(viewModel, sheet) {
         viewModel.events.filter { it.sheet == sheet }.collect { event ->
-            when (event) {
-                is LocalConnectEvent.Connected -> currentOnConnected()
-                // The device is in the account now (listed under Connect devices): not a failure.
-                is LocalConnectEvent.Ready -> notice.value = context.getString(
-                    if (event.selected) R.string.player_devices_selected else R.string.local_connect_ready,
-                    event.deviceName,
-                )
-                is LocalConnectEvent.Added -> notice.value = context.getString(R.string.local_connect_added, event.deviceName)
-                is LocalConnectEvent.Failed -> {
-                    error.value = context.getString(
-                        when {
-                            event.offline -> R.string.local_connect_login_failed_offline
-                            event.network -> R.string.local_connect_login_failed_network
-                            else -> R.string.local_connect_login_failed
-                        },
-                        event.deviceName,
-                    )
-                }
-                is LocalConnectEvent.TransferFailed -> {
-                    error.value = context.getString(
-                        if (event.network) R.string.player_devices_transfer_failed_network else R.string.player_devices_transfer_failed,
-                        event.deviceName,
-                    )
-                }
+            if (event is LocalConnectEvent.Connected) {
+                currentOnConnected()
+                return@collect
             }
+            val text = event.message()?.let { context.getString(it.res, *it.args.toTypedArray()) } ?: return@collect
+            if (event.isFailure) error.value = text else notice.value = text
         }
     }
 

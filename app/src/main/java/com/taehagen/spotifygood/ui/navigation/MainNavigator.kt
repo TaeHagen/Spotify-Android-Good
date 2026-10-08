@@ -17,6 +17,7 @@ import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
@@ -36,6 +37,7 @@ import com.taehagen.spotifygood.ui.screens.library.launchTrackStart
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.serialization.json.Json
 
 /** Top-level destinations shown in the navigation bar / rail. */
 enum class MainTab(
@@ -61,6 +63,10 @@ class MainNavigator internal constructor(
     nowPlayingState: MutableState<Boolean>,
     queueState: MutableState<Boolean>,
     lyricsState: MutableState<Boolean>,
+    devicesState: MutableState<Boolean>,
+    sleepTimerState: MutableState<Boolean>,
+    actionTargetState: MutableState<MediaActionTarget?>,
+    addToPlaylistState: MutableState<List<String>?>,
 ) : AppNavigator {
     var isNowPlayingOpen: Boolean by nowPlayingState
         private set
@@ -68,13 +74,16 @@ class MainNavigator internal constructor(
         private set
     var isLyricsOpen: Boolean by lyricsState
         private set
-    var isDevicesOpen: Boolean by mutableStateOf(false)
+    // Sheets are saved like the overlays: a configuration change (rotation, dark mode, font size,
+    // split-screen resize) recreates the activity, and the sheets' own saved state (the devices
+    // sheet's token and LAN results, a half-typed playlist name) expects to come back.
+    var isDevicesOpen: Boolean by devicesState
         private set
-    var isSleepTimerOpen: Boolean by mutableStateOf(false)
+    var isSleepTimerOpen: Boolean by sleepTimerState
         private set
-    var actionTarget: MediaActionTarget? by mutableStateOf(null)
+    var actionTarget: MediaActionTarget? by actionTargetState
         private set
-    var addToPlaylistUris: List<String>? by mutableStateOf(null)
+    var addToPlaylistUris: List<String>? by addToPlaylistState
         private set
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 16)
@@ -260,8 +269,53 @@ fun rememberMainNavigator(navController: NavHostController): MainNavigator {
     val nowPlaying = rememberSaveable { mutableStateOf(false) }
     val queue = rememberSaveable { mutableStateOf(false) }
     val lyrics = rememberSaveable { mutableStateOf(false) }
-    return remember(navController) { MainNavigator(navController, graph, nowPlaying, queue, lyrics) }
+    val devices = rememberSaveable { mutableStateOf(false) }
+    val sleepTimer = rememberSaveable { mutableStateOf(false) }
+    val actionTarget = rememberSaveable(stateSaver = ActionTargetSaver) { mutableStateOf<MediaActionTarget?>(null) }
+    val addToPlaylist = rememberSaveable(stateSaver = UriListSaver) { mutableStateOf<List<String>?>(null) }
+    return remember(navController) {
+        MainNavigator(navController, graph, nowPlaying, queue, lyrics, devices, sleepTimer, actionTarget, addToPlaylist)
+    }
 }
+
+private val savedStateJson = Json {
+    ignoreUnknownKeys = true
+    encodeDefaults = false
+    // Not "type": a model class could have a property of that name.
+    classDiscriminator = "targetKind"
+}
+
+/** Larger saved targets are dropped (the sheet closes) rather than risk the saved-state size limit. */
+private const val MAX_SAVED_TARGET_CHARS = 32_000
+
+/**
+ * The saved form of an action sheet's target: its model as JSON, without what the sheet doesn't
+ * show (an episode's description). Null when it can't be encoded or is too large.
+ */
+internal fun encodeActionTarget(target: MediaActionTarget): String? {
+    val slim = when (target) {
+        is MediaActionTarget.EpisodeTarget -> target.copy(episode = target.episode.copy(description = ""))
+        else -> target
+    }
+    return runCatching { savedStateJson.encodeToString(MediaActionTarget.serializer(), slim) }
+        .getOrNull()
+        ?.takeIf { it.length <= MAX_SAVED_TARGET_CHARS }
+}
+
+/** The target saved by [encodeActionTarget]; null (the sheet stays closed) when it can't be read. */
+internal fun decodeActionTarget(saved: String): MediaActionTarget? =
+    runCatching { savedStateJson.decodeFromString(MediaActionTarget.serializer(), saved) }.getOrNull()
+
+internal val ActionTargetSaver: Saver<MediaActionTarget?, String> = Saver(
+    save = { target -> target?.let(::encodeActionTarget) },
+    restore = ::decodeActionTarget,
+)
+
+/** URI lists as a bundle-safe ArrayList (the list's own runtime type may not be). */
+internal val UriListSaver: Saver<List<String>?, ArrayList<String>> = Saver(
+    save = { uris -> uris?.let { ArrayList(it) } },
+    restore = { it },
+)
 
 /** Opens the sleep timer sheet (no-op outside the main scaffold). */
 fun AppNavigator.openSleepTimer() {
