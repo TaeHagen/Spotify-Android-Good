@@ -74,6 +74,25 @@ pub(crate) struct EnabledArgs {
     pub enabled: bool,
 }
 
+/// `player.setSpeed`: the speed the app's sink plays at (podcasts).
+#[derive(Debug, Deserialize)]
+pub(crate) struct SpeedArgs {
+    pub speed: f64,
+}
+
+impl SpeedArgs {
+    pub const MIN: f64 = 0.5;
+    pub const MAX: f64 = 3.5;
+
+    pub fn validate(&self) -> AppResult<f64> {
+        if self.speed.is_finite() && (Self::MIN..=Self::MAX).contains(&self.speed) {
+            Ok(self.speed)
+        } else {
+            Err(AppError::invalid(format!("speed must be {}..{}", Self::MIN, Self::MAX)))
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct RepeatArgs {
     pub mode: RepeatMode,
@@ -188,6 +207,16 @@ impl ResumeArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_args_are_spotifys_range() {
+        let parse = |json: &str| serde_json::from_str::<SpeedArgs>(json).expect("parse").validate();
+        assert_eq!(parse(r#"{"speed":1.5}"#).expect("valid"), 1.5);
+        assert_eq!(parse(r#"{"speed":0.5}"#).expect("valid"), 0.5);
+        assert_eq!(parse(r#"{"speed":3.5}"#).expect("valid"), 3.5);
+        assert!(parse(r#"{"speed":0.25}"#).is_err());
+        assert!(parse(r#"{"speed":4}"#).is_err());
+    }
 
     #[test]
     fn load_args_parse_and_validate() {

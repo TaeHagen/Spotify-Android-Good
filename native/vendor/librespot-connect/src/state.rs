@@ -184,6 +184,9 @@ pub(super) struct ConnectState {
     // SPOTIFYGOOD: see ConnectState::place_current_track_when_resolved
     /// the current track plays outside the default context until the page with it is there
     place_current_track: bool,
+    // SPOTIFYGOOD: see ConnectState::set_playback_speed
+    /// the speed playback runs at while playing (podcasts); `None`: normal speed
+    playing_speed: Option<f64>,
 }
 
 impl ConnectState {
@@ -400,6 +403,8 @@ impl ConnectState {
     }
 
     pub(crate) fn set_status(&mut self, status: &SpircPlayStatus) {
+        // SPOTIFYGOOD: the real speed while playing (was always 1), see set_playback_speed
+        let speed = self.playing_speed();
         let player = self.player_mut();
         player.is_paused = matches!(
             status,
@@ -411,7 +416,7 @@ impl ConnectState {
         if player.is_paused {
             player.playback_speed = 0.;
         } else {
-            player.playback_speed = 1.;
+            player.playback_speed = speed;
         }
 
         // desktop and mobile require all 'states' set to true, when we are paused,
@@ -445,6 +450,36 @@ impl ConnectState {
                 self.player_mut().index = MessageField::some(new_index)
             }
         }
+    }
+
+    // SPOTIFYGOOD: the speed the app's sink plays at (podcasts, 0.5 to 3.5), reported as the
+    // `playback_speed` while playing so that the other clients (and the snapshot) extrapolate
+    // positions at the real rate. Returns whether it changed; the caller applies it with
+    // `set_status`.
+    pub fn set_playback_speed(&mut self, speed: f64) -> bool {
+        let speed = if speed.is_finite() && speed > 0. && (speed - 1.).abs() > 1e-3 {
+            Some(speed)
+        } else {
+            None
+        };
+        if self.playing_speed == speed {
+            return false;
+        }
+        self.playing_speed = speed;
+        true
+    }
+
+    // SPOTIFYGOOD: see set_playback_speed
+    pub fn playing_speed(&self) -> f64 {
+        self.playing_speed.unwrap_or(1.)
+    }
+
+    // SPOTIFYGOOD: the position at `timestamp` as the state extrapolates it (its speed is 0 while
+    // paused)
+    pub fn extrapolated_position(&self, timestamp: i64) -> i64 {
+        let player = self.player();
+        let elapsed = (timestamp - player.timestamp).max(0) as f64;
+        player.position_as_of_timestamp + (elapsed * player.playback_speed) as i64
     }
 
     pub fn update_position(&mut self, position_ms: u32, timestamp: i64) {

@@ -478,6 +478,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 | `player.setRepeat` | `{"mode":"off|context|track"}` |
 | `player.setVolume` | `{"volume":0..65535,"fromSystem":false}` |
 | `player.setAudioOutput` | `{"type":"speaker|bluetooth|line_out|car|unknown","name":"…"}` (local only; reported to Connect) |
+| `player.setSpeed` | `{"speed":0.5..3.5}` (the app's podcast speed; it sends 1 for music and while another device plays). The app's sink plays at that speed (AudioTrack `PlaybackParams`, pitch kept), the decoder is throttled by it, so the player's position stays media time. Stored and applied to every later Spirc: the Spirc reports it as `playback_speed` while playing (other clients and the snapshot extrapolate at the real rate) and swallows the player's position corrections that match that extrapolation (the player expects 1x, they came every second or two, each a state put); the offline queue extrapolates with it. A device receiving a transfer from here gets no speed (Connect has no speed command). Invalid outside the range |
 | `player.applySettings` | `EngineSettings` subset (`bitrate`, `normalize`, `normalizePregain`, `gapless`), applied to the running Player (§4.3) |
 | `queue.add` | `{"uri":"spotify:track:…"}` — on this device at most 80 tracks can be queued (Connect's next-tracks window); a further add fails with `UNAVAILABLE` "The queue is full" |
 | `queue.remove` | `{"uid":"…"}` |
@@ -885,6 +886,17 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   play) is merged into it, or waits ≤ 3 s for the activation, and is dropped if the load failed.
   Plain track-list contexts (`spotify:web-api`) are never resumed or loaded as a context.
   Auto browse/search/voice wait the same way.
+* Podcast speed (`PodcastSpeed`, Spotify's 0.5× – 3.5×): one global speed for every episode,
+  remembered across restarts (a DataStore of its own). It applies to an episode played here
+  (offline queue included) and is 1× for music and while another device plays. Each change of the
+  effective speed goes to the sink (`AudioSinkBridge.setPlaybackSpeed`, AudioTrack
+  `PlaybackParams`, pitch kept, also for tracks recreated later) and the engine
+  (`player.setSpeed`, §6.2). Now Playing has a speed menu next to the episode controls (hidden
+  while another device plays); the session player advertises `COMMAND_SET_SPEED_AND_PITCH` for
+  local episodes (Auto, Wear and other controllers may change it) and reports the chosen speed in
+  its playback parameters. The notification has no speed button (Media3's default provider has
+  none). The switch at an episode's end follows the snapshot, so the first moments of the next
+  item may still play at the episode's speed.
 * Modes of a load (`PlayerController.withCurrentModes`): a load that names no shuffle / repeat
   (a row tap, a Play button, Auto's picks, radio) keeps those of the playback it replaces, here
   or on the active device (modes just toggled included); smart shuffle only for a load of the
@@ -1257,7 +1269,7 @@ follow), Liked Songs, saved albums/artists/podcasts, follow artists, search (all
 recent searches), home feed, album/artist/playlist/show/episode pages, podcast resume
 points (this phone's progress, kept on the phone and not synced to other devices; Spotify's
 when its web API provides them, §6.5), lyrics (synced),
-radio, share links, deep links, downloads (track/album/playlist/liked/podcast, Wi-Fi only
+podcast playback speed (0.5×–3.5×, on this phone), radio, share links, deep links, downloads (track/album/playlist/liked/podcast, Wi-Fi only
 option, storage management, auto-sync), offline mode, sleep timer, explicit-content
 filter, system equalizer, settings, adaptive layouts, accessibility (content
 descriptions, touch targets, TalkBack-friendly controls).
