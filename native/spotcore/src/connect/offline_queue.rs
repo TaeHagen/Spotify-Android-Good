@@ -161,8 +161,6 @@ pub(crate) struct OfflineQueue {
     restart: Option<Continuation>,
     /// Items that aren't tracks of `context_uri` (see [`Adoption::outside`]).
     outside: Vec<usize>,
-    /// ... of which these came from Spirc's user queue (see [`Adoption::user_queued`]).
-    user_queued: Vec<usize>,
     /// The driver: a visible online session is up, the window's end hands back to Spirc.
     hand_back: bool,
     /// The speed the app's sink plays at, in thousandths (podcasts; see `connect::set_speed`):
@@ -180,8 +178,8 @@ pub(crate) struct Adoption {
     pub start: usize,
     /// Indices of `uris` that aren't tracks of the context (the user queue's, suggestions).
     pub outside: Vec<usize>,
-    /// ... of which these are the user queue's (queued again when the queue is pushed to
-    /// another device as its context).
+    /// ... of which these are the user queue's: the ones after `start` are this queue's user
+    /// queue again (the "Next in queue" entries, before later adds, cleared with it).
     pub user_queued: Vec<usize>,
     pub position_ms: u64,
     pub duration_ms: u64,
@@ -232,7 +230,6 @@ impl Default for OfflineQueue {
             continuation: None,
             restart: None,
             outside: Vec::new(),
-            user_queued: Vec::new(),
             hand_back: false,
             speed_milli: 1000,
         }
@@ -747,9 +744,16 @@ impl OfflineQueue {
             play: a.playing,
             seed: 0,
         };
-        // The user queue is in the handed over tracks already.
+        // The user queue is in the handed over tracks (taken out of them below).
         self.queue.clear();
         let load = self.load(spec, now_ms)?;
+        // Spirc's queued tracks after the current one are the user queue here too, in order.
+        for i in a.user_queued.into_iter().filter(|&i| i > a.start && i < self.items.len()) {
+            let uid = format!("q{}", self.next_queue_id);
+            self.next_queue_id += 1;
+            self.queue.push_back(Item { uri: self.items[i].uri.clone(), uid });
+            self.skipped.insert(i);
+        }
         if a.repeat == RepeatMode::Track {
             self.set_repeat(RepeatMode::Track);
         }
@@ -758,7 +762,6 @@ impl OfflineQueue {
         self.continuation = a.continuation;
         self.restart = a.restart;
         self.outside = a.outside;
-        self.user_queued = a.user_queued;
         let Some(request) = request else { return Some(load) };
         self.pending_loads = self.pending_loads.saturating_sub(1);
         self.own_request = Some(request);
@@ -859,7 +862,8 @@ impl OfflineQueue {
                 self.position_ts = now_ms;
                 out.changed = true;
             }
-            Event::Stopped(id) if self.own(id) => {
+            // (a load of the queue on its way supersedes a stop of the track before it)
+            Event::Stopped(id) if self.own(id) && self.pending_loads == 0 => {
                 out.changed = self.status != PlaybackStatus::Stopped;
                 self.status = PlaybackStatus::Stopped;
                 self.play_intent = false;
@@ -972,17 +976,10 @@ impl OfflineQueue {
         }
     }
 
-    /// The user queue still ahead, in the order it plays: the entries queued here, then the
-    /// adopted ones of Spirc's after the current position (without wrapping); at most
-    /// [`MAX_NEXT`].
+    /// The user queue still ahead, in the order it plays (also Spirc's, see
+    /// [`Adoption::user_queued`]); at most [`MAX_NEXT`].
     fn user_queue(&self) -> Vec<String> {
-        let adopted = self
-            .order
-            .iter()
-            .skip(self.pos + 1)
-            .filter(|&&i| self.user_queued.contains(&i) && self.playable(i))
-            .map(|&i| self.items[i].uri.clone());
-        self.queue.iter().map(|q| q.uri.clone()).chain(adopted).take(MAX_NEXT).collect()
+        self.queue.iter().map(|q| q.uri.clone()).take(MAX_NEXT).collect()
     }
 
     /// The snapshot (bare tracks; metadata is filled by the caller). Positions are reported as
@@ -1584,6 +1581,33 @@ mod tests {
     }
 
     #[test]
+    fn spirc_queued_tracks_stay_the_user_queue_after_a_handoff() {
+        // the window [current, q1, q2, c1]: q1 and q2 were Spirc's user queue
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        let uris = vec!["spotify:track:c0".into(), "spotify:track:q1".into(), "spotify:track:q2".into(), "spotify:track:c1".into()];
+        q.adopt(Adoption { uris, outside: vec![1, 2], user_queued: vec![1, 2], ..adoption(4, 0) }, 0);
+        q.add_to_queue("spotify:track:q3".into());
+        let next = q.snapshot(dev(), 0).next_tracks;
+        let shown: Vec<(&str, TrackProvider)> = next.iter().map(|t| (t.uri.as_str(), t.provider)).collect();
+        assert_eq!(
+            shown,
+            [
+                ("spotify:track:q1", TrackProvider::Queue),
+                ("spotify:track:q2", TrackProvider::Queue),
+                ("spotify:track:q3", TrackProvider::Queue),
+                ("spotify:track:c1", TrackProvider::Context),
+            ],
+            "a later add after them, all in Next in queue"
+        );
+        assert_eq!(load_uri(&q.on_event(Event::EndOfTrack(7), 0).action).as_deref(), Some("spotify:track:q1"));
+        // Clear queue clears them all
+        q.clear_queue();
+        let next = q.snapshot(dev(), 0).next_tracks;
+        assert_eq!(next.iter().map(|t| t.uri.as_str()).collect::<Vec<_>>(), ["spotify:track:c1"]);
+    }
+
+    #[test]
     fn a_handover_names_the_context_at_a_track_of_it() {
         let context = |h: &Handover| h.context.as_ref().map(|c| (c.context_uri.clone(), c.track_uri.clone()));
         let mut q = OfflineQueue::default();
@@ -1618,7 +1642,7 @@ mod tests {
         q.add_to_queue("spotify:track:here".into());
         let h = q.handover(0, 50);
         assert_eq!(h.context.as_ref().map(|c| c.track_uri.as_str()), Some("spotify:track:1"));
-        assert_eq!(h.queued, ["spotify:track:here", "spotify:track:2"], "in the order they play");
+        assert_eq!(h.queued, ["spotify:track:2", "spotify:track:here"], "in the order they play");
         // played past: not any more (the one queued here played first)
         q.on_event(Event::EndOfTrack(7), 0);
         q.on_event(Event::RequestId(8), 0);
