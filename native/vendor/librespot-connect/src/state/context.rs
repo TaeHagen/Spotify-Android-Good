@@ -46,6 +46,42 @@ pub enum ResetContext<'s> {
     WhenDifferent(&'s str),
 }
 
+// SPOTIFYGOOD: see generated_uid
+/// The prefix of the uids made up for context tracks without one. `g` and `n` aren't hex digits
+/// (the uids of the server are hex), and no other uid starts with it: queued tracks have `q`,
+/// smart shuffle suggestions `s`, delimiters `delimiter`.
+pub(super) const GENERATED_UID_PREFIX: &str = "gen";
+
+fn is_none_or_empty(value: &Option<String>) -> bool {
+    value.as_deref().is_none_or(str::is_empty)
+}
+
+// SPOTIFYGOOD: a context track without a uid got a random one (`Uuid::new_v4`) on every
+// resolve, so the uids of a session never matched the context resolved again: a restored
+// shuffle order (`Options::shuffle_order`, after a reconnect) was shuffled anew, and an update
+// of the context matched its tracks only by uri
+/// A uid for the track `uri` at index `index` of the page whose tracks start at `base` in the
+/// context `context_uri`: the same for the same content on every resolve, and unique within the
+/// context (also for a track that is there twice, the base and index tell its places apart)
+///
+/// FNV-1a (64 bit) of the inputs, which doesn't change between builds (unlike std's hasher).
+fn generated_uid(context_uri: &str, uri: &str, base: usize, index: usize) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let bytes = context_uri
+        .bytes()
+        .chain([0])
+        .chain(uri.bytes())
+        .chain([0])
+        .chain((base as u64).to_le_bytes())
+        .chain((index as u64).to_le_bytes());
+    let hash = bytes.fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    });
+    format!("{GENERATED_UID_PREFIX}{hash:016x}")
+}
+
 /// Extracts the spotify uri from a given page_url
 ///
 /// Just extracts "spotify/album/5LFzwirfFwBKXJQGfwmiMY" and replaces the slash's with colon's
@@ -762,7 +798,15 @@ impl ConnectState {
                     Some(&page.metadata),
                     provider.clone(),
                 ) {
-                    Ok(t) => Some(t),
+                    Ok(mut t) => {
+                        // SPOTIFYGOOD: a track of the default context (it has a length, autoplay
+                        // has none) without a uid gets one that stays the same on every resolve,
+                        // see generated_uid
+                        if let (Some(base), true) = (context_length, is_none_or_empty(&track.uid)) {
+                            t.uid = generated_uid(new_context_uri, &t.uri, base, i);
+                        }
+                        Some(t)
+                    }
                     Err(why) => {
                         error!("couldn't convert {track:#?} into ProvidedTrack: {why}");
                         None
