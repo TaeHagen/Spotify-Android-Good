@@ -1567,11 +1567,20 @@ fn a_failed_resolve_still_finishes_a_transfer() {
 fn a_failed_last_page_still_shuffles_a_load() {
     use crate::context_resolver::{ContextAction, ResolveContext};
 
-    // a shuffled load of a multi-page context: the shuffle waits for the further pages
-    let (rt, mut state) = state(20);
+    let seed = |state: &ConnectState| {
+        state
+            .get_context(ContextType::Default)
+            .unwrap()
+            .get_shuffle_seed()
+            .cloned()
+    };
+
+    // a shuffled load of a multi-page context (an artist): the first page is shuffled right away
+    let (rt, mut state) = state(10);
     state.set_shuffle(true);
-    state.clear_next_tracks();
     state.set_current_track(5).unwrap();
+    state.shuffle_new().unwrap();
+    let first_seed = seed(&state);
 
     let mut resolver = resolver(&rt);
     for page in ["spotify:album:1", "spotify:album:2"] {
@@ -1584,20 +1593,52 @@ fn a_failed_last_page_still_shuffles_a_load() {
     }
 
     // a failure that isn't the last of its kind changes nothing
+    let next = next_uids(&state);
     assert!(!resolver.finish_after_failure(&mut state, &mut None));
-    assert!(state.next_tracks().is_empty());
+    assert_eq!(next_uids(&state), next);
+
+    // the first album arrives (in its order at the end of the shuffled order)
+    let album = Context {
+        uri: Some(CONTEXT_URI.to_string()),
+        pages: vec![default_page(10..60)],
+        ..Default::default()
+    };
+    resolver.apply_next_context(&mut state, album).unwrap();
     resolver.remove_used_and_invalid();
 
-    // the last one: shuffled with the pages there are
+    // the last one fails for good: shuffled again with the pages there are
     assert!(resolver.finish_after_failure(&mut state, &mut None));
     assert!(state.default_context_shuffled());
+    assert_ne!(seed(&state), first_seed, "shuffled again");
     assert_eq!(state.current_track(|t| t.uid.clone()), "uid5");
-    let mut next = next_uids(&state);
-    next.sort();
-    let mut expected = uids(0..20);
+    let next = next_uids(&state);
+    let mut sorted = next.clone();
+    sorted.sort();
+    let mut expected = uids(0..60);
     expected.retain(|uid| uid != "uid5");
     expected.sort();
-    assert_eq!(next, expected);
+    assert_eq!(sorted, expected);
+    // the album isn't played in its order
+    let album_order = next
+        .iter()
+        .filter(|uid| uid_index(uid) >= 10)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_ne!(album_order, uids(10..60));
+
+    // a failed update of the context that plays shuffled keeps its order
+    let (rt, mut state) = self::state(10);
+    state.handle_shuffle(true).unwrap();
+    let before = (seed(&state), next_uids(&state));
+    let mut resolver = self::resolver(&rt);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Default,
+        ContextAction::Replace,
+    ));
+    assert!(resolver.finish_after_failure(&mut state, &mut None));
+    assert_eq!((seed(&state), next_uids(&state)), before);
 }
 
 #[test]

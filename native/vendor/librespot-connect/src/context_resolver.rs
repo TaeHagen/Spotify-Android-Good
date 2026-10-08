@@ -478,16 +478,20 @@ impl ContextResolver {
         state: &mut ConnectState,
         transfer_state: &mut Option<TransferState>,
     ) -> bool {
-        match self.last_of_kind(state) {
-            Some(next) if next.update == ContextType::Default => {}
+        let replace = match self.last_of_kind(state) {
+            Some(next) if next.update == ContextType::Default => {
+                next.action == ContextAction::Replace
+            }
             // an autoplay resolve: nothing waits for it
             _ => return false,
-        }
+        };
 
         let res = if let Some(transfer) = transfer_state.take() {
             state.finish_transfer_without_context(transfer)
-        } else if state.shuffling_context() && !state.default_context_shuffled() {
-            // the shuffle a load deferred until its pages were resolved
+        } else if state.shuffling_context() && !(replace && state.default_context_shuffled()) {
+            // like try_finish: the further pages of a shuffled load (shuffled with the pages
+            // there were, the ones after it went to the end in their order) are shuffled in.
+            // Not after a failed update of the context that plays shuffled.
             state.shuffle_new()
         } else if matches!(state.get_context(state.active_context), Ok(ctx) if ctx.index.track == 0)
         {
