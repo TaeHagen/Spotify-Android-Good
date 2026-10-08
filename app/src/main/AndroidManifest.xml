@@ -77,12 +77,15 @@
         </activity>
 
         <!-- Links, the login redirect, shares and voice search: forwarded to MainActivity in the
-             app's task (no UI, no history) -->
+             app's task (no UI, no history). taskAffinity="": a caller's NEW_TASK start gives it a
+             throwaway task of its own, so it never roots (and names) the app's task, which is
+             always rooted by MainActivity with the launcher intent -->
         <activity
             android:name=".LinkActivity"
             android:exported="true"
             android:excludeFromRecents="true"
             android:noHistory="true"
+            android:taskAffinity=""
             android:theme="@android:style/Theme.NoDisplay">
             <!-- Login redirect from the loopback server / browser -->
             <intent-filter>
@@ -98,7 +101,9 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="spotify" />
             </intent-filter>
-            <!-- open.spotify.com links (not verified app links; shown in the chooser) -->
+            <!-- open.spotify.com links: unverifiable for this app, so on Android 12+ they open
+                 here only after the user approves the domain in "Open by default" (Settings ›
+                 Links offers it); shown in the chooser below Android 12 -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
