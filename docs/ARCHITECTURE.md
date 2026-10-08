@@ -1136,11 +1136,18 @@ while online). Unknown hearts / Save / Follow controls are shown disabled. A tog
 opposite of the state the control showed, never of the server's current state, so a stale
 "not saved" can't remove an item (and its download).
 Native catalog calls don't wait for a session: they fail `NOT_CONNECTED` at once while it
-connects or reconnects. Browse screens load once the engine's reach (§4.6) is ONLINE and
-again after a reconnect when they failed. Search waits up to 10 s for a connecting session
-(not when offline or in backoff, so a captive portal can't stall it); a search or result page
-that failed before the session was ONLINE shows its error and runs again by itself once it is
-(a connection error while ONLINE: after the next reconnect), without a Retry tap.
+connects or reconnects (cold start, the idle stop, a network change, a link opened from
+another app). Screens wait up to 10 s for a connecting session (not when offline or in
+backoff, so a captive portal can't stall them) and load again by themselves once the
+engine's reach (§4.6) is ONLINE, without a Retry tap (`ui/screens/album/SessionReach.kt`).
+Detail pages (album, playlist, artist, discography, show, episode), the profile and the
+library lists start their stale-while-revalidate load at once (a cached copy shows right
+away); a `NOT_CONNECTED` of that first load while connecting keeps the page loading instead
+of saying "You're offline", and the load runs again once the session is up. Each time the
+reach becomes ONLINE, a page that failed, shows a stale cached copy (its refresh failed) or
+the download loads again, once a load still running has settled. A search or result page that
+failed before the session was ONLINE shows its error and runs again once it is (a connection
+error while ONLINE: after the next reconnect).
 
 ### 9.9 UI
 

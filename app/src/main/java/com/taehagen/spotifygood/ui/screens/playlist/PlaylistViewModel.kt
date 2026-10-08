@@ -227,13 +227,14 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     init {
         viewModelScope.launch {
             retryTrigger.collectLatest {
-                graph.catalog.playlist(uri, PAGE_SIZE)
+                loadOnceConnected { graph.catalog.playlist(uri, PAGE_SIZE) }
                     .catch { emit(Resource.Error(it)) }
                     .collect { onFirstPage(it) }
             }
         }
-        // Session back ONLINE while showing the download: fetch the server's rows (they replace it).
-        refetchWhenOnline(showingDownload = { data.value.dataOrNull()?.downloadedCopy == true })
+        // Session ONLINE after the page failed, showed a stale copy or the download: fetch the
+        // server's rows (they replace it).
+        reloadWhenOnline(data, showingDownload = { data.value.dataOrNull()?.downloadedCopy == true })
         // Loaded rows carry the playable flags of the old explicit filter; the revision doesn't
         // change, so the live page alone wouldn't replace them.
         graph.explicitFilterChanges()

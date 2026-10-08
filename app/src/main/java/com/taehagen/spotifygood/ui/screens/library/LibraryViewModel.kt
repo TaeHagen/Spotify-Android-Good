@@ -23,6 +23,8 @@ import com.taehagen.spotifygood.model.User
 import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.ui.screens.album.engineReach
 import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
+import com.taehagen.spotifygood.ui.screens.album.resourceOnceConnected
+import com.taehagen.spotifygood.ui.screens.album.retryWhenOnline
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.Flow
@@ -34,6 +36,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.launchIn
@@ -83,6 +86,8 @@ private data class LibraryData(
     val shows: List<LibraryItem> = emptyList(),
     val isInitialLoading: Boolean = true,
     val error: Throwable? = null,
+    /** A list is still loading or refreshing. */
+    val loading: Boolean = true,
 )
 
 private data class Presentation(
@@ -140,22 +145,27 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
         PageResult(page.items.map { it.episode }, page.total)
     }
 
+    /** The last [data], for the reload once the session is ONLINE (see init). */
+    private val lastData = MutableStateFlow<LibraryData?>(null)
+
     // The library flows are live (they re-emit after edits); [reload] only re-subscribes after a
-    // pull-to-refresh or retry.
+    // pull-to-refresh, a retry, or the session coming ONLINE after a list failed (see init). Opened
+    // while the session connects, the lists wait for it (bounded) instead of failing NOT_CONNECTED.
     private val data: Flow<LibraryData> = reload
         .flatMapLatest {
             combine(
-                graph.library.playlists(),
-                graph.library.albums(),
-                graph.library.artists(),
-                graph.library.shows(),
+                graph.resourceOnceConnected { graph.library.playlists() },
+                graph.resourceOnceConnected { graph.library.albums() },
+                graph.resourceOnceConnected { graph.library.artists() },
+                graph.resourceOnceConnected { graph.library.shows() },
                 ::LibrarySources,
             )
         }
         .map { it.toData() }
         .flowOn(Dispatchers.Default)
-        .catch { emit(LibraryData(isInitialLoading = false, error = it)) }
+        .catch { emit(LibraryData(isInitialLoading = false, error = it, loading = false)) }
         .onStart { emit(LibraryData()) }
+        .onEach { lastData.value = it }
 
     /** Every downloaded collection: downloads need not be saved in the library. */
     private val downloadedCollections: Flow<List<DownloadedCollection>> = graph.downloadedCollectionsFlow()
@@ -253,6 +263,16 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
             .filter { it == EngineReach.ONLINE }
             .onEach { if (likedCount.value == null || recentRank.value.isEmpty()) loadExtras() }
             .launchIn(viewModelScope)
+        // The lists: again once the session is ONLINE when one failed or only a stale copy came
+        // back (its refresh failed, e.g. NOT_CONNECTED while the session connected).
+        viewModelScope.launch {
+            retryWhenOnline(
+                graph.engineReachFlow(),
+                settled = { lastData.first { it != null && !it.loading } },
+                needsRetry = { it.error != null },
+                retry = { reload.update { it + 1 } },
+            )
+        }
         // Liked Songs and saved episodes are paged and not cached: refetch after library edits.
         graph.library.changes.debounce(CHANGE_DEBOUNCE_MS)
             .onEach {
@@ -377,6 +397,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
             shows = shows.dataOrNull?.showItems().orEmpty(),
             isInitialLoading = noneCached && resources.any { it is Resource.Loading },
             error = resources.firstNotNullOfOrNull { (it as? Resource.Error)?.error },
+            loading = resources.any { it is Resource.Loading },
         )
     }
 

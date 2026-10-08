@@ -32,8 +32,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.drop
-import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -55,6 +54,15 @@ internal sealed interface LoadState<out T> {
 }
 
 internal val LoadState<*>.isRefreshing: Boolean get() = this is LoadState.Ready<*> && refreshing
+
+/** Neither loading nor refreshing: what the page will show until something reloads it. */
+internal val LoadState<*>.isSettled: Boolean get() = this !is LoadState.Loading && !isRefreshing
+
+/**
+ * Failed, or a stale cached copy (its refresh failed, e.g. NOT_CONNECTED while the session was
+ * connecting): worth loading again once the session is ONLINE ([DetailViewModel.reloadWhenOnline]).
+ */
+internal val LoadState<*>.needsReloadWhenOnline: Boolean get() = this is LoadState.Failed || (this is LoadState.Ready<*> && stale)
 
 internal fun <T> LoadState<T>.dataOrNull(): T? = (this as? LoadState.Ready<T>)?.data
 
@@ -234,15 +242,32 @@ internal abstract class DetailViewModel(
     protected fun downloadFallbackAllowed(error: Throwable): Boolean = useDownloadFallback(graph.engineReach(), error)
 
     /**
-     * Each time the engine reaches ONLINE (the session connected, not merely a network appearing)
-     * while [showingDownload] — the page or part of it was built from the download — [refetch]es
-     * the server's data, which replaces it. Call from the subclass's init.
+     * [load] for this page with the session in mind ([resourceOnceConnected]): opened while the
+     * session connects (a link from another app, cold start, after the idle stop), the page waits
+     * for it (bounded) instead of failing NOT_CONNECTED as "You're offline".
      */
-    protected fun refetchWhenOnline(showingDownload: () -> Boolean, refetch: () -> Unit = ::retry) {
+    protected fun <T> loadOnceConnected(load: () -> Flow<Resource<T>>): Flow<Resource<T>> = graph.resourceOnceConnected(load)
+
+    /**
+     * Keeps the page current with the session (docs §9.8): each time the engine reaches ONLINE
+     * (the session connected, not merely a network appearing), once [load] has settled, [refetch]es
+     * when the page failed or shows a stale cached copy ([needsReloadWhenOnline]), or while
+     * [showingDownload] (the page or part of it was built from the download, which the server's
+     * data replaces). A load still running when the session comes online is waited for, not
+     * duplicated. Call from the subclass's init.
+     */
+    protected fun reloadWhenOnline(
+        load: Flow<LoadState<*>>,
+        showingDownload: () -> Boolean = { false },
+        refetch: () -> Unit = ::retry,
+    ) {
         viewModelScope.launch {
-            graph.engineReachFlow().drop(1).filter { it == EngineReach.ONLINE }.collect {
-                if (showingDownload()) refetch()
-            }
+            retryWhenOnline(
+                graph.engineReachFlow(),
+                settled = { load.first { it.isSettled } },
+                needsRetry = { it.needsReloadWhenOnline || showingDownload() },
+                retry = refetch,
+            )
         }
     }
 
