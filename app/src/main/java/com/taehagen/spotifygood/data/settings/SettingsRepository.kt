@@ -59,6 +59,13 @@ data class Settings(
     val libraryView: LibraryView = LibraryView.LIST,
     val librarySort: LibrarySort = LibrarySort.RECENT,
     val showLyricsOnNowPlaying: Boolean = true,
+    /**
+     * Not a user setting: the account's own explicit filter (Spotify's parental setting) as an
+     * online session last reported it, for a start without a network
+     * ([com.taehagen.spotifygood.engine.accountExplicitFilter]). Cleared on logout and when another
+     * account's data is removed.
+     */
+    val accountExplicitFilter: Boolean = false,
 )
 
 /**
@@ -75,6 +82,7 @@ fun Settings.toEngineSettings(metered: Boolean, defaultDeviceName: String): Engi
     streamingCacheMb = streamingCacheMb,
     offline = offlineMode,
     filterExplicit = hideExplicit,
+    accountFilterExplicit = accountExplicitFilter,
 )
 
 /**

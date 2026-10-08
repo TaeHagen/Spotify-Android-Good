@@ -10,6 +10,9 @@ import com.taehagen.spotifygood.model.PlaylistRef
 import com.taehagen.spotifygood.model.Rootlist
 import com.taehagen.spotifygood.model.User
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import com.taehagen.spotifygood.ui.screens.album.awaitConnectingSession
+import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
+import com.taehagen.spotifygood.ui.screens.album.retryWhenOnline
 import com.taehagen.spotifygood.ui.screens.library.BrowseError
 import com.taehagen.spotifygood.ui.screens.library.attempt
 import com.taehagen.spotifygood.ui.screens.library.offlineFlow
@@ -22,8 +25,10 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.transformLatest
@@ -44,7 +49,8 @@ data class ProfileUiState(
     val myUsername: String? = null,
 )
 
-private data class Fetched(val user: User?, val error: Throwable?, val loading: Boolean)
+/** [loading]: nothing to show yet; [pending]: the fetch is still running (a cached user may show). */
+private data class Fetched(val user: User?, val error: Throwable?, val loading: Boolean, val pending: Boolean = false)
 
 /** Profile of [username] (null = the logged-in user). */
 class ProfileViewModel(private val graph: AppGraph, private val username: String?) : ViewModel() {
@@ -55,16 +61,26 @@ class ProfileViewModel(private val graph: AppGraph, private val username: String
 
     private val isMe: Flow<Boolean> = me.map { user -> username == null || username == user?.username }.distinctUntilChanged()
 
-    /** Cached session user first (instant), then the fresh profile. */
+    /** The last [fetched] value, for the reload once the session is ONLINE (see init). */
+    private val lastFetched = MutableStateFlow<Fetched?>(null)
+
+    /**
+     * Cached session user first (instant), then the fresh profile. Opened while the session
+     * connects (a profile link, cold start), the fetch waits for it (bounded) instead of failing
+     * NOT_CONNECTED; one that failed anyway runs again once the session is ONLINE.
+     */
     private val fetched: Flow<Fetched> = combine(retry, isMe, graph.offlineFlow(), ::Triple)
         .transformLatest { (_, isMe, offline) ->
             val cached = if (isMe) graph.engine.user.value else null
-            emit(Fetched(cached, null, loading = cached == null))
-            if (offline && cached != null) return@transformLatest
+            val skip = offline && cached != null
+            emit(Fetched(cached, null, loading = cached == null, pending = !skip))
+            if (skip) return@transformLatest
+            graph.awaitConnectingSession()
             attempt { graph.catalog.user(if (isMe) null else username) }
                 .onSuccess { emit(Fetched(it, null, loading = false)) }
                 .onFailure { emit(Fetched(cached, it, loading = false)) }
         }
+        .onEach { lastFetched.value = it }
 
     /** My playlists from the rootlist (another user's come with their profile, [publicPlaylistsOf]). */
     private val myPlaylists: Flow<List<PlaylistRef>> = combine(isMe, me, ::Pair).flatMapLatest { (isMe, user) ->
@@ -99,6 +115,17 @@ class ProfileViewModel(private val graph: AppGraph, private val username: String
             myUsername = myUsername,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ProfileUiState(isMe = username == null))
+
+    init {
+        viewModelScope.launch {
+            retryWhenOnline(
+                graph.engineReachFlow(),
+                settled = { lastFetched.first { it != null && !it.pending } },
+                needsRetry = { it.error != null },
+                retry = { retry() },
+            )
+        }
+    }
 
     fun retry() = retry.update { it + 1 }
 

@@ -19,20 +19,36 @@ class ExplicitFilterTest {
 
     private fun explicitGreyed(uri: String) = Track(uri = uri, name = "Explicit song", explicit = true, playable = false)
 
-    private fun settledOff() = ExplicitFilterWatch().apply { settle(update(false)) }
+    private val off = ExplicitFilterWatch.Filter.OFF
+    private val app = ExplicitFilterWatch.Filter.APP
+    private val account = ExplicitFilterWatch.Filter.ACCOUNT
+
+    /** Both sources known off: the app setting applied, the account reported without its filter. */
+    private fun settledOff() = ExplicitFilterWatch().apply {
+        updateAccount(false)
+        settleApp(updateApp(false))
+    }
+
+    private fun ExplicitFilterWatch.now() = filterAt(begin())
 
     // ---- ExplicitFilterWatch ---------------------------------------------------------------------
 
     @Test
-    fun theFilterMayApplyUntilItIsKnownOffAndApplied() {
+    fun aFilterMayApplyUntilItIsKnownOff() {
         val watch = ExplicitFilterWatch()
-        assertTrue("before the first value", watch.mayFilter(watch.begin()))
-        val generation = watch.update(false)
-        assertTrue("off, but the engine may still filter", watch.mayFilter(watch.begin()))
-        watch.settle(generation)
-        assertFalse(watch.mayFilter(watch.begin()))
-        watch.settle(watch.update(true))
-        assertTrue(watch.mayFilter(watch.begin()))
+        assertEquals("before the first values", account, watch.now())
+        watch.updateAccount(false)
+        assertEquals("the app setting is not known yet", app, watch.now())
+        val generation = watch.updateApp(false)
+        assertEquals("off, but the engine may still filter", app, watch.now())
+        watch.settleApp(generation)
+        assertEquals(off, watch.now())
+        watch.settleApp(watch.updateApp(true))
+        assertEquals(app, watch.now())
+        watch.updateAccount(true)
+        assertEquals(account, watch.now())
+        watch.updateAccount(null)
+        assertEquals("no longer reported: may still be on", account, watch.now())
     }
 
     @Test
@@ -40,43 +56,72 @@ class ExplicitFilterTest {
         val watch = settledOff()
         val lookup = watch.begin()
         // Turned on while the lookup ran, and even back off before it answered.
-        watch.settle(watch.update(true))
-        watch.settle(watch.update(false))
-        assertTrue(watch.mayFilter(lookup))
-        assertFalse(watch.mayFilter(watch.begin()))
+        watch.settleApp(watch.updateApp(true))
+        watch.settleApp(watch.updateApp(false))
+        assertEquals(app, watch.filterAt(lookup))
+        assertEquals(off, watch.now())
+
+        // The account turned its filter on and off again while a lookup ran.
+        val second = watch.begin()
+        watch.updateAccount(true)
+        watch.updateAccount(false)
+        assertEquals(account, watch.filterAt(second))
+        assertEquals(off, watch.now())
 
         // Started while on, answered after it went off: still filtered.
-        val on = ExplicitFilterWatch().apply { settle(update(true)) }
+        val on = ExplicitFilterWatch().apply {
+            updateAccount(false)
+            settleApp(updateApp(true))
+        }
         val whileOn = on.begin()
-        on.settle(on.update(false))
-        assertTrue(on.mayFilter(whileOn))
+        on.settleApp(on.updateApp(false))
+        assertEquals(app, on.filterAt(whileOn))
     }
 
     @Test
     fun aLateSettleOfAnOlderValueIsIgnored() {
         val watch = ExplicitFilterWatch()
-        val off = watch.update(false)
-        watch.update(true)
-        watch.settle(off) // the engine applied the old value; the new one is not applied yet
-        assertTrue(watch.mayFilter(watch.begin()))
-        assertTrue(watch.filtered)
+        watch.updateAccount(false)
+        val old = watch.updateApp(false)
+        watch.updateApp(true)
+        watch.settleApp(old) // the engine applied the old value; the new one is not applied yet
+        assertEquals(app, watch.now())
     }
 
     // ---- verdicts --------------------------------------------------------------------------------
 
     @Test
-    fun onlyAnExplicitItemWhileFilteredHasNoVerdict() {
-        assertNull(DownloadRules.downloadVerdict(playable = false, explicit = true, filterMayApply = true))
-        assertEquals(false, DownloadRules.downloadVerdict(playable = false, explicit = true, filterMayApply = false))
+    fun anExplicitItemHasNoVerdictWhileOnlyTheAppSettingMayApply() {
+        // Members (queueing).
+        assertNull(DownloadRules.memberVerdict(playable = false, explicit = true, filter = app))
+        assertEquals(false, DownloadRules.memberVerdict(playable = false, explicit = true, filter = off))
+        assertEquals("not downloaded for a filtered account", false, DownloadRules.memberVerdict(playable = false, explicit = true, filter = account))
         // Region / restriction: a verdict whatever the filter.
-        assertEquals(false, DownloadRules.downloadVerdict(playable = false, explicit = false, filterMayApply = true))
-        assertEquals(true, DownloadRules.downloadVerdict(playable = true, explicit = true, filterMayApply = true))
-        assertNull(DownloadRules.downloadVerdict(playable = false, explicit = false, filterMayApply = false, resolved = false))
+        assertEquals(false, DownloadRules.memberVerdict(playable = false, explicit = false, filter = app))
+        assertEquals(true, DownloadRules.memberVerdict(playable = true, explicit = true, filter = account))
+        assertNull(DownloadRules.memberVerdict(playable = false, explicit = false, filter = off, resolved = false))
+        // Download rows: no filter ever fails one.
+        assertNull(DownloadRules.rowVerdict(playable = false, explicit = true, filter = app))
+        assertNull(DownloadRules.rowVerdict(playable = false, explicit = true, filter = account))
+        assertEquals(false, DownloadRules.rowVerdict(playable = false, explicit = true, filter = off))
+        assertEquals(false, DownloadRules.rowVerdict(playable = false, explicit = false, filter = account))
+        assertEquals(true, DownloadRules.rowVerdict(playable = true, explicit = true, filter = app))
+    }
+
+    @Test
+    fun aFilteredAccountDoesNotQueueExplicitMembers() {
+        val item = CollectionResolver.trackItem(explicitGreyed("spotify:track:e"), json, account)
+        assertTrue(item.unavailable)
+        assertTrue(item.checked)
+        // Re-checked (and queued) once the account's filter goes off.
+        val again = CollectionResolver.trackItem(Track(uri = "spotify:track:e", name = "Explicit song", explicit = true), json, off)
+        assertFalse(again.unavailable)
+        assertTrue(again.checked)
     }
 
     @Test
     fun anExplicitMemberWhileFilteredIsQueuedAndStoredWithoutTheFilter() {
-        val item = CollectionResolver.trackItem(explicitGreyed("spotify:track:e"), json, filterMayApply = true)
+        val item = CollectionResolver.trackItem(explicitGreyed("spotify:track:e"), json, filter = app)
         assertFalse(item.unavailable)
         assertFalse(item.checked)
         val stored = json.decodeFromString(Track.serializer(), item.metadataJson!!)
@@ -86,7 +131,7 @@ class ExplicitFilterTest {
         val episode = CollectionResolver.episodeItem(
             Episode(uri = "spotify:episode:e", name = "Explicit episode", explicit = true, playable = false),
             json,
-            filterMayApply = true,
+            filter = app,
         )
         assertFalse(episode.unavailable)
         assertFalse(episode.checked)
@@ -94,11 +139,11 @@ class ExplicitFilterTest {
 
     @Test
     fun withTheFilterKnownOffAGreyedOutExplicitMemberIsUnavailable() {
-        val item = CollectionResolver.trackItem(explicitGreyed("spotify:track:e"), json, filterMayApply = false)
+        val item = CollectionResolver.trackItem(explicitGreyed("spotify:track:e"), json, filter = off)
         assertTrue(item.unavailable)
         assertTrue(item.checked)
         // A region-locked member stays unavailable while filtered too.
-        val region = CollectionResolver.trackItem(Track(uri = "spotify:track:r", name = "Not here", playable = false), json, filterMayApply = true)
+        val region = CollectionResolver.trackItem(Track(uri = "spotify:track:r", name = "Not here", playable = false), json, filter = app)
         assertTrue(region.unavailable)
         assertTrue(region.checked)
     }
@@ -106,10 +151,10 @@ class ExplicitFilterTest {
     /** The scenario of the finding: Liked Songs synced while "Hide explicit content" is on. */
     @Test
     fun aSyncWhileFilteredQueuesNewExplicitLikesAndKeepsWhatWasKnown() {
-        val newLike = CollectionResolver.trackItem(explicitGreyed("spotify:track:new"), json, filterMayApply = true)
+        val newLike = CollectionResolver.trackItem(explicitGreyed("spotify:track:new"), json, filter = app)
         // Recorded unavailable earlier, with the filter off (really not playable here).
-        val gone = CollectionResolver.trackItem(explicitGreyed("spotify:track:gone"), json, filterMayApply = true)
-        val fine = CollectionResolver.trackItem(Track(uri = "spotify:track:f", name = "Song"), json, filterMayApply = true)
+        val gone = CollectionResolver.trackItem(explicitGreyed("spotify:track:gone"), json, filter = app)
+        val fine = CollectionResolver.trackItem(Track(uri = "spotify:track:f", name = "Song"), json, filter = app)
         val items = listOf(fine, newLike, gone)
         val (checked, complete) = DownloadRules.availabilityOf(items, resolutionComplete = true)
         assertEquals(listOf(fine), checked)

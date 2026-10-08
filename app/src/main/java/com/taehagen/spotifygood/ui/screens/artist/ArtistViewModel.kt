@@ -87,7 +87,7 @@ internal data class ArtistUiState(
 internal class ArtistViewModel(graph: AppGraph, private val uri: String) : DetailViewModel(graph, uri) {
 
     private val content: StateFlow<LoadState<ArtistContent>> = retryTrigger
-        .flatMapLatest { graph.catalog.artist(uri).catch { emit(Resource.Error(it)) } }
+        .flatMapLatest { loadOnceConnected { graph.catalog.artist(uri) }.catch { emit(Resource.Error(it)) } }
         .map { resource -> resource.toLoadState(::toContent) }
         .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LoadState.Loading)
@@ -105,6 +105,11 @@ internal class ArtistViewModel(graph: AppGraph, private val uri: String) : Detai
     ) { load, playback, following, rows, connectivity ->
         ArtistUiState(load, playback, following, rows, connectivity.offline, connectivity.online, connectivity.filterExplicit)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ArtistUiState())
+
+    init {
+        // Opened while the session connected and it failed, or a stale copy: load again once ONLINE.
+        reloadWhenOnline(content)
+    }
 
     /** Plays the artist context starting at [track] (top tracks come first in an artist context). */
     fun playTrack(track: Track) {
@@ -160,7 +165,7 @@ internal class ArtistDiscographyViewModel(
     private val selected = MutableStateFlow(initialGroup)
 
     private val artist: Flow<LoadState<Artist>> = retryTrigger
-        .flatMapLatest { graph.catalog.artist(uri).catch { emit(Resource.Error(it)) } }
+        .flatMapLatest { loadOnceConnected { graph.catalog.artist(uri) }.catch { emit(Resource.Error(it)) } }
         .map { resource -> resource.toLoadState { it } }
 
     val state: StateFlow<DiscographyUiState> = combine(artist, selected, offline) { load, group, offline ->
@@ -172,6 +177,11 @@ internal class ArtistDiscographyViewModel(
         DiscographyUiState(mapped, offline)
     }.flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DiscographyUiState())
+
+    init {
+        // Opened while the session connected and it failed, or a stale copy: load again once ONLINE.
+        reloadWhenOnline(state.map { it.load })
+    }
 
     fun select(group: DiscographyGroup) {
         selected.value = group

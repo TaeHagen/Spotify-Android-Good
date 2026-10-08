@@ -317,6 +317,12 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             .launchIn(viewModelScope)
         // Refresh indicator ends with the reload.
         pager.state.onEach { if (!it.isLoading) refreshing.value = false }.launchIn(viewModelScope)
+        // A downloaded Liked Songs follows likes made elsewhere (another device): a loaded server page
+        // asks the download to sync (at most every few minutes; pull-to-refresh always does).
+        combine(contextUri, pager.state.map { !it.isLoading && it.error == null && it.items.isNotEmpty() }.distinctUntilChanged(), ::Pair)
+            .onEach { (uri, loaded) -> if (uri != null && loaded && graph.engineReach() == EngineReach.ONLINE) graph.downloads.requestSync(uri) }
+            .catch { }
+            .launchIn(viewModelScope)
     }
 
     fun onFilterChange(text: String) {

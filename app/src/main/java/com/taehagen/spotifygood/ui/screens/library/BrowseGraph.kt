@@ -2,6 +2,7 @@ package com.taehagen.spotifygood.ui.screens.library
 
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.engine.accountExplicitFilter
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.Track
@@ -66,13 +67,14 @@ internal fun AppGraph.explicitFilterChanges(): Flow<Boolean> =
         }
 
 /**
- * Whether explicit content is filtered: "Hide explicit content", or the account's own filter.
- * The engine marks catalog results unplayable then; metadata stored with downloads isn't, so
- * lists built from it apply [withExplicitFilter].
+ * Whether explicit content is filtered: "Hide explicit content", or the account's own filter (as
+ * last reported online when no session reported it yet: a start without a network). The engine
+ * marks catalog results unplayable then; metadata stored with downloads isn't, so lists built
+ * from it apply [withExplicitFilter].
  */
 internal fun AppGraph.explicitFilterFlow(): Flow<Boolean> =
-    combine(settings.settings.map { it.hideExplicit }, engine.user.map { it?.explicitFilter == true }) { hide, account ->
-        hide || account
+    combine(settings.settings, engine.user) { prefs, user ->
+        prefs.hideExplicit || accountExplicitFilter(user, prefs.accountExplicitFilter)
     }.distinctUntilChanged()
 
 /** [filter]ed explicit tracks are unplayable (the player refuses them and skips to the next). */

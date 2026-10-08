@@ -26,6 +26,7 @@ pub mod metadata;
 mod pages;
 mod pathfinder;
 mod pfparse;
+mod played;
 mod playlist;
 mod proto;
 mod radio;

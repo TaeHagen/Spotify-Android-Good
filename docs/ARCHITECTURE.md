@@ -257,9 +257,16 @@ Explicit filter: `EngineSettings.filterExplicit` is OR-ed into the session's own
 and restored when the setting goes off). librespot reads that attribute everywhere: the Player
 refuses explicit tracks (Spirc skips them) and skips a loaded one when the filter turns on,
 the catalog returns them with `playable:false` (its cached metadata is dropped when the
-effective filter changes). Downloads ignore it: they are filtered when shown and played (§9.7). It is applied to the live session (when
-it is declared online and on every health tick, since Spirc can overwrite it) and to the
-offline session the Player uses while not online. `User.explicitFilter` stays the account's.
+effective filter changes). Downloads ignore the app setting (they are filtered when shown and
+played) but not the account's own filter: `download.track` refuses explicit items for such an
+account (§9.7). It is applied to the live session (when it is declared online and on every health
+tick, since Spirc can overwrite it) and to the offline session the Player uses while not online.
+`User.explicitFilter` stays the account's. The offline session is never connected, so no server
+tells it the account's filter: Kotlin persists the value an online session last reported
+(`Settings.accountExplicitFilter`, cleared on logout and when another account's data is removed)
+and sends it as `EngineSettings.accountFilterExplicit`, which the offline session takes as the
+account's value. Until a session reports the user again (a cold start without a network: only the
+username is known), the app's lists use the persisted value too (`explicitFilterFlow`).
 
 ### 4.4 Audio output
 
@@ -452,9 +459,11 @@ for the restore and a play restores right away (one already answered restores th
 
 `EngineSettings`: `{"bitrate":96|160|320,"normalize":true,"normalizePregain":"quiet|normal|loud",
 "autoplay":true,"gapless":true,"deviceName":"…","streamingCacheMb":1024,"offline":false,
-"filterExplicit":false,"connectVisible":true}`. `connectVisible`: listed as a Spotify Connect
-target (Spirc runs), see §8. `filterExplicit` ("Hide explicit content") is OR-ed into the account's
-own explicit filter (see §4.3); it can never turn the account's filter off.
+"filterExplicit":false,"accountFilterExplicit":false,"connectVisible":true}`. `connectVisible`: listed
+as a Spotify Connect target (Spirc runs), see §8. `filterExplicit` ("Hide explicit content") is
+OR-ed into the account's own explicit filter (see §4.3); it can never turn the account's filter off.
+`accountFilterExplicit`: the account's own filter as last reported online, for the offline session
+(§4.3).
 
 ### 6.2 Player (routed local/remote)
 
@@ -595,6 +604,20 @@ Show         ShowRef + {"description","episodes":[Episode],"total","offset","fol
 partial      present (true) only when some item metadata could not be fetched right now; those items
              are placeholders with just `uri` (and `playable:false`). Artist: some top tracks,
              releases or related artists are missing. Do not cache as fresh; retry (§6.3).
+resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the account's
+             `playedState`). Extended metadata has none; `catalog.show` pages and `catalog.episodes`
+             for one or two episodes (an episode page) overlay it from Pathfinder
+             (`queryPodcastEpisodes`, `getEpisodeOrChapter`, `catalog/played.rs`): best effort, only
+             when the operation's hash is known (never triggers a hash discovery), at most 3 s, a
+             failure leaves the fields out and never makes a page `partial`. Search results carry it
+             when Pathfinder sends it. Kotlin overlays the phone's own progress on top
+             (`EpisodeProgressStore`): local playback of an episode is recorded (on pause, on a change
+             of item, when playback leaves the phone, every 15 s while playing; within 30 s of the
+             end it is played), shown on show / episode pages, saved episodes and downloads, and a
+             play of an episode with no position resumes there (`PlayerController.episodeResume`).
+             The phone's progress wins unless Spotify's state changed since it was recorded (the
+             episode was played elsewhere afterwards). Nothing is reported back to Spotify: progress
+             made on this phone, offline above all, is not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
               "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
@@ -816,8 +839,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   state: the previous account's data is removed first and only then is the new owner recorded
   (§9.2). Logout forgets the owner only once its whole wipe succeeded.
 * Logout (with confirmation): stops the login flows and deletes the pending device code, then
-  `session.logout`, credentials, downloads, the resume state, the response and image caches,
-  the DB and the settings. Every step runs even if an earlier one failed; no new login reaches
+  `session.logout`, credentials, downloads, the resume state, the podcast progress, the
+  response and image caches, the DB and the settings. Every step runs even if an earlier one failed; no new login reaches
   the engine until the wipe is done. The account owner is forgotten last, only when every step
   succeeded (otherwise a later login of another account wipes again).
 
@@ -1049,8 +1072,21 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   are queued once they become playable (also from a failed row). Each sync also queues failed
   downloads that still own their file (failed by re-validation or the key check) and are playable
   again; `download.track` reuses the file.
+* Changes made elsewhere (another device): a server page of a downloaded collection asks it to sync
+  within seconds, like an edit made here (`DownloadManager.requestSync`: a playlist page whose
+  revision is not the downloaded one, at most every 30 s; a Liked Songs page at most every 5 min);
+  pull-to-refresh (`LibraryEdit.Refreshed`) syncs every downloaded Liked Songs and playlist; and in
+  the foreground while online (coming to the foreground, coming online) Liked Songs and playlists
+  synced over 30 min ago are re-listed (albums and shows keep the 12 h / daily cadence). A sync after
+  an edit that cannot come online marks the collection due instead.
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
   `noBackupFilesDir/offline/images/<imageIdHex>.jpg`.
+* Covers (`OfflineCovers`, a Coil interceptor): lists built from downloads and the online pages
+  of downloaded items name the CDN image URLs of the stored metadata. Every size of a completed
+  download's album images (an episode's own images, else its show's) is served from the download's
+  cover file, also online; the network only when the file went. A downloaded collection's own image
+  URL (a playlist mosaic) is loaded from the network and falls back to its first downloaded
+  member's cover. The maps follow the completed downloads (metadata read once per download).
 * Audio keys (`KeyVault`, envelope encryption): one random AES-256 data key in
   `noBackupFilesDir/offline/datakey.bin`, sealed with the `CredentialStore` Keystore key, unsealed
   once per process and kept in memory; each download's key is sealed with it in software (AES-GCM,
@@ -1071,23 +1107,28 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   writes (`download.fileId`, stored in `fileId`); garbage collection (when the queue is idle)
   keeps a `.part` while an unfinished row (pending, failed, cancelled) names it, so "Retry
   failed" resumes it, and deletes files and `.part`s no row names.
-* Explicit filter ("Hide explicit content", or the account's own): downloads are the user's
-  content, so the filter applies when they are shown and played (the Downloads screens dim
-  explicit entries, the Player refuses them, offline too), never to download rows. `download.track`
-  downloads explicit items whatever the filter. The catalog's `playable` includes the filter, so an
-  explicit item answered `playable:false` while the filter may have applied (`ExplicitFilterWatch`:
-  unless the effective filter was known off and applied by the engine from before the lookup until
-  after it) gets no verdict: re-validation leaves the download COMPLETED (re-validated at a later
-  sync), a failed download is not requeued for it, a member is neither recorded as not playable nor
-  taken out of that set (a new member is queued; `download.track` decides), and a collection with
-  such members is re-checked at the next sync. Catalog metadata stored with a row drops the filter's
-  `playable:false`. When the effective filter goes off (applied by the engine), every collection's
-  unavailable members become due for a re-check and the re-validation (failed downloads, unavailable
-  members, stale downloads) runs at once when online, else once online. Once per installation, the
-  downloads earlier versions failed for the filter are repaired: explicit downloads re-validation
-  marked no longer available are restored to COMPLETED (file and key were kept; registered with
-  `offline.add`, re-validated at the next sync), explicit downloads refused as not available are
-  queued again, and every collection's unavailable members are re-checked.
+* Explicit filter: downloads are the user's content, so a filter applies when they are shown and
+  played (the Downloads screens dim explicit entries, the Player refuses them, offline too: the
+  offline session takes the account's filter as last reported, §4.3), never to download rows.
+  "Hide explicit content" never keeps an item from being downloaded; the account's own filter
+  (Spotify's parental setting) does: `download.track` refuses explicit items for such an account
+  and explicit members are not queued (recorded as not playable here, re-checked when the filter
+  goes off). The catalog's `playable` includes both, so an explicit item's `playable:false` is
+  judged per what may have applied (`ExplicitFilterWatch`: a source counts as off only if it was
+  known off, the setting applied by the engine and the account's value reported online, from before
+  the lookup until after it): with only the app setting a member gets no verdict (queued;
+  `download.track` decides, neither recorded as not playable nor taken out of that set, its
+  collection re-checked at the next sync); with either filter, re-validation leaves the download
+  COMPLETED (re-validated at a later sync) and a failed download is not requeued for it. Catalog
+  metadata stored with a row drops the filter's `playable:false`. When the effective filter goes off
+  (applied by the engine), every collection's unavailable members become due for a re-check and the
+  re-validation (failed downloads, unavailable members, stale downloads) runs at once when online,
+  else once online. Once per installation, and only once an online session reported the account
+  without its own filter, the downloads earlier versions failed for "Hide explicit content" are
+  repaired: explicit downloads re-validation marked no longer available are restored to COMPLETED
+  (file and key were kept; registered with `offline.add`, re-validated at the next sync), explicit
+  downloads refused as not available are queued again, and every collection's unavailable members
+  are re-checked.
 * Downloads require Premium (they are always Premium here) and are wiped on logout.
 
 ### 9.8 Data layer
@@ -1147,11 +1188,18 @@ while online). Unknown hearts / Save / Follow controls are shown disabled. A tog
 opposite of the state the control showed, never of the server's current state, so a stale
 "not saved" can't remove an item (and its download).
 Native catalog calls don't wait for a session: they fail `NOT_CONNECTED` at once while it
-connects or reconnects. Browse screens load once the engine's reach (§4.6) is ONLINE and
-again after a reconnect when they failed. Search waits up to 10 s for a connecting session
-(not when offline or in backoff, so a captive portal can't stall it); a search or result page
-that failed before the session was ONLINE shows its error and runs again by itself once it is
-(a connection error while ONLINE: after the next reconnect), without a Retry tap.
+connects or reconnects (cold start, the idle stop, a network change, a link opened from
+another app). Screens wait up to 10 s for a connecting session (not when offline or in
+backoff, so a captive portal can't stall them) and load again by themselves once the
+engine's reach (§4.6) is ONLINE, without a Retry tap (`ui/screens/album/SessionReach.kt`).
+Detail pages (album, playlist, artist, discography, show, episode), the profile and the
+library lists start their stale-while-revalidate load at once (a cached copy shows right
+away); a `NOT_CONNECTED` of that first load while connecting keeps the page loading instead
+of saying "You're offline", and the load runs again once the session is up. Each time the
+reach becomes ONLINE, a page that failed, shows a stale cached copy (its refresh failed) or
+the download loads again, once a load still running has settled. A search or result page that
+failed before the session was ONLINE shows its error and runs again once it is (a connection
+error while ONLINE: after the next reconnect).
 
 ### 9.9 UI
 
@@ -1193,7 +1241,9 @@ and receive (phone as Connect device), shuffle, smart shuffle with suggestions, 
 all/one, queue (view, add, remove, reorder, clear, jump), autoplay, gapless,
 normalisation, streaming quality, playlists (view, create, edit, reorder, delete,
 follow), Liked Songs, saved albums/artists/podcasts, follow artists, search (all types,
-recent searches), home feed, album/artist/playlist/show/episode pages, lyrics (synced),
+recent searches), home feed, album/artist/playlist/show/episode pages, podcast resume
+points (this phone's progress, kept on the phone and not synced to other devices; Spotify's
+when its web API provides them, §6.5), lyrics (synced),
 radio, share links, deep links, downloads (track/album/playlist/liked/podcast, Wi-Fi only
 option, storage management, auto-sync), offline mode, sleep timer, explicit-content
 filter, system equalizer, settings, adaptive layouts, accessibility (content

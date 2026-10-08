@@ -76,6 +76,9 @@ Tests: `./gradlew :app:testDebugUnitTest` and `cd native && cargo test -p spotco
 - Smart shuffle is computed locally; other Connect clients see the suggestions as ordinary
   tracks.
 - Downloads can only be played inside the app.
+- Podcast progress made on this phone (offline above all) is kept on the phone and resumes
+  there, but is not reported back to Spotify: other devices don't see it. Spotify's own resume
+  points are shown when its web player API provides them (best effort).
 - Signing in a local-network speaker uses the Spotify Connect ZeroConf protocol as
   implemented by librespot. It is tested against librespot's own server code, not against
   commercial speakers.

@@ -8,6 +8,7 @@ import com.taehagen.spotifygood.auth.CredentialStore
 import com.taehagen.spotifygood.connect.DevicesRepository
 import com.taehagen.spotifygood.connect.LocalDeviceDiscovery
 import com.taehagen.spotifygood.data.CatalogRepository
+import com.taehagen.spotifygood.data.EpisodeProgressStore
 import com.taehagen.spotifygood.data.HomeRepository
 import com.taehagen.spotifygood.data.LibraryRepository
 import com.taehagen.spotifygood.data.LyricsRepository
@@ -37,6 +38,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
+import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
@@ -82,7 +84,15 @@ class AppGraph(val app: Application) {
     val playback: PlaybackRepository by lazy { PlaybackRepository(appScope, events) }
     /** Last local session (playback resumption, cold-start play); one DataStore per process. */
     val resumeStore: ResumeStore by lazy { ResumeStore(app) }
-    val player: PlayerController by lazy { PlayerController(appScope, rpc, playback, resumeStore, devices) }
+    val player: PlayerController by lazy {
+        PlayerController(appScope, rpc, playback, resumeStore, devices).also { it.episodeResume = episodeProgress::resumeMs }
+    }
+    /** Podcast progress made on this phone (docs §6.5); records local episode playback. */
+    val episodeProgress: EpisodeProgressStore by lazy {
+        EpisodeProgressStore(File(app.filesDir, "episode_progress.json"), appScope).also { store ->
+            appScope.launch { store.recordFrom(playback.snapshot) }
+        }
+    }
     val devices: DevicesRepository by lazy {
         DevicesRepository(appScope, rpc, events, resumeStore::read).also { repo ->
             // Coroutine timers don't count deep sleep: an expired pending target goes when the app
@@ -162,7 +172,11 @@ class AppGraph(val app: Application) {
      * rethrown (the login then fails, and the next one tries again). Not cancellable.
      */
     private suspend fun removePreviousAccountData(): Unit = withContext(NonCancellable) {
-        val steps = accountDataSteps() + WipeStep("event replays") { events.resetAccountReplays() }
+        val steps = accountDataSteps() + listOf(
+            WipeStep("event replays") { events.resetAccountReplays() },
+            // The previous account's parental filter (the new account's arrives with its session).
+            WipeStep("account explicit filter") { settings.update { it.copy(accountExplicitFilter = false) } },
+        )
         runWipeSteps(steps) { step, t -> Log.e(TAG, "Account change: ${step.name} failed", t) }
     }
 
@@ -173,6 +187,7 @@ class AppGraph(val app: Application) {
         // The playback service clears it too, but only while it runs.
         WipeStep("resume state") { resumeStore.clear() },
         WipeStep("response cache") { responseCache.clear() },
+        WipeStep("episode progress") { episodeProgress.clear() },
         // Recent searches, downloaded collections and the rest of the account's tables.
         WipeStep("database") { withContext(Dispatchers.IO) { database.clearAllTables() } },
         WipeStep("image cache") {

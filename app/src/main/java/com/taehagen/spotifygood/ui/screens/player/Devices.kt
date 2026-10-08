@@ -102,21 +102,33 @@ internal data class DevicesUiState(
     val thisDevice: ConnectDevice? get() = devices.devices.firstOrNull { it.isThisDevice }
     val thisDeviceId: String? get() = devices.thisDeviceId ?: thisDevice?.id
 
-    /** The Connect device playing when it is not this phone. */
-    val remoteActive: ConnectDevice?
-        get() {
-            val listed = devices.activeDevice?.takeIf { !it.isThisDevice && it.id != thisDeviceId }
-            if (listed != null) return listed
-            val ref = snapshot.activeDevice ?: return null
-            if (snapshot.source != PlaybackSource.REMOTE) return null
-            return devices.devices.firstOrNull { it.id == ref.id } ?: ConnectDevice(id = ref.id, name = ref.name, type = ref.type, isActive = true)
-        }
+    /** The Connect device playing when it is not this phone ([remoteActiveDevice]). */
+    val remoteActive: ConnectDevice? get() = remoteActiveDevice(devices, snapshot)
 
     val currentOutput: AudioOutput? get() = outputs.firstOrNull { it.isCurrent }
     val hasPreferredOutput: Boolean get() = outputs.any { it.isPreferred }
     val otherDevices: List<ConnectDevice>
         get() = devices.devices.filter { !it.isThisDevice && it.id != thisDeviceId }.distinctBy { it.id }
     val distinctOutputs: List<AudioOutput> get() = outputs.distinctBy { it.id }
+}
+
+/**
+ * The device presented as the current one when it is not this phone, or null when this phone is.
+ *
+ * The playback snapshot wins over the cluster: while it shows playback on this phone (playing or
+ * paused, `source == local`, also the offline queue), the cluster's active device is not the
+ * current one. The cluster can keep naming a paused speaker as the account's active device after
+ * "This phone" kept the offline queue playing here (docs/ARCHITECTURE.md §6.2 `connect.transfer`).
+ * Otherwise the cluster's active device (not this phone), else a remote snapshot's device.
+ */
+internal fun remoteActiveDevice(devices: DeviceList, snapshot: PlaybackSnapshot): ConnectDevice? {
+    if (snapshot.source == PlaybackSource.LOCAL && snapshot.isActive) return null
+    val thisDeviceId = devices.thisDeviceId ?: devices.devices.firstOrNull { it.isThisDevice }?.id
+    val listed = devices.activeDevice?.takeIf { !it.isThisDevice && it.id != thisDeviceId }
+    if (listed != null) return listed
+    val ref = snapshot.activeDevice ?: return null
+    if (snapshot.source != PlaybackSource.REMOTE) return null
+    return devices.devices.firstOrNull { it.id == ref.id } ?: ConnectDevice(id = ref.id, name = ref.name, type = ref.type, isActive = true)
 }
 
 /**

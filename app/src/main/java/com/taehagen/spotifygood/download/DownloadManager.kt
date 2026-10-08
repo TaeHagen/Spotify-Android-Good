@@ -22,6 +22,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
+import coil3.intercept.Interceptor
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.db.RetryRow
 import com.taehagen.spotifygood.auth.CredentialStore
@@ -35,6 +36,8 @@ import com.taehagen.spotifygood.data.db.IndexRow
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.engine.SpotifyEngine
+import com.taehagen.spotifygood.engine.accountExplicitFilter
+import com.taehagen.spotifygood.engine.reportedOnline
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.model.OfflineTrackRecord
@@ -56,7 +59,6 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
-import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -139,10 +141,11 @@ data class DownloadActivity(
  *   deletes downloads. A collection whose sync keeps failing is retried with a growing backoff
  *   ([DownloadRules.nextSyncAt]). Members the catalog reports as not playable here are kept in the
  *   membership but not queued, and do not hold the collection status back.
- * * The explicit filter never touches download rows (it applies when they are shown and played):
- *   an explicit item's `playable:false` while it may have applied is no verdict
- *   ([ExplicitFilterWatch], [DownloadRules.downloadVerdict]); when it goes off, what it may have
- *   hidden is looked up again at once ([onExplicitFilterOff]).
+ * * The explicit filter never touches download rows (it applies when they are shown and played).
+ *   "Hide explicit content" never keeps an item from being downloaded; the account's own filter
+ *   keeps explicit ones from being queued ([ExplicitFilterWatch], [DownloadRules.memberVerdict],
+ *   [DownloadRules.rowVerdict]). When a filter goes off, what it may have hidden is looked up again
+ *   at once ([onExplicitFilterOff]).
  * * Removal deletes files, rows and the native offline index entries.
  * * The native offline index follows the database through numbered changes ([OfflineIndexSync]):
  *   every commit and removal takes its number under [mutex] with its database write.
@@ -177,6 +180,15 @@ class DownloadManager(
     /** Which catalog answers say nothing about explicit items (the filter was or may have been on). */
     private val explicitFilter = ExplicitFilterWatch()
     private val resolver = CollectionResolver(rpc, json, explicitFilter)
+
+    /** When [requestSync] last asked each collection to sync (in memory). */
+    private val syncRequests = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** The app is in the foreground ([ProcessLifecycleOwner] started). */
+    @Volatile private var foreground = false
+
+    /** Downloaded covers for the image loader ([coverInterceptor]). */
+    private val covers = OfflineCovers()
 
     /** The explicit filter went off while offline: look again at what it hid once online. */
     @Volatile private var recheckWhenOnline = false
@@ -255,6 +267,12 @@ class DownloadManager(
         .flowOn(Dispatchers.Default)
         .shareIn(scope, SharingStarted.WhileSubscribed(STATES_STOP_TIMEOUT_MS, replayExpirationMillis = 0), replay = 1)
 
+    /**
+     * For the image loader: serves the downloaded cover for the CDN image URLs of completed
+     * downloads (and stands in for downloaded collections' images), offline too ([OfflineCovers]).
+     */
+    internal val coverInterceptor: Interceptor get() = covers.interceptor
+
     /** Live state of the downloader (current item, bytes, last stop reason). */
     val activity: StateFlow<DownloadActivity> get() = runner.activity
 
@@ -290,6 +308,7 @@ class DownloadManager(
         scope.launch {
             engine.isOnline.filter { it }.collect {
                 syncIfStale()
+                if (foreground) syncRemoteChanges()
                 if (recheckWhenOnline) {
                     recheckWhenOnline = false
                     if (!recheckAfterFilterOff()) recheckWhenOnline = true
@@ -298,12 +317,14 @@ class DownloadManager(
                 if (!runner.isRunning && dao.pendingCount() > 0) scheduleExecution(kick = true)
             }
         }
+        scope.launch { followCovers() }
         scope.launch { watchExplicitFilter() }
         scope.launch { repairExplicitFailures() }
         scope.launch(Dispatchers.Main) {
             // Back in the app: resume a queue that stopped (storage was full, retries ran out …).
             ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
                 override fun onStart(owner: LifecycleOwner) {
+                    foreground = true
                     scope.launch {
                         try {
                             if (!runner.isRunning && dao.pendingCount() > 0) scheduleExecution(kick = true)
@@ -312,7 +333,13 @@ class DownloadManager(
                         } catch (e: Exception) {
                             Log.w(TAG, "Resuming downloads failed", e)
                         }
+                        // Changes made on another device while the app was away (else once online).
+                        if (engine.isOnline.value) syncRemoteChanges()
                     }
+                }
+
+                override fun onStop(owner: LifecycleOwner) {
+                    foreground = false
                 }
             })
         }
@@ -637,32 +664,66 @@ class DownloadManager(
         stillBusy
     }
 
+    // ---- offline covers ------------------------------------------------------------------------------
+
+    /**
+     * Keeps [covers] in step with the completed downloads and the downloaded collections. Each
+     * download's metadata is read once (memoised by URI); a download run that completes items one
+     * after another updates the maps once it settles.
+     */
+    private suspend fun followCovers() {
+        val known = HashMap<String, DownloadRules.CoverSource>()
+        combine(downloadedUris, collectionDao.observeAll()) { uris, collections -> uris to collections }
+            .collectLatest { (uris, collections) ->
+                delay(COVERS_SETTLE_MS)
+                try {
+                    val maps = withContext(Dispatchers.Default) {
+                        known.keys.retainAll(uris)
+                        val fresh = uris.filter { it !in known }
+                        fresh.chunked(SQL_CHUNK).flatMap { dao.coverRows(it) }.forEach { row ->
+                            known[row.uri] = DownloadRules.CoverSource(row.uri, row.imagePath, DownloadRules.coverUrls(json, row.metadataJson, row.recordJson))
+                        }
+                        // Not completed any more by the time it was read: looked at again next time.
+                        DownloadRules.offlineCoverMaps(known.values, collections.map { it.imageUrl to decodeItems(it.itemUrisJson) })
+                    }
+                    covers.update(maps)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Updating the offline covers failed", e)
+                }
+            }
+    }
+
     // ---- explicit filter -----------------------------------------------------------------------------
 
     /**
-     * Follows the effective explicit filter ("Hide explicit content", or the account's own) for
-     * [explicitFilter]: the catalog's `playable` includes it, downloads do not. When it goes off,
-     * what was looked up while it was on is looked up again within seconds ([onExplicitFilterOff]).
+     * Follows "Hide explicit content" and the account's own filter for [explicitFilter] (the
+     * catalog's `playable` includes both). When the effective filter goes off, what was looked up
+     * while it was on is looked up again within seconds ([onExplicitFilterOff]).
      */
     private suspend fun watchExplicitFilter() {
         var settledFiltered: Boolean? = null
-        combine(
-            settings.persisted.map { it.hideExplicit },
-            // No user (engine stopped, logged out): the account's filter stays as last reported.
-            engine.user.filterNotNull().map { it.explicitFilter },
-        ) { hide, account -> hide to account }
+        combine(settings.persisted, engine.user) { prefs, user ->
+            // Reported: as an online session reported it (unknown before); effective: else the
+            // value last reported (a start without a network).
+            ExplicitInputs(prefs.hideExplicit, user?.takeIf { it.reportedOnline }?.explicitFilter, accountExplicitFilter(user, prefs.accountExplicitFilter))
+        }
             .distinctUntilChanged()
-            .collectLatest { (hide, account) ->
-                val filtered = hide || account
-                val generation = explicitFilter.update(filtered)
-                // The catalog answers with the new filter once the engine runs with the setting.
-                engine.awaitSettingsApplied(EXPLICIT_APPLY_TIMEOUT_MS) { it.filterExplicit == hide }
-                explicitFilter.settle(generation)
+            .collectLatest { inputs ->
+                explicitFilter.updateAccount(inputs.reportedAccount)
+                val generation = explicitFilter.updateApp(inputs.hide)
+                // The catalog answers with the new setting once the engine runs with it.
+                engine.awaitSettingsApplied(EXPLICIT_APPLY_TIMEOUT_MS) { it.filterExplicit == inputs.hide }
+                explicitFilter.settleApp(generation)
+                val filtered = inputs.hide || inputs.account
                 val before = settledFiltered
                 settledFiltered = filtered
                 if (before == true && !filtered) onExplicitFilterOff()
             }
     }
+
+    private data class ExplicitInputs(val hide: Boolean, val reportedAccount: Boolean?, val account: Boolean)
 
     /**
      * The explicit filter went off: collections' unavailable members are due for a re-check (also
@@ -694,16 +755,19 @@ class DownloadManager(
     }
 
     /**
-     * Once per installation: earlier versions applied the explicit filter to downloads. Restores the
-     * explicit downloads re-validation failed as no longer playable (file and key were kept), queues
-     * the explicit ones the downloader refused, and makes every collection's unavailable members due
-     * for a re-check ([DownloadRules.explicitRepair]). Restored downloads are registered with the
-     * offline index at once, and re-validated at the next sync.
+     * Once per installation: earlier versions applied "Hide explicit content" to downloads. Restores
+     * the explicit downloads re-validation failed as no longer playable (file and key were kept),
+     * queues the explicit ones the downloader refused, and makes every collection's unavailable
+     * members due for a re-check ([DownloadRules.explicitRepair]). Restored downloads are registered
+     * with the offline index at once, and re-validated at the next sync. Only once an online session
+     * reported the account without its own explicit filter: for a filtered account those downloads
+     * stay as they are (explicit items are not downloaded for it), and the repair waits.
      */
     private suspend fun repairExplicitFailures() {
         try {
             val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             if (withContext(Dispatchers.IO) { prefs.getInt(KEY_EXPLICIT_REPAIR, 0) } >= EXPLICIT_REPAIR_VERSION) return
+            engine.user.first { it != null && it.reportedOnline && !it.explicitFilter }
             val unplayable = appContext.getString(R.string.data_dl_error_unplayable)
             val unavailable = appContext.getString(R.string.data_dl_error_unavailable)
             val (repair, restored, seq) = mutex.withLock {
@@ -841,6 +905,8 @@ class DownloadManager(
             val targets = when (edit) {
                 is LibraryEdit.LikedTracks -> downloaded.filter { it.type == CollectionType.LIKED_SONGS.wire }.map { it.uri }
                 is LibraryEdit.PlaylistEdited -> downloaded.filter { it.uri == edit.uri }.map { it.uri }
+                // Pull-to-refresh: whatever changed elsewhere (no revision to tell).
+                LibraryEdit.Refreshed -> downloaded.filter { it.type in REMOTE_TYPES }.map { it.uri }
             }
             targets.forEach(editSyncs::offer)
         } catch (e: CancellationException) {
@@ -857,11 +923,54 @@ class DownloadManager(
                 mutex.withLock { collectionDao.markSyncDue(uris.toList()) }
                 return
             }
-            sync(only = uris, wait = true)
+            // Not online after all: due at the next sync instead of lost.
+            if (!sync(only = uris, wait = true)) mutex.withLock { collectionDao.markSyncDue(uris.toList()) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "Sync after a library edit failed", e)
+        }
+    }
+
+    /**
+     * A server page of [uri] was loaded (Liked Songs, a playlist with its [revision]): changes made
+     * on another device show up there first. A downloaded [uri] then syncs within seconds, like after
+     * an edit made here ([DownloadRules.syncRequestDue]: a playlist only when its revision is not the
+     * downloaded one; otherwise at most every few minutes).
+     */
+    suspend fun requestSync(uri: String, revision: String? = null) {
+        try {
+            val entity = collectionDao.get(uri) ?: return
+            val now = System.currentTimeMillis()
+            if (!DownloadRules.syncRequestDue(revision, entity.revision, syncRequests[uri], entity.lastAttemptAt, now)) return
+            syncRequests[uri] = now
+            editSyncs.offer(uri)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not ask $uri to sync", e)
+        }
+    }
+
+    /**
+     * In the foreground and online: re-lists the downloaded Liked Songs and playlists whose last sync
+     * is [DownloadRules.FOREGROUND_STALE_MS] old (they change on other devices; albums and shows keep
+     * the daily cadence), so opening the app picks up remote changes also when the session stayed
+     * online.
+     */
+    private suspend fun syncRemoteChanges() {
+        try {
+            if (settings.awaitLoaded().offlineMode) return
+            val now = System.currentTimeMillis()
+            val due = collectionDao.syncStates().filter {
+                it.type in REMOTE_TYPES &&
+                    DownloadRules.nextSyncAt(it.lastSyncedAt, it.lastAttemptAt, it.syncFailures, DownloadRules.FOREGROUND_STALE_MS) <= now
+            }.mapTo(HashSet()) { it.uri }
+            if (due.isNotEmpty()) sync(only = due)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Foreground sync failed", e)
         }
     }
 
@@ -1384,6 +1493,10 @@ class DownloadManager(
         private const val COUNTRY_TIMEOUT_MS = 10_000L
         private const val EDIT_SYNC_DELAY_MS = 5_000L
         private const val RESEAL_BATCH = 200
+        private const val COVERS_SETTLE_MS = 1_000L
+
+        /** Collections that change on other devices (likes, playlist edits). */
+        private val REMOTE_TYPES = setOf(CollectionType.LIKED_SONGS.wire, CollectionType.PLAYLIST.wire)
 
         /** Longest wait for the engine to apply a changed explicit filter (as Settings waits). */
         private const val EXPLICIT_APPLY_TIMEOUT_MS = 15_000L

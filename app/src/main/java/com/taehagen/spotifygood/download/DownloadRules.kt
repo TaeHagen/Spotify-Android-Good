@@ -8,10 +8,12 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 import java.io.File
 
 /**
@@ -42,6 +44,15 @@ internal object DownloadRules {
     const val CONNECTIVITY_PAUSE_MS = 60_000L
 
     /** Longest queue pause. */
+    /** Liked Songs and playlists re-listed when the app is in the foreground and online this long after a sync. */
+    const val FOREGROUND_STALE_MS = 30 * 60_000L
+
+    /** Least time between two syncs a loaded page asks for, per collection (no revision to compare). */
+    const val REQUEST_SYNC_MIN_MS = 5 * 60_000L
+
+    /** Least time between two syncs a page with another revision asks for (an incomplete sync keeps the old one). */
+    const val REQUEST_SYNC_CHANGED_MS = 30_000L
+
     const val MAX_QUEUE_PAUSE_MS = 30 * 60_000L
 
     /** Rate-limit pauses one run waits out before it hands the queue back to the system. */
@@ -299,21 +310,88 @@ internal object DownloadRules {
 
     // ---- explicit filter -----------------------------------------------------------------------------
     //
-    // Downloads are the user's content: the explicit filter ("Hide explicit content", or the account's
-    // own) is applied when they are shown and played, never to download rows. The catalog's `playable`
-    // includes the filter (every explicit item is `playable:false` while it is on), so for an explicit
-    // item it says nothing about availability then.
+    // Downloads are the user's content: the explicit filter is applied when they are shown and played,
+    // never to download rows. "Hide explicit content" never keeps an item from being downloaded; the
+    // account's own filter (Spotify's parental setting) does, as `download.track` refuses explicit
+    // items for such an account. The catalog's `playable` includes both (every explicit item is
+    // `playable:false` while either is on), so for an explicit item it says nothing about
+    // availability then ([ExplicitFilterWatch]).
 
     /**
-     * What the catalog's answer about an item means for downloading it: true (playable here), false
-     * (not playable here) or null (no verdict). An explicit item reported not playable while the
-     * explicit filter [filterMayApply] (see [ExplicitFilterWatch]) gets no verdict, nor does a
-     * placeholder without a name (its lookup failed).
+     * Whether a collection member can be downloaded per the catalog's answer, for queueing it: true,
+     * false (not playable here, or explicit while the account's own filter is or may be on: not for
+     * this account), or null (no verdict: an explicit item while only "Hide explicit content" may have
+     * applied, or a placeholder without a name whose lookup failed). Members without a verdict are
+     * queued and `download.track` decides.
      */
-    fun downloadVerdict(playable: Boolean, explicit: Boolean, filterMayApply: Boolean, resolved: Boolean = true): Boolean? = when {
+    fun memberVerdict(playable: Boolean, explicit: Boolean, filter: ExplicitFilterWatch.Filter, resolved: Boolean = true): Boolean? = when {
         !resolved -> null
-        !playable && explicit && filterMayApply -> null
-        else -> playable
+        playable || !explicit -> playable
+        filter == ExplicitFilterWatch.Filter.APP -> null
+        else -> false
+    }
+
+    /**
+     * Whether an existing download is still playable here per the catalog's answer (re-validation,
+     * failed downloads that may be playable again): an explicit item reported not playable while any
+     * explicit filter may have applied gets no verdict, so the filter never changes a download row
+     * (the Player refuses filtered downloads at play time). Null too for a placeholder.
+     */
+    fun rowVerdict(playable: Boolean, explicit: Boolean, filter: ExplicitFilterWatch.Filter, resolved: Boolean = true): Boolean? = when {
+        !resolved -> null
+        playable || !explicit -> playable
+        filter == ExplicitFilterWatch.Filter.OFF -> false
+        else -> null
+    }
+
+    // ---- offline covers ------------------------------------------------------------------------------
+
+    /** A completed download's cover file and the image URLs that show it. */
+    data class CoverSource(val uri: String, val imagePath: String?, val urls: List<String>)
+
+    /** URL → cover file maps of [OfflineCovers]. */
+    data class CoverMaps(val exact: Map<String, String>, val fallback: Map<String, String>)
+
+    /**
+     * The image URLs a download's cover file shows, from its stored metadata (Track / Episode JSON)
+     * or record (`OfflineTrackRecord`): every size of a track's album images; of an episode its own
+     * images, else its show's (as the downloader picks the cover).
+     */
+    fun coverUrls(json: Json, metadataJson: String?, recordJson: String?): List<String> {
+        fun parse(text: String?) = text?.let { runCatching { json.parseToJsonElement(it) }.getOrNull() } as? JsonObject
+        fun urls(images: JsonElement?): List<String> = (images as? JsonArray).orEmpty().mapNotNull { image ->
+            ((image as? JsonObject)?.get("url") as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+        }
+        fun of(item: JsonObject?): List<String> {
+            if (item == null) return emptyList()
+            val own = urls(item["images"])
+            return urls((item["album"] as? JsonObject)?.get("images")) + own +
+                if (own.isEmpty()) urls((item["show"] as? JsonObject)?.get("images")) else emptyList()
+        }
+        val record = parse(recordJson)
+        return (of(parse(metadataJson)) + of(record?.get("track") as? JsonObject) + of(record?.get("episode") as? JsonObject)).distinct()
+    }
+
+    /**
+     * [CoverMaps] for completed [downloads] and downloaded [collections] (their image URL and
+     * members in order): each URL of a download maps to its cover file; a collection image URL no
+     * download shows falls back to the cover of its first downloaded member (for an album exactly its
+     * cover).
+     */
+    fun offlineCoverMaps(downloads: Collection<CoverSource>, collections: List<Pair<String?, List<String>>>): CoverMaps {
+        val exact = HashMap<String, String>()
+        val byUri = HashMap<String, String>()
+        downloads.forEach { download ->
+            val path = download.imagePath ?: return@forEach
+            byUri[download.uri] = path
+            download.urls.forEach { exact.putIfAbsent(it, path) }
+        }
+        val fallback = HashMap<String, String>()
+        collections.forEach { (imageUrl, members) ->
+            if (imageUrl.isNullOrBlank() || imageUrl in exact || imageUrl in fallback) return@forEach
+            members.firstNotNullOfOrNull { byUri[it] }?.let { fallback[imageUrl] = it }
+        }
+        return CoverMaps(exact, fallback)
     }
 
     /** Whether a row's stored metadata (Track / Episode JSON) or record (`OfflineTrackRecord`) is explicit. */
@@ -362,14 +440,27 @@ internal object DownloadRules {
     fun cancelIdleWork(pending: Int, running: Boolean, jobExecuting: Boolean): Boolean = pending == 0 && !running && !jobExecuting
 
     /**
+     * Whether a server page of a downloaded collection asks it to sync ([DownloadManager.requestSync]):
+     * a playlist page with a [pageRevision] other than the downloaded one at most every
+     * [REQUEST_SYNC_CHANGED_MS]; the same revision never (nothing changed); a page without one (Liked
+     * Songs) at most every [REQUEST_SYNC_MIN_MS] after the last request or sync attempt.
+     */
+    fun syncRequestDue(pageRevision: String?, downloadedRevision: String?, lastRequestAt: Long?, lastAttemptAt: Long?, now: Long): Boolean {
+        if (pageRevision != null && pageRevision == downloadedRevision) return false
+        val gap = if (pageRevision != null) REQUEST_SYNC_CHANGED_MS else REQUEST_SYNC_MIN_MS
+        return now - maxOf(lastRequestAt ?: 0L, lastAttemptAt ?: 0L) >= gap
+    }
+
+    /**
      * Earliest time a downloaded collection is synced again when the session comes online:
-     * [SYNC_STALE_MS] after its last complete sync, and after [failures] consecutive failed or
+     * [staleMs] ([SYNC_STALE_MS]; [FOREGROUND_STALE_MS] for Liked Songs and playlists while the app
+     * is in the foreground) after its last complete sync, and after [failures] consecutive failed or
      * incomplete attempts no sooner than [SYNC_RETRY_BASE_MS] (doubling, ≤ [SYNC_RETRY_MAX_MS]) after
      * the last one, so a collection that keeps failing (deleted playlist) is not re-fetched at every
      * reconnect.
      */
-    fun nextSyncAt(lastSyncedAt: Long?, lastAttemptAt: Long?, failures: Int): Long {
-        val afterSync = (lastSyncedAt ?: 0L) + SYNC_STALE_MS
+    fun nextSyncAt(lastSyncedAt: Long?, lastAttemptAt: Long?, failures: Int, staleMs: Long = SYNC_STALE_MS): Long {
+        val afterSync = (lastSyncedAt ?: 0L) + staleMs
         if (failures <= 0 || lastAttemptAt == null) return afterSync
         var backoff = SYNC_RETRY_BASE_MS
         repeat((failures - 1).coerceIn(0, 10)) { backoff = (backoff * 2).coerceAtMost(SYNC_RETRY_MAX_MS) }
