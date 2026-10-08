@@ -14,6 +14,7 @@ import coil3.request.ImageRequest
 import coil3.request.SuccessResult
 import coil3.request.allowHardware
 import coil3.toBitmap
+import com.taehagen.spotifygood.download.DownloadLocations
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -28,7 +29,8 @@ import kotlin.concurrent.thread
  * (docs/ARCHITECTURE.md §9.4).
  *
  * Only Spotify CDN images (https, hosts `scdn.co` / `spotifycdn.com` and their subdomains) and files inside the
- * app's offline images directory are served, so the exported provider cannot be abused to read
+ * offline images directories of the download locations (internal storage, an SD card:
+ * [DownloadLocations.imageDirs]) are served, so the exported provider cannot be abused to read
  * other files or fetch arbitrary URLs. Images come from the Coil disk cache when present, from the
  * offline image store when downloaded, otherwise they are fetched through the app's ImageLoader
  * (blocking a binder thread of the provider, never the main thread).
@@ -124,18 +126,21 @@ class ArtworkProvider : ContentProvider() {
         private const val FETCH_SIZE_PX = 640
         private const val FETCH_TIMEOUT_MS = 15_000L
         private const val JPEG_QUALITY = 90
-        private val OFFLINE_IMAGES = listOf("offline", "images")
 
         fun authority(context: Context): String = "${context.packageName}.artwork"
 
         /**
          * `content://` uri serving [url] (an https Spotify CDN image or a local offline image path),
-         * or null if [url] is not servable.
+         * or null if [url] is not servable: also a downloaded cover that is not there (an SD card
+         * removed), so callers fall back to the CDN url.
          */
         fun artworkUri(context: Context, url: String?): Uri? {
             if (url.isNullOrBlank()) return null
             val normalized = when {
-                url.startsWith("/") -> Uri.fromFile(File(url)).toString()
+                url.startsWith("/") -> {
+                    if (!DownloadLocations.namesFileIn(url, DownloadLocations.imageDirs(context)) || !File(url).isFile) return null
+                    Uri.fromFile(File(url)).toString()
+                }
                 else -> url
             }
             if (!isAllowedUrl(normalized)) return null
@@ -178,16 +183,10 @@ class ArtworkProvider : ContentProvider() {
             return h == "scdn.co" || h.endsWith(".scdn.co") || h == "spotifycdn.com" || h.endsWith(".spotifycdn.com")
         }
 
-        private fun offlineDirs(context: Context): List<File> = listOf(context.noBackupFilesDir, context.filesDir)
-            .map { base -> OFFLINE_IMAGES.fold(base) { dir, name -> File(dir, name) } }
+        /** The download locations' cover directories (internal, SD cards, the legacy one). */
+        private fun offlineDirs(context: Context): List<File> = DownloadLocations.imageDirs(context)
 
-        private fun isInsideOfflineImages(context: Context, file: File): Boolean {
-            val canonical = runCatching { file.canonicalFile }.getOrNull() ?: return false
-            return offlineDirs(context).any { dir ->
-                val root = runCatching { dir.canonicalFile }.getOrNull() ?: return@any false
-                canonical.parentFile?.let { it == root || it.path.startsWith(root.path + File.separator) } == true
-            }
-        }
+        private fun isInsideOfflineImages(context: Context, file: File): Boolean = DownloadLocations.isInside(file, offlineDirs(context))
 
         /**
          * Downloaded copy of a CDN image, if any: `offline/images/<image id>.jpg` (what the native

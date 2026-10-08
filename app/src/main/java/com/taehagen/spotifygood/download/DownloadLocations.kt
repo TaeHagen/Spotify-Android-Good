@@ -116,6 +116,60 @@ internal class DownloadLocations(private val context: Context) {
         /** Location id of internal storage. */
         const val INTERNAL = ""
         private const val TAG = "DownloadLocations"
+        private const val OFFLINE = "offline"
+        private const val DIRS_TTL_MS = 10_000L
+
+        /**
+         * Every directory a download's cover can be in: `images` of each location root a download can
+         * have (internal storage, every app-specific external files dir: an SD card, mounted or
+         * not yet), plus the legacy `filesDir/offline/images`. The one definition the exported
+         * artwork provider allows local files from. Cached briefly (`getExternalFilesDirs` creates
+         * the directories on each call).
+         */
+        fun imageDirs(context: Context): List<File> {
+            val now = android.os.SystemClock.elapsedRealtime()
+            cachedDirs?.takeIf { now - it.first < DIRS_TTL_MS }?.let { return it.second }
+            val external = try {
+                context.getExternalFilesDirs(null).toList()
+            } catch (e: RuntimeException) {
+                emptyList()
+            }
+            val dirs = imageDirsOf(candidateRoots(context.noBackupFilesDir, context.filesDir, external))
+            cachedDirs = now to dirs
+            return dirs
+        }
+
+        @Volatile private var cachedDirs: Pair<Long, List<File>>? = null
+
+        /** Location roots downloads can have: internal, legacy internal, each external files dir. */
+        fun candidateRoots(noBackupFilesDir: File, filesDir: File, externalFilesDirs: List<File?>): List<File> =
+            (listOf(noBackupFilesDir, filesDir) + externalFilesDirs.filterNotNull()).map { File(it, OFFLINE) }.distinct()
+
+        fun imageDirsOf(roots: List<File>): List<File> = roots.map { File(it, DownloadStorage.IMAGES) }
+
+        /**
+         * Whether [file] is directly in (or below) one of [dirs] (canonical paths: `..` and links
+         * resolved). The exported artwork provider's boundary.
+         */
+        fun isInside(file: File, dirs: List<File>): Boolean {
+            val parent = runCatching { file.canonicalFile.parentFile }.getOrNull() ?: return false
+            return dirs.any { dir ->
+                val root = runCatching { dir.canonicalFile }.getOrNull() ?: return@any false
+                parent == root || parent.path.startsWith(root.path + File.separator)
+            }
+        }
+
+        /**
+         * Whether [path] names a file directly in one of [dirs], without resolving links (cheap,
+         * for building uris; [isInside] decides when a file is served).
+         */
+        fun namesFileIn(path: String, dirs: List<File>): Boolean {
+            val file = File(path)
+            if (!file.isAbsolute || file.path.split(File.separatorChar).any { it == ".." || it == "." }) return false
+            val parent = file.parentFile ?: return false
+            val folder = DownloadRules.normalizeRoot(parent.path)
+            return dirs.any { DownloadRules.normalizeRoot(it.absolutePath) == folder }
+        }
         private val MEDIA_ACTIONS = listOf(
             Intent.ACTION_MEDIA_MOUNTED,
             Intent.ACTION_MEDIA_UNMOUNTED,
