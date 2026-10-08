@@ -7,12 +7,9 @@ import com.taehagen.spotifygood.download.DownloadedCollection
  * The downloads in the media browser (Android Auto / AAOS, docs/ARCHITECTURE.md §9.4), pure rules
  * (JVM-testable) for [LibraryTree]: the Downloads tab grouped as the app's Downloads screen is
  * (Liked Songs and playlists, albums, podcasts, then the songs and the episodes downloaded on their
- * own), downloaded collections listed from the download database, and Media3 paging over them.
+ * own), and downloaded collections listed from the download database (paged by [BrowsePaging]).
  */
 internal object OfflineTree {
-    /** Most items of a list a browser asks for without paging (or with a page larger than this). */
-    const val UNPAGED_MAX = 500
-
     /** A section of the Downloads tab, in tab order. */
     enum class Section { PLAYLISTS, ALBUMS, PODCASTS, SONGS, EPISODES }
 
@@ -82,24 +79,6 @@ internal object OfflineTree {
     /** The items of [collection] that play offline, in collection order (what an offline load of it plays). */
     fun playableItems(collection: DownloadedCollection, downloaded: Set<String>): List<String> =
         collection.itemUris.filter(downloaded::contains)
-
-    /**
-     * The indices page [page] of [pageSize] covers in a list of [size] (Media3 paging). An unpaged
-     * request (a size of `Int.MAX_VALUE` or none) gets the first [unpagedMax]; a page holds no more
-     * than [unpagedMax] either (a browser asking for more pages that way gets them short).
-     */
-    fun range(page: Int, pageSize: Int, size: Int, unpagedMax: Int = UNPAGED_MAX): IntRange {
-        if (size <= 0) return IntRange.EMPTY
-        if (pageSize <= 0 || pageSize == Int.MAX_VALUE) return if (page <= 0) 0 until minOf(size, unpagedMax) else IntRange.EMPTY
-        val from = page.coerceAtLeast(0).toLong() * pageSize
-        if (from >= size) return IntRange.EMPTY
-        val to = minOf(size.toLong(), from + minOf(pageSize, unpagedMax))
-        return from.toInt() until to.toInt()
-    }
-
-    /** [list] paged like [range]. */
-    fun <T> page(list: List<T>, page: Int, pageSize: Int, unpagedMax: Int = Int.MAX_VALUE): List<T> =
-        range(page, pageSize, list.size, unpagedMax).let { if (it.isEmpty()) emptyList() else list.subList(it.first, it.last + 1) }
 
     private fun isEpisode(uri: String) = uri.startsWith("spotify:episode:")
 }
