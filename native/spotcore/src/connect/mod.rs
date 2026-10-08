@@ -262,13 +262,14 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
         Target::Local { activate } => {
             let spirc = spirc()?;
             let request = local::load_request(&args)?;
+            // Until it plays, a push sends this load to the target (see `push`); recorded before
+            // the restore or a hand-back it replaces go (their loads are ahead of it).
+            hub::set_loading(&args);
             restore::clear();
             // The offline queue hands the Player over to Spirc (and a hand-back on its way is
             // replaced: its failure must not make this phone inactive).
             offline::stop();
             hub::forget_hand_back();
-            // Until it plays, a push sends this load to the target (see `push`).
-            hub::set_loading(&args);
             let sent = (|| {
                 if activate {
                     local::sent(spirc.activate())?;
@@ -556,6 +557,35 @@ fn send_queue_adds(device: &str, adds: Vec<Value>) {
     });
 }
 
+/// What a transfer to this phone does (see [`pull`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pull {
+    /// This phone's session plays on (a play if asked).
+    Here,
+    /// The offline queue owns the session here: it plays on.
+    Offline,
+    /// Another device's session comes here (a Connect transfer).
+    TakeOver,
+    /// Nothing is active: the given session starts here.
+    Resume,
+}
+
+/// A transfer to this phone: its own session (Spirc, or the offline queue that hasn't given way)
+/// stays; another device's session is taken only if there is none here, or that device actually
+/// plays (one that only sits paused as the account's active device doesn't own the session, the
+/// same rule as `route`).
+fn pull(local_session: bool, offline_owns: bool, other_active: bool, other_playing: bool) -> Pull {
+    if local_session {
+        Pull::Here
+    } else if offline_owns && !other_playing {
+        Pull::Offline
+    } else if other_active {
+        Pull::TakeOver
+    } else {
+        Pull::Resume
+    }
+}
+
 /// Whether a push to another device starts a session there (a connect-state `play` of the
 /// frozen or the given session) instead of transferring this phone's: a restore is still being
 /// applied here, or there is no session to transfer (nothing active, or this phone active with
@@ -603,27 +633,33 @@ async fn transfer(args: TransferArgs) -> AppResult<Value> {
     let offline_owns = offline::is_active() && !offline::yields();
     if args.device_id == me {
         let spirc = spirc()?;
-        if hub::local_active_or_activating() && !hub::local_active_empty() {
-            if args.play {
-                local::sent(spirc.play())?;
+        let local_session = hub::local_active_or_activating() && !hub::local_active_empty();
+        match pull(local_session, offline_owns, other_active, offline::elsewhere_playing()) {
+            Pull::Here => {
+                if args.play {
+                    local::sent(spirc.play())?;
+                }
             }
-        } else if other_active {
-            let request = TransferRequest {
-                transfer_options: TransferOptions {
-                    restore_paused: Some(if args.play { "restore" } else { "pause" }.to_string()),
-                    ..Default::default()
-                },
-            };
-            local::sent(spirc.transfer(Some(request)))?;
-        } else if offline_owns {
-            // Already playing here (downloads).
-            if args.play {
-                offline::control(&Ctl::Play).await?;
+            Pull::Offline => {
+                // Already playing here (downloads).
+                if args.play {
+                    offline::control(&Ctl::Play).await?;
+                }
             }
-        } else {
-            // Nothing is active anywhere: start the given session here.
-            let resume = args.resume.as_ref().and_then(|r| r.load_args(args.play)).ok_or_else(nothing_active)?;
-            return load(resume).await;
+            Pull::TakeOver => {
+                let request = TransferRequest {
+                    transfer_options: TransferOptions {
+                        restore_paused: Some(if args.play { "restore" } else { "pause" }.to_string()),
+                        ..Default::default()
+                    },
+                };
+                local::sent(spirc.transfer(Some(request)))?;
+            }
+            Pull::Resume => {
+                // Nothing is active anywhere: start the given session here.
+                let resume = args.resume.as_ref().and_then(|r| r.load_args(args.play)).ok_or_else(nothing_active)?;
+                return load(resume).await;
+            }
         }
         return ok();
     }
@@ -945,6 +981,19 @@ mod tests {
         assert_eq!(start.len(), 2);
         assert!(start[1].to_string().contains("pause") && !start[1].to_string().contains("add_to_queue"));
         assert_eq!(adds.len(), 1);
+    }
+
+    #[test]
+    fn a_pull_keeps_the_offline_queue_over_a_paused_device() {
+        // the offline queue plays here, the cluster still names a paused speaker
+        assert_eq!(pull(false, true, true, false), Pull::Offline);
+        // ... a speaker that plays is taken over
+        assert_eq!(pull(false, true, true, true), Pull::TakeOver);
+        // this phone's own session, another device's, or nothing
+        assert_eq!(pull(true, false, true, true), Pull::Here);
+        assert_eq!(pull(false, false, true, false), Pull::TakeOver);
+        assert_eq!(pull(false, true, false, false), Pull::Offline);
+        assert_eq!(pull(false, false, false, false), Pull::Resume);
     }
 
     #[test]
