@@ -76,4 +76,15 @@ class SleepScheduleTest {
         assertEquals(now + 149_600, SleepSchedule.trackEndsAt(now, durationMs = 200_000, positionMs = 50_000))
         assertEquals(now, SleepSchedule.trackEndsAt(now, durationMs = 200_000, positionMs = 199_900))
     }
+
+    @Test
+    fun trackEndFollowsThePodcastSpeed() {
+        // 150 s of media left: 75 s at 2x, 300 s at 0.5x, 187.5 s at 0.8x; the margin is wall time.
+        assertEquals(now + 75_000 - 400, SleepSchedule.trackEndsAt(now, durationMs = 200_000, positionMs = 50_000, speed = 2.0))
+        assertEquals(now + 300_000 - 400, SleepSchedule.trackEndsAt(now, durationMs = 200_000, positionMs = 50_000, speed = 0.5))
+        assertEquals(now + 187_500 - 400, SleepSchedule.trackEndsAt(now, durationMs = 200_000, positionMs = 50_000, speed = 0.8))
+        // Not a usable speed (0 while not playing): 1x.
+        assertEquals(now + 149_600, SleepSchedule.trackEndsAt(now, durationMs = 200_000, positionMs = 50_000, speed = 0.0))
+        assertEquals(now + 149_600, SleepSchedule.trackEndsAt(now, durationMs = 200_000, positionMs = 50_000, speed = Double.NaN))
+    }
 }

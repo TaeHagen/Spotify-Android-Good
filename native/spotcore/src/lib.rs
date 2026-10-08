@@ -8,9 +8,12 @@
 //! * `audio` — AndroidSink and AndroidMixer.
 //! * `catalog` — Spotify internal APIs for metadata, library, search, home, lyrics.
 //! * `offline` — downloads and the offline track index used by the patched Player.
+//! * `zeroconf_client`, `cast_client` — sign LAN speakers (ZeroConf) and Google Cast devices in
+//!   to the account (Connect send).
 
 pub mod audio;
 pub mod bridge;
+pub mod cast_client;
 pub mod catalog;
 pub mod connect;
 pub mod engine;

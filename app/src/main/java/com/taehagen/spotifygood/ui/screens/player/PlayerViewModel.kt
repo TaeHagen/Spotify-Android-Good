@@ -230,8 +230,11 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
 
     val sleepTimerState: StateFlow<SleepTimerState> = sleepTimer.state
 
-    /** The podcast playback speed (episodes played on this phone, one speed for all). */
+    /** The chosen podcast playback speed (episodes played on this phone, one speed for all). */
     val podcastSpeed: StateFlow<Float> = speedControl.speed
+
+    /** The speed episodes play at here: the chosen one, or the highest the audio output takes below it. */
+    val podcastSpeedInEffect: StateFlow<Float> = speedControl.inEffect
 
     fun setPodcastSpeed(speed: Float) = speedControl.set(speed)
 

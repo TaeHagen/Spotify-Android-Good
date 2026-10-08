@@ -515,7 +515,8 @@ fn set_volume(args: VolumeArgs) -> AppResult<Value> {
 /// `player.setSpeed`: the speed the app's sink plays at (podcasts; the app sends 1 for music). The
 /// Spirc reports it as the playback speed while playing (also every later Spirc, see
 /// `hub::attach`) and the offline queue extrapolates with it, so positions here and on the other
-/// clients follow the real rate.
+/// clients follow the real rate. The Player measures its position corrections against it (also
+/// every later Player).
 fn set_speed(speed: f64) -> AppResult<Value> {
     hub::HUB.lock().playback_speed = Some(speed);
     if let Some(spirc) = hub::spirc() {
@@ -524,6 +525,7 @@ fn set_speed(speed: f64) -> AppResult<Value> {
         }
     }
     offline::set_speed(speed);
+    crate::engine::player_host::set_playback_speed(speed);
     ok()
 }
 
@@ -849,6 +851,12 @@ pub(crate) fn find_cluster_device(device_id: &str) -> Option<String> {
         .find(|id| id.as_str() == device_id)
         .or_else(|| ids.iter().find(|id| id.eq_ignore_ascii_case(device_id)))
         .cloned()
+}
+
+/// The `(id, name)` of every device in the cluster. Used by the Cast client to recognise a
+/// receiver that joined under an id other than the one it was given.
+pub(crate) fn cluster_device_names() -> Vec<(String, String)> {
+    hub::cluster().map(|c| c.device.iter().map(|(id, d)| (id.clone(), d.name.clone())).collect()).unwrap_or_default()
 }
 
 /// Woken on every cluster update (a new device joining pushes a cluster update to us).

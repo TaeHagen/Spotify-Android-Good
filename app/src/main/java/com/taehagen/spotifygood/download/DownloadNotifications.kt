@@ -18,6 +18,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.work.ForegroundInfo
 import com.taehagen.spotifygood.Notifications
+import com.taehagen.spotifygood.MainActivity
 import com.taehagen.spotifygood.R
 
 /**
@@ -157,8 +158,8 @@ internal class DownloadNotifications(private val context: Context) {
     )
 
     private fun contentIntent(): PendingIntent? {
-        val launch = context.packageManager.getLaunchIntentForPackage(context.packageName) ?: return null
-        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val launch = MainActivity.launchIntent(context)
+        launch.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
         return PendingIntent.getActivity(context, REQUEST_OPEN, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
 

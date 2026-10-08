@@ -88,6 +88,15 @@ class MediaIdsTest {
     fun planPlaysDownloadsAsQueue() {
         val all = listOf(t1, t2, "spotify:track:3")
         assertEquals(LoadPlan(trackUris = all, startIndex = 1), MediaIds.plan(listOf(MediaIds.downloaded(t2)), 0) { all })
+        // The queue is the one of the start item (its section of the Downloads tab).
+        val episode = "spotify:episode:e"
+        val asked = mutableListOf<String>()
+        val plan = MediaIds.plan(listOf(MediaIds.downloaded(episode)), 0) { start ->
+            asked += start
+            listOf("spotify:episode:d", episode)
+        }
+        assertEquals(listOf(episode), asked)
+        assertEquals(LoadPlan(trackUris = listOf("spotify:episode:d", episode), startIndex = 1), plan)
         // A download missing from the list is still played first.
         val missing = "spotify:track:9"
         assertEquals(

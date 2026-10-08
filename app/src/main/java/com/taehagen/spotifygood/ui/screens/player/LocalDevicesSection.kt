@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.WifiTethering
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -41,6 +42,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.connect.CastServices
 import com.taehagen.spotifygood.connect.LocalConnectDevice
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.nativebridge.NativeException
@@ -198,9 +200,9 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
         discovery.discovering,
         combine(connecting, online, ::Pair),
     ) { found, cluster, discovering, (connectingId, online) ->
-        val clusterIds = cluster.devices.map { it.id }.toSet()
         LocalDevicesUiState(
-            devices = found.filter { it.deviceId !in clusterIds },
+            // Not the account's devices again, nor a Cast twin of a ZeroConf speaker.
+            devices = CastServices.visible(found, cluster.devices),
             discovering = discovering,
             connectingId = connectingId,
             online = online,
@@ -244,7 +246,7 @@ internal class LocalDevicesViewModel(graph: AppGraph) : ViewModel() {
         val pick = DevicePicks.mark()
         val activeBefore = devicesRepository.devices.value.activeDeviceId
         viewModelScope.launch {
-            connecting.value = device.deviceId
+            connecting.value = device.key
             try {
                 // transferTo sends the saved session as `resume`, so it starts on the device
                 // when nothing is playing anywhere.
@@ -352,9 +354,10 @@ internal fun rememberLocalDevices(sheet: String, onConnected: () -> Unit): Local
 }
 
 /**
- * "Other devices on your network": Spotify Connect receivers found on the LAN that aren't in the
- * account yet (docs/ARCHITECTURE.md §8). Rendering only; [rememberLocalDevices] in the sheet owns
- * discovery and the results. Tapping a device logs it in, transfers playback and closes the sheet.
+ * "Other devices on your network": Spotify Connect receivers and Google Cast devices found on the
+ * LAN that aren't in the account yet (docs/ARCHITECTURE.md §8). Rendering only;
+ * [rememberLocalDevices] in the sheet owns discovery and the results. Tapping a device logs it in,
+ * transfers playback and closes the sheet.
  */
 @Composable
 internal fun LocalDevicesSection(local: LocalDevicesHolder, transferring: Boolean = false) {
@@ -392,7 +395,7 @@ internal fun LocalDevicesSection(local: LocalDevicesHolder, transferring: Boolea
             state.devices.forEach { device ->
                 LocalDeviceRow(
                     device = device,
-                    busy = state.connectingId == device.deviceId,
+                    busy = state.connectingId == device.key,
                     // Not while a Connect transfer from this sheet is running either.
                     enabled = state.connectingId == null && !transferring,
                     onClick = { local.connect(device) },
@@ -436,11 +439,13 @@ private fun LocalDeviceRow(
             Text(text = device.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
         },
         supportingContent = {
-            val subtitle = if (busy) {
-                stringResource(R.string.local_connect_connecting)
-            } else {
-                listOfNotNull(device.brand, device.model).joinToString(" ").ifBlank { null }
-                    ?: stringResource(R.string.local_connect_subtitle)
+            val details = listOfNotNull(device.brand, device.model).joinToString(" ").ifBlank { null }
+            val subtitle = when {
+                busy -> stringResource(R.string.local_connect_connecting)
+                // The small "Google Cast" hint: signed in through Cast, not Spotify Connect.
+                device.isCast -> details?.let { stringResource(R.string.local_connect_cast_subtitle_model, it) }
+                    ?: stringResource(R.string.local_connect_cast_subtitle)
+                else -> details ?: stringResource(R.string.local_connect_subtitle)
             }
             Text(
                 text = subtitle,
@@ -455,7 +460,13 @@ private fun LocalDeviceRow(
         trailingContent = if (busy) {
             { Box(Modifier.size(24.dp)) { CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) } }
         } else {
-            { Icon(Icons.Rounded.WifiTethering, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+            {
+                Icon(
+                    if (device.isCast) Icons.Rounded.Cast else Icons.Rounded.WifiTethering,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         },
         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
         modifier = Modifier.clickable(enabled = enabled, role = Role.Button, onClick = onClick),

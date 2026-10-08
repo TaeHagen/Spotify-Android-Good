@@ -55,7 +55,7 @@ class ServiceAddressTest {
     @Test
     fun ipv4AndRoutableIpv6NeedNoScope() {
         val target = ServiceAddress.target(v4, 4070, "/zc") { error("not asked") }
-        assertEquals(ServiceTarget("http://192.168.1.20:4070/zc", null), target)
+        assertEquals(ServiceTarget("http://192.168.1.20:4070/zc", null, "192.168.1.20"), target)
         val ipv6 = ServiceAddress.target(ula, 80, null) { error("not asked") }
         assertEquals(null, ipv6?.scopeId)
         assertEquals("http://[fd00:0:0:0:0:0:0:1]:80/", ipv6?.url)

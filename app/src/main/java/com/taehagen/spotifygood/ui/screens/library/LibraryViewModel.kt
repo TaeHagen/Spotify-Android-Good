@@ -220,7 +220,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
 
     /** Saved episodes with this phone's podcast progress where it is newer than Spotify's (docs §6.5). */
     private val episodes: Flow<PagedState<Episode>> = combine(episodesLoader.state, graph.episodeProgress.version) { page, _ ->
-        page.copy(items = page.items.map(graph.episodeProgress::merge))
+        page.copy(items = page.items.map(graph.episodeProgress::overlay))
     }
 
     val state: StateFlow<LibraryUiState> = combine(
@@ -386,7 +386,12 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
     fun downloadState(uri: String): Flow<DownloadState?> =
         graph.downloads.collectionStatus(uri).map { it.toIndicatorState() }.catch { emit(null) }.distinctUntilChanged()
 
+    /** A Your Episodes row: the episode playing toggles; any other starts at its resume point (the player's lookup). */
     fun playEpisode(episode: Episode) {
+        if (graph.playback.snapshot.value.track?.uri == episode.uri) {
+            graph.player.togglePlayPause()
+            return
+        }
         val episodes = episodesLoader.state.value.items
         val index = episodes.indexOfFirst { it.uri == episode.uri }
         if (index >= 0) graph.player.playTracks(episodes.map { it.uri }, index) else graph.player.playTracks(listOf(episode.uri))

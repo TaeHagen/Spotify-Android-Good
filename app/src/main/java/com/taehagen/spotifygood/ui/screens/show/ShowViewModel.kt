@@ -118,7 +118,7 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
     val state: StateFlow<ShowUiState> = combine(
         // Episodes show this phone's podcast progress where it is newer than Spotify's (docs §6.5).
         combine(header, list, graph.episodeProgress.version) { header, page, _ ->
-            header to page.copy(episodes = page.episodes.map(graph.episodeProgress::merge))
+            header to page.copy(episodes = page.episodes.map(graph.episodeProgress::overlay))
         },
         playbackInfo,
         graph.savedFlow(uri),
@@ -319,14 +319,23 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
         if (sort == EpisodeSort.OLDEST) loadMore()
     }
 
+    /**
+     * A row tap: the episode playing (here or on a Connect device) toggles, as the episode page's
+     * button does (reloading it at the row's point would restart a remote device's progress); any
+     * other starts at its resume point.
+     */
     fun playEpisode(episode: Episode) {
         if (episode.isPlaceholder || !episode.playable) return
+        if (currentPlayback().isCurrent(episode.uri)) {
+            graph.player.togglePlayPause()
+            return
+        }
         graph.player.play(PlayRequest(contextUri = uri, startUri = episode.uri, positionMs = episode.resumePosition()))
     }
 
-    /** Toggles playback of this show, or starts its newest episode. */
+    /** Toggles playback of this show, or starts its newest episode at its resume point. */
     override fun playContext() {
-        val newest = firstPage.firstOrNull { it.playable && !it.isPlaceholder }
+        val newest = firstPage.firstOrNull { it.playable && !it.isPlaceholder }?.let(graph.episodeProgress::overlay)
         when {
             currentPlayback().isContext(uri) -> graph.player.togglePlayPause()
             newest != null -> playEpisode(newest)
@@ -392,7 +401,7 @@ internal class EpisodeViewModel(graph: AppGraph, private val uri: String) : Deta
     val state: StateFlow<EpisodeUiState> = combine(
         // This phone's podcast progress where it is newer than Spotify's (docs §6.5).
         combine(content, graph.episodeProgress.version) { load, _ ->
-            if (load is LoadState.Ready) load.copy(data = load.data.copy(episode = graph.episodeProgress.merge(load.data.episode))) else load
+            if (load is LoadState.Ready) load.copy(data = load.data.copy(episode = graph.episodeProgress.overlay(load.data.episode))) else load
         },
         playbackInfo,
         graph.savedFlow(uri),

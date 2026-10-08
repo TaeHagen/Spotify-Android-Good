@@ -44,7 +44,9 @@ import com.google.common.util.concurrent.ListenableFuture
 import com.taehagen.spotifygood.App
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.Notifications
+import com.taehagen.spotifygood.MainActivity
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.download.DownloadedCollection
 import com.taehagen.spotifygood.engine.EngineHolder
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.model.PlaybackSource
@@ -56,6 +58,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
@@ -134,6 +137,8 @@ class PlaybackService : MediaLibraryService() {
     private val searchCache = ConcurrentHashMap<String, List<MediaItem>>()
     /** uri → downloaded cover path of completed downloads (offline artwork). */
     @Volatile private var downloadedImages: Map<String, String> = emptyMap()
+    /** The downloaded collections ([downloadedQueue]: what is downloaded on its own). */
+    @Volatile private var downloadedCollections: List<DownloadedCollection> = emptyList()
     /** The stored credentials were read: "logged out" is real from then on. */
     @Volatile private var engineReady = false
     /** Last published player error (the same instance while unchanged, so controllers see it once). */
@@ -155,12 +160,12 @@ class PlaybackService : MediaLibraryService() {
             devices = graph.devices,
             volume = coordinator.volumeSync,
             audioSessionId = graph.audioSink.audioSessionId,
-            downloadedUris = { graph.downloads.downloadedUris.value.toList() },
+            downloadedQueue = ::downloadedQueue,
             downloadedImage = { uri -> downloadedImages[uri] },
             playerError = ::currentPlayerError,
             onRetry = ::retryAfterError,
             onCommand = ::ensurePlaybackHolder,
-            podcastSpeed = { graph.podcastSpeed.speed.value },
+            podcastSpeed = { graph.podcastSpeed.inEffect.value },
             onSpeed = graph.podcastSpeed::set,
         )
 
@@ -386,6 +391,14 @@ class PlaybackService : MediaLibraryService() {
     private fun observeState() {
         val playback = graph.playback
         lifecycleScope.launch {
+            // Android Auto orders its tabs by the network (Downloads first offline): re-read the
+            // root when that flips (also when a stopped engine's flag is refreshed on a read).
+            combine(graph.engine.isNetworkAvailable, graph.settings.settings.map { it.offlineMode }) { network, offline -> network && !offline }
+                .distinctUntilChanged()
+                .drop(1)
+                .collect { session?.notifyChildrenChanged(LibraryTree.ROOT, ROOT_TABS, null) }
+        }
+        lifecycleScope.launch {
             // Local or mirrored playback (e.g. "play on this phone" from another device) keeps the
             // engine; a browse-only bind (nothing loaded) does not start it.
             playback.snapshot.map { it.source != PlaybackSource.NONE }.distinctUntilChanged().filter { it }
@@ -399,7 +412,7 @@ class PlaybackService : MediaLibraryService() {
                 // Inputs of the player error.
                 graph.engine.state.map { },
                 graph.player.failure.map { },
-                graph.podcastSpeed.speed.map { },
+                graph.podcastSpeed.inEffect.map { },
             ).collect {
                 player.refresh()
                 // Runs on most wake-ups (engine and snapshot events): a cheap check of the
@@ -438,6 +451,11 @@ class PlaybackService : MediaLibraryService() {
                     triggerNotificationUpdate()
                 }
             }
+        }
+        lifecycleScope.launch {
+            graph.downloads.collections
+                .catch { Log.w(TAG, "Downloaded collections unavailable", it) }
+                .collect { downloadedCollections = it }
         }
         lifecycleScope.launch {
             // Changes only with the set of completed downloads (not on download progress).
@@ -526,7 +544,7 @@ class PlaybackService : MediaLibraryService() {
 
     /** "Sign in" resolution (Android Auto shows it with the error): opens the app's login. */
     private fun signInExtras(): Bundle {
-        val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return Bundle.EMPTY
+        val launch = MainActivity.launchIntent(this)
         val intent = PendingIntent.getActivity(this, REQUEST_SIGN_IN, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Bundle().apply {
             putString(MediaConstants.EXTRAS_KEY_ERROR_RESOLUTION_ACTION_LABEL_COMPAT, getString(R.string.playback_error_action_sign_in))
@@ -590,7 +608,7 @@ class PlaybackService : MediaLibraryService() {
     // ---- notifications ------------------------------------------------------------------------
 
     private fun sessionActivity(): PendingIntent? {
-        val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return null
+        val launch = MainActivity.launchIntent(this)
         launch.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         launch.putExtra(EXTRA_OPEN_PLAYER, true)
         return PendingIntent.getActivity(this, REQUEST_SESSION, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -822,14 +840,15 @@ class PlaybackService : MediaLibraryService() {
             accountLibraryError()?.let { return@future LibraryResult.ofError(it) }
             // Auto browses right after connecting, often on a cold engine: let the session come up
             // first instead of answering from an empty cache. The local parents (root, recent,
-            // downloads) never start the engine.
-            if (LibraryTree.needsSession(parentId)) {
+            // downloads) never start the engine, nor does a downloaded collection browsed offline.
+            if (LibraryTree.needsSession(parentId) && !tree.browsesDownloads(parentId)) {
                 holdForBrowsing()
                 coordinator.environment.awaitSessionStart()
             }
-            val children = tree.children(parentId, params)
+            // Paged by the tree: the downloads are read a page at a time.
+            val children = tree.pagedChildren(parentId, page, pageSize, params)
                 ?: return@future LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
-            LibraryResult.ofItemList(children.page(page, pageSize), params)
+            LibraryResult.ofItemList(ImmutableList.copyOf(children), params)
         }
 
         override fun onSearch(
@@ -898,18 +917,18 @@ class PlaybackService : MediaLibraryService() {
             val first = mediaItems.firstOrNull()
             val query = first?.requestMetadata?.searchQuery
             if (mediaItems.size == 1 && query != null) {
-                // Voice: "play X" (empty query = "play something": resume the last context).
-                if (query.isBlank()) {
-                    val last = resumeStore.read()
-                        ?: return@future MediaItemsWithStartPosition(emptyList(), C.INDEX_UNSET, C.TIME_UNSET)
-                    MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
-                } else {
-                    // "Play X" right after a cold start: search needs the session (NOT_CONNECTED otherwise).
-                    coordinator.environment.awaitSessionStart()
-                    val item = runCatching { tree.resolveVoiceQuery(query, first.requestMetadata.extras) }
-                        .onFailure { if (it is CancellationException) throw it }
-                        .getOrNull()
-                    MediaItemsWithStartPosition(listOfNotNull(item), 0, C.TIME_UNSET)
+                // Voice: "play X" (empty query = "play something": resume the last context). The
+                // same resolver as the activity's MEDIA_PLAY_FROM_SEARCH (LibraryTree.resolveVoice).
+                val voice = VoiceRequest.of(query, first.requestMetadata.extras)
+                // "Play X" right after a cold start: search needs the session (NOT_CONNECTED otherwise).
+                if (!voice.isBlank) coordinator.environment.awaitSessionStart()
+                when (val outcome = tree.resolveVoice(voice)) {
+                    VoiceOutcome.PlaySomething -> {
+                        val last = resumeStore.read() ?: noVoiceMatch(PlaybackErrorKind.NOT_ACTIVE_DEVICE)
+                        MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
+                    }
+                    is VoiceOutcome.NoMatch -> noVoiceMatch(outcome.kind)
+                    is VoiceOutcome.Play -> MediaItemsWithStartPosition(outcome.items, 0, C.TIME_UNSET)
                 }
             } else {
                 MediaItemsWithStartPosition(mediaItems, startIndex, startPositionMs)
@@ -942,6 +961,23 @@ class PlaybackService : MediaLibraryService() {
         searchCache[query] = results
     }
 
+    /**
+     * A voice request ("play X", or "play something" with no stored session) that found nothing:
+     * shown as the player's error, and the request fails. An empty answer would not do: Media3
+     * would still prepare and play, resuming whatever was loaded instead.
+     */
+    private fun noVoiceMatch(kind: PlaybackErrorKind): Nothing {
+        graph.player.noteFailure(kind, null)
+        throw UnsupportedOperationException("Nothing matches the voice request")
+    }
+
+    /**
+     * The downloads a `dl|` item (a song or episode the Downloads tab lists on its own) plays
+     * with: its section of the tab, newest first, as the app's Downloads screen plays it.
+     */
+    private fun downloadedQueue(startUri: String): List<String> =
+        OfflineTree.singles(graph.downloads.downloadedUris.value, downloadedCollections).sectionOf(startUri)
+
     private fun List<MediaItem>.page(page: Int, pageSize: Int): ImmutableList<MediaItem> {
         if (pageSize <= 0 || pageSize == Int.MAX_VALUE || (page <= 0 && pageSize >= size)) return ImmutableList.copyOf(this)
         val from = page.toLong() * pageSize
@@ -951,6 +987,8 @@ class PlaybackService : MediaLibraryService() {
 
     companion object {
         private const val TAG = "PlaybackService"
+        /** The root's tabs (Home, Library, Downloads, Browse), for the children-changed hint. */
+        private const val ROOT_TABS = 4
 
         /** Start (while the app is visible) to bring up the opt-in Connect presence. */
         const val ACTION_START_PRESENCE = "com.taehagen.spotifygood.playback.START_PRESENCE"

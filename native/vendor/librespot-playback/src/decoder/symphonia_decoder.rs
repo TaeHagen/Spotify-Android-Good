@@ -227,7 +227,8 @@ impl AudioDecoder for SymphoniaDecoder {
                     if err.kind() == io::ErrorKind::UnexpectedEof {
                         return Ok(None);
                     } else {
-                        return Err(DecoderError::SymphoniaDecoder(err.to_string()));
+                        // SPOTIFYGOOD: a timed-out read is a stall (DecoderError::Stalled)
+                        return Err(DecoderError::from_io(err));
                     }
                 }
                 Err(err) => {

@@ -134,6 +134,11 @@ class SpotifyEngine(
     val user: StateFlow<User?> = _user.asStateFlow()
     /** True while the native session is ONLINE. */
     val isOnline: StateFlow<Boolean> = _online.asStateFlow()
+    /**
+     * Whether a network is available. Kept current by [NetworkMonitor]'s callback while the engine
+     * runs; while it is stopped no callback is registered, and the value is read from the system
+     * when it matters (a holder is taken, the engine stops, [currentNetworkAvailable]).
+     */
     val isNetworkAvailable: StateFlow<Boolean> = _networkAvailable.asStateFlow()
     /** True while the native session is started (any state but STOPPED); listeners may register. */
     val isRunning: StateFlow<Boolean> = _running.asStateFlow()
@@ -232,6 +237,9 @@ class SpotifyEngine(
     }
 
     init {
+        // Not `true` by default: a cold start without a network (Android Auto in a garage) must
+        // read offline before the engine ever ran.
+        refreshNetworkWhileStopped()
         // The account's explicit filter outlives the session: a start without a network (the
         // offline Player, the lists, the downloads) still filters for a filtered account.
         launchSafe("account-explicit-filter") {
@@ -319,8 +327,33 @@ class SpotifyEngine(
             updateConnectVisibleLocked()
         }
         Log.d(TAG, "acquire $type")
+        // The caller decides on [state] right away (PlaybackEnvironment.reach before the start
+        // ran): a stopped engine's network flag may be hours old.
+        refreshNetworkWhileStopped()
         requestReconcile(acquired = true)
         return Holder(type)
+    }
+
+    /**
+     * The network as of now, for readers that hold no holder (Android Auto's root, the downloads
+     * shortcut): the callback-kept flag while the engine runs, else read from the system.
+     */
+    fun currentNetworkAvailable(): Boolean {
+        refreshNetworkWhileStopped()
+        return _networkAvailable.value
+    }
+
+    /**
+     * While the engine is stopped no callback keeps the network flag current: reads it from the
+     * system. Never overwrites what a running engine's collector wrote (checked again under
+     * [stateLock], which a start's first network write also takes).
+     */
+    private fun refreshNetworkWhileStopped() {
+        if (_running.value) return
+        val available = networkMonitor.snapshot().available
+        synchronized(stateLock) {
+            if (!_running.value) updateState { it.copy(networkAvailable = refreshedNetwork(_running.value, it.networkAvailable) { available }) }
+        }
     }
 
     /** Suspends until the stored credentials have been read; afterwards [isLoggedIn] is accurate. */
@@ -518,6 +551,7 @@ class SpotifyEngine(
             accountError = null
             updateState { EngineState(networkAvailable = it.networkAvailable) }
             _running.value = false
+            refreshNetworkWhileStopped()
         }
         Log.i(TAG, "Logged out")
     }
@@ -697,6 +731,7 @@ class SpotifyEngine(
         appliedSettings.value = null
         updateState { it.copy(session = SessionState.STOPPED, error = accountError, nextRetryMs = null) }
         _running.value = false
+        refreshNetworkWhileStopped()
     }
 
     private suspend fun runStart(gen: Long, args: SessionStartArgs) {
@@ -1051,6 +1086,9 @@ internal fun knownUser(current: User?, credentials: StoredCredentials?): User? {
     val username = credentials?.username?.takeIf { it.isNotBlank() } ?: return current
     return current?.takeIf { it.username == username } ?: User(username = username)
 }
+
+/** The network flag after a refresh: a running engine's own value, else what the system reports. */
+internal fun refreshedNetwork(running: Boolean, current: Boolean, read: () -> Boolean): Boolean = if (running) current else read()
 
 /** `session.setNetworkAvailable` args (docs/ARCHITECTURE.md §6.1); `network` only when known. */
 internal fun networkArgs(status: NetworkStatus): JsonObject = buildJsonObject {

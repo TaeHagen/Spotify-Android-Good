@@ -55,6 +55,21 @@ data class PlayRequest(
     val play: Boolean = true,
 )
 
+/**
+ * The modes of a music playback ([contextUri]: its context, for smart shuffle), which
+ * [PlayerController.withCurrentModes] gives a music load replacing an episode.
+ */
+internal data class MusicModes(val shuffle: ShuffleMode, val repeat: RepeatMode, val contextUri: String?) {
+    companion object {
+        /** The modes of [snapshot] when it plays music (a track, not an episode); null otherwise. */
+        fun of(snapshot: PlaybackSnapshot): MusicModes? {
+            val track = snapshot.track ?: return null
+            if (snapshot.source == PlaybackSource.NONE || track.isEpisode) return null
+            return MusicModes(snapshot.shuffleMode, snapshot.repeat, snapshot.context?.uri)
+        }
+    }
+}
+
 /** Outcome of [PlayerController.addToQueueCounted]: [added] items, then the first failure ([error]; null: none). */
 data class QueueAddResult(val added: Int, val error: NativeErrorInfo?)
 
@@ -170,6 +185,13 @@ class PlayerController internal constructor(
      */
     @Volatile var episodeResume: ((episodeUri: String) -> Long?)? = null
 
+    /**
+     * For a load of an episode whose resume point isn't known ([episodeResume] gave none): looks
+     * Spotify's up before the load is sent (bounded; `EpisodeProgressStore.resumeOrLookUp`).
+     * Installed by the app graph.
+     */
+    @Volatile var episodeResumeLookup: (suspend (episodeUri: String) -> Long?)? = null
+
     private class Command(
         val name: String,
         val conflateKey: String?,
@@ -228,6 +250,9 @@ class PlayerController internal constructor(
 
     private data class Pending<T>(val value: T, val atNanos: Long)
 
+    /** The modes of the last music playback seen ([withCurrentModes]: a music load after an episode keeps them). */
+    @Volatile private var lastMusic: MusicModes? = null
+
     init {
         scope.launch {
             for (command in queue) {
@@ -239,8 +264,11 @@ class PlayerController internal constructor(
             }
         }
         scope.launch {
-            // Something plays: whatever failed before is no longer the state to show.
-            snapshot.collect { if (it.isPlayingOrLoading()) _failure.value = null }
+            snapshot.collect {
+                // Something plays: whatever failed before is no longer the state to show.
+                if (it.isPlayingOrLoading()) _failure.value = null
+                MusicModes.of(it)?.let { modes -> lastMusic = modes }
+            }
         }
     }
 
@@ -370,7 +398,7 @@ class PlayerController internal constructor(
                 radio.trackUris.isNotEmpty() -> PlayRequest(trackUris = radio.trackUris)
                 else -> throw NativeException(NativeErrorInfo(NativeErrorCode.NOT_FOUND, "Radio station is empty"))
             }
-            load(request, toPendingTarget = true)
+            load(radioModes(keepingModes(request)), toPendingTarget = true)
         }
     }
 
@@ -635,7 +663,8 @@ class PlayerController internal constructor(
 
     /** [load] of a queued `player.load` [command], with a play merged in until the last moment. */
     private suspend fun sendLoad(command: Command) {
-        val initial = synchronized(lock) { checkNotNull(command.request) }
+        val queued = synchronized(lock) { checkNotNull(command.request) }
+        val initial = episodeResumeLookup?.let { withEpisodeResumeLookup(queued, it) } ?: queued
         val prepared = prepare(withLoadableContext(keepingModes(initial)))
         val play = synchronized(lock) {
             command.sent = true
@@ -648,7 +677,8 @@ class PlayerController internal constructor(
     /** [withCurrentModes] of the playback the load replaces, with the modes just toggled. */
     private fun keepingModes(request: PlayRequest): PlayRequest {
         val s = snapshot.value
-        return withCurrentModes(request, s, pendingShuffle.validOr(s.shuffleMode), pendingRepeat.validOr(s.repeat))
+        MusicModes.of(s)?.let { lastMusic = it }
+        return withCurrentModes(request, s, pendingShuffle.validOr(s.shuffleMode), pendingRepeat.validOr(s.repeat), lastMusic)
     }
 
     /**
@@ -930,7 +960,47 @@ class PlayerController internal constructor(
             return request.copy(positionMs = position)
         }
 
+        /** [withEpisodeResume] with a suspending [resumeOf] (a lookup before the load). */
+        suspend fun withEpisodeResumeLookup(request: PlayRequest, resumeOf: suspend (String) -> Long?): PlayRequest {
+            val start = episodeStartOf(request) ?: return request
+            val position = resumeOf(start)?.takeIf { it > 0 } ?: return request
+            return request.copy(positionMs = position)
+        }
+
+        /** The episode [request] starts at when it names no position (null: none, or not an episode). */
+        private fun episodeStartOf(request: PlayRequest): String? {
+            if (request.positionMs > 0) return null
+            val start = request.startUri
+                ?: request.trackUris?.getOrNull(request.startIndex ?: 0)?.takeIf { request.startUid == null }
+                ?: request.contextUri?.takeIf { request.trackUris == null && request.startUid == null }
+            return start?.takeIf { it.startsWith(EPISODE_PREFIX) }
+        }
+
         private const val EPISODE_PREFIX = "spotify:episode:"
+        private const val SHOW_PREFIX = "spotify:show:"
+        private const val YOUR_EPISODES_SUFFIX = ":collection:your-episodes"
+
+        /**
+         * Whether [request] loads podcast content: a show, an episode, Your Episodes, or a list or
+         * context starting at an episode (the start item looked up as in [withEpisodeResume]).
+         */
+        fun isPodcastLoad(request: PlayRequest): Boolean {
+            val context = request.contextUri
+            if (context != null &&
+                (context.startsWith(SHOW_PREFIX) || context.startsWith(EPISODE_PREFIX) || context.endsWith(YOUR_EPISODES_SUFFIX))
+            ) {
+                return true
+            }
+            val start = request.startUri ?: request.trackUris?.getOrNull(request.startIndex ?: 0)
+            return start?.startsWith(EPISODE_PREFIX) == true
+        }
+
+        /**
+         * A radio load ([startRadio]) with repeat-one turned into repeat off: the station is new
+         * music, repeat-one inherited from a song would play its first track over and over.
+         */
+        fun radioModes(request: PlayRequest): PlayRequest =
+            if (request.repeat == RepeatMode.TRACK) request.copy(repeat = RepeatMode.OFF) else request
 
         private const val TAG = "PlayerController"
         private const val COMMAND_TIMEOUT_MS = 15_000L
@@ -1012,25 +1082,42 @@ class PlayerController internal constructor(
          * a load of the same context, any other gets a plain shuffle. A load naming only shuffle
          * (a Shuffle button) gets no smart shuffle; one naming smart shuffle shuffles. With
          * nothing loaded there is nothing to keep (also a play sent to the pending target).
+         *
+         * Podcasts play in order with repeat off, as on Spotify: Now Playing, the notification and
+         * Auto show no shuffle or repeat for episodes, so a podcast load ([isPodcastLoad]) names
+         * the modes it leaves open off (explicitly, so a remote device turns its own off too),
+         * whatever plays now. An episode's (off) modes are no music modes: a music load replacing
+         * an episode keeps those of the last music playback ([lastMusic]; none: the request as
+         * is, off on this phone).
          */
         fun withCurrentModes(
             request: PlayRequest,
             current: PlaybackSnapshot,
             shuffle: ShuffleMode,
             repeat: RepeatMode,
+            lastMusic: MusicModes? = null,
         ): PlayRequest {
-            if (current.source == PlaybackSource.NONE || current.track == null) return request
+            if (isPodcastLoad(request)) {
+                return request.copy(
+                    shuffle = request.shuffle ?: (request.smartShuffle == true),
+                    smartShuffle = request.smartShuffle ?: false,
+                    repeat = request.repeat ?: RepeatMode.OFF,
+                )
+            }
+            val track = current.track
+            if (current.source == PlaybackSource.NONE || track == null) return request
+            val modes = if (track.isEpisode) lastMusic ?: return request else MusicModes(shuffle, repeat, current.context?.uri)
             var r = request
             r = when {
                 r.shuffle == null && r.smartShuffle == null -> {
-                    val sameContext = r.contextUri != null && r.contextUri == current.context?.uri
-                    r.copy(shuffle = shuffle != ShuffleMode.OFF, smartShuffle = shuffle == ShuffleMode.SMART && sameContext)
+                    val sameContext = r.contextUri != null && r.contextUri == modes.contextUri
+                    r.copy(shuffle = modes.shuffle != ShuffleMode.OFF, smartShuffle = modes.shuffle == ShuffleMode.SMART && sameContext)
                 }
                 r.smartShuffle == null -> r.copy(smartShuffle = false)
-                r.shuffle == null -> r.copy(shuffle = r.smartShuffle == true || shuffle != ShuffleMode.OFF)
+                r.shuffle == null -> r.copy(shuffle = r.smartShuffle == true || modes.shuffle != ShuffleMode.OFF)
                 else -> r
             }
-            if (r.repeat == null) r = r.copy(repeat = repeat)
+            if (r.repeat == null) r = r.copy(repeat = modes.repeat)
             return r
         }
 
