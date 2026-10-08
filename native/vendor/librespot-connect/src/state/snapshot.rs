@@ -71,9 +71,11 @@ impl ConnectState {
                 .iter()
                 .any(|t| !t.hidden && t.provider != TrackProvider::Unavailable);
 
+        // SPOTIFYGOOD: the playing speed. The state's own is only brought up to date with the
+        // next put (set_status): right after a resume at another speed (podcasts) the snapshot
+        // said 1, and the app's position went at 1x until the put.
         let playback_speed = match status {
-            SnapshotPlayStatus::Playing if player.playback_speed > 0. => player.playback_speed,
-            SnapshotPlayStatus::Playing => 1.,
+            SnapshotPlayStatus::Playing => self.playing_speed(),
             _ => 0.,
         };
 
@@ -122,6 +124,10 @@ impl ConnectState {
     ///
     /// The position is hashed as the line it describes (the nominal start while `playing`), so
     /// that the periodic position re-anchoring of spirc doesn't count as a change.
+    // SPOTIFYGOOD: at another speed (podcasts) the line is that of the playing speed, and the
+    // re-anchoring (update_position_in_relation) moves it by the rounding of a millisecond, so
+    // its start is hashed to 50 ms; at 1x it stays exact. The speed is the one the snapshot
+    // reports.
     pub(crate) fn snapshot_fingerprint(&self, playing: bool, extra: impl Hash) -> u64 {
         fn hash_track(track: &ProvidedTrack, state: &mut DefaultHasher) {
             track.uri.hash(state);
@@ -138,13 +144,17 @@ impl ConnectState {
         self.is_active().hash(&mut state);
         self.active_context.hash(&mut state);
         playing.hash(&mut state);
-        if playing {
+        let speed = if playing { self.playing_speed() } else { 0. };
+        if playing && speed == 1. {
             (player.timestamp - player.position_as_of_timestamp).hash(&mut state);
+        } else if playing {
+            let start = player.timestamp as f64 - player.position_as_of_timestamp as f64 / speed;
+            ((start / 50.).round() as i64).hash(&mut state);
         } else {
             player.position_as_of_timestamp.hash(&mut state);
         }
         player.duration.hash(&mut state);
-        player.playback_speed.to_bits().hash(&mut state);
+        speed.to_bits().hash(&mut state);
         player.context_uri.hash(&mut state);
         player.context_url.hash(&mut state);
         // order independent, the map is rebuilt regularly
