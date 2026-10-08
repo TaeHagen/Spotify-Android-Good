@@ -919,16 +919,19 @@ class PlaybackService : MediaLibraryService() {
             if (mediaItems.size == 1 && query != null) {
                 // Voice: "play X" (empty query = "play something": resume the last context).
                 if (query.isBlank()) {
-                    val last = resumeStore.read()
-                        ?: return@future MediaItemsWithStartPosition(emptyList(), C.INDEX_UNSET, C.TIME_UNSET)
+                    val last = resumeStore.read() ?: noVoiceMatch(PlaybackErrorKind.NOT_ACTIVE_DEVICE)
                     MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
                 } else {
                     // "Play X" right after a cold start: search needs the session (NOT_CONNECTED otherwise).
                     coordinator.environment.awaitSessionStart()
-                    val item = runCatching { tree.resolveVoiceQuery(query, first.requestMetadata.extras) }
+                    val items = runCatching { tree.resolveVoiceQuery(query, first.requestMetadata.extras) }
                         .onFailure { if (it is CancellationException) throw it }
                         .getOrNull()
-                    MediaItemsWithStartPosition(listOfNotNull(item), 0, C.TIME_UNSET)
+                        .orEmpty()
+                    if (items.isEmpty()) {
+                        noVoiceMatch(if (tree.isOffline()) PlaybackErrorKind.NOT_AVAILABLE_OFFLINE else PlaybackErrorKind.NOT_FOUND)
+                    }
+                    MediaItemsWithStartPosition(items, 0, C.TIME_UNSET)
                 }
             } else {
                 MediaItemsWithStartPosition(mediaItems, startIndex, startPositionMs)
@@ -959,6 +962,16 @@ class PlaybackService : MediaLibraryService() {
     private fun cacheSearch(query: String, results: List<MediaItem>) {
         if (searchCache.size >= MAX_CACHED_SEARCHES) searchCache.clear()
         searchCache[query] = results
+    }
+
+    /**
+     * A voice request ("play X", or "play something" with no stored session) that found nothing:
+     * shown as the player's error, and the request fails. An empty answer would not do: Media3
+     * would still prepare and play, resuming whatever was loaded instead.
+     */
+    private fun noVoiceMatch(kind: PlaybackErrorKind): Nothing {
+        graph.player.noteFailure(kind, null)
+        throw UnsupportedOperationException("Nothing matches the voice request")
     }
 
     /**
