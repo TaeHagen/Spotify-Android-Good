@@ -25,11 +25,13 @@ import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.engine.EngineState
+import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.playback.LibraryTree
 import com.taehagen.spotifygood.playback.MediaIds
 import com.taehagen.spotifygood.playback.PlaybackErrorKind
+import com.taehagen.spotifygood.playback.VoiceEntry
 import com.taehagen.spotifygood.playback.VoiceOutcome
 import com.taehagen.spotifygood.playback.VoiceRequest
 import com.taehagen.spotifygood.ui.components.BackgroundMessages
@@ -228,8 +230,14 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
      * catalog's search next, offline only the downloads), so both entries play the same thing.
      * An empty request resumes playback; one that finds nothing says so (not found, or not
      * available offline).
+     *
+     * The request holds the engine from the start: it arrives in onCreate / onNewIntent, before
+     * onStart takes the UI holder, and an idle-stopped session only starts (and is waited for)
+     * for a holder. Let go once the play went out (it has its own), also when the request is
+     * dropped before it ran.
      */
     fun playFromSearch(request: MediaSearchRequest) {
+        val holder = graph.engine.acquire(HolderType.UI)
         viewModelScope.launch {
             // A cold start ("Play X on SpotifyGood" with no process) gets here before the engine has
             // read the stored credentials: wait for that instead of answering "log in first".
@@ -243,10 +251,10 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
                 return@launch
             }
             val voiceRequest = VoiceRequest.of(request.query, request.focus, request.artist, request.album, request.title, request.playlist)
-            // The catalog's search needs the session; offline the downloads answer at once.
-            if (!voiceRequest.isBlank && !voice.isOffline()) graph.engine.awaitOnline(ONLINE_TIMEOUT_MS)
             val outcome = try {
-                voice.resolveVoice(voiceRequest)
+                // The catalog's search needs the session (waited for as the media session does);
+                // offline (no network as of now, or offline mode) the downloads answer at once.
+                VoiceEntry.resolve(voiceRequest, voice::isOffline, ::awaitVoiceSession, voice::resolveVoice)
             } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
@@ -273,7 +281,13 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
                     }
                 }
             }
-        }
+        }.invokeOnCompletion { holder.release() }
+    }
+
+    /** The media session's bounded wait for a starting session (awaitOnline before it is installed). */
+    private suspend fun awaitVoiceSession() {
+        val environment = graph.player.environment
+        if (environment != null) environment.awaitSessionStart() else graph.engine.awaitOnline(ONLINE_TIMEOUT_MS)
     }
 
     private companion object {
