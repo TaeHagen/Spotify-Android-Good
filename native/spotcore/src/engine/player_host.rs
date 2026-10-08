@@ -37,6 +37,10 @@ static HOST: Mutex<Option<Host>> = parking_lot::const_mutex(None);
 /// The offline Session last handed to the Player (it plays with it while not online); kept to
 /// apply the explicit filter to it.
 static OFFLINE: Mutex<Option<Session>> = parking_lot::const_mutex(None);
+/// The online Session the Player is bound to ([`bind`]: a connect attempt, then the live
+/// session), `None` while it plays with the offline one; kept to apply the explicit filter to an
+/// attempt that isn't online yet.
+static BOUND: Mutex<Option<Session>> = parking_lot::const_mutex(None);
 static MIXER: OnceLock<Arc<AndroidMixer>> = OnceLock::new();
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Serialises Player creation (online bind vs. offline playback). The offline path must never
@@ -88,8 +92,23 @@ pub(crate) fn apply_explicit_filter_offline(settings: &EngineSettings) -> Option
 }
 
 fn apply_offline_filter(session: &Session, settings: &EngineSettings) -> Option<bool> {
-    explicit::seed_account(session, settings.account_filter_explicit);
-    explicit::apply(session, settings.filter_explicit)
+    explicit::seed(session, settings.account_filter_explicit, settings.filter_explicit)
+}
+
+/// A connect attempt's new Session, before anything can bind the Player to it: the explicit
+/// filter like the offline Session's (the setting, and the account's last known filter until
+/// ProductInfo brings the current one), so downloads the offline queue loads or preloads during
+/// the attempt are filtered as before it.
+pub(crate) fn prepare_session(session: &Session, settings: &EngineSettings) {
+    apply_offline_filter(session, settings);
+}
+
+/// Applies "Hide explicit content" to the session of a connect attempt the Player is bound to
+/// (not online yet): `Some(Some(effective))` if it changed, `Some(None)` if not, `None` when
+/// the Player plays with the offline session.
+pub(crate) fn apply_explicit_filter_bound(filter: bool) -> Option<Option<bool>> {
+    let session = BOUND.lock().clone()?;
+    Some(explicit::apply(&session, filter))
 }
 
 /// Tells the Player its explicit filter changed (when it turns on, a loaded explicit track is
@@ -137,6 +156,7 @@ async fn get_or_create(rebind: Option<&Session>, settings: &EngineSettings) -> A
             Some(h) if !h.player.is_invalid() => {
                 if let Some(session) = rebind {
                     h.player.set_session(session.clone());
+                    *BOUND.lock() = Some(session.clone());
                 }
                 return h.player.clone();
             }
@@ -148,8 +168,14 @@ async fn get_or_create(rebind: Option<&Session>, settings: &EngineSettings) -> A
         drop_player(dead.player).await;
     }
     match rebind {
-        Some(session) => create(session, settings),
-        None => create(&offline_session(), settings),
+        Some(session) => {
+            *BOUND.lock() = Some(session.clone());
+            create(session, settings)
+        }
+        None => {
+            *BOUND.lock() = None;
+            create(&offline_session(), settings)
+        }
     }
 }
 
@@ -172,11 +198,13 @@ pub(crate) fn detach_session() {
     if let Some(p) = player() {
         p.set_session(offline_session());
     }
+    *BOUND.lock() = None;
 }
 
 /// Drops the Player (`session.stop {releasePlayer:true}`).
 pub(crate) async fn release() {
     let host = HOST.lock().take();
+    *BOUND.lock() = None;
     if let Some(host) = host {
         log::info!("releasing player {}", host.generation);
         drop_player(host.player).await;

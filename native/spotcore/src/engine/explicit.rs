@@ -1,67 +1,53 @@
 //! "Hide explicit content" (`EngineSettings::filter_explicit`), OR-ed into the session's own
 //! `filter-explicit-content` user attribute (the account's parental setting).
 //!
-//! librespot reads that attribute wherever explicit content matters
+//! librespot reads the effective value wherever explicit content matters
 //! (`Session::filter_explicit_content`): the Player refuses to load explicit tracks (Spirc then
 //! skips them) and skips the current one when the filter turns on, and the catalog marks them
 //! unplayable. Downloads ignore the app setting (the Player still refuses a downloaded explicit
 //! track at play time) but not the account's own filter ([`account_filter`]): explicit items are
-//! not downloaded for such an account. Forcing it on the session is the single choke point.
+//! not downloaded for such an account. The session is the single choke point.
 //!
-//! The offline Session (never connected: no server ever sets its attributes) gets the account's
-//! value as last reported online ([`seed_account`], `EngineSettings::account_filter_explicit`,
-//! persisted by Kotlin), so a filtered account's downloads don't play offline either.
+//! The setting is the session's forced flag (the vendored `Session::set_filter_explicit_forced`),
+//! never written into the attribute: the attribute stays the account's own value, whatever
+//! ProductInfo (which replaces all attributes), Spirc's attribute updates and its mutations
+//! (which flip the local value) do, and none of them can lift the setting.
 //!
-//! The account's own value is kept in a private attribute of the same session, so turning the
-//! setting off restores it. ProductInfo and Spirc (server attribute pushes and mutations) can
-//! overwrite the attribute; [`apply`] recognises a value it didn't write as the account's new
-//! value. The supervisor re-applies it when declaring the session online and on every health
-//! tick, and `player_host` whenever the Player reports the filter was turned off.
+//! A session no server talks to (the offline one, and one whose connect attempt hasn't reached
+//! ProductInfo yet) gets the account's value as last reported online ([`seed`],
+//! `EngineSettings::account_filter_explicit`, persisted by Kotlin), so a filtered account's
+//! downloads don't play offline or during a reconnect either.
 
 use librespot_core::Session;
 
 const ATTRIBUTE: &str = "filter-explicit-content";
-/// The value [`apply`] last wrote to [`ATTRIBUTE`] (local only, never sent anywhere).
-const WRITTEN: &str = "spotifygood-filter-explicit-written";
-/// The account's own value, remembered while [`ATTRIBUTE`] is forced.
-const ACCOUNT: &str = "spotifygood-filter-explicit-account";
-
-fn flag(value: Option<&str>) -> bool {
-    value == Some("1")
-}
 
 /// The account's own filter (what Spotify says), not the app setting.
 pub(crate) fn account_filter(session: &Session) -> bool {
-    let current = session.get_user_attribute(ATTRIBUTE);
-    if current != session.get_user_attribute(WRITTEN) {
-        return flag(current.as_deref());
-    }
-    flag(session.get_user_attribute(ACCOUNT).as_deref())
-}
-
-/// For a session no server talks to (the offline one): takes [`account`] as the account's own
-/// value. A connected session gets it from ProductInfo and Spirc instead.
-pub(crate) fn seed_account(session: &Session, account: bool) {
-    session.set_user_attribute(ACCOUNT, if account { "1" } else { "0" });
+    session.get_user_attribute(ATTRIBUTE).as_deref() == Some("1")
 }
 
 /// Makes the session's filter `app_filter || account filter`. Returns the new effective value
 /// when it changed (the caller then tells the Player), `None` when nothing changed.
 pub(crate) fn apply(session: &Session, app_filter: bool) -> Option<bool> {
-    let current = session.get_user_attribute(ATTRIBUTE);
-    if current != session.get_user_attribute(WRITTEN) {
-        // Not our write: the account's own value (ProductInfo, a server push), or still absent.
-        session.set_user_attribute(ACCOUNT, if flag(current.as_deref()) { "1" } else { "0" });
-    }
-    let account = flag(session.get_user_attribute(ACCOUNT).as_deref());
-    let want = app_filter || account;
-    if flag(current.as_deref()) == want {
-        return None;
-    }
-    let value = if want { "1" } else { "0" };
-    session.set_user_attribute(ATTRIBUTE, value);
-    session.set_user_attribute(WRITTEN, value);
-    Some(want)
+    let before = session.filter_explicit_content();
+    session.set_filter_explicit_forced(app_filter);
+    changed(session, before)
+}
+
+/// For a session no server talks to yet: takes [`account`] as the account's own value, then
+/// applies [`app_filter`]. ProductInfo replaces the account's value once the session connects.
+/// Returns the new effective value when it changed.
+pub(crate) fn seed(session: &Session, account: bool, app_filter: bool) -> Option<bool> {
+    let before = session.filter_explicit_content();
+    session.set_user_attribute(ATTRIBUTE, if account { "1" } else { "0" });
+    session.set_filter_explicit_forced(app_filter);
+    changed(session, before)
+}
+
+fn changed(session: &Session, before: bool) -> Option<bool> {
+    let now = session.filter_explicit_content();
+    (now != before).then_some(now)
 }
 
 #[cfg(test)]
@@ -69,11 +55,26 @@ mod tests {
     use super::*;
     use librespot_core::SessionConfig;
 
+    /// What Spirc does with an attribute mutation: flips the local value.
+    fn mutate(session: &Session) {
+        let flipped = if account_filter(session) { "0" } else { "1" };
+        session.set_user_attribute(ATTRIBUTE, flipped);
+    }
+
+    /// The account's attributes from the server (ProductInfo, which replaces them all, or an
+    /// attributes update).
+    fn product_info(session: &Session, filter: &str) {
+        let mut attributes = std::collections::HashMap::new();
+        attributes.insert(ATTRIBUTE.to_owned(), filter.to_owned());
+        attributes.insert("type".to_owned(), "premium".to_owned());
+        session.set_user_attributes(attributes);
+    }
+
     #[tokio::test]
     async fn ors_the_setting_into_the_account_filter() {
         let session = Session::new(SessionConfig::default(), None);
         // ProductInfo: the account doesn't filter.
-        session.set_user_attribute(ATTRIBUTE, "0");
+        product_info(&session, "0");
         assert_eq!(apply(&session, false), None);
         assert!(!session.filter_explicit_content());
 
@@ -85,55 +86,80 @@ mod tests {
         assert_eq!(apply(&session, false), Some(false));
         assert!(!session.filter_explicit_content());
 
-        // A server push resets it while the setting is on: re-applied on the next call.
+        // A server push of the attributes can't lift the setting.
         apply(&session, true);
-        session.set_user_attribute(ATTRIBUTE, "0");
-        assert_eq!(apply(&session, true), Some(true));
+        product_info(&session, "0");
         assert!(session.filter_explicit_content());
+        assert_eq!(apply(&session, true), None);
 
         // The account filters (parental control): the setting can never turn it off.
         let session = Session::new(SessionConfig::default(), None);
-        session.set_user_attribute(ATTRIBUTE, "1");
+        product_info(&session, "1");
         assert_eq!(apply(&session, false), None);
         assert_eq!(apply(&session, true), None);
         assert_eq!(apply(&session, false), None);
         assert!(session.filter_explicit_content() && account_filter(&session));
+    }
 
-        // The account turns its filter on while the setting is off.
+    #[tokio::test]
+    async fn a_mutation_while_the_setting_is_on_changes_the_account_value() {
+        // "Hide explicit content" on, the account allows explicit content.
         let session = Session::new(SessionConfig::default(), None);
-        session.set_user_attribute(ATTRIBUTE, "0");
-        assert_eq!(apply(&session, true), Some(true));
-        assert_eq!(apply(&session, false), Some(false));
-        session.set_user_attribute(ATTRIBUTE, "1");
+        product_info(&session, "0");
+        apply(&session, true);
+        // A Family manager turns "Allow explicit content" off: Spirc flips the local value.
+        mutate(&session);
+        assert!(account_filter(&session), "the account filters now");
+        // Turning the setting off doesn't lift the account's filter.
         assert_eq!(apply(&session, false), None);
-        assert!(account_filter(&session));
+        assert!(session.filter_explicit_content());
+        // Allowed again (another mutation): the setting off now lets explicit content through.
+        mutate(&session);
+        assert!(!account_filter(&session));
+        assert!(!session.filter_explicit_content());
+        // Also when the mutation meets the setting on: still filtered, account value right.
+        apply(&session, true);
+        mutate(&session);
+        mutate(&session);
+        assert!(!account_filter(&session) && session.filter_explicit_content());
     }
 
     #[tokio::test]
     async fn the_offline_session_takes_the_last_known_account_filter() {
         let session = Session::new(SessionConfig::default(), None);
         // A filtered account (last reported online), "Hide explicit content" off.
-        seed_account(&session, true);
-        assert_eq!(apply(&session, false), Some(true));
+        assert_eq!(seed(&session, true, false), Some(true));
         assert!(session.filter_explicit_content() && account_filter(&session));
         // The setting can't turn it off.
         assert_eq!(apply(&session, false), None);
         // The account turned its filter off (reported online, persisted, seeded again).
-        seed_account(&session, false);
-        assert_eq!(apply(&session, false), Some(false));
+        assert_eq!(seed(&session, false, false), Some(false));
         assert!(!session.filter_explicit_content());
         assert_eq!(apply(&session, true), Some(true), "the setting alone still filters");
-        seed_account(&session, true);
-        assert_eq!(apply(&session, false), None, "still on: now the account's");
+        assert_eq!(seed(&session, true, true), None, "still on: now also the account's");
         assert!(account_filter(&session));
     }
 
     #[tokio::test]
-    async fn applies_before_product_info() {
+    async fn a_connect_attempt_filters_before_product_info() {
+        // A fresh attempt session, seeded like the offline one: filtered from the start, with
+        // either the setting or the account's last known filter.
         let session = Session::new(SessionConfig::default(), None);
-        // A never-connected (offline playback) session has no attributes at all.
-        assert_eq!(apply(&session, false), None);
-        assert_eq!(apply(&session, true), Some(true));
+        seed(&session, false, true);
         assert!(session.filter_explicit_content());
+        let session = Session::new(SessionConfig::default(), None);
+        seed(&session, true, false);
+        assert!(session.filter_explicit_content());
+        // ProductInfo brings the account's current value; the setting stays.
+        product_info(&session, "0");
+        assert!(!session.filter_explicit_content(), "the account allows it now");
+        let session = Session::new(SessionConfig::default(), None);
+        seed(&session, false, true);
+        product_info(&session, "0");
+        assert!(session.filter_explicit_content(), "ProductInfo can't lift the setting");
+        // Nothing known, setting off: not filtered.
+        let session = Session::new(SessionConfig::default(), None);
+        assert_eq!(seed(&session, false, false), None);
+        assert!(!session.filter_explicit_content());
     }
 }

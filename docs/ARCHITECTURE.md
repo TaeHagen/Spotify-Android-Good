@@ -253,20 +253,26 @@ through the patched runtime setters, without recreating it: bitrate and gapless 
 load (track change), normalisation from the next audio packet.
 
 Explicit filter: `EngineSettings.filterExplicit` is OR-ed into the session's own
-`filter-explicit-content` user attribute (the account's value is kept in a private attribute
-and restored when the setting goes off). librespot reads that attribute everywhere: the Player
-refuses explicit tracks (Spirc skips them) and skips a loaded one when the filter turns on,
-the catalog returns them with `playable:false` (its cached metadata is dropped when the
-effective filter changes). Downloads ignore the app setting (they are filtered when shown and
-played) but not the account's own filter: `download.track` refuses explicit items for such an
-account (§9.7). It is applied to the live session (when it is declared online and on every health
-tick, since Spirc can overwrite it) and to the offline session the Player uses while not online.
-`User.explicitFilter` stays the account's. The offline session is never connected, so no server
-tells it the account's filter: Kotlin persists the value an online session last reported
+`filter-explicit-content` user attribute, the account's value: the setting is a separate flag
+of the session (the vendored `Session::set_filter_explicit_forced`), so the attribute stays the
+account's whatever ProductInfo, Spirc's attribute updates and its mutations (which flip the local
+value) do, and none of them can lift the setting. librespot reads the effective value
+everywhere: the Player refuses explicit tracks (Spirc skips them) and skips a loaded one when the
+filter turns on, the catalog returns them with `playable:false` (its cached metadata is dropped
+when the effective filter changes). Downloads ignore the app setting (they are filtered when
+shown and played) but not the account's own filter: `download.track` refuses explicit items for
+such an account (§9.7). It is applied to the live session, to the offline session the Player uses
+while not online, and to the session of a connect attempt, which the Player is bound to before
+the session is online (from its creation, so a download the offline queue loads or preloads
+during the attempt is filtered too). `User.explicitFilter` stays the account's, and is reported
+again when it changes while connected (a Family manager flips "Allow explicit content": checked
+on every 5 s health tick). The offline session is never connected, so no server tells it the
+account's filter: Kotlin persists the value an online session last reported
 (`Settings.accountExplicitFilter`, cleared on logout and when another account's data is removed)
-and sends it as `EngineSettings.accountFilterExplicit`, which the offline session takes as the
-account's value. Until a session reports the user again (a cold start without a network: only the
-username is known), the app's lists use the persisted value too (`explicitFilterFlow`).
+and sends it as `EngineSettings.accountFilterExplicit`, which the offline session (and a connect
+attempt's until its ProductInfo) takes as the account's value. Until a session reports the user
+again (a cold start without a network: only the username is known), the app's lists use the
+persisted value too (`explicitFilterFlow`).
 
 ### 4.4 Audio output
 
@@ -1108,8 +1114,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   keeps a `.part` while an unfinished row (pending, failed, cancelled) names it, so "Retry
   failed" resumes it, and deletes files and `.part`s no row names.
 * Explicit filter: downloads are the user's content, so a filter applies when they are shown and
-  played (the Downloads screens dim explicit entries, the Player refuses them, offline too: the
-  offline session takes the account's filter as last reported, §4.3), never to download rows.
+  played (the Downloads screens dim explicit entries, the Player refuses them, offline and during
+  reconnect attempts too: those sessions take the account's filter as last reported, §4.3),
+  never to download rows.
   "Hide explicit content" never keeps an item from being downloaded; the account's own filter
   (Spotify's parental setting) does: `download.track` refuses explicit items for such an account
   and explicit members are not queued (recorded as not playable here, re-checked when the filter
