@@ -550,7 +550,13 @@ impl ContextResolver {
         if let Err(why) = state.finish_transfer(transfer) {
             error!("setup of the transfer failed: {why}")
         }
-        if self.has_pending_pages(ContextType::Default) && state.current_track_outside_context() {
+        // SPOTIFYGOOD: not while shuffled (like a load, see Spirc's handle_load): the placement
+        // reset the shuffled next tracks to the album order after the track (nothing for a
+        // single), with unplayed prev tracks; the last page's shuffle puts it first instead
+        if !state.shuffling_context()
+            && self.has_pending_pages(ContextType::Default)
+            && state.current_track_outside_context()
+        {
             state.place_current_track_when_resolved();
         }
 
