@@ -644,12 +644,17 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                replaces an older point (a not-started one keeps none). With no reference yet (the
                phone played it, nothing fresh seen since) the furthest point wins. A partly played
                state is kept when nothing is.
-             * Connect: after a remote device's position is saved, Spotify's next state is news
-               when partly or fully played (that device may have played on after the phone stopped
-               following); a not-started one (a device that reports nothing, e.g. librespot)
-               changes nothing. When this phone takes an episode over (seen remote just before, or
-               arriving far from the kept point), the next state (the other device's, older than
-               this phone's progress) only becomes the reference.
+             * Connect marks (each lasts until the next fresh answer, whose state then becomes the
+               reference; the last real state seen is kept under them): after a followed remote
+               device's save, Spotify's next state is news when partly or fully played and
+               different from the last real state seen (with none: when beyond the point); a
+               not-started one (a device that reports nothing, e.g. a librespot receiver) changes
+               nothing. Once this phone saved its own progress after that, and after it took an
+               episode over (seen remote just before, or arriving far from the kept point),
+               Spotify's next state is at best the other device's older one: only a state beyond
+               the point, or finished, is news. A play of an episode whose point came from a
+               followed remote device looks Spotify's point up first (that device may have played
+               on after the phone stopped following).
              * Every play path resumes from the point: the app's pages (rows and the show's Play),
                Your Episodes, Downloads, search, Android Auto / Assistant / media browsers (their
                rows also carry the completion status) via `PlayerController.episodeResume` for a
@@ -1052,17 +1057,19 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `ctx|` rows (the offline load plays them in that order), without waiting for or starting the
   session; online it lists the catalog's copy, all of it, and its downloads when the catalog has
   nothing for it (no session, a failed or empty answer, a cleared cache). Voice "play X"
-  (Assistant, Auto: `LibraryTree.resolveVoiceQuery`, `VoiceMatch`) matches the user's own
+  has one resolver (`LibraryTree.resolveVoice`, `VoiceRequest`, `VoiceMatch`) for both of its
+  entries: the media session (Assistant, Auto: a set item with a search query) and the activity
+  (`MEDIA_PLAY_FROM_SEARCH` through `LinkActivity`, `ShellViewModel.playFromSearch`, §9.9). It matches the user's own
   collections by name first (case, accents and punctuation aside; "my", "the", "playlist", ...
   dropped), honouring `EXTRA_MEDIA_FOCUS` and the `EXTRA_MEDIA_*` names: Liked Songs and the
   downloaded collections, then online Library's playlists, albums, artists and podcasts. The
   same or loosely the same name wins over the catalog's search (the user's own, maybe private,
   playlist over a stranger's); a name that only starts so is used when the search has nothing.
   Offline only the downloads count: their collections, then the downloaded songs and episodes
-  by title, else all of an artist's, album's or show's, played as a list. A request that finds
-  nothing (also "play something" with no stored session) fails with the player's error (Not
-  found, or Not available offline) instead of an empty answer, which Media3 would still prepare
-  and play, resuming whatever was loaded. Auto's search offline lists the downloads whose names
+  by title, else all of an artist's, album's or show's, played as a list. On the session, a
+  request that finds nothing (also "play something" with no stored session) fails with the
+  player's error (Not found, or Not available offline) instead of an empty answer, which Media3
+  would still prepare and play, resuming whatever was loaded. Auto's search offline lists the downloads whose names
   have the query's words; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
   on a mode change and every 15 s while playing (`ResumeSaver`): the account's last session as
@@ -1415,6 +1422,12 @@ error while ONLINE: after the next reconnect).
   Spotify app holds the domain, its "Open supported links" has to go off first. Shared links
   always work.
 * Offline: banner + downloaded-only filtering when offline mode or no network.
+* Voice search sent to the activity (`MEDIA_PLAY_FROM_SEARCH`, forwarded by `LinkActivity`):
+  `ShellViewModel.playFromSearch` waits for the stored login, then (unless offline) for the
+  session, and hands the request (query, focus and the `EXTRA_MEDIA_*` names, as
+  `VoiceRequest`) to the media session's resolver (§9.4), so both entries play the same thing:
+  a match plays as an in-app play (to the pending Connect target too), an empty request resumes
+  playback, no match shows "Nothing found for …" or, offline, "That isn't downloaded".
 
 ## 10. Lifecycle & battery policy (summary)
 
