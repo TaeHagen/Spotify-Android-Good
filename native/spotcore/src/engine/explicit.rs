@@ -4,8 +4,13 @@
 //! librespot reads that attribute wherever explicit content matters
 //! (`Session::filter_explicit_content`): the Player refuses to load explicit tracks (Spirc then
 //! skips them) and skips the current one when the filter turns on, and the catalog marks them
-//! unplayable. Downloads ignore it (the Player still refuses a downloaded explicit track at play
-//! time). Forcing it on the session is the single choke point.
+//! unplayable. Downloads ignore the app setting (the Player still refuses a downloaded explicit
+//! track at play time) but not the account's own filter ([`account_filter`]): explicit items are
+//! not downloaded for such an account. Forcing it on the session is the single choke point.
+//!
+//! The offline Session (never connected: no server ever sets its attributes) gets the account's
+//! value as last reported online ([`seed_account`], `EngineSettings::account_filter_explicit`,
+//! persisted by Kotlin), so a filtered account's downloads don't play offline either.
 //!
 //! The account's own value is kept in a private attribute of the same session, so turning the
 //! setting off restores it. ProductInfo and Spirc (server attribute pushes and mutations) can
@@ -32,6 +37,12 @@ pub(crate) fn account_filter(session: &Session) -> bool {
         return flag(current.as_deref());
     }
     flag(session.get_user_attribute(ACCOUNT).as_deref())
+}
+
+/// For a session no server talks to (the offline one): takes [`account`] as the account's own
+/// value. A connected session gets it from ProductInfo and Spirc instead.
+pub(crate) fn seed_account(session: &Session, account: bool) {
+    session.set_user_attribute(ACCOUNT, if account { "1" } else { "0" });
 }
 
 /// Makes the session's filter `app_filter || account filter`. Returns the new effective value
@@ -95,6 +106,25 @@ mod tests {
         assert_eq!(apply(&session, false), Some(false));
         session.set_user_attribute(ATTRIBUTE, "1");
         assert_eq!(apply(&session, false), None);
+        assert!(account_filter(&session));
+    }
+
+    #[tokio::test]
+    async fn the_offline_session_takes_the_last_known_account_filter() {
+        let session = Session::new(SessionConfig::default(), None);
+        // A filtered account (last reported online), "Hide explicit content" off.
+        seed_account(&session, true);
+        assert_eq!(apply(&session, false), Some(true));
+        assert!(session.filter_explicit_content() && account_filter(&session));
+        // The setting can't turn it off.
+        assert_eq!(apply(&session, false), None);
+        // The account turned its filter off (reported online, persisted, seeded again).
+        seed_account(&session, false);
+        assert_eq!(apply(&session, false), Some(false));
+        assert!(!session.filter_explicit_content());
+        assert_eq!(apply(&session, true), Some(true), "the setting alone still filters");
+        seed_account(&session, true);
+        assert_eq!(apply(&session, false), None, "still on: now the account's");
         assert!(account_filter(&session));
     }
 

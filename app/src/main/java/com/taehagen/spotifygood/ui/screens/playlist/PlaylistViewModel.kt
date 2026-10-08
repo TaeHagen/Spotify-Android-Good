@@ -256,6 +256,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
 
     private suspend fun onFirstPage(resource: Resource<Playlist>) {
         val page = resource.dataOrNull
+        // A downloaded playlist follows changes made elsewhere: a fresh server revision other than
+        // the downloaded one syncs the download.
+        if (resource is Resource.Success && !resource.fromCache) {
+            page?.revision?.let { revision -> viewModelScope.launch { graph.downloads.requestSync(uri, revision) } }
+        }
         if (page == null) {
             val shown = data.value
             if (shown is LoadState.Ready && shown.data.downloadedCopy) {

@@ -11,6 +11,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.disk.DiskCache
+import coil3.intercept.Interceptor
 import coil3.memory.MemoryCache
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.crossfade
@@ -83,7 +84,12 @@ object AppInitializer {
             object : SingletonImageLoader.Factory {
                 override fun newImageLoader(context: Context): ImageLoader =
                     ImageLoader.Builder(context)
-                        .components { add(OkHttpNetworkFetcherFactory(callFactory = { graph.httpClient })) }
+                        .components {
+                            add(OkHttpNetworkFetcherFactory(callFactory = { graph.httpClient }))
+                            // Downloaded covers for the CDN URLs of downloads (offline lists). Resolved at
+                            // the first request, off the main thread (the downloads stay lazy here).
+                            add(Interceptor { chain -> graph.downloads.coverInterceptor.intercept(chain) })
+                        }
                         .memoryCache { MemoryCache.Builder().maxSizePercent(context, IMAGE_MEMORY_CACHE_PERCENT).build() }
                         .diskCache {
                             DiskCache.Builder()

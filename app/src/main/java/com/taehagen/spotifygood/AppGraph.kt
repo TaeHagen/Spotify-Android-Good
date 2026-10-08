@@ -172,7 +172,11 @@ class AppGraph(val app: Application) {
      * rethrown (the login then fails, and the next one tries again). Not cancellable.
      */
     private suspend fun removePreviousAccountData(): Unit = withContext(NonCancellable) {
-        val steps = accountDataSteps() + WipeStep("event replays") { events.resetAccountReplays() }
+        val steps = accountDataSteps() + listOf(
+            WipeStep("event replays") { events.resetAccountReplays() },
+            // The previous account's parental filter (the new account's arrives with its session).
+            WipeStep("account explicit filter") { settings.update { it.copy(accountExplicitFilter = false) } },
+        )
         runWipeSteps(steps) { step, t -> Log.e(TAG, "Account change: ${step.name} failed", t) }
     }
 

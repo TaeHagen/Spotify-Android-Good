@@ -70,18 +70,26 @@ pub(crate) fn dead_generation() -> Option<u64> {
 }
 
 /// A never-connected Session (offline playback needs no network), with the explicit filter
-/// applied (offline loads check it too). Needs the runtime context.
+/// applied (offline loads check it too): "Hide explicit content" OR-ed into the account's own
+/// filter as last reported online (`accountFilterExplicit`; no server tells this session).
+/// Needs the runtime context.
 pub(crate) fn offline_session() -> Session {
     let session = Session::new(config::session_config(), None);
-    explicit::apply(&session, super::settings().filter_explicit);
+    apply_offline_filter(&session, &super::settings());
     *OFFLINE.lock() = Some(session.clone());
     session
 }
 
-/// Applies the explicit filter to the offline Session; `Some(effective)` if it changed.
-pub(crate) fn apply_explicit_filter_offline(filter: bool) -> Option<bool> {
+/// Applies the explicit filter of [`settings`] to the offline Session; `Some(effective)` if it
+/// changed.
+pub(crate) fn apply_explicit_filter_offline(settings: &EngineSettings) -> Option<bool> {
     let session = OFFLINE.lock().clone()?;
-    explicit::apply(&session, filter)
+    apply_offline_filter(&session, settings)
+}
+
+fn apply_offline_filter(session: &Session, settings: &EngineSettings) -> Option<bool> {
+    explicit::seed_account(session, settings.account_filter_explicit);
+    explicit::apply(session, settings.filter_explicit)
 }
 
 /// Tells the Player its explicit filter changed (when it turns on, a loaded explicit track is

@@ -257,9 +257,16 @@ Explicit filter: `EngineSettings.filterExplicit` is OR-ed into the session's own
 and restored when the setting goes off). librespot reads that attribute everywhere: the Player
 refuses explicit tracks (Spirc skips them) and skips a loaded one when the filter turns on,
 the catalog returns them with `playable:false` (its cached metadata is dropped when the
-effective filter changes). Downloads ignore it: they are filtered when shown and played (§9.7). It is applied to the live session (when
-it is declared online and on every health tick, since Spirc can overwrite it) and to the
-offline session the Player uses while not online. `User.explicitFilter` stays the account's.
+effective filter changes). Downloads ignore the app setting (they are filtered when shown and
+played) but not the account's own filter: `download.track` refuses explicit items for such an
+account (§9.7). It is applied to the live session (when it is declared online and on every health
+tick, since Spirc can overwrite it) and to the offline session the Player uses while not online.
+`User.explicitFilter` stays the account's. The offline session is never connected, so no server
+tells it the account's filter: Kotlin persists the value an online session last reported
+(`Settings.accountExplicitFilter`, cleared on logout and when another account's data is removed)
+and sends it as `EngineSettings.accountFilterExplicit`, which the offline session takes as the
+account's value. Until a session reports the user again (a cold start without a network: only the
+username is known), the app's lists use the persisted value too (`explicitFilterFlow`).
 
 ### 4.4 Audio output
 
@@ -452,9 +459,11 @@ for the restore and a play restores right away (one already answered restores th
 
 `EngineSettings`: `{"bitrate":96|160|320,"normalize":true,"normalizePregain":"quiet|normal|loud",
 "autoplay":true,"gapless":true,"deviceName":"…","streamingCacheMb":1024,"offline":false,
-"filterExplicit":false,"connectVisible":true}`. `connectVisible`: listed as a Spotify Connect
-target (Spirc runs), see §8. `filterExplicit` ("Hide explicit content") is OR-ed into the account's
-own explicit filter (see §4.3); it can never turn the account's filter off.
+"filterExplicit":false,"accountFilterExplicit":false,"connectVisible":true}`. `connectVisible`: listed
+as a Spotify Connect target (Spirc runs), see §8. `filterExplicit` ("Hide explicit content") is
+OR-ed into the account's own explicit filter (see §4.3); it can never turn the account's filter off.
+`accountFilterExplicit`: the account's own filter as last reported online, for the offline session
+(§4.3).
 
 ### 6.2 Player (routed local/remote)
 
@@ -1063,8 +1072,21 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   are queued once they become playable (also from a failed row). Each sync also queues failed
   downloads that still own their file (failed by re-validation or the key check) and are playable
   again; `download.track` reuses the file.
+* Changes made elsewhere (another device): a server page of a downloaded collection asks it to sync
+  within seconds, like an edit made here (`DownloadManager.requestSync`: a playlist page whose
+  revision is not the downloaded one, at most every 30 s; a Liked Songs page at most every 5 min);
+  pull-to-refresh (`LibraryEdit.Refreshed`) syncs every downloaded Liked Songs and playlist; and in
+  the foreground while online (coming to the foreground, coming online) Liked Songs and playlists
+  synced over 30 min ago are re-listed (albums and shows keep the 12 h / daily cadence). A sync after
+  an edit that cannot come online marks the collection due instead.
 * Storage: `noBackupFilesDir/offline/audio/<fileIdHex>` (+ `.part`),
   `noBackupFilesDir/offline/images/<imageIdHex>.jpg`.
+* Covers (`OfflineCovers`, a Coil interceptor): lists built from downloads and the online pages
+  of downloaded items name the CDN image URLs of the stored metadata. Every size of a completed
+  download's album images (an episode's own images, else its show's) is served from the download's
+  cover file, also online; the network only when the file went. A downloaded collection's own image
+  URL (a playlist mosaic) is loaded from the network and falls back to its first downloaded
+  member's cover. The maps follow the completed downloads (metadata read once per download).
 * Audio keys (`KeyVault`, envelope encryption): one random AES-256 data key in
   `noBackupFilesDir/offline/datakey.bin`, sealed with the `CredentialStore` Keystore key, unsealed
   once per process and kept in memory; each download's key is sealed with it in software (AES-GCM,
@@ -1085,23 +1107,28 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   writes (`download.fileId`, stored in `fileId`); garbage collection (when the queue is idle)
   keeps a `.part` while an unfinished row (pending, failed, cancelled) names it, so "Retry
   failed" resumes it, and deletes files and `.part`s no row names.
-* Explicit filter ("Hide explicit content", or the account's own): downloads are the user's
-  content, so the filter applies when they are shown and played (the Downloads screens dim
-  explicit entries, the Player refuses them, offline too), never to download rows. `download.track`
-  downloads explicit items whatever the filter. The catalog's `playable` includes the filter, so an
-  explicit item answered `playable:false` while the filter may have applied (`ExplicitFilterWatch`:
-  unless the effective filter was known off and applied by the engine from before the lookup until
-  after it) gets no verdict: re-validation leaves the download COMPLETED (re-validated at a later
-  sync), a failed download is not requeued for it, a member is neither recorded as not playable nor
-  taken out of that set (a new member is queued; `download.track` decides), and a collection with
-  such members is re-checked at the next sync. Catalog metadata stored with a row drops the filter's
-  `playable:false`. When the effective filter goes off (applied by the engine), every collection's
-  unavailable members become due for a re-check and the re-validation (failed downloads, unavailable
-  members, stale downloads) runs at once when online, else once online. Once per installation, the
-  downloads earlier versions failed for the filter are repaired: explicit downloads re-validation
-  marked no longer available are restored to COMPLETED (file and key were kept; registered with
-  `offline.add`, re-validated at the next sync), explicit downloads refused as not available are
-  queued again, and every collection's unavailable members are re-checked.
+* Explicit filter: downloads are the user's content, so a filter applies when they are shown and
+  played (the Downloads screens dim explicit entries, the Player refuses them, offline too: the
+  offline session takes the account's filter as last reported, §4.3), never to download rows.
+  "Hide explicit content" never keeps an item from being downloaded; the account's own filter
+  (Spotify's parental setting) does: `download.track` refuses explicit items for such an account
+  and explicit members are not queued (recorded as not playable here, re-checked when the filter
+  goes off). The catalog's `playable` includes both, so an explicit item's `playable:false` is
+  judged per what may have applied (`ExplicitFilterWatch`: a source counts as off only if it was
+  known off, the setting applied by the engine and the account's value reported online, from before
+  the lookup until after it): with only the app setting a member gets no verdict (queued;
+  `download.track` decides, neither recorded as not playable nor taken out of that set, its
+  collection re-checked at the next sync); with either filter, re-validation leaves the download
+  COMPLETED (re-validated at a later sync) and a failed download is not requeued for it. Catalog
+  metadata stored with a row drops the filter's `playable:false`. When the effective filter goes off
+  (applied by the engine), every collection's unavailable members become due for a re-check and the
+  re-validation (failed downloads, unavailable members, stale downloads) runs at once when online,
+  else once online. Once per installation, and only once an online session reported the account
+  without its own filter, the downloads earlier versions failed for "Hide explicit content" are
+  repaired: explicit downloads re-validation marked no longer available are restored to COMPLETED
+  (file and key were kept; registered with `offline.add`, re-validated at the next sync), explicit
+  downloads refused as not available are queued again, and every collection's unavailable members
+  are re-checked.
 * Downloads require Premium (they are always Premium here) and are wiped on logout.
 
 ### 9.8 Data layer
