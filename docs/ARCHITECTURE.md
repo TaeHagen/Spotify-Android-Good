@@ -524,11 +524,13 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `library.invalidate` | `{}` | `{}` — forgets the engine's cached library lists (set snapshots ≤ 60 s, Liked Songs fallback, rootlist ≤ 30–300 s), so the next `library.*` reads come from the server; called on pull-to-refresh |
 | `library.save` / `library.remove` | `{"uris":[…]}` | `{}` (tracks/albums/artists/shows/episodes — routed to the right collection set) |
 | — | | Playlist revision conflicts (stale `revision`) fail with `INVALID_ARGUMENT` and a message containing "revision"; clients reload and retry. |
-| `playlist.create` | `{"name","description"?,"public":false,"uris"?:[…]}` | `{"uri","revision"}` (also added to the top of the rootlist) |
+| `playlist.create` | `{"name","description"?,"public":false,"uris"?:[…]}` | `{"uri","revision"}` (also added to the top of the rootlist; `public`: shown on the profile, the app's create dialog defaults it on as Spotify does) |
 | `playlist.addItems` | `{"uri","uris":[…],"position":null}` | `{"revision"}` |
 | `playlist.removeItems` | `{"uri","items":[{"uri","index"}],"revision"}` | `{"revision"}` |
 | `playlist.moveItems` | `{"uri","fromIndex","length","toIndex","revision"}` | `{"revision"}` — `toIndex` uses playlist4 MOV semantics: the insert-before position in the list *before* the move (moving item 2 to the end of a 5-item list: from 2, to 5) |
 | `playlist.updateDetails` | `{"uri","name"?,"description"?}` | `{}` |
+| `playlist.setPublic` | `{"uri","public":bool}` | `{}`: shows the playlist on the profile or not — the rootlist item's `public` attribute (`UPDATE_ITEM_ATTRIBUTES` at its index, rootlist base revision, one retry on a conflict); `NOT_FOUND` when it is not in the library. The app offers it for owned, non-collaborative playlists |
+| `playlist.setCollaborative` | `{"uri","collaborative":bool}` | `{"revision"?}`: `UPDATE_LIST_ATTRIBUTES` `collaborative` on the playlist; making it collaborative also makes it private (as in Spotify) |
 | `playlist.delete` | `{"uri"}` | `{}` (removes from rootlist; unfollow) |
 | `playlist.follow` / `playlist.unfollow` | `{"uri"}` | `{}` |
 
@@ -595,7 +597,9 @@ Artist       {"uri","name","images","headerImages"?,"biography"?,"topTracks":[Tr
               "partial"?:true}
 PlaylistRef  {"uri","name","description"?,"images","owner":{"username","displayName"?},"totalTracks"?}
 Playlist     PlaylistRef + {"collaborative","isOwnedByMe","canEdit","revision","offset","total",
-              "items":[{"uid"?,"addedAt"?,"addedBy"?,"track"?:Track,"episode"?:Episode}],"following"?:bool,"partial"?:true}
+              "items":[{"uid"?,"addedAt"?,"addedBy"?,"track"?:Track,"episode"?:Episode}],"following"?:bool,"isPublic"?:bool,"partial"?:true}
+             (`isPublic`: on the user's profile, known when it is in the user's rootlist; an owned
+              playlist's page reads the rootlist for it)
              (items never drop out, so indexes stay aligned for edits: local files and unresolved
               items keep their slot as a `track`/`episode` with `playable:false`; local files have
               empty `artists`)
@@ -627,7 +631,8 @@ SearchResults {"tracks","artists","albums","playlists","shows","episodes" (array
               "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
 HomeSection  {"id","title","items":[MediaRef]}
-RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit"}
+RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit",
+              "isPublic"?:bool (playlists: the item's `public` attribute)}
 Lyrics       {"syncType":"LINE_SYNCED|UNSYNCED|SYLLABLE_SYNCED","lines":[{"startTimeMs","words"}],
               "provider"?,"colors"?:{"background","text","highlightText"}}
 User         {"username","displayName","images","product","country","explicitFilter",

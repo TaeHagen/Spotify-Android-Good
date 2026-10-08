@@ -180,6 +180,13 @@ class LibraryRepository(
         _edits.tryEmit(LibraryEdit.PlaylistEdited(uri))
     }
 
+    /** Public / collaborative changed: the page and the rootlist carry them; the items didn't change. */
+    internal suspend fun onPlaylistAttributesChanged(uri: String) {
+        cache.invalidatePrefix(CacheKeys.playlistPrefix(uri))
+        cache.invalidate(CacheKeys.LIBRARY_PLAYLISTS)
+        _changes.emit(Unit)
+    }
+
     internal suspend fun onPlaylistDeleted(uri: String) {
         saved.mutate(listOf(uri), false)
         cache.invalidatePrefix(CacheKeys.playlistPrefix(uri))
