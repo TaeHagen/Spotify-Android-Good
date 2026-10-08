@@ -1073,8 +1073,13 @@ refetched twice while on screen (after 15 s and 30 s). The home feed is treated 
 when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
-app scope, so they complete even if their screen closes. Liked-state of the
-current track is cached in memory (LRU) and refreshed via `library.contains`.
+app scope, so they complete even if their screen closes. Saved/liked state is cached in
+memory (LRU) and looked up via `library.contains` (batched). It is unknown until looked up: a
+failed lookup (offline, the session still connecting, a network error) stays unknown, never
+"not saved", and is looked up again when the session comes online (with backoff if it fails
+while online). Unknown hearts / Save / Follow controls are shown disabled. A toggle writes the
+opposite of the state the control showed, never of the server's current state, so a stale
+"not saved" can't remove an item (and its download).
 
 ### 9.9 UI
 
