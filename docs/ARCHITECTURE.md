@@ -1490,8 +1490,11 @@ error while ONLINE: after the next reconnect).
   always work.
 * Offline: banner + downloaded-only filtering when offline mode or no network.
 * Voice search sent to the activity (`MEDIA_PLAY_FROM_SEARCH`, forwarded by `LinkActivity`):
-  `ShellViewModel.playFromSearch` waits for the stored login, then (unless offline) for the
-  session, and hands the request (query, focus and the `EXTRA_MEDIA_*` names, as
+  `ShellViewModel.playFromSearch` holds the engine (a UI holder, taken at once: the request
+  arrives in onCreate / onNewIntent, before onStart's holder, and an idle-stopped session only
+  starts for a holder; released once the play went out), waits for the stored login, then,
+  unless offline (offline mode, or no network as of now: a stopped engine reads it from the
+  system), for the session as the media session does (`VoiceEntry`, bounded), and hands the request (query, focus and the `EXTRA_MEDIA_*` names, as
   `VoiceRequest`) to the media session's resolver (§9.4), so both entries play the same thing:
   a match plays as an in-app play (to the pending Connect target too), an empty request resumes
   playback, no match shows "Nothing found for …" or, offline, "That isn't downloaded".

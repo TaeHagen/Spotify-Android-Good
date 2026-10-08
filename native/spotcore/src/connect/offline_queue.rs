@@ -452,7 +452,7 @@ impl OfflineQueue {
     fn advance(&mut self, auto: bool, play: bool, now_ms: i64) -> Action {
         if auto && self.repeat == RepeatMode::Track {
             if let Some(item) = self.current_item() {
-                return self.begin_load(item.uri, true, 0, now_ms);
+                return self.begin_load(item.uri, play, 0, now_ms);
             }
         }
         if let Some(item) = self.queue.pop_front() {
@@ -777,7 +777,7 @@ impl OfflineQueue {
         self.position_ts = now_ms;
         self.duration_ms = a.duration_ms;
         if ended {
-            return Some(self.advance(true, true, now_ms));
+            return Some(self.advance(true, a.playing, now_ms));
         }
         a.playing.then_some(Action::Play)
     }
@@ -873,7 +873,10 @@ impl OfflineQueue {
                 out.action = self.peek_next_uri().map(Action::Preload);
             }
             Event::EndOfTrack(id) if self.own(id) => {
-                out.action = Some(self.advance(true, true, now_ms));
+                // As it plays or not: the Player also ends a paused track (an explicit download
+                // when the filter turns on), the next one then loads paused.
+                let play = self.play_intent;
+                out.action = Some(self.advance(true, play, now_ms));
                 out.changed = true;
             }
             Event::Unavailable { id, uri } if self.own(id) => {
@@ -1320,6 +1323,21 @@ mod tests {
         assert_eq!(q.pause(0), Some(Action::Pause));
         let out = q.on_event(Event::Unavailable { id: 1, uri: "spotify:track:0".into() }, 0);
         assert!(!play_of(out.action));
+        // a paused track that ends (the explicit filter turned on): the next one loads paused,
+        // also with repeat-one; one that ends while playing plays on
+        for repeat in [RepeatMode::Off, RepeatMode::Track] {
+            let mut q = OfflineQueue::default();
+            q.load(spec(4, 0, false, repeat), 0);
+            q.on_event(Event::RequestId(1), 0);
+            q.on_event(Event::Playing { id: 1, position_ms: 0 }, 0);
+            q.on_event(Event::Paused { id: 1, position_ms: 5_000 }, 0);
+            assert!(!play_of(q.on_event(Event::EndOfTrack(1), 0).action), "{repeat:?}");
+            let mut q = OfflineQueue::default();
+            q.load(spec(4, 0, false, repeat), 0);
+            q.on_event(Event::RequestId(1), 0);
+            q.on_event(Event::Playing { id: 1, position_ms: 0 }, 0);
+            assert!(play_of(q.on_event(Event::EndOfTrack(1), 0).action), "{repeat:?}");
+        }
     }
 
     #[test]
