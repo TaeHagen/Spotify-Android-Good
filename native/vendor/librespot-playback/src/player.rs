@@ -30,7 +30,8 @@ use crate::{
     // SPOTIFYGOOD: for the audio-key retry and for classifying load failures.
     core::{FileId, audio_key::AudioKey, audio_key::is_permanent_denial, session::SessionError},
     metadata::MetadataError,
-    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, SymphoniaDecoder},
+    // SPOTIFYGOOD: DecoderError for the stall handling
+    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, SymphoniaDecoder},
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
@@ -221,6 +222,60 @@ struct PlayerInternal {
 
     // SPOTIFYGOOD: see Player::set_playback_speed and nominal_start_time
     playback_speed: f64,
+    // SPOTIFYGOOD: see stall_action
+    stream_stall: Option<StreamStall>,
+}
+
+// SPOTIFYGOOD: how long a playing streamed track waits for its data before it pauses, as long as
+// the engine keeps the session up for a device that streams from its buffer
+const STREAM_STALL_MAX: Duration = Duration::from_secs(60);
+
+// SPOTIFYGOOD: a track whose reads timed out (see stall_action): its decoder is re-seeked to the
+// position played before it reads again, until a packet comes
+#[derive(Debug, Clone, Copy)]
+struct StreamStall {
+    play_request_id: u64,
+    /// the first read that timed out while it played; `None` after a pause or a resume (it waits
+    /// anew)
+    since: Option<Instant>,
+}
+
+// SPOTIFYGOOD: what the packet loop does when the decoder fails
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallAction {
+    /// read again (re-seeked to the position played), the track keeps playing
+    Retry,
+    /// pause at the position played: the data didn't come for STREAM_STALL_MAX
+    Pause,
+    /// a broken track (or the session is gone): on to the next one, as stock
+    Skip,
+}
+
+// SPOTIFYGOOD: a read of a streamed file times out after librespot-audio's `download_timeout`
+// (8 s) without data. Stock took it as a broken track and skipped it (EndOfTrack): a stall of a
+// few seconds past the buffer (a tunnel, a cell handover) ended the episode, and Spirc went on
+// with the next one. A stall keeps the track: each retry waits again in the read (which requests
+// a range whose request failed once more), between the attempts the commands are handled (a
+// pause ends the waiting: a paused track doesn't read), and after STREAM_STALL_MAX it pauses at
+// the position played. A session that is gone (the engine restores the playback) and any
+// other error skip as before.
+/// What to do with a decoder error of the playing track, stalled since `stalled_since` (its first
+/// timed-out read)
+fn stall_action(
+    error: &DecoderError,
+    stalled_since: Option<Instant>,
+    now: Instant,
+    session_valid: bool,
+) -> StallAction {
+    if !error.is_stall() || !session_valid {
+        return StallAction::Skip;
+    }
+    match stalled_since {
+        Some(since) if now.saturating_duration_since(since) >= STREAM_STALL_MAX => {
+            StallAction::Pause
+        }
+        _ => StallAction::Retry,
+    }
 }
 
 // SPOTIFYGOOD: the line of a playback in media time. Stock assumed 1x: the nominal start time
@@ -694,6 +749,8 @@ impl Player {
 
                 // SPOTIFYGOOD: see Player::set_playback_speed
                 playback_speed: 1.,
+                // SPOTIFYGOOD: see stall_action
+                stream_stall: None,
             };
 
             // While PlayerInternal is written as a future, it still contains blocking code.
@@ -1803,6 +1860,9 @@ impl Future for PlayerInternal {
                 self.ensure_sink_running();
                 // SPOTIFYGOOD: see nominal_start_time
                 let speed = self.playback_speed;
+                // SPOTIFYGOOD: see stall_action
+                let stall = self.stream_stall;
+                let session_valid = !self.session.is_invalid();
 
                 if let PlayerState::Playing {
                     ref track_id,
@@ -1815,8 +1875,23 @@ impl Future for PlayerInternal {
                 } = self.state
                 {
                     let track_id = track_id.clone();
-                    match decoder.next_packet() {
+                    // SPOTIFYGOOD: a stalled track reads again from the position played (its
+                    // reader may have stopped in the middle of a page); the seek's reads wait for
+                    // the data like any other
+                    let stall = stall.filter(|stall| stall.play_request_id == play_request_id);
+                    let next_packet = match stall {
+                        Some(_) => decoder
+                            .seek(*stream_position_ms)
+                            .and_then(|_| decoder.next_packet()),
+                        None => decoder.next_packet(),
+                    };
+                    match next_packet {
                         Ok(result) => {
+                            // SPOTIFYGOOD: the data came after a stall (its first packet reports
+                            // its position, the line was cleared at the stall)
+                            if stall.is_some() {
+                                info!("Stream of <{track_id:?}> goes on");
+                            }
                             if let Some((ref packet_position, ref packet)) = result {
                                 let new_stream_position_ms = packet_position.position_ms;
                                 let expected_position_ms = std::mem::replace(
@@ -1909,17 +1984,49 @@ impl Future for PlayerInternal {
                                 }
                             }
 
+                            // SPOTIFYGOOD: see above
+                            if stall.is_some() {
+                                self.stream_stall = None;
+                            }
                             self.handle_packet(result, normalisation_factor);
                         }
-                        Err(e) => {
-                            error!(
-                                "Skipping to next track, unable to get next packet for track <{track_id:?}>: {e:?}"
-                            );
-                            self.send_event(PlayerEvent::EndOfTrack {
-                                track_id,
-                                play_request_id,
-                            })
-                        }
+                        // SPOTIFYGOOD: see stall_action
+                        Err(e) => match stall_action(
+                            &e,
+                            stall.and_then(|stall| stall.since),
+                            Instant::now(),
+                            session_valid,
+                        ) {
+                            StallAction::Retry => {
+                                // the first packet after it reports its position
+                                *reported_nominal_start_time = None;
+                                warn!(
+                                    "Stream of <{track_id:?}> stalled, waiting for its data: {e}"
+                                );
+                                let since = stall.and_then(|stall| stall.since);
+                                self.stream_stall = Some(StreamStall {
+                                    play_request_id,
+                                    since: Some(since.unwrap_or_else(Instant::now)),
+                                });
+                            }
+                            StallAction::Pause => {
+                                warn!(
+                                    "Stream of <{track_id:?}> stalled for {STREAM_STALL_MAX:?}, pausing: {e}"
+                                );
+                                // still re-seeked when it is resumed
+                                self.handle_pause();
+                            }
+                            StallAction::Skip => {
+                                error!(
+                                    "Skipping to next track, unable to get next packet for track <{track_id:?}>: {e:?}"
+                                );
+                                self.stream_stall = None;
+                                self.send_event(PlayerEvent::EndOfTrack {
+                                    track_id,
+                                    play_request_id,
+                                })
+                            }
+                        },
                     }
                 } else {
                     // SPOTIFYGOOD: was `exit(1)`. We get here when `ensure_sink_running()` failed
@@ -2070,6 +2177,10 @@ impl PlayerInternal {
     }
 
     fn handle_play(&mut self) {
+        // SPOTIFYGOOD: a resumed track waits anew if its data still doesn't come (stall_action)
+        if let Some(stall) = self.stream_stall.as_mut() {
+            stall.since = None;
+        }
         match self.state {
             PlayerState::Paused {
                 ref track_id,
@@ -2098,6 +2209,10 @@ impl PlayerInternal {
     }
 
     fn handle_pause(&mut self) {
+        // SPOTIFYGOOD: a paused track doesn't read, it stops waiting for its data (stall_action)
+        if let Some(stall) = self.stream_stall.as_mut() {
+            stall.since = None;
+        }
         match self.state {
             PlayerState::Paused { .. } => self.ensure_sink_stopped(false),
             PlayerState::Playing {
@@ -2708,12 +2823,13 @@ impl PlayerInternal {
         }
 
         // ensure we have a bit of a buffer of downloaded data
-        self.preload_data_before_playback()?;
+        let preloaded = self.preload_data_before_playback();
 
         // SPOTIFYGOOD: no line until the first packet after the seek, which reports its
         // position (a PositionCorrection) and starts the line there (see nominal_start_time).
         // The line started after the wait for the data above, so the Seeked position, sent
-        // before it, stayed ahead of the audio by that wait (at every speed).
+        // before it, stayed ahead of the audio by that wait (at every speed). Also when the wait
+        // timed out (the data comes with a later read). The seek starts any stall afresh.
         if let PlayerState::Playing {
             ref mut reported_nominal_start_time,
             ..
@@ -2721,8 +2837,9 @@ impl PlayerInternal {
         {
             *reported_nominal_start_time = None;
         }
+        self.stream_stall = None;
 
-        Ok(())
+        preloaded
     }
 
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
@@ -3352,6 +3469,44 @@ mod spotifygood_tests {
         kept.stall(3_000);
         kept.play(10_000);
         assert_eq!(kept.corrections, 0);
+    }
+
+    // SPOTIFYGOOD: see stall_action
+    #[test]
+    fn a_stall_keeps_the_track_for_a_while() {
+        let stall = DecoderError::Stalled("timed out".into());
+        let broken = DecoderError::SymphoniaDecoder("malformed".into());
+        let now = Instant::now() + Duration::from_secs(3600);
+        // the first timed-out read, and the ones after it while the data doesn't come
+        assert_eq!(stall_action(&stall, None, now, true), StallAction::Retry);
+        assert_eq!(
+            stall_action(&stall, Some(now - Duration::from_secs(40)), now, true),
+            StallAction::Retry
+        );
+        // then it pauses (at the position played)
+        assert_eq!(
+            stall_action(&stall, Some(now - STREAM_STALL_MAX), now, true),
+            StallAction::Pause
+        );
+        // a broken track, or a session that is gone, is skipped as before
+        assert_eq!(stall_action(&broken, None, now, true), StallAction::Skip);
+        assert_eq!(stall_action(&stall, None, now, false), StallAction::Skip);
+    }
+
+    // SPOTIFYGOOD: see DecoderError::Stalled
+    #[test]
+    fn a_timed_out_read_is_a_stall() {
+        use std::io;
+        let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "no data");
+        assert!(DecoderError::from_io(timed_out()).is_stall());
+        assert!(
+            !DecoderError::from_io(io::Error::new(io::ErrorKind::BrokenPipe, "closed")).is_stall()
+        );
+        // as next_packet and seek get it from symphonia
+        let err: DecoderError = symphonia::core::errors::Error::IoError(timed_out()).into();
+        assert!(err.is_stall());
+        let err: DecoderError = symphonia::core::errors::Error::DecodeError("bad packet").into();
+        assert!(!err.is_stall());
     }
 
     #[test]

@@ -917,21 +917,18 @@ class PlaybackService : MediaLibraryService() {
             val first = mediaItems.firstOrNull()
             val query = first?.requestMetadata?.searchQuery
             if (mediaItems.size == 1 && query != null) {
-                // Voice: "play X" (empty query = "play something": resume the last context).
-                if (query.isBlank()) {
-                    val last = resumeStore.read() ?: noVoiceMatch(PlaybackErrorKind.NOT_ACTIVE_DEVICE)
-                    MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
-                } else {
-                    // "Play X" right after a cold start: search needs the session (NOT_CONNECTED otherwise).
-                    coordinator.environment.awaitSessionStart()
-                    val items = runCatching { tree.resolveVoiceQuery(query, first.requestMetadata.extras) }
-                        .onFailure { if (it is CancellationException) throw it }
-                        .getOrNull()
-                        .orEmpty()
-                    if (items.isEmpty()) {
-                        noVoiceMatch(if (tree.isOffline()) PlaybackErrorKind.NOT_AVAILABLE_OFFLINE else PlaybackErrorKind.NOT_FOUND)
+                // Voice: "play X" (empty query = "play something": resume the last context). The
+                // same resolver as the activity's MEDIA_PLAY_FROM_SEARCH (LibraryTree.resolveVoice).
+                val voice = VoiceRequest.of(query, first.requestMetadata.extras)
+                // "Play X" right after a cold start: search needs the session (NOT_CONNECTED otherwise).
+                if (!voice.isBlank) coordinator.environment.awaitSessionStart()
+                when (val outcome = tree.resolveVoice(voice)) {
+                    VoiceOutcome.PlaySomething -> {
+                        val last = resumeStore.read() ?: noVoiceMatch(PlaybackErrorKind.NOT_ACTIVE_DEVICE)
+                        MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
                     }
-                    MediaItemsWithStartPosition(items, 0, C.TIME_UNSET)
+                    is VoiceOutcome.NoMatch -> noVoiceMatch(outcome.kind)
+                    is VoiceOutcome.Play -> MediaItemsWithStartPosition(outcome.items, 0, C.TIME_UNSET)
                 }
             } else {
                 MediaItemsWithStartPosition(mediaItems, startIndex, startPositionMs)

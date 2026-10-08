@@ -331,6 +331,121 @@ class EpisodeProgressStoreTest {
         scope.cancel()
     }
 
+    /** The speaker plays E from [from] to [to] (minutes) while this phone follows it, then pauses. */
+    private fun EpisodeProgressTracker.followSpeaker(from: Long, to: Long, at: Long) {
+        onSnapshot(snapshot(source = PlaybackSource.REMOTE, positionMs = from * MIN, at = at), at)
+        onSnapshot(snapshot(source = PlaybackSource.REMOTE, status = PlaybackStatus.PAUSED, positionMs = to * MIN, at = at + 1), at + 1)
+    }
+
+    @Test
+    fun aSpeakerThatReportsNothingKeepsItsProgressAgainstSpotifysOlderPoint() = runTest {
+        val (store, scope) = store()
+        store.fresh(played(10), at = 100) // the desktop left it at 10:00 (the pre-play lookup saw it)
+        now = 200
+        store.tracker().followSpeaker(10, 40, at = 200) // a librespot receiver plays on to 40:00
+        assertEquals(40 * MIN, store.resumeMs(EP))
+        store.fresh(played(10), at = 1_000) // Spotify still says 10:00
+        assertEquals(40 * MIN, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun notStartedAfterARemoteSaveChangesNothing() = runTest {
+        val (store, scope) = store()
+        store.fresh(played(10), at = 100)
+        now = 200
+        store.tracker().followSpeaker(10, 40, at = 200)
+        store.fresh(NOT_STARTED, at = 1_000)
+        assertEquals(40 * MIN, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun anEpisodeTheSpeakerFinishedStaysFinished() = runTest {
+        val (store, scope) = store()
+        store.fresh(played(10), at = 100)
+        now = 200
+        val tracker = store.tracker()
+        tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, positionMs = 10 * MIN, at = 200), 200)
+        tracker.onSnapshot(snapshot(source = PlaybackSource.REMOTE, status = PlaybackStatus.PAUSED, positionMs = 2 * HOUR - 10_000, at = 300), 300)
+        assertEquals(true, store.overlay(episode()).fullyPlayed)
+        store.fresh(played(10), at = 1_000)
+        assertEquals(true, store.overlay(episode()).fullyPlayed)
+        scope.cancel()
+    }
+
+    @Test
+    fun aLaterPointFromAReportingSpeakerOrElsewhereStillWins() = runTest {
+        val (store, scope) = store()
+        store.fresh(played(10), at = 100)
+        now = 200
+        store.tracker().followSpeaker(10, 40, at = 200)
+        store.fresh(played(55), at = 1_000)
+        assertEquals(55 * MIN, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun continuingHereWhatTheSpeakerPlayedKeepsThePhonesNewerProgress() = runTest {
+        val (store, scope) = store()
+        now = 100
+        store.tracker().followSpeaker(1, 40, at = 100) // an official device: it reports 40:00 to Spotify
+        // Next morning (process restarted: a new tracker): resumed here at 40:00, played to 55:00.
+        val tracker = store.tracker()
+        now = 1_000
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, positionMs = 40 * MIN, at = 1_000), 1_000)
+        now = 2_000
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, status = PlaybackStatus.PAUSED, positionMs = 55 * MIN, at = 2_000), 2_000)
+        store.fresh(played(40), at = 3_000) // the speaker's 40:00
+        assertEquals(55 * MIN, store.resumeMs(EP))
+        store.fresh(played(40), at = 4_000)
+        assertEquals(55 * MIN, store.resumeMs(EP))
+        // Played further elsewhere afterwards, or finished: news.
+        store.fresh(played(70), at = 5_000)
+        assertEquals(70 * MIN, store.resumeMs(EP))
+        store.fresh(PlayedPoint(0, true), at = 6_000)
+        assertEquals(true, store.overlay(episode()).fullyPlayed)
+        scope.cancel()
+    }
+
+    @Test
+    fun continuingHereAfterTheSpeakerMovedOnToMusicKeepsThePhonesProgress() = runTest {
+        val (store, scope) = store()
+        val tracker = store.tracker()
+        now = 100
+        tracker.followSpeaker(1, 30, at = 100)
+        // The speaker then plays a song (no takeover seen any more), and this phone continues E.
+        tracker.onSnapshot(
+            snapshot(uri = "spotify:track:t", source = PlaybackSource.REMOTE, positionMs = 1_000, at = 200).let { it.copy(track = it.track!!.copy(isEpisode = false)) },
+            200,
+        )
+        now = 1_000
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, positionMs = 30 * MIN, at = 1_000), 1_000)
+        now = 2_000
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, status = PlaybackStatus.PAUSED, positionMs = 55 * MIN, at = 2_000), 2_000)
+        store.fresh(played(30), at = 3_000)
+        assertEquals(55 * MIN, store.resumeMs(EP))
+        store.fresh(played(70), at = 4_000)
+        assertEquals(70 * MIN, store.resumeMs(EP))
+        scope.cancel()
+    }
+
+    @Test
+    fun aPlayOfAnEpisodeLastPlayedOnAFollowedSpeakerLooksUpFirst() = runTest {
+        val (store, scope) = store()
+        now = 100
+        store.tracker().followSpeaker(1, 30, at = 100)
+        now = 10 * HOUR // much later: the speaker may have played on after the phone stopped following
+        var calls = 0
+        val position = store.resumeOrLookUp(EP, online = { true }) {
+            calls++
+            store.fresh(played(50), at = now)
+        }
+        assertEquals(1, calls)
+        assertEquals(50 * MIN, position)
+        scope.cancel()
+    }
+
     @Test
     fun aRemoteRestartNearTheStartDoesNotReplaceAPointFurtherOn() = runTest {
         val (store, scope) = store()
