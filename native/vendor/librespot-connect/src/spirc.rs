@@ -1556,6 +1556,20 @@ impl SpircTask {
     }
 
     fn handle_player_event(&mut self, event: PlayerEvent) -> Result<(), Error> {
+        // SPOTIFYGOOD: the explicit filter changed (the player reports every change of the
+        // effective filter, the app's and the account's; the event has no request id, and it
+        // matters while inactive too): once it is off, the tracks it refused play again (see
+        // ConnectState::forget_filtered_unavailable). Spirc ignored it.
+        if let PlayerEvent::FilterExplicitContentChanged { .. } = event {
+            if !self.session.filter_explicit_content()
+                && self.connect_state.forget_filtered_unavailable()?
+                && self.connect_state.is_active()
+            {
+                self.update_state = true;
+            }
+            return Ok(());
+        }
+
         // SPOTIFYGOOD: an inactive device doesn't own the player (an app's offline playback may
         // drive the same player): never adopt its request ids or act on its events. It used to
         // stop the player at the end of every offline track. Spirc's own loads happen after it
@@ -1736,6 +1750,13 @@ impl SpircTask {
                     self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()?;
                 if !transient {
                     self.connect_state.mark_unavailable(&track_id)?;
+                    // SPOTIFYGOOD: see ConnectState::forget_filtered_unavailable (the explicit
+                    // filter's refusal is NotAvailable)
+                    if reason == UnavailableReason::NotAvailable
+                        && self.session.filter_explicit_content()
+                    {
+                        self.connect_state.note_filtered_unavailable(&track_id)?;
+                    }
                 }
                 if is_current {
                     self.handle_preload_next_track();
