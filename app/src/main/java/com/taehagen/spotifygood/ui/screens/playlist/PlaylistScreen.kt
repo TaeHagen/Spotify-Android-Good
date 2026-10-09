@@ -459,7 +459,7 @@ private fun PlaylistHeader(
                                 onClick = actions.onShuffle,
                             )
                             PlayFab(
-                                isPlaying = state.playback.isPlayingContext(meta.uri) || (state.sortedListIsCurrent && state.playback.isPlaying),
+                                isPlaying = state.playback.isPlayingContext(meta.uri) || (state.listIsCurrent && state.playback.isPlaying),
                                 onClick = actions.onPlay,
                             )
                         },

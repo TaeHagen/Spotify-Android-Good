@@ -80,8 +80,11 @@ data class LikedSongsUiState(
     val loadedCount: Int = 0,
     /** Every page is being fetched (a sort or a filter needs them all). */
     val loadingAll: Boolean = false,
-    /** What plays is this sorted list (playing or paused), also when started before the page reopened. */
-    val sortedListIsCurrent: Boolean = false,
+    /**
+     * What plays is Liked Songs (playing or paused): its context, or a track list this app started
+     * for it (sorted, or its downloads offline), also before the page was reopened ([isListPlaying]).
+     */
+    val listIsCurrent: Boolean = false,
     /** The session is ONLINE: songs that aren't downloaded can start ([canStartNow]). */
     val online: Boolean = true,
 )
@@ -118,6 +121,7 @@ private data class LikedMeta(
     val sort: TrackSort,
     val lastSorted: SortedPlays.Entry?,
     val online: Boolean,
+    val listPlayback: ListPlayback,
 )
 
 /** Likes and unlikes made in the app, applied to a fully loaded Liked Songs instead of paging it again. */
@@ -324,13 +328,20 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         sortedSource,
         filterQuery,
         contextUri,
-        combine(download, refreshing, partialPages.partial, reach, combine(sort, SortedPlays.last, ::Pair)) { download, refreshing, partial, reach, (sort, last) ->
+        combine(
+            download,
+            refreshing,
+            partialPages.partial,
+            reach,
+            combine(sort, SortedPlays.last, graph.listPlaybackFlow(), ::Triple),
+        ) { download, refreshing, partial, reach, (sort, last, listPlayback) ->
             LikedMeta(
                 download, refreshing, partial,
                 offline = reach == EngineReach.OFFLINE,
                 sort = sort,
                 lastSorted = last,
                 online = reach == EngineReach.ONLINE,
+                listPlayback = listPlayback,
             )
         },
         graph.nowPlayingFlow(),
@@ -358,11 +369,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             sort = sort,
             loadedCount = source.tracks.size,
             loadingAll = needsAll && !source.fromDownload && source.tracks.isNotEmpty() && (source.canLoadMore || source.isLoading),
-            sortedListIsCurrent = sort != TrackSort.RECENTLY_ADDED && isSortedPlayback(
-                nowPlaying.trackUri,
-                nowPlaying.contextUri,
-                sortedListUris(ListSortStore.LIKED_SONGS, lastSorted) { source.tracks.map { it.uri } },
-            ),
+            listIsCurrent = isListPlaying(ListSortStore.LIKED_SONGS, contextUri, meta.listPlayback, lastSorted),
             online = online,
         )
     }.flowOn(Dispatchers.Default)
@@ -438,8 +445,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         // Not ONLINE, a track list goes to the offline queue: planned like any plain list.
         return when (val plan = planSortedPlay(uris, startUri, graph.engineReach(), graph.downloads.downloadedUris.value)) {
             is SortedStart.Load -> {
-                SortedPlays.record(ListSortStore.LIKED_SONGS, plan.request)
-                graph.player.play(plan.request)
+                startList(plan.request)
                 true
             }
             SortedStart.NotDownloaded -> {
@@ -502,15 +508,22 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         tracks.filter { it.playable && !it.isPlaceholder }.map { it.uri }
     }
 
-    /** Play button: toggles when Liked Songs (or a sorted list of it started here) is already playing. */
+    /**
+     * Play button: toggles when Liked Songs is what plays (its context, or a track list started for
+     * it here: sorted, or its downloads), else starts it.
+     */
     fun playOrToggle() {
-        val current = state.value
-        val isContext = current.nowPlaying.contextUri != null && current.nowPlaying.contextUri == current.contextUri
-        if (isContext || current.sortedListIsCurrent) {
+        if (state.value.listIsCurrent) {
             graph.player.togglePlayPause()
         } else {
             play(shuffle = false)
         }
+    }
+
+    /** Sends a track list of Liked Songs, recorded so the Play button knows it ([SortedPlays]). */
+    private fun startList(request: PlayRequest) {
+        SortedPlays.record(graph, ListSortStore.LIKED_SONGS, request)
+        graph.player.play(request)
     }
 
     fun shuffle() = play(shuffle = true)
@@ -532,7 +545,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             messages.trySend(LibraryMessage.NOTHING_TO_PLAY)
             return
         }
-        graph.player.play(PlayRequest(trackUris = uris, startIndex = if (shuffle) null else 0, shuffle = shuffle))
+        startList(PlayRequest(trackUris = uris, startIndex = if (shuffle) null else 0, shuffle = shuffle))
     }
 
     fun playTrack(track: Track) {
@@ -546,7 +559,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         } else {
             val uris = playableUris()
             val index = uris.indexOf(track.uri)
-            if (index >= 0) graph.player.playTracks(uris, index) else graph.player.playTracks(listOf(track.uri))
+            startList(if (index >= 0) PlayRequest(trackUris = uris, startIndex = index) else PlayRequest(trackUris = listOf(track.uri)))
         }
     }
 
