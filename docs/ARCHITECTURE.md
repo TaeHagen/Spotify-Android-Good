@@ -1364,6 +1364,17 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   shown as not available (FAILED with "On an SD card that isn't available", left out of the
   playable downloads and the "Retry" count) and taken out of the offline index; the index snapshot
   leaves them out. On remount they are registered again, and whatever waited for the card moves.
+  A card that never comes back (it died, or another card with another UUID, or internal storage,
+  is chosen): its downloads are on a card that is no longer the download location ("On an SD card
+  that's no longer used"). They still wait (the card may be inserted again), but "Download" on
+  them, "Retry" (the row's, and "Retry failed", which counts them), downloading their collection
+  again and Settings > Storage "Downloads on an SD card no longer used" download them again to the
+  chosen location: the rows go back into the queue without their old file references, key and
+  record (`requeueFromUnusedCard`, out of the index with a numbered change), and their old files
+  are collected if that card is ever mounted again. Downloads on the chosen card while it is away
+  just wait: "Download" and "Retry" say so instead of claiming to start (`DownloadRequest`, also
+  "queued" while the chosen card is missing). Retrying a collection member never makes it an
+  individual download.
 * Covers (`OfflineCovers`, a Coil interceptor): lists built from downloads and the online pages
   of downloaded items name the CDN image URLs of the stored metadata. Every size of a completed
   download's album images (an episode's own images, else its show's) is served from the download's

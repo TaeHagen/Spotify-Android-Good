@@ -139,7 +139,10 @@ class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
 
     fun retryFailed() = mutate(notify = false) { graph.downloads.retryFailed() }
 
-    fun retryItem(uri: String) = mutate(notify = false) { graph.downloads.downloadItems(listOf(uri)) }
+    /** Retry of one row: says so when nothing could start (its SD card is away). */
+    fun retryItem(uri: String) = mutate(notify = false) {
+        graph.downloads.downloadItems(listOf(uri)).notice?.let { messenger.post(it) }
+    }
 
     /**
      * Runs in the app scope: leaving the screen must not interrupt a removal half-way. The result
