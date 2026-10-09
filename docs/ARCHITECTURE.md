@@ -410,7 +410,8 @@ start that is not downloaded move on to the next download. Smart shuffle is not 
 { "source": "local|remote|none",        // local = this phone is the active device
   "offline": false,
   "activeDevice": {"id","name","type"},  // omitted when none
-  "status": "stopped|loading|playing|paused",
+  "status": "stopped|loading|playing|paused",  // loading: to play (also a stall while playing,
+                                         // at the position heard); a paused load is "paused"
   "positionMs": 0, "positionTimestampMs": 0,   // wall-clock epoch ms when positionMs was valid
   "playbackSpeed": 1.0, "durationMs": 0,
   "context": {"uri":"spotify:playlist:…","name":"…","type":"playlist|album|artist|collection|search|show|station|tracks|unknown"},

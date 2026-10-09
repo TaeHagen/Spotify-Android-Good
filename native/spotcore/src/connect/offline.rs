@@ -592,16 +592,23 @@ pub(crate) async fn control(cmd: &Ctl) -> AppResult<()> {
 fn convert(event: &PlayerEvent) -> Option<Event> {
     Some(match event {
         PlayerEvent::PlayRequestIdChanged { play_request_id } => Event::RequestId(*play_request_id),
-        PlayerEvent::Loading { play_request_id, .. } => Event::Loading(*play_request_id),
+        PlayerEvent::Loading { play_request_id, position_ms, .. } => {
+            Event::Loading { id: *play_request_id, position_ms: *position_ms }
+        }
         PlayerEvent::Playing { play_request_id, position_ms, .. } => {
             Event::Playing { id: *play_request_id, position_ms: *position_ms }
         }
         PlayerEvent::Paused { play_request_id, position_ms, .. } => {
             Event::Paused { id: *play_request_id, position_ms: *position_ms }
         }
-        PlayerEvent::Seeked { play_request_id, position_ms, .. }
-        | PlayerEvent::PositionCorrection { play_request_id, position_ms, .. } => {
+        PlayerEvent::Seeked { play_request_id, position_ms, .. } => {
+            Event::Seeked { id: *play_request_id, position_ms: *position_ms }
+        }
+        PlayerEvent::PositionCorrection { play_request_id, position_ms, .. } => {
             Event::Position { id: *play_request_id, position_ms: *position_ms }
+        }
+        PlayerEvent::Stalled { play_request_id, position_ms, .. } => {
+            Event::Stalled { id: *play_request_id, position_ms: *position_ms }
         }
         PlayerEvent::Stopped { play_request_id, .. } => Event::Stopped(*play_request_id),
         PlayerEvent::TimeToPreloadNextTrack { play_request_id, .. } => Event::TimeToPreload(*play_request_id),
