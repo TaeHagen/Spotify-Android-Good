@@ -579,6 +579,29 @@ fn seek_waiting(
     }
 }
 
+// SPOTIFYGOOD: see cached_file_is_cut
+/// How much shorter than its track a cached file may be (the metadata's duration and the file's
+/// differ a little)
+const CACHED_SHORTFALL_MAX: u32 = 3_000;
+
+// SPOTIFYGOOD: a file in librespot's cache that ends early (a save that failed partway: stock
+// left it under its final name, see the vendored librespot-core's Cache::save_file, atomic now)
+// loaded as complete, and every play of it ended there (the track skipped, a resume past the cut
+// at its end). Its duration (its container's, or estimated from its frames) is checked against
+// the track's: exactly for Ogg (from its last page), within a tenth for the others (an estimate).
+/// Whether a cached file lasting `file_ms` is cut short for a track of `track_ms`
+fn cached_file_is_cut(file_ms: Option<u32>, track_ms: u32, exact: bool) -> bool {
+    let Some(file_ms) = file_ms else {
+        return false;
+    };
+    let tolerance = if exact {
+        CACHED_SHORTFALL_MAX
+    } else {
+        CACHED_SHORTFALL_MAX.max(track_ms / 10)
+    };
+    file_ms.saturating_add(tolerance) < track_ms
+}
+
 // SPOTIFYGOOD: see PlayerInternal::stalled_step
 enum StallStep {
     /// no stall waits for data: the decoder reads on
@@ -1970,14 +1993,25 @@ impl PlayerTrackLoader {
                 }
             };
 
+            // SPOTIFYGOOD: `and_then` (was `map`), see cached_file_is_cut: a cut file in the cache
+            // fails like one the decoder can't read, it is removed and downloaded again (below)
+            let track_ms = audio_item.duration_ms;
             let mut symphonia_decoder = |audio_file, format| {
-                SymphoniaDecoder::new(audio_file, format).map(|mut decoder| {
+                SymphoniaDecoder::new(audio_file, format).and_then(|mut decoder| {
+                    if is_cached
+                        && cached_file_is_cut(decoder.file_duration_ms(), track_ms, is_ogg_vorbis)
+                    {
+                        return Err(DecoderError::SymphoniaDecoder(format!(
+                            "the cached file ends at {:?} ms, the track lasts {track_ms} ms",
+                            decoder.file_duration_ms()
+                        )));
+                    }
                     // For formats other that Vorbis, we'll try getting normalisation data from
                     // ReplayGain metadata fields, if present.
                     if normalisation_data.is_none() {
                         normalisation_data = decoder.normalisation_data();
                     }
-                    Box::new(decoder) as Decoder
+                    Ok(Box::new(decoder) as Decoder)
                 })
             };
 
@@ -5139,6 +5173,61 @@ mod spotifygood_tests {
             .expect("no failure but a stall");
         lands(seeked, said_and_true(&mut decoder, FRAMES), 70_000);
         // and back to the start (exact, the first frame)
+        let seeked =
+            seek_waiting(&mut decoder, &source, 0, 16_000, ms(2_000), || false).expect("seek");
+        assert_eq!(seeked, 0);
+        assert_eq!(said_and_true(&mut decoder, FRAMES), (0, 0));
+    }
+
+    // SPOTIFYGOOD: see cached_file_is_cut
+    #[test]
+    fn a_cached_file_that_ends_early_is_cut() {
+        // a 4:00 song whose cache save failed after 2:20 (the Ogg's last page says so)
+        assert!(cached_file_is_cut(Some(140_000), 240_000, true));
+        assert!(cached_file_is_cut(Some(236_000), 240_000, true));
+        // what the metadata and the file differ by, or more, or unknown
+        assert!(!cached_file_is_cut(Some(238_500), 240_000, true));
+        assert!(!cached_file_is_cut(Some(250_000), 240_000, true));
+        assert!(!cached_file_is_cut(None, 240_000, true));
+        // an estimated duration (an MP3 episode) within a tenth
+        assert!(!cached_file_is_cut(Some(3_300_000), 3_600_000, false));
+        assert!(cached_file_is_cut(Some(3_000_000), 3_600_000, false));
+        assert!(!cached_file_is_cut(Some(1_000), 3_500, false));
+
+        // the real decoder's duration of a file (an MP3 of 3000 frames: 78.4 s)
+        let source = ChunkedFile::new(noisy_mp3(3_000), usize::MAX, 7_919);
+        let duration = source.decoder().file_duration_ms().expect("its duration");
+        assert!(duration.abs_diff(78_367) <= 30, "{duration}");
+    }
+
+    // SPOTIFYGOOD: see SymphoniaDecoder's seek (a seek to 0)
+    #[test]
+    fn an_mp3_seek_to_0_after_a_far_miss_goes_back_to_the_start() {
+        const FRAMES: usize = 3_000;
+        let file = noisy_mp3(FRAMES);
+        // a track loaded (or preloaded) at 0 that never decoded a packet skips to 60 s, past the
+        // download: the seek misses; then a seek to 0:00 (Previous, the seek bar) while it waits
+        // for that data. It read on at the far byte: Missed there, then it played from 60 s
+        // counting from 0 (or failed on a false sync).
+        let source = ChunkedFile::new(file.clone(), 65_536, 7_919);
+        let mut decoder = source.decoder();
+        assert!(matches!(
+            seek_without_waiting(&mut decoder, &source, 60_000),
+            SeekOutcome::Missed(_)
+        ));
+        assert!(matches!(
+            seek_without_waiting(&mut decoder, &source, 0),
+            SeekOutcome::Done(0)
+        ));
+        assert_eq!(said_and_true(&mut decoder, FRAMES), (0, 0));
+
+        // the loader's seek to 0 after such a miss
+        let source = ChunkedFile::new(file, 65_536, 7_919);
+        let mut decoder = source.decoder();
+        assert!(matches!(
+            seek_without_waiting(&mut decoder, &source, 45_000),
+            SeekOutcome::Missed(_)
+        ));
         let seeked =
             seek_waiting(&mut decoder, &source, 0, 16_000, ms(2_000), || false).expect("seek");
         assert_eq!(seeked, 0);

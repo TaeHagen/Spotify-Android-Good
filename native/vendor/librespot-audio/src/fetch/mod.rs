@@ -3,7 +3,8 @@ mod receive;
 use std::{
     cmp::min,
     fs,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write}, // SPOTIFYGOOD: Write (MemoryFile)
+    path::Path,                              // SPOTIFYGOOD: see temp_buffer
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -428,7 +429,8 @@ impl StreamLoaderController {
 }
 
 pub struct AudioFileStreaming {
-    read_file: fs::File,
+    // SPOTIFYGOOD: StreamInput (was fs::File), see temp_buffer
+    read_file: StreamInput,
     position: u64,
     stream_loader_command_tx: mpsc::UnboundedSender<StreamLoaderCommand>,
     shared: Arc<AudioFileShared>,
@@ -523,7 +525,11 @@ impl AudioFile {
 
             if let Some(cache) = session_.cache() {
                 if let Some(cache_id) = cache.file_path(file_id) {
-                    if let Err(e) = cache.save_file(file_id, &mut file) {
+                    // SPOTIFYGOOD: all of it or nothing (see the vendored librespot-core's
+                    // Cache::save_file_of_len): a save that failed partway left a cut file that
+                    // loaded as complete, and the track ended there on every play
+                    let len = file.as_file().metadata().map(|m| m.len()).ok();
+                    if let Err(e) = cache.save_file_of_len(file_id, &mut file, len) {
                         error!("Error caching file {file_id} to {cache_id:?}: {e}");
                     } else {
                         debug!("File {file_id} cached to {cache_id:?}");
@@ -681,10 +687,20 @@ impl AudioFileStreaming {
             missed: AtomicUsize::new(usize::MAX),
         });
 
-        let write_file = NamedTempFile::new_in(session.config().tmp_dir.clone())?;
-        write_file.as_file().set_len(file_size as u64)?;
-
-        let read_file = write_file.reopen()?;
+        // SPOTIFYGOOD: see temp_buffer
+        let (write_file, read_file) = match temp_buffer(&session.config().tmp_dir, file_size) {
+            Ok((write_file, read_file)) => {
+                (StreamOutput::File(write_file), StreamInput::File(read_file))
+            }
+            Err(e) => {
+                warn!("No temp file for the stream ({e}): it is kept in memory, and not cached");
+                let memory = MemoryFile::new(file_size);
+                (
+                    StreamOutput::Memory(memory.clone()),
+                    StreamInput::Memory(memory),
+                )
+            }
+        };
 
         let (stream_loader_command_tx, stream_loader_command_rx) =
             mpsc::unbounded_channel::<StreamLoaderCommand>();
@@ -705,6 +721,144 @@ impl AudioFileStreaming {
             stream_loader_command_tx,
             shared,
         })
+    }
+}
+
+// SPOTIFYGOOD: a stream's bytes go to a temp file in the session's `tmp_dir`, which the engine
+// keeps in the app's cache dir: Settings' "Clear cache", or the system's trim of the cache, empty
+// it while the session lives, and `NamedTempFile::new_in` failed (NotFound) for every stream
+// after that, until a new session (every load Unavailable, a network error). The directory is
+// made again when it is missing. When no temp file can be made at all, the stream is kept in
+// memory (and not saved to the cache) instead of failing its load.
+/// A temp file of `file_size` bytes for a stream in `tmp_dir`, and a reader of it
+fn temp_buffer(tmp_dir: &Path, file_size: usize) -> io::Result<(NamedTempFile, fs::File)> {
+    fs::create_dir_all(tmp_dir)?;
+    let write_file = NamedTempFile::new_in(tmp_dir)?;
+    write_file.as_file().set_len(file_size as u64)?;
+    let read_file = write_file.reopen()?;
+    Ok((write_file, read_file))
+}
+
+// SPOTIFYGOOD: see temp_buffer
+/// A stream's bytes in memory: each handle has its own position (like a file opened again)
+#[derive(Clone)]
+pub(super) struct MemoryFile {
+    data: Arc<Mutex<Vec<u8>>>,
+    position: u64,
+}
+
+impl MemoryFile {
+    fn new(len: usize) -> Self {
+        Self {
+            data: Arc::new(Mutex::new(vec![0; len])),
+            position: 0,
+        }
+    }
+
+    fn data(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        // nothing can poison it: no panic while it is held
+        self.data.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Read for MemoryFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let data = self.data();
+        let start = (self.position as usize).min(data.len());
+        let n = buf.len().min(data.len() - start);
+        buf[..n].copy_from_slice(&data[start..start + n]);
+        drop(data);
+        self.position += n as u64;
+        Ok(n)
+    }
+}
+
+impl Write for MemoryFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut data = self.data();
+        let start = self.position as usize;
+        let end = start.saturating_add(buf.len());
+        if data.len() < end {
+            data.resize(end, 0);
+        }
+        data[start..end].copy_from_slice(buf);
+        drop(data);
+        self.position = end as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for MemoryFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let position = match pos {
+            SeekFrom::Start(position) => Some(position),
+            SeekFrom::End(delta) => (self.data().len() as u64).checked_add_signed(delta),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+        };
+        self.position = position
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before the start"))?;
+        Ok(self.position)
+    }
+}
+
+// SPOTIFYGOOD: see temp_buffer
+/// Where the loader writes a stream's bytes (only a temp file is saved to the cache)
+pub(super) enum StreamOutput {
+    File(NamedTempFile),
+    Memory(MemoryFile),
+}
+
+impl Write for StreamOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::File(file) => file.write(buf),
+            Self::Memory(memory) => memory.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::File(file) => file.flush(),
+            Self::Memory(memory) => memory.flush(),
+        }
+    }
+}
+
+impl Seek for StreamOutput {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::File(file) => file.seek(pos),
+            Self::Memory(memory) => memory.seek(pos),
+        }
+    }
+}
+
+// SPOTIFYGOOD: see temp_buffer
+/// Where a stream is read
+enum StreamInput {
+    File(fs::File),
+    Memory(MemoryFile),
+}
+
+impl Read for StreamInput {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(buf),
+            Self::Memory(memory) => memory.read(buf),
+        }
+    }
+}
+
+impl Seek for StreamInput {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::File(file) => file.seek(pos),
+            Self::Memory(memory) => memory.seek(pos),
+        }
     }
 }
 
@@ -999,7 +1153,8 @@ mod spotifygood_tests {
                             end - start + 1
                         )
                         .into_bytes();
-                        response.resize(response.len() + end - start + 1, 0);
+                        // every byte tells its offset (see byte_at)
+                        response.extend((start..=end).map(byte_at));
                         response
                     } else {
                         format!("HTTP/1.1 {status} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -1365,5 +1520,202 @@ mod spotifygood_tests {
             assert_eq!(second.requests(), 1);
             assert!(!controller.is_loader_gone());
         });
+    }
+
+    /// The byte the CDN above serves at `offset`
+    fn byte_at(offset: usize) -> u8 {
+        (offset % 251) as u8
+    }
+
+    /// The bytes a blocking read of `length` at `offset` gives
+    async fn bytes_at(mut file: AudioFile, offset: u64, length: usize) -> (AudioFile, Vec<u8>) {
+        tokio::task::spawn_blocking(move || {
+            let mut bytes = vec![0; length];
+            file.seek(SeekFrom::Start(offset)).expect("seek");
+            file.read_exact(&mut bytes).expect("read");
+            (file, bytes)
+        })
+        .await
+        .expect("read")
+    }
+
+    // SPOTIFYGOOD: see temp_buffer
+    #[test]
+    fn a_stream_makes_its_temp_dir_again_or_keeps_its_bytes_in_memory() {
+        params();
+        runtime().block_on(async {
+            let cdn = cdn(206).await;
+            let scratch =
+                std::env::temp_dir().join(format!("spotifygood-tmp-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&scratch);
+            let session_with_tmp = |tmp_dir: std::path::PathBuf| {
+                let config = SessionConfig {
+                    tmp_dir,
+                    ..Default::default()
+                };
+                Session::new(config, None)
+            };
+            let expected =
+                |offset: usize| (offset..offset + 4_096).map(byte_at).collect::<Vec<_>>();
+
+            // the app's cache was cleared while the session lived: its librespot-tmp is gone
+            let tmp_dir = scratch.join("cache").join("librespot-tmp");
+            let session = session_with_tmp(tmp_dir.clone());
+            let (file, controller) = open(&session, &cdn, false).await;
+            assert!(tmp_dir.is_dir());
+            controller.fetch_range(300_000, 65_536);
+            assert!(arrives(&controller, 300_000, Duration::from_secs(2)).await);
+            let (file, bytes) = bytes_at(file, 300_000, 4_096).await;
+            assert_eq!(bytes, expected(300_000));
+            let (_, bytes) = bytes_at(file, 1_000, 4_096).await;
+            assert_eq!(bytes, expected(1_000));
+
+            // no temp file can be made there at all (a file stands in its way): in memory
+            fs::create_dir_all(&scratch).expect("scratch");
+            let blocked = scratch.join("blocked");
+            fs::write(&blocked, b"a file").expect("file");
+            let session = session_with_tmp(blocked.join("librespot-tmp"));
+            let (file, controller) = open(&session, &cdn, false).await;
+            controller.fetch_range(500_000, 65_536);
+            assert!(arrives(&controller, 500_000, Duration::from_secs(2)).await);
+            let (file, bytes) = bytes_at(file, 500_000, 4_096).await;
+            assert_eq!(bytes, expected(500_000));
+            let (_, bytes) = bytes_at(file, 1_000, 4_096).await;
+            assert_eq!(bytes, expected(1_000));
+
+            let _ = fs::remove_dir_all(&scratch);
+        });
+    }
+
+    /// A cache of audio files in a directory of its own (removed when it is dropped)
+    struct AudioCache {
+        dir: std::path::PathBuf,
+        cache: librespot_core::cache::Cache,
+    }
+
+    impl AudioCache {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("spotifygood-cache-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            Self {
+                cache: Self::open(&dir),
+                dir,
+            }
+        }
+
+        fn open(dir: &std::path::Path) -> librespot_core::cache::Cache {
+            librespot_core::cache::Cache::new(None, None, Some(dir), Some(1 << 30)).expect("cache")
+        }
+
+        fn files(&self) -> Vec<std::path::PathBuf> {
+            fn walk(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+                for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, found);
+                    } else {
+                        found.push(path);
+                    }
+                }
+            }
+            let mut found = vec![];
+            walk(&self.dir, &mut found);
+            found
+        }
+    }
+
+    impl Drop for AudioCache {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Gives `good` bytes, then fails (no space left for the copy)
+    struct FailsAfter {
+        good: usize,
+    }
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.good == 0 {
+                return Err(io::Error::other("no space left on device"));
+            }
+            let n = buf.len().min(self.good);
+            buf[..n].fill(7);
+            self.good -= n;
+            Ok(n)
+        }
+    }
+
+    // SPOTIFYGOOD: see the vendored librespot-core's Cache::save_file_of_len (its crate can't
+    // run tests: dev-dependencies outside the workspace)
+    #[test]
+    fn a_cache_save_that_fails_partway_leaves_no_file() {
+        let audio = AudioCache::new("partway");
+        let id = FileId([3; 20]);
+
+        // the copy fails after 3000 bytes: no file (it was there, cut, and loaded as complete)
+        let e = audio
+            .cache
+            .save_file(id, &mut FailsAfter { good: 3_000 })
+            .unwrap_err();
+        assert!(e.to_string().contains("no space left"), "{e}");
+        assert!(audio.cache.file(id).is_none());
+        assert_eq!(audio.files(), Vec::<std::path::PathBuf>::new());
+
+        // the contents end before the file's length
+        assert!(
+            audio
+                .cache
+                .save_file_of_len(id, &mut &[1u8; 100][..], Some(5_000))
+                .is_err()
+        );
+        assert!(audio.cache.file(id).is_none());
+        assert_eq!(audio.files(), Vec::<std::path::PathBuf>::new());
+
+        // a complete one is there, all of it
+        let path = audio
+            .cache
+            .save_file_of_len(id, &mut &[1u8; 5_000][..], Some(5_000))
+            .expect("saved");
+        assert_eq!(fs::metadata(&path).expect("file").len(), 5_000);
+        assert!(audio.cache.file(id).is_some());
+        assert_eq!(audio.files(), vec![path]);
+    }
+
+    // SPOTIFYGOOD: see the vendored librespot-core's Cache::save_file_of_len
+    #[test]
+    fn a_cache_save_another_process_left_is_removed_when_the_cache_opens() {
+        let audio = AudioCache::new("left");
+        let id = FileId([4; 20]);
+        let path = audio.cache.file_path(id).expect("path");
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        // one of a process that ended during its save, and one of this process (in flight)
+        let left = path.with_extension("part1-0");
+        let ours = path.with_extension(format!("part{}-99", std::process::id()));
+        fs::write(&left, [0u8; 10]).expect("left");
+        fs::write(&ours, [0u8; 10]).expect("ours");
+        // the cache of the next process (or session) on the same directory
+        let _again = AudioCache::open(&audio.dir);
+        assert!(!left.exists());
+        assert!(ours.exists());
+        assert!(audio.cache.file(id).is_none());
+    }
+
+    #[test]
+    fn a_memory_file_reads_what_was_written_at_its_own_position() {
+        let mut writer = MemoryFile::new(10);
+        let mut reader = writer.clone();
+        writer.seek(SeekFrom::Start(4)).expect("seek");
+        writer.write_all(&[1, 2, 3]).expect("write");
+        let mut bytes = [9; 4];
+        reader.seek(SeekFrom::Start(3)).expect("seek");
+        assert_eq!(reader.read(&mut bytes).expect("read"), 4);
+        assert_eq!(bytes, [0, 1, 2, 3]);
+        assert_eq!(reader.seek(SeekFrom::End(-1)).expect("seek"), 9);
+        assert_eq!(reader.read(&mut bytes).expect("read"), 1);
+        assert_eq!(reader.read(&mut bytes).expect("read"), 0, "the end");
+        assert!(reader.seek(SeekFrom::Current(-20)).is_err());
     }
 }

@@ -4,7 +4,11 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    // SPOTIFYGOOD: + atomic (see partial_path)
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::SystemTime,
 };
 
@@ -14,6 +18,30 @@ use thiserror::Error;
 use crate::{Error, FileId, authentication::Credentials, error::ErrorKind};
 
 const CACHE_LIMITER_POISON_MSG: &str = "cache limiter mutex should not be poisoned";
+
+// SPOTIFYGOOD: see Cache::save_file_of_len
+/// The extension of a file being saved: `part<pid>-<n>`
+const PART_EXTENSION: &str = "part";
+
+// SPOTIFYGOOD: see Cache::save_file_of_len
+/// Where `path` is written before it is renamed to it: unique in the process
+fn partial_path(path: &Path) -> PathBuf {
+    static SAVES: AtomicUsize = AtomicUsize::new(0);
+    let save = SAVES.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("{PART_EXTENSION}{}-{save}", std::process::id()))
+}
+
+// SPOTIFYGOOD: see Cache::save_file_of_len
+/// Whether `path` is a save another process left (it ended during the save)
+fn is_stale_partial(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let Some(owner) = extension.strip_prefix(PART_EXTENSION) else {
+        return false;
+    };
+    owner.split('-').next() != Some(std::process::id().to_string().as_str())
+}
 
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -162,6 +190,13 @@ impl FsSizeLimiter {
                 }
                 Ok(file_type) if file_type.is_file() => {
                     let path = entry.path();
+                    // SPOTIFYGOOD: see Cache::save_file_of_len (never opened, it only took space)
+                    if is_stale_partial(&path) {
+                        if let Err(e) = fs::remove_file(&path) {
+                            warn!("Could not remove the partial file {path:?} in cache dir: {e}");
+                        }
+                        continue;
+                    }
                     match Self::get_metadata(&path) {
                         Ok((access_time, size)) => {
                             limiter.add(&path, size, access_time);
@@ -411,22 +446,55 @@ impl Cache {
         }
     }
 
+    // SPOTIFYGOOD: see save_file_of_len
     pub fn save_file<F: Read>(&self, file: FileId, contents: &mut F) -> Result<PathBuf, Error> {
-        if let Some(path) = self.file_path(file) {
-            if let Some(parent) = path.parent() {
-                if let Ok(size) = fs::create_dir_all(parent)
-                    .and_then(|_| File::create(&path))
-                    .and_then(|mut file| io::copy(contents, &mut file))
-                {
-                    if let Some(limiter) = self.size_limiter.as_deref() {
-                        limiter.add(&path, size);
-                        limiter.prune()?;
-                    }
-                    return Ok(path);
-                }
+        self.save_file_of_len(file, contents, None)
+    }
+
+    // SPOTIFYGOOD: the file is written next to its place (`partial_path`) and renamed to it once
+    // it is all there (of `len` bytes, when given): a save that failed partway (no space left
+    // for the copy, the process ended) left what it had written under the final name, which
+    // loaded as the complete file, so the track ended there on every play; a concurrent open saw
+    // a half written file. A failed save removes its partial file and returns its error (it was
+    // `CacheError::Path`); one the process didn't live to finish is removed when the next
+    // process opens the cache. The size limiter counts the file once it is in place.
+    /// Saves `contents` as the file `file`, of `len` bytes when given
+    pub fn save_file_of_len<F: Read>(
+        &self,
+        file: FileId,
+        contents: &mut F,
+        len: Option<u64>,
+    ) -> Result<PathBuf, Error> {
+        let path = self.file_path(file).ok_or(CacheError::Path)?;
+        let parent = path.parent().ok_or(CacheError::Path)?;
+        fs::create_dir_all(parent)?;
+
+        let partial = partial_path(&path);
+        let written = File::create(&partial).and_then(|mut out| {
+            let size = io::copy(contents, &mut out)?;
+            if len.is_some_and(|len| len != size) {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("{size} bytes of {len:?} were written"),
+                ));
             }
+            out.sync_all()?;
+            fs::rename(&partial, &path)?;
+            Ok(size)
+        });
+        let size = match written {
+            Ok(size) => size,
+            Err(e) => {
+                let _ = fs::remove_file(&partial);
+                return Err(e.into());
+            }
+        };
+
+        if let Some(limiter) = self.size_limiter.as_deref() {
+            limiter.add(&path, size);
+            limiter.prune()?;
         }
-        Err(CacheError::Path.into())
+        Ok(path)
     }
 
     pub fn remove_file(&self, file: FileId) -> Result<(), Error> {

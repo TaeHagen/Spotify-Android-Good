@@ -98,6 +98,14 @@ impl SymphoniaDecoder {
         })
     }
 
+    // SPOTIFYGOOD: see the vendored player's cached_file_is_cut
+    /// How long the file lasts, as its container says or its frames estimate
+    pub fn file_duration_ms(&self) -> Option<u32> {
+        let params = &self.probe_result.format.default_track()?.codec_params;
+        let time = params.time_base?.calc_time(params.n_frames?);
+        Some(Duration::from(time).as_millis().min(u32::MAX as u128) as u32)
+    }
+
     pub fn normalisation_data(&mut self) -> Option<NormalisationData> {
         let metadata = symphonia_util::get_latest_metadata(&mut self.probe_result)?;
         let tags = metadata.current()?.tags();
@@ -229,6 +237,22 @@ impl AudioDecoder for SymphoniaDecoder {
             time: target.into(),
             track_id: None,
         };
+        // SPOTIFYGOOD: an MP3's seek to 0 first seeks coarsely to 0, which puts the reader back
+        // on the first frame (whose data is always there, the open fetched it) and its count
+        // past 0: the accurate seek then rewinds (it rewinds only from a count past its target).
+        // A coarse seek that missed data left the reader at its byte, and the count where it
+        // was, 0 for a decoder that hadn't decoded a packet (a load or a preload at 0, a track
+        // paused at 0): the accurate seek to 0 read on from that byte, played from there and
+        // counted from 0 (a seek back to 0:00 during a far stall played on at 25:00 while
+        // showing 0:00), or synced on a frame body and failed (the episode was skipped).
+        if self.coarse_seeks && position_ms == 0 {
+            match self.probe_result.format.seek(SeekMode::Coarse, to()) {
+                Err(Error::SeekError(SeekErrorKind::Unseekable)) => (),
+                coarse => {
+                    coarse?;
+                }
+            }
+        }
         // `track_id: None` implies the default track ID (of the container, not of Spotify).
         let seeked_to_ts = match self.probe_result.format.seek(mode, to()) {
             Err(Error::SeekError(SeekErrorKind::Unseekable)) if mode == SeekMode::Coarse => {
