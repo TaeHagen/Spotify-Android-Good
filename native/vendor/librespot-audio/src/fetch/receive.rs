@@ -62,6 +62,17 @@ fn retry_backoff(failures: u32) -> Duration {
     }
 }
 
+// SPOTIFYGOOD: a range request that gets no response, or no part of its body, for this long
+// failed (a transport error: `Failed(None)`, the backoff). Requests had no timeout: on a network
+// that silently drops its packets (a Wi-Fi that lost its internet while Android switched to LTE)
+// one hung for good and held the file's only download slot, so nothing else was requested and
+// the track stalled until it paused. `download_timeout`: the time librespot waits for news of a
+// download anyway (8 s).
+/// How long a range request may wait for its response or the next part of its body
+fn request_idle_timeout() -> Duration {
+    AudioFetchParams::get().download_timeout
+}
+
 // SPOTIFYGOOD: a CDN URL that is expired (403) or invalid (401, 404, 410) never delivers again:
 // the loader ends, so that a read gets `BrokenPipe` and the vendored player opens the file again
 // (with a new URL) instead of asking the dead one for a minute
@@ -98,10 +109,14 @@ async fn receive_data(
 
                 data
             }
-            None => match request.streamer.next().await {
-                Some(Ok(response)) => response,
-                Some(Err(e)) => break Err(e.into()),
-                None => {
+            // SPOTIFYGOOD: bounded, see request_idle_timeout
+            None => match tokio::time::timeout(request_idle_timeout(), request.streamer.next())
+                .await
+            {
+                Err(_) => break Err(Error::deadline_exceeded(AudioFileError::WaitTimeout)),
+                Ok(Some(Ok(response))) => response,
+                Ok(Some(Err(e))) => break Err(e.into()),
+                Ok(None) => {
                     if actual_length != request.length {
                         let msg = format!("did not expect body to contain {actual_length} bytes");
                         break Err(Error::data_loss(msg));
@@ -141,17 +156,31 @@ async fn receive_data(
             }
         }
 
-        let body = response.into_body();
-        let data = match body.collect().await.map(|b| b.to_bytes()) {
-            Ok(bytes) => bytes,
-            Err(e) => break Err(e.into()),
+        // SPOTIFYGOOD: frame by frame, each within request_idle_timeout (see there); the data
+        // that came is kept when the body fails (it was collected whole, and dropped)
+        let mut body = response.into_body();
+        let failed = loop {
+            let frame = match tokio::time::timeout(request_idle_timeout(), body.frame()).await {
+                Err(_) => break Some(Error::deadline_exceeded(AudioFileError::WaitTimeout)),
+                Ok(None) => break None,
+                Ok(Some(Err(e))) => break Some(e.into()),
+                Ok(Some(Ok(frame))) => frame,
+            };
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            if data.is_empty() {
+                continue;
+            }
+            let data_size = data.len();
+            file_data_tx.send(ReceivedData::Data(PartialFileData { offset, data }))?;
+
+            actual_length += data_size;
+            offset += data_size;
         };
-
-        let data_size = data.len();
-        file_data_tx.send(ReceivedData::Data(PartialFileData { offset, data }))?;
-
-        actual_length += data_size;
-        offset += data_size;
+        if let Some(e) = failed {
+            break Err(e);
+        }
     };
 
     drop(request.streamer);

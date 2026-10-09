@@ -509,6 +509,63 @@ impl<'ct> ConnectState {
         Ok(())
     }
 
+    // SPOTIFYGOOD: see forget_filtered_unavailable
+    /// Notes that `id` (marked unavailable) was refused while the explicit filter was on
+    pub fn note_filtered_unavailable(&mut self, id: &SpotifyUri) -> Result<(), Error> {
+        let uri = id.to_uri()?;
+        if !self.filtered_uri.contains(&uri) {
+            self.filtered_uri.push(uri);
+        }
+        Ok(())
+    }
+
+    // SPOTIFYGOOD: the explicit filter (the app's "Hide explicit content", the account's own) can
+    // be turned off at any time, but the tracks it refused stayed marked unavailable for the
+    // whole Spirc session (`unavailable_uri` only grew): every fill-up and every context resolved
+    // later skipped them, Up Next and the other clients didn't show them, smart shuffle never
+    // suggested them. The marks noted while the filter was on (a refusal for another reason then
+    // is tried once more, and marked again) are forgotten: the context tracks get their provider
+    // back and the next tracks are filled up again.
+    /// Forgets the unavailable marks noted while the explicit filter was on; whether there were
+    /// any
+    pub fn forget_filtered_unavailable(&mut self) -> Result<bool, Error> {
+        if self.filtered_uri.is_empty() {
+            return Ok(false);
+        }
+        let filtered = std::mem::take(&mut self.filtered_uri);
+        debug!(
+            "the explicit filter is off, {} tracks play again",
+            filtered.len()
+        );
+        self.unavailable_uri.retain(|uri| !filtered.contains(uri));
+        for (ty, provider) in [
+            (ContextType::Default, Provider::Context),
+            (ContextType::Autoplay, Provider::Autoplay),
+        ] {
+            if let Ok(ctx) = self.get_context_mut(ty) {
+                ctx.tracks
+                    .iter_mut()
+                    .filter(|t| t.is_unavailable() && filtered.contains(&t.uri))
+                    .for_each(|t| t.set_provider(provider.clone()));
+            }
+        }
+        // the next tracks again from the playing track on (a refused one right after it was
+        // removed from them, see mark_unavailable), the queue kept; while autoplay plays only
+        // what the fill up adds
+        let default_plays = matches!(self.active_context, ContextType::Default)
+            && matches!(self.fill_up_context, ContextType::Default);
+        match self.playback_anchor() {
+            Some(anchor) if default_plays => {
+                self.reset_playback_to_position(self.anchor_position(&anchor))?
+            }
+            _ if self.get_context(self.fill_up_context).is_ok() => self.fill_up_next_tracks()?,
+            _ => (),
+        }
+        self.update_restrictions();
+        self.update_queue_revision();
+        Ok(true)
+    }
+
     // SPOTIFYGOOD: returns an error when the queue is full
     pub fn add_to_queue(
         &mut self,

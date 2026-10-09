@@ -144,6 +144,9 @@ pub(super) struct ConnectState {
     request: PutStateRequest,
 
     unavailable_uri: Vec<String>,
+    // SPOTIFYGOOD: see ConnectState::forget_filtered_unavailable
+    /// the ones of `unavailable_uri` refused while the explicit filter was on
+    filtered_uri: Vec<String>,
 
     active_since: Option<SystemTime>,
     queue_count: u64,
