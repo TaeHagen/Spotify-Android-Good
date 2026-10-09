@@ -1614,6 +1614,20 @@ impl SpircTask {
                     trace!("==> Loading");
                 }
             },
+            // SPOTIFYGOOD: the stream stalled (see the vendored player's stall_action): buffering
+            // at the position played until its data comes (the PositionCorrection of its first
+            // packet then goes on as Playing), so nothing extrapolates past what was heard. It
+            // stayed Playing: the seek bar, a -15 s from there, the progress saved and the other
+            // clients ran ahead by speed x stall.
+            PlayerEvent::Stalled { position_ms, .. } => {
+                trace!("==> Stalled");
+                if !matches!(self.play_status, SpircPlayStatus::Playing { .. }) {
+                    return Ok(());
+                }
+                self.connect_state
+                    .update_position(position_ms, self.now_ms());
+                self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
+            }
             PlayerEvent::Seeked { position_ms, .. } => {
                 trace!("==> Seeked");
                 self.connect_state
