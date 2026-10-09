@@ -11,6 +11,7 @@ rust-version = "1.85"
 librespot-core = { path = "vendor/librespot-core" }
 librespot-connect = { path = "vendor/librespot-connect" }
 librespot-playback = { path = "vendor/librespot-playback" }
+librespot-audio = { path = "vendor/librespot-audio" }
 
 [profile.release]
 opt-level = 3

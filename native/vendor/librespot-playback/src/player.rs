@@ -21,7 +21,8 @@ use std::{
 #[cfg(feature = "passthrough-decoder")]
 use crate::decoder::PassthroughDecoder;
 use crate::{
-    audio::{AudioDecrypt, AudioFetchParams, AudioFile, StreamLoaderController},
+    // SPOTIFYGOOD: AudioFileError for the bounded wait of preload_data_before_playback
+    audio::{AudioDecrypt, AudioFetchParams, AudioFile, AudioFileError, StreamLoaderController},
     audio_backend::Sink,
     // SPOTIFYGOOD: added NormalisationSettings.
     config::{Bitrate, NormalisationMethod, NormalisationSettings, NormalisationType, PlayerConfig},
@@ -183,6 +184,15 @@ pub struct Player {
     thread_handle: Option<thread::JoinHandle<()>>,
     // SPOTIFYGOOD: see Player::last_decoded
     decoded: SharedDecoded,
+    // SPOTIFYGOOD: see Player::fully_buffered
+    buffered: SharedBuffered,
+}
+
+// SPOTIFYGOOD: see Player::fully_buffered
+type SharedBuffered = Arc<Mutex<Option<SpotifyUri>>>;
+
+fn lock_buffered(buffered: &SharedBuffered) -> MutexGuard<'_, Option<SpotifyUri>> {
+    buffered.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 // SPOTIFYGOOD: see Player::last_decoded
@@ -264,6 +274,12 @@ struct PlayerInternal {
     stream_stall: Option<StreamStall>,
     // SPOTIFYGOOD: see Player::last_decoded
     decoded: SharedDecoded,
+    // SPOTIFYGOOD: see Player::fully_buffered
+    buffered: SharedBuffered,
+    // SPOTIFYGOOD: a track whose loader can't deliver (it stalled for STREAM_STALL_MAX, or its
+    // loader is gone): its next play or load opens it again (load_track: a new CDN URL, a new
+    // loader) at the position played, instead of reusing its decoder
+    reopen: Option<SpotifyUri>,
 }
 
 // SPOTIFYGOOD: how long a playing streamed track waits for its data before it pauses, as long as
@@ -315,18 +331,82 @@ impl StreamStall {
 /// page or two)
 const STALL_WAIT_BYTES: usize = 16 * 1024;
 
-// SPOTIFYGOOD: the wait of a stalled stream for its data, at the read position (where the read
-// that timed out stopped), without the decoder: the decoder's seek (to read again from the
-// position played) bisects the whole Ogg file, and each of its probes past the data waited
-// `download_timeout` again (30-40 s for an attempt, with every command waiting). A range whose
-// request failed is requested again. One attempt is one wait of about `download_timeout`.
-fn wait_for_stalled_data(
-    controller: &StreamLoaderController,
-    bytes_per_second: usize,
-) -> Result<(), Error> {
-    let read_ahead = AudioFetchParams::get().read_ahead_during_playback;
-    let request = (read_ahead.as_secs_f32() * bytes_per_second as f32) as usize;
-    controller.fetch_next_and_wait(request.max(STALL_WAIT_BYTES), STALL_WAIT_BYTES)
+// SPOTIFYGOOD: see wait_for_data
+/// How often a wait for the data of a stream looks whether it is there
+const DATA_POLL: Duration = Duration::from_millis(100);
+
+// SPOTIFYGOOD: what a wait for the data of a stream needs of its loader (a test fakes it)
+trait DataSource {
+    /// where the file is read; `None`: not streamed, its data is there
+    fn read_position(&self) -> Option<usize>;
+    /// requests the bytes once
+    fn request(&self, start: usize, length: usize);
+    fn available(&self, start: usize, length: usize) -> bool;
+}
+
+impl DataSource for StreamLoaderController {
+    fn read_position(&self) -> Option<usize> {
+        StreamLoaderController::read_position(self)
+    }
+
+    fn request(&self, start: usize, length: usize) {
+        self.fetch_range(start, length)
+    }
+
+    fn available(&self, start: usize, length: usize) -> bool {
+        self.range_available_at(start, length)
+    }
+}
+
+// SPOTIFYGOOD: one bounded wait for the data at the read position: `request` bytes are requested
+// once, then it looks every DATA_POLL whether `wait` bytes are there, until `deadline` from its
+// start (nothing extends it, nothing is requested again). librespot-audio's
+// `fetch_next_and_wait` requested a range again after every failure of it and started its
+// timeout anew with every wake-up: with requests that fail at once (an expired CDN URL's 403, a
+// 5xx, a refused connection) it never returned, the player thread handled no command, and it
+// drained the per-domain rate limit, which ended the file's loader for good.
+/// Whether the data came
+fn wait_for_data(
+    source: &impl DataSource,
+    request: usize,
+    wait: usize,
+    deadline: Duration,
+) -> bool {
+    let Some(start) = source.read_position() else {
+        return true;
+    };
+    if source.available(start, wait) {
+        return true;
+    }
+    source.request(start, request.max(wait));
+    let end = Instant::now() + deadline;
+    loop {
+        thread::sleep(DATA_POLL.min(end.saturating_duration_since(Instant::now())));
+        if source.available(start, wait) {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+    }
+}
+
+// SPOTIFYGOOD: the wait of a stalled stream for its data (see wait_for_data), at the read position
+// (where the read that timed out stopped) and without the decoder: the decoder's seek (to read
+// again from the position played) bisects the whole Ogg file, and each of its probes past the
+// data waited `download_timeout` again. One attempt is one request and one wait of at most
+// `download_timeout`.
+/// Whether the data came
+fn wait_for_stalled_data(controller: &StreamLoaderController, bytes_per_second: usize) -> bool {
+    let params = AudioFetchParams::get();
+    let request =
+        (params.read_ahead_during_playback.as_secs_f32() * bytes_per_second as f32) as usize;
+    wait_for_data(
+        controller,
+        request,
+        STALL_WAIT_BYTES,
+        params.download_timeout,
+    )
 }
 
 // SPOTIFYGOOD: what the packet loop does when the decoder fails
@@ -527,6 +607,14 @@ pub enum PlayerEvent {
         track_id: SpotifyUri,
         position_ms: u32,
     },
+    // SPOTIFYGOOD: see stall_action
+    /// The stream of the playing track stalled: nothing plays from `position_ms` on until its data
+    /// comes (a `PositionCorrection` then) or it pauses (`Paused`)
+    Stalled {
+        play_request_id: u64,
+        track_id: SpotifyUri,
+        position_ms: u32,
+    },
     /// Requires `PlayerConfig::position_update_interval` to be set to Some.
     /// Once set this event will be sent periodically while playing the track to inform about the
     /// current playback position
@@ -598,6 +686,10 @@ impl PlayerEvent {
                 play_request_id, ..
             }
             | PositionCorrection {
+                play_request_id, ..
+            }
+            // SPOTIFYGOOD: Stalled
+            | Stalled {
                 play_request_id, ..
             }
             | Seeked {
@@ -768,6 +860,9 @@ impl Player {
         // SPOTIFYGOOD: see Player::last_decoded
         let decoded = SharedDecoded::default();
         let internal_decoded = decoded.clone();
+        // SPOTIFYGOOD: see Player::fully_buffered
+        let buffered = SharedBuffered::default();
+        let internal_buffered = buffered.clone();
 
         if config.normalisation {
             debug!("Normalisation Type: {:?}", config.normalisation_type);
@@ -846,6 +941,10 @@ impl Player {
                 stream_stall: None,
                 // SPOTIFYGOOD: see Player::last_decoded
                 decoded: internal_decoded,
+                // SPOTIFYGOOD: see Player::fully_buffered
+                buffered: internal_buffered,
+                // SPOTIFYGOOD: see PlayerInternal::reopen
+                reopen: None,
             };
 
             // While PlayerInternal is written as a future, it still contains blocking code.
@@ -871,7 +970,16 @@ impl Player {
             commands: Some(cmd_tx),
             thread_handle: Some(handle),
             decoded,
+            buffered,
         })
+    }
+
+    // SPOTIFYGOOD: the engine hands a playing track over to its offline queue when the session
+    // goes away: a downloaded one, or a streamed one whose data is all there
+    /// The playing (or paused) track if its file is all there (downloaded, or streamed to its
+    /// end); read without a command
+    pub fn fully_buffered(&self) -> Option<SpotifyUri> {
+        lock_buffered(&self.buffered).clone()
     }
 
     // SPOTIFYGOOD: Connect's position of a playing track is extrapolated from its last anchor;
@@ -1999,15 +2107,13 @@ impl Future for PlayerInternal {
                     let mut data_came = false;
                     let next_packet = match stall {
                         Some(stall) if stall.waiting => {
-                            match wait_for_stalled_data(stream_loader_controller, bytes_per_second)
-                            {
-                                Ok(()) => {
-                                    data_came = true;
-                                    decoder
-                                        .seek(stall.position_ms)
-                                        .and_then(|_| decoder.next_packet())
-                                }
-                                Err(e) => Err(DecoderError::Stalled(e.to_string())),
+                            if wait_for_stalled_data(stream_loader_controller, bytes_per_second) {
+                                data_came = true;
+                                decoder
+                                    .seek(stall.position_ms)
+                                    .and_then(|_| decoder.next_packet())
+                            } else {
+                                Err(DecoderError::Stalled("no data in time".into()))
                             }
                         }
                         _ => decoder.next_packet(),
@@ -2121,6 +2227,15 @@ impl Future for PlayerInternal {
                             }
                             self.handle_packet(result, normalisation_factor);
                         }
+                        // SPOTIFYGOOD: the file's loader is gone (it ended after its requests
+                        // failed): the data can't come, the track is opened again when it plays
+                        // again (at the position played)
+                        Err(e) if e.is_loader_gone() => {
+                            warn!("The stream of <{track_id:?}> can't get its data, pausing: {e}");
+                            self.stream_stall = None;
+                            self.reopen = Some(track_id);
+                            self.handle_pause();
+                        }
                         // SPOTIFYGOOD: see stall_action
                         Err(e) => match stall_action(
                             e.is_stall(),
@@ -2137,18 +2252,32 @@ impl Future for PlayerInternal {
                                         "Stream of <{track_id:?}> stalled, waiting for its data: {e}"
                                     );
                                 }
-                                self.stream_stall = Some(StreamStall::again(
+                                let starts = stall.and_then(|stall| stall.since).is_none();
+                                let stall = StreamStall::again(
                                     stall,
                                     play_request_id,
                                     position_ms,
                                     Instant::now(),
-                                ));
+                                );
+                                self.stream_stall = Some(stall);
+                                // SPOTIFYGOOD: Spirc shows it as buffering at the position
+                                // played; it went on extrapolating (the seek bar, a -15 s from
+                                // there, the progress saved, the other clients ran ahead)
+                                if starts {
+                                    self.send_event(PlayerEvent::Stalled {
+                                        play_request_id,
+                                        track_id,
+                                        position_ms: stall.position_ms,
+                                    });
+                                }
                             }
                             StallAction::Pause => {
                                 warn!(
                                     "Stream of <{track_id:?}> stalled for {STREAM_STALL_MAX:?}, pausing: {e}"
                                 );
-                                // still re-seeked when it is resumed
+                                // SPOTIFYGOOD: its loader may never deliver (an expired CDN
+                                // URL), the next play opens it again at the position played
+                                self.reopen = Some(track_id);
                                 self.handle_pause();
                             }
                             StallAction::Skip => {
@@ -2170,6 +2299,8 @@ impl Future for PlayerInternal {
                 };
             }
 
+            // SPOTIFYGOOD: see Player::fully_buffered
+            let buffered = self.buffered.clone();
             if let PlayerState::Playing {
                 ref track_id,
                 play_request_id,
@@ -2190,6 +2321,11 @@ impl Future for PlayerInternal {
             } = self.state
             {
                 let track_id = track_id.clone();
+                // SPOTIFYGOOD: see Player::fully_buffered (its data stays once it is all there)
+                let marked = lock_buffered(&buffered).as_ref() == Some(&track_id);
+                if !marked && stream_loader_controller.range_to_end_available() {
+                    *lock_buffered(&buffered) = Some(track_id.clone());
+                }
 
                 if (!*suggested_to_preload_next_track)
                     && ((duration_ms as i64 - stream_position_ms as i64)
@@ -2300,8 +2436,10 @@ impl PlayerInternal {
                     play_request_id,
                 });
                 self.state = PlayerState::Stopped;
-                // SPOTIFYGOOD: see Player::last_decoded
+                // SPOTIFYGOOD: see Player::last_decoded, fully_buffered and PlayerInternal::reopen
                 *lock_decoded(&self.decoded) = None;
+                *lock_buffered(&self.buffered) = None;
+                self.reopen = None;
             }
             PlayerState::Stopped => (),
             PlayerState::Invalid => {
@@ -2326,6 +2464,18 @@ impl PlayerInternal {
                 ..
             } => {
                 let track_id = track_id.clone();
+                // SPOTIFYGOOD: see PlayerInternal::reopen
+                if self.reopen.as_ref() == Some(&track_id) {
+                    if let Err(e) = self.handle_command_load(
+                        track_id,
+                        Some(play_request_id),
+                        true,
+                        stream_position_ms,
+                    ) {
+                        error!("Opening the track again failed: {e}");
+                    }
+                    return;
+                }
 
                 self.state.paused_to_playing(self.playback_speed);
                 self.send_event(PlayerEvent::Playing {
@@ -2659,6 +2809,14 @@ impl PlayerInternal {
     ) -> PlayerResult {
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
+        // SPOTIFYGOOD: see PlayerInternal::reopen (any other load forgets it); and see
+        // Player::fully_buffered
+        let reopen = self.reopen.take().is_some_and(|reopen| reopen == track_id);
+        if reopen {
+            info!("Opening <{track_id:?}> again");
+            self.stream_stall = None;
+        }
+        *lock_buffered(&self.buffered) = None;
 
         self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
 
@@ -2683,7 +2841,8 @@ impl PlayerInternal {
             ..
         } = &self.state
         {
-            if *previous_track_id == track_id {
+            // SPOTIFYGOOD: not when it is opened again (see PlayerInternal::reopen)
+            if *previous_track_id == track_id && !reopen {
                 let mut loaded_track = match mem::replace(&mut self.state, PlayerState::Invalid) {
                     PlayerState::EndOfTrack { loaded_track, .. } => loaded_track,
                     _ => {
@@ -2724,7 +2883,8 @@ impl PlayerInternal {
             ..
         } = self.state
         {
-            if *current_track_id == track_id {
+            // SPOTIFYGOOD: not when it is opened again (see PlayerInternal::reopen)
+            if *current_track_id == track_id && !reopen {
                 // we can use the current decoder. Ensure it's at the correct position.
                 if position_ms != *stream_position_ms {
                     // This may be blocking.
@@ -2932,6 +3092,45 @@ impl PlayerInternal {
             );
         }
 
+        // SPOTIFYGOOD: a seek while the stream stalls (-15 s, scrubbing) waits for the data like
+        // the stall does: the decoder is seeked once the data is there (see the packet loop).
+        // Its seek bisects the whole Ogg file, and without data each probe waited
+        // `download_timeout`: every command waited tens of seconds, and the seek was dropped.
+        if let PlayerState::Playing {
+            ref track_id,
+            play_request_id,
+            duration_ms,
+            ref mut stream_position_ms,
+            ..
+        }
+        | PlayerState::Paused {
+            ref track_id,
+            play_request_id,
+            duration_ms,
+            ref mut stream_position_ms,
+            ..
+        } = self.state
+        {
+            if let Some(stall) = self
+                .stream_stall
+                .as_mut()
+                .filter(|stall| stall.play_request_id == play_request_id)
+            {
+                let target = position_ms.min(duration_ms);
+                stall.position_ms = target;
+                stall.waiting = true;
+                *stream_position_ms = target;
+                set_decoded(&self.decoded, track_id, target);
+                let track_id = track_id.clone();
+                self.send_event(PlayerEvent::Seeked {
+                    play_request_id,
+                    track_id,
+                    position_ms: target,
+                });
+                return Ok(());
+            }
+        }
+
         if let Some(decoder) = self.state.decoder() {
             match decoder.seek(position_ms) {
                 Ok(new_position_ms) => {
@@ -2959,7 +3158,24 @@ impl PlayerInternal {
                         });
                     }
                 }
-                Err(e) => error!("PlayerInternal::handle_command_seek error: {e}"),
+                Err(e) => {
+                    error!("PlayerInternal::handle_command_seek error: {e}");
+                    // SPOTIFYGOOD: Player::seek put the target in last_decoded, the playback
+                    // stays where it was
+                    if let PlayerState::Playing {
+                        ref track_id,
+                        stream_position_ms,
+                        ..
+                    }
+                    | PlayerState::Paused {
+                        ref track_id,
+                        stream_position_ms,
+                        ..
+                    } = self.state
+                    {
+                        set_decoded(&self.decoded, track_id, stream_position_ms);
+                    }
+                }
             }
         } else {
             error!("Player::seek called from invalid state: {:?}", self.state);
@@ -3185,7 +3401,19 @@ impl PlayerInternal {
             let wait_for_data_length =
                 (read_ahead_during_playback.as_secs_f32() * bytes_per_second as f32) as usize;
 
-            stream_loader_controller.fetch_next_and_wait(request_data_length, wait_for_data_length)
+            // SPOTIFYGOOD: bounded (see wait_for_data), fetch_blocking's wait didn't return with
+            // requests that fail at once
+            let deadline = AudioFetchParams::get().download_timeout;
+            if wait_for_data(
+                stream_loader_controller,
+                request_data_length,
+                wait_for_data_length,
+                deadline,
+            ) {
+                Ok(())
+            } else {
+                Err(AudioFileError::WaitTimeout.into())
+            }
         } else {
             Ok(())
         }
@@ -3614,6 +3842,66 @@ mod spotifygood_tests {
         assert_eq!(kept.corrections, 0);
     }
 
+    // SPOTIFYGOOD: see wait_for_data
+    struct FakeSource {
+        position: Option<usize>,
+        /// the data is there from this look on (`None`: never, its requests fail at once)
+        available_after: Option<usize>,
+        looks: std::cell::Cell<usize>,
+        requests: std::cell::Cell<usize>,
+    }
+
+    impl FakeSource {
+        fn new(position: Option<usize>, available_after: Option<usize>) -> Self {
+            Self {
+                position,
+                available_after,
+                looks: Default::default(),
+                requests: Default::default(),
+            }
+        }
+    }
+
+    impl DataSource for FakeSource {
+        fn read_position(&self) -> Option<usize> {
+            self.position
+        }
+
+        fn request(&self, _start: usize, _length: usize) {
+            self.requests.set(self.requests.get() + 1);
+        }
+
+        fn available(&self, _start: usize, _length: usize) -> bool {
+            let looks = self.looks.get();
+            self.looks.set(looks + 1);
+            self.available_after.is_some_and(|after| looks >= after)
+        }
+    }
+
+    #[test]
+    fn a_wait_for_the_data_is_bounded() {
+        // its requests fail at once, the data never comes: one request, back at the deadline
+        let failing = FakeSource::new(Some(4_096), None);
+        let started = Instant::now();
+        assert!(!wait_for_data(&failing, 65_536, STALL_WAIT_BYTES, ms(300)));
+        let took = started.elapsed();
+        assert!(took >= ms(300) && took < ms(1_000), "{took:?}");
+        assert_eq!(failing.requests.get(), 1);
+
+        // the data comes after a few looks
+        let coming = FakeSource::new(Some(4_096), Some(3));
+        assert!(wait_for_data(&coming, 65_536, STALL_WAIT_BYTES, ms(5_000)));
+        assert_eq!(coming.requests.get(), 1);
+
+        // it is there already, or the file isn't streamed: no request
+        let there = FakeSource::new(Some(4_096), Some(0));
+        assert!(wait_for_data(&there, 65_536, STALL_WAIT_BYTES, ms(5_000)));
+        assert_eq!(there.requests.get(), 0);
+        let local = FakeSource::new(None, None);
+        assert!(wait_for_data(&local, 65_536, STALL_WAIT_BYTES, ms(5_000)));
+        assert_eq!(local.requests.get(), 0);
+    }
+
     // SPOTIFYGOOD: see stall_action
     #[test]
     fn a_stall_keeps_the_track_for_a_while() {
@@ -3702,6 +3990,9 @@ mod spotifygood_tests {
         assert!(
             !DecoderError::from_io(io::Error::new(io::ErrorKind::BrokenPipe, "closed")).is_stall()
         );
+        // a loader that is gone
+        let gone = DecoderError::from_io(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+        assert!(gone.is_loader_gone() && !gone.is_stall());
         // as next_packet and seek get it from symphonia
         let err: DecoderError = symphonia::core::errors::Error::IoError(timed_out()).into();
         assert!(err.is_stall());

@@ -21,6 +21,10 @@ pub enum DecoderError {
     // track (see `stall_action` in player.rs); stock skipped it as broken.
     #[error("Decoder Stalled: {0}")]
     Stalled(String),
+    // SPOTIFYGOOD: a read of a streamed file found its loader gone (it ended after its requests
+    // failed): the data can't come any more, the player opens the track again
+    #[error("Decoder Loader Gone: {0}")]
+    LoaderGone(String),
 }
 
 pub type DecoderResult<T> = Result<T, DecoderError>;
@@ -103,15 +107,21 @@ impl From<symphonia::core::errors::Error> for DecoderError {
 impl DecoderError {
     // SPOTIFYGOOD: see DecoderError::Stalled
     pub(crate) fn from_io(err: std::io::Error) -> Self {
-        if err.kind() == std::io::ErrorKind::TimedOut {
-            Self::Stalled(err.to_string())
-        } else {
-            Self::SymphoniaDecoder(err.to_string())
+        match err.kind() {
+            std::io::ErrorKind::TimedOut => Self::Stalled(err.to_string()),
+            // SPOTIFYGOOD: see DecoderError::LoaderGone
+            std::io::ErrorKind::BrokenPipe => Self::LoaderGone(err.to_string()),
+            _ => Self::SymphoniaDecoder(err.to_string()),
         }
     }
 
     // SPOTIFYGOOD: see DecoderError::Stalled
     pub fn is_stall(&self) -> bool {
         matches!(self, Self::Stalled(_))
+    }
+
+    // SPOTIFYGOOD: see DecoderError::LoaderGone
+    pub fn is_loader_gone(&self) -> bool {
+        matches!(self, Self::LoaderGone(_))
     }
 }

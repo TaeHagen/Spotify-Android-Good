@@ -339,8 +339,11 @@ on after the handoff), at the context's start for a new pass; with its options a
 user changed the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
 stays shown (loading), so the notification and the media session stay; a failed load makes
 this phone inactive (nothing plays, the app's own resume is the fallback).
-A streamed current track is frozen for the reconnect as before (§8), and so is any playback
-when the session dies while the network is up (the reconnect follows within seconds).
+A streamed current track is frozen for the reconnect as before (§8), unless its data is all in
+the Player (the vendored `Player::fully_buffered`): it plays on to its end, then the downloaded
+tracks after it, and it isn't loaded again offline (the window around it is the downloads only).
+Any playback is frozen when the session dies while the network is up (the reconnect follows
+within seconds).
 The OfflineController notices a Player whose thread died: the queue stops where it was (so its
 snapshot no longer shows playing), and the next control starts a new Player (a play loads the
 track there again at that position). A paused or finished
