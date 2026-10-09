@@ -150,6 +150,8 @@ struct WaitInput {
     connecting: bool,
     /// The settings want this device visible to Spotify Connect.
     visible: bool,
+    /// Offline mode (`settings.offline`).
+    offline_mode: bool,
     offline_active: bool,
 }
 
@@ -167,6 +169,7 @@ impl WaitInput {
             restore_deciding,
             connecting: engine::is_connecting(),
             visible: engine::settings().connect_visible,
+            offline_mode: engine::settings().offline,
             offline_active: offline::is_active(),
         }
     }
@@ -200,6 +203,53 @@ fn should_wait(kind: CommandKind, i: WaitInput, for_restore: bool) -> bool {
 /// Holds a command for at most [`CONNECTING_WAIT`] while [`should_wait`]; stops early once the
 /// condition is gone or the attempt ended (error, offline, stop, backoff).
 async fn await_ready(kind: CommandKind, for_restore: bool) {
+    hold_while(|i| should_wait(kind, i, for_restore)).await
+}
+
+/// What a load's downloads mean for its route (docs/ARCHITECTURE.md §4.6).
+#[derive(Debug, Clone, Copy)]
+struct Downloads {
+    /// Something of the load is downloaded.
+    any: bool,
+    /// ... and so is the requested start item (or no start was asked for: a shuffle begins
+    /// anywhere), so the offline queue starts exactly there.
+    start: bool,
+}
+
+impl Downloads {
+    fn of(args: &LoadArgs) -> Self {
+        Self::of_selection(&offline::resolve(args))
+    }
+
+    fn of_selection(s: &offline_queue::Selection) -> Self {
+        let any = !s.items.is_empty();
+        Downloads { any, start: any && s.exact }
+    }
+
+    /// Whether the load plays from the downloads (`route`'s `downloaded`). Streaming plays
+    /// nothing from them. Offline (no network, or offline mode; also while the session still
+    /// reads online without a network) any download plays: a start that isn't downloaded moves
+    /// on to the next one. While the session is only on its way (connecting, a reconnect
+    /// backoff) another download is never swapped in for the one asked for: only a downloaded
+    /// start plays offline, otherwise the load waits for the session
+    /// ([`Downloads::await_session`]) and then fails as "not available offline".
+    fn play_offline(self, i: WaitInput) -> bool {
+        if !i.network || i.offline_mode {
+            self.any
+        } else {
+            !i.online && self.start
+        }
+    }
+
+    /// A load whose start isn't downloaded waits for the session (bounded) also when no attempt
+    /// is in flight (a reconnect backoff), as long as it may still come.
+    fn await_session(self, i: WaitInput) -> bool {
+        !i.online && i.network && !i.offline_mode && !self.start
+    }
+}
+
+/// Holds a command for at most [`CONNECTING_WAIT`] while `holds`; stops early once it is false.
+async fn hold_while(holds: impl Fn(WaitInput) -> bool) {
     let mut status = engine::status_watch();
     let mut online = engine::online_watch();
     let wait = async {
@@ -208,7 +258,7 @@ async fn await_ready(kind: CommandKind, for_restore: bool) {
             let changed = hub::CHANGED.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if !should_wait(kind, WaitInput::now(), for_restore) {
+            if !holds(WaitInput::now()) {
                 break;
             }
             tokio::select! {
@@ -248,9 +298,9 @@ async fn load(args: LoadArgs) -> AppResult<Value> {
     // An explicit load replaces whatever a reconnect would restore, but only once it is known to
     // go through: the restore doesn't run meanwhile, and stays if the load fails.
     let _hold = restore::hold();
-    await_ready(CommandKind::Load, false).await;
-    // Without a network downloads play offline, also while the session still reads online.
-    let downloaded = (!engine::is_online() || !engine::network_available()) && offline::has_downloaded(&args);
+    let wanted = Downloads::of(&args);
+    hold_while(|i| should_wait(CommandKind::Load, i, false) || wanted.await_session(i)).await;
+    let downloaded = Downloads::of(&args).play_offline(WaitInput::now());
     let local = explicit_local(
         args.local,
         engine::is_online(),
@@ -784,10 +834,12 @@ pub(crate) fn clear_restore() {
     restore::clear();
 }
 
-/// The session of the Spirc `generation` goes away without a network, or offline mode was turned
-/// on, while this device plays a downloaded track: the OfflineController takes the playback over
+/// The session of the Spirc `generation` goes away to come back (without a network, or a reconnect
+/// with one: `connector::keep_playing_offline`), or offline mode was turned on, while this device
+/// plays a downloaded (or fully buffered) track: the OfflineController takes the playback over
 /// without a gap instead of a restore point being frozen. Called before the teardown pauses
-/// anything; returns whether it did (docs/ARCHITECTURE.md §4.6).
+/// anything; returns whether it did (docs/ARCHITECTURE.md §4.6). It keeps the track already
+/// playing; a new load meanwhile never swaps in another download (see [`Downloads::play_offline`]).
 pub(crate) fn hand_off_to_offline(generation: u64) -> bool {
     offline::take_over(generation)
 }
@@ -898,6 +950,7 @@ mod tests {
         restore_deciding: false,
         connecting: true,
         visible: true,
+        offline_mode: false,
         offline_active: false,
     };
     const READY: WaitInput = WaitInput { online: true, spirc: true, cluster_known: true, connecting: false, ..CONNECTING };
@@ -947,6 +1000,44 @@ mod tests {
         assert!(should_wait(Queue, deciding, true));
         // a load replaces the restore (it holds the decision instead of waiting for it)
         assert!(!should_wait(Load, deciding, false));
+    }
+
+    #[test]
+    fn only_offline_swaps_in_another_download() {
+        // a stored track-list resume [X, Y, Z] at X where only Z is downloaded
+        let list: Vec<String> = ["x", "y", "z"].iter().map(|t| format!("spotify:track:{t}")).collect();
+        let only_z = |u: &str| u == "spotify:track:z";
+        let x_missing =
+            Downloads::of_selection(&offline_queue::select_downloaded(&list, only_z, Some(0), None));
+        let x_there =
+            Downloads::of_selection(&offline_queue::select_downloaded(&list, |_| true, Some(0), None));
+        let nothing = Downloads::of_selection(&offline_queue::select_downloaded(&list, |_| false, Some(0), None));
+        let shuffle = Downloads::of_selection(&offline_queue::select_downloaded(&list, only_z, None, None));
+        let backoff = WaitInput { connecting: false, ..CONNECTING };
+
+        for (name, i) in [("connecting", CONNECTING), ("backoff", backoff)] {
+            assert!(!x_missing.play_offline(i), "{name}: Z is never played for X");
+            assert!(x_missing.await_session(i), "{name}: X waits for the session");
+            assert!(x_there.play_offline(i), "{name}: a downloaded start plays offline at once");
+            assert!(!x_there.await_session(i), "{name}");
+            assert!(!nothing.play_offline(i) && nothing.await_session(i), "{name}");
+            assert!(shuffle.play_offline(i), "{name}: no start asked for, a shuffle begins anywhere");
+        }
+        // the backoff wait (no attempt in flight) comes from the load's start alone
+        assert!(!should_wait(CommandKind::Load, backoff, false));
+
+        // offline: the next download starts (resumptions rely on it), nothing waits
+        let no_network = WaitInput { network: false, connecting: false, ..CONNECTING };
+        let offline_mode = WaitInput { offline_mode: true, connecting: false, ..CONNECTING };
+        let grace = WaitInput { network: false, ..READY };
+        for (name, i) in [("no network", no_network), ("offline mode", offline_mode), ("network-loss grace", grace)] {
+            assert!(x_missing.play_offline(i), "{name}");
+            assert!(!x_missing.await_session(i), "{name}");
+            assert!(!nothing.play_offline(i), "{name}");
+        }
+        // streaming: Spirc plays it
+        assert!(!x_there.play_offline(READY));
+        assert!(!x_missing.await_session(READY));
     }
 
     #[test]

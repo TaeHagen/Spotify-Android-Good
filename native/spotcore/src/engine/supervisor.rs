@@ -34,8 +34,12 @@ const VERIFY_INTERVAL: Duration = Duration::from_millis(250);
 /// 20 × 250 ms: wait at most 5 s for the ProductInfo attributes before declaring Online.
 const VERIFY_TICKS: u32 = 20;
 const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
-/// A network outage longer than this means librespot's connections are probably dead.
-const OUTAGE_RECONNECT: Duration = Duration::from_secs(5);
+/// A network outage longer than this may have killed librespot's connections: the AP connection
+/// is checked ([`probe_ap`]) and the session reconnects only if it doesn't answer. A suspended
+/// mobile network (a tunnel, a lift) usually comes back on the same network and address with the
+/// AP socket alive, while a network that is really gone has its sockets destroyed by Android
+/// (`Session::is_invalid`). A shorter outage is taken as survived.
+const OUTAGE_CHECK: Duration = Duration::from_secs(5);
 /// Online but Android reports the network lost: after this long the session is torn down and
 /// the engine goes Offline (downloads then play through the OfflineController, §4.6). A
 /// suspended mobile network keeps the AP socket open, so librespot itself would only notice
@@ -266,6 +270,29 @@ fn probe_ap(session: &Session) -> Probe {
         let Ok(response) = request else { return false };
         tokio::time::timeout(AP_PROBE_TIMEOUT, response).await.is_ok() && !session.is_invalid()
     })
+}
+
+/// What the network coming back after `outage` (or another default network: an unknown outage)
+/// does to an online session.
+#[derive(Debug, PartialEq, Eq)]
+enum NetworkBack {
+    /// The connection survived (a short outage, or a check is under way already).
+    Keep,
+    /// Check the AP connection first: playing from downloads or the buffer goes on meanwhile,
+    /// and a connection that still answers is kept.
+    Probe,
+    /// The session is dead: reconnect now.
+    Reconnect,
+}
+
+fn on_network_back(outage: Option<Duration>, invalid: bool, probing: bool) -> NetworkBack {
+    if invalid {
+        NetworkBack::Reconnect
+    } else if outage.is_some_and(|d| d > OUTAGE_CHECK) && !probing {
+        NetworkBack::Probe
+    } else {
+        NetworkBack::Keep
+    }
 }
 
 async fn probe_done(probe: &mut Option<Probe>) -> bool {
@@ -617,12 +644,16 @@ impl Supervisor {
                 }
                 alive = probe_done(&mut probe) => {
                     probe = None;
-                    if !alive {
-                        log::info!("the connection to Spotify doesn't answer after the network change: reconnecting");
+                    if alive {
+                        log::info!("the connection to Spotify still answers: kept");
+                    } else if !state::network_available() {
+                        // Gone again meanwhile: the network-loss grace decides (it is armed).
+                        log::info!("the connection to Spotify doesn't answer, and the network is gone again");
+                    } else {
+                        log::info!("the connection to Spotify doesn't answer: reconnecting");
                         self.backoff.reset();
                         return self.reconnect(live).await;
                     }
-                    log::info!("the connection to Spotify still answers after the network change");
                 }
                 _ = spirc_ended(&mut live.device) => {
                     self.backoff.note_uptime(connected_at, std::time::Instant::now());
@@ -686,27 +717,31 @@ impl Supervisor {
                         connector::teardown(live, false).await;
                         return Phase::Exit;
                     }
-                    Some(Msg::Network { available: true, outage }) => {
-                        network_loss.restored();
-                        if outage.is_some_and(|d| d > OUTAGE_RECONNECT) || live.session.is_invalid() {
-                            self.backoff.reset();
-                            return self.reconnect(live).await;
+                    Some(msg @ (Msg::Network { available: true, .. } | Msg::NetworkChanged)) => {
+                        // Not torn down blindly: the AP connection usually survives a tunnel, and
+                        // the previous network may still work (LTE stays up for a while after
+                        // Wi-Fi took over). A reconnect stops what plays from the buffer and
+                        // costs one of the limited attempts.
+                        let outage = match msg {
+                            Msg::Network { outage, .. } => {
+                                network_loss.restored();
+                                outage
+                            }
+                            _ => Some(Duration::MAX),
+                        };
+                        match on_network_back(outage, live.session.is_invalid(), probe.is_some()) {
+                            NetworkBack::Reconnect => {
+                                self.backoff.reset();
+                                return self.reconnect(live).await;
+                            }
+                            NetworkBack::Probe => {
+                                log::info!("the network is back or changed: checking the connection to Spotify");
+                                probe = Some(probe_ap(&live.session));
+                            }
+                            NetworkBack::Keep => {}
                         }
                     }
                     Some(Msg::Network { available: false, .. }) => network_loss.lost(Instant::now()),
-                    Some(Msg::NetworkChanged) => {
-                        if live.session.is_invalid() {
-                            self.backoff.reset();
-                            return self.reconnect(live).await;
-                        }
-                        // Not torn down blindly: the previous network may still work (LTE stays
-                        // up for a while after Wi-Fi took over), and playback would be frozen
-                        // and restored for nothing.
-                        if probe.is_none() {
-                            log::info!("the default network changed: checking the connection to Spotify");
-                            probe = Some(probe_ap(&live.session));
-                        }
-                    }
                     Some(Msg::Reconnect) => {
                         if live.session.is_invalid() {
                             return self.reconnect(live).await;
@@ -809,6 +844,25 @@ mod tests {
             prefer_token: false,
             login_generation: 0,
         }
+    }
+
+    #[test]
+    fn the_network_coming_back_checks_the_connection_first() {
+        let after = |secs| Some(Duration::from_secs(secs));
+        // A tunnel of 10 s: the session still reads valid, so the AP is asked before anything
+        // is torn down (downloads and a full buffer play on meanwhile).
+        assert_eq!(on_network_back(after(10), false, false), NetworkBack::Probe);
+        assert_eq!(on_network_back(after(59), false, false), NetworkBack::Probe);
+        // A check already under way answers for this one too.
+        assert_eq!(on_network_back(after(10), false, true), NetworkBack::Keep);
+        // A blip is taken as survived.
+        assert_eq!(on_network_back(after(3), false, false), NetworkBack::Keep);
+        assert_eq!(on_network_back(None, false, false), NetworkBack::Keep);
+        // Lost for an unknown time, or another default network: checked too.
+        assert_eq!(on_network_back(Some(Duration::MAX), false, false), NetworkBack::Probe);
+        // A dead session (its sockets went with the network) reconnects at once.
+        assert_eq!(on_network_back(after(10), true, false), NetworkBack::Reconnect);
+        assert_eq!(on_network_back(after(1), true, true), NetworkBack::Reconnect);
     }
 
     #[tokio::test]

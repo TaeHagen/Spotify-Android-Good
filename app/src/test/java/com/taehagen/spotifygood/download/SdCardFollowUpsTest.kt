@@ -183,24 +183,72 @@ class SdCardFollowUpsTest {
         assertEquals("moved last at the next pass", listOf("b"), failed)
     }
 
-    @Test
-    fun aRunOfUnreadableOriginalsStopsTheMove() = runTest {
+    /** One move pass over [plan] as relocatePass runs it: the card is judged by [SourceHealth]. */
+    private suspend fun pass(plan: List<String>, damaged: (String) -> Boolean): Triple<List<String>, List<String>, Throwable?> {
         val switched = ArrayList<String>()
         val skipped = ArrayList<String>()
+        val health = SourceHealth()
         val stop = runCatching {
-            copyThenSwitch(
-                listOf("a", "x1", "b", "y1", "y2", "y3", "c"),
-                copy = { item -> if (item.startsWith("x") || item.startsWith("y")) throw unreadable(item) },
-                onDone = {},
-                switch = { switched += it },
-                skip = { skipped += it },
-                maxConsecutiveSkips = 3,
-            )
+            for (batch in plan.chunked(50)) {
+                copyThenSwitch(
+                    batch,
+                    copy = { item ->
+                        if (damaged(item)) {
+                            health.unreadable()
+                            throw unreadable(item)
+                        }
+                        health.copied()
+                    },
+                    onDone = {},
+                    switch = { switched += it },
+                    skip = { skipped += it },
+                    cardFailing = { health.failing },
+                )
+            }
         }.exceptionOrNull()
-        // The card itself is failing: stopped, and the run is tried again later (not re-downloaded).
-        assertTrue(stop is SourceUnreadableException)
-        assertEquals(listOf("a", "b"), switched)
-        assertEquals("a lone damaged file before a good one is still skipped", listOf("x1"), skipped)
+        return Triple(switched, skipped, stop)
+    }
+
+    @Test
+    fun adjacentDamagedFilesAreAllDownloadedAgainAndTheMoveGoesOn() = runTest {
+        // An album in one bad region of the card: three damaged files in a row.
+        val plan = listOf("a", "x1", "x2", "x3", "b", "c")
+        val (switched, skipped, stop) = pass(plan) { it.startsWith("x") }
+        assertNull(stop)
+        assertEquals(listOf("a", "b", "c"), switched)
+        assertEquals(listOf("x1", "x2", "x3"), skipped)
+
+        // A fresh process (nothing failed before) with the same files still moves b and c.
+        val fresh = DownloadRules.orderPlan(plan.map { DownloadRules.FileMove(it, "/internal/$it", image = false) }, emptySet()).map { it.from }
+        val (again, againSkipped, againStop) = pass(fresh) { it.startsWith("x") }
+        assertNull(againStop)
+        assertEquals(listOf("a", "b", "c"), again)
+        assertEquals(listOf("x1", "x2", "x3"), againSkipped)
+    }
+
+    @Test
+    fun aCardThatCannotBeReadAtAllStopsTheMove() = runTest {
+        // Everything after x1 is unreadable: the card itself is failing.
+        val plan = listOf("a") + (1..40).map { "x$it" }
+        val (switched, skipped, stop) = pass(plan) { it.startsWith("x") }
+        assertTrue(stop is CardFailingException)
+        assertEquals(listOf("a"), switched)
+        // What was found unreadable is still downloaded again; the rest waits for a later pass.
+        assertEquals((1..19).map { "x$it" }, skipped)
+    }
+
+    @Test
+    fun aFewDamagedFilesNeverMakeTheCardFailing() {
+        val health = SourceHealth(sample = 20, ratio = 0.8)
+        repeat(5) { health.unreadable() }
+        assertFalse("too few tried to judge the card", health.failing)
+        repeat(30) { health.copied() }
+        repeat(5) { health.unreadable() }
+        assertFalse(health.failing)
+        val bad = SourceHealth(sample = 20, ratio = 0.8)
+        repeat(3) { bad.copied() }
+        repeat(17) { bad.unreadable() }
+        assertTrue(bad.failing)
     }
 
     @Test

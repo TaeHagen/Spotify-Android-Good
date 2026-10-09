@@ -55,7 +55,8 @@ pub(crate) fn hidden() -> AppError {
     AppError::new(ErrorCode::NotConnected, "This device isn't connected to Spotify Connect right now")
 }
 
-/// Decides the target. `downloaded`: for `Load`, whether every requested item is downloaded.
+/// Decides the target. `downloaded`: for `Load`, whether it may play from the downloads (see
+/// `Downloads::play_offline` in `connect`: offline any download, else only its start).
 pub(crate) fn route(input: &RouteInput, kind: CommandKind, downloaded: bool) -> AppResult<Target> {
     let other_active = input.active_device.filter(|id| !id.is_empty() && *id != input.me).map(str::to_string);
 

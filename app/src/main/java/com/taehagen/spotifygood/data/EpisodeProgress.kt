@@ -528,7 +528,9 @@ internal interface ResumeSink {
 
 /**
  * Turns playback snapshots into resume points ([ResumeSink]).
- * * A playing or paused episode has a position worth keeping (a load reports 0 before its seek):
+ * * A playing or paused episode has a position worth keeping, once it isn't loading (a load
+ *   reports 0 before its seek; a paused load reads paused, with the previous item's duration,
+ *   and a seek during it doesn't land):
  *   on this phone, and on a remote device this phone follows (it is its remote, or handed it
  *   over: the phone's view of the account's progress). It is saved on every snapshot, and where
  *   the outgoing one got to when it is left (its end when it finished or stopped there). A remote
@@ -693,7 +695,8 @@ internal class EpisodeProgressTracker(private val sink: ResumeSink) {
         sink.record(uri, position, duration, elsewhere = remote, stateAt = stateAt)
     }
 
-    private fun PlaybackSnapshot.hasPosition(): Boolean = status == PlaybackStatus.PLAYING || status == PlaybackStatus.PAUSED
+    private fun PlaybackSnapshot.hasPosition(): Boolean =
+        (status == PlaybackStatus.PLAYING || status == PlaybackStatus.PAUSED) && !loading
 
     private fun PlaybackSnapshot.durationOrTrack(): Long = durationMs.takeIf { it > 0 } ?: track?.durationMs ?: 0
 
