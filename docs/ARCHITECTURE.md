@@ -847,9 +847,19 @@ For a remote active device, smart shuffle is not supported (the command reports
     `clientKey`. The inner blob is the inverse of `Credentials::with_blob`
     (`0x49,bytes(user),0x50,int(authType),0x51,bytes(authData)`, block-padded, the XOR-with-prior-
     block step, AES-192-ECB under a PBKDF2 key from `SHA1(deviceId)` and the username, then base64).
-    When `getInfo` advertises `tokenType` `accesstoken`, a fresh login5 access token (keymaster,
-    `streaming` scope) is sent as the blob with the device's client id as `clientKey`; otherwise the
-    stored reusable credentials blob is used. A `default`-token device whose service is not
+    When `getInfo` advertises `tokenType` `accesstoken`, an access token is sent as the blob with
+    the device's client id as `clientKey`; otherwise the stored reusable credentials blob is used.
+    The token is minted by **`device_token`**, the module the Cast login uses too, from the
+    `clientID` and `deviceID` of the current getInfo (re-read after a wake-up or a 203). Sources in
+    order: spclient `POST /device-auth/v1/refresh {"clientId","deviceId"}`, then a keymaster
+    request for that client id with the Connect playback scopes (both skipped when `clientID` is
+    empty or not alphanumeric), then this session's own login5 token as the last resort (what
+    such devices were sent before, so one that took it still signs in). Each mint is bounded
+    (10 s); a source that mints nothing, or whose token the device refuses (any status but 101 or
+    203, or an error page), hands over to the next, and the last refusal is the error; a network
+    failure ends the login. The token never leaves native code and is never logged (only the
+    source's name). The device-facing part of the login is capped at 90 s as a whole. A
+    `default`-token device whose service is not
     loaded (`availability` NOT-LOADED, `publicKey` "INVALID") first gets a **wake-up `addUser`**
     with empty `blob` and `clientKey` (no credential material; origin `deviceName`/`deviceId`);
     it loads and answers 203 ERROR-INVALID-PUBLICKEY, the engine polls getInfo (≤ 5 s) until it is
@@ -890,7 +900,8 @@ For a remote active device, smart shuffle is not supported (the command reports
     `deviceID`); send `addUser {blob: <access token>, tokenType: "accesstoken"}` and wait for
     `addUserResponse` (`addUserError` is a refusal). PINGs on `urn:x-cast:com.google.cast.tp.heartbeat`
     are answered with PONG throughout, also while the token is minted. The token must be issued for
-    the receiver's `clientID`; it is minted on the live session, first with spclient
+    the receiver's `clientID`; `device_token` mints it on the live session (shared with the ZeroConf
+    `accesstoken` login above, without its last-resort session token), first with spclient
     `POST /device-auth/v1/refresh {"clientId","deviceId"}` (what open-source Cast senders use), then,
     if that fails or the receiver refuses it, with a keymaster token request
     (`hm://keymaster/token/authenticated`, the receiver's client id, scopes `streaming,
