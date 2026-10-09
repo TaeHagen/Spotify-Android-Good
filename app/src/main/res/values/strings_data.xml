@@ -47,4 +47,6 @@
     <string name="data_dl_location_card">SD card</string>
     <string name="data_dl_move_no_space">Not enough space to move all downloads there.</string>
     <string name="data_dl_move_failed">Some downloads couldn\'t be moved. Will try again later.</string>
+    <string name="data_dl_move_card_gone">The SD card isn\'t available. Moving continues once it\'s back.</string>
+    <string name="data_dl_move_card_failing">The SD card can\'t be read. Will try again later.</string>
 </resources>
