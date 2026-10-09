@@ -218,7 +218,11 @@ impl ConnectState {
         let found = match transfer.current_session.current_uid.as_ref() {
             Some(uid) if track.is_queue() => Self::find_index_in_context(ctx, |c| &c.uid == uid)
                 .map(|i| if i > 0 { i - 1 } else { i }),
-            _ => Self::find_index_in_context(ctx, |c| c.uri == track.uri || c.uid == track.uid),
+            // SPOTIFYGOOD: by uid first (position_in_context): a song that is twice in the
+            // context was found by its uri, as its first copy, and the playback went on after that
+            // one (the songs played before the transfer again)
+            _ => Self::position_in_context(ctx, &track)
+                .ok_or(StateError::CanNotFindTrackInContext(None, ctx.tracks.len())),
         };
         // SPOTIFYGOOD: see above
         let after_the_end =

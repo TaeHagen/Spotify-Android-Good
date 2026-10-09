@@ -3164,3 +3164,92 @@ fn a_transferred_track_list_goes_on_in_autoplay_after_its_end() {
         assert!(crate::spirc::autoplay_resolve_when_required(&state, false).is_none());
     }
 }
+
+// SPOTIFYGOOD: see ConnectState::start_loading (Spirc's load_track)
+#[test]
+fn a_load_has_no_duration_until_the_track_is_open() {
+    let (_rt, mut state) = state(3);
+    // a 3:30 song played, then an episode loads at its resume point, 35:00
+    state.update_duration(210_000);
+    state.start_loading(2_100_000, 1_000);
+    let snapshot = state.snapshot(SnapshotPlayStatus::LoadingPlay, 0, None);
+    assert_eq!(snapshot.duration_ms, 0, "the song's duration");
+    assert_eq!(snapshot.position_ms, 2_100_000);
+    // the player opened it (TrackChanged)
+    state.update_duration(3_600_000);
+    let snapshot = state.snapshot(SnapshotPlayStatus::Playing, 0, None);
+    assert_eq!(snapshot.duration_ms, 3_600_000);
+}
+
+// SPOTIFYGOOD: see ConnectState::mark_unavailable (and Spirc's skip_refused_after_transfer)
+#[test]
+fn a_track_refused_while_a_transfer_waits_is_marked_and_skipped_after_it() {
+    let (_rt, mut state) = state(3);
+    let mut transfer = transferred(&mut state, 2, false);
+    assert!(state.get_context(ContextType::Default).is_err());
+    // the player refuses the transferred track before its context is there (a local file, a
+    // song the explicit filter hides): it failed (NoContext), and Spirc never skipped it
+    let refused = SpotifyUri::from_uri(&track_uri(2, 0)).unwrap();
+    state
+        .mark_unavailable(&refused)
+        .expect("marked without a context");
+    // the context resolves, the transfer is finished around it, then the skip (handle_next)
+    state
+        .update_context(context(10, 0), ContextType::Default)
+        .unwrap();
+    state.finish_transfer(transfer.take().unwrap()).unwrap();
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid2");
+    assert!(state.current_track(|t| t.is_unavailable()));
+    assert!(!state.next_tracks().iter().any(|t| t.uri == track_uri(2, 0)));
+    let played = play_through(&mut state, 2);
+    assert!(
+        played[0].starts_with('q'),
+        "the transferred queue: {played:?}"
+    );
+    assert_eq!(played[1], "uid3");
+}
+
+// SPOTIFYGOOD: see ConnectState::finish_transfer (position_in_context)
+#[test]
+fn a_transfer_of_a_song_that_is_twice_in_the_playlist_goes_on_after_its_copy() {
+    use crate::protocol::{
+        playback::Playback, queue::Queue, session::Session as PlayingSession,
+        transfer_state::TransferState,
+    };
+
+    // a playlist with the same song at 12 and 240; the other device played the second one
+    let (_rt, mut state) = state(3);
+    state.reset_context(ResetContext::Completely);
+    let mut playlist = context(300, 0);
+    let song = playlist.pages[0].tracks[11].uri.clone();
+    playlist.pages[0].tracks[239].uri = song.clone();
+    let mut transfer = TransferState {
+        playback: MessageField::some(Playback {
+            current_track: MessageField::some(ContextTrack {
+                uri: song,
+                uid: Some("uid239".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        current_session: MessageField::some(PlayingSession {
+            context: MessageField::some(Context {
+                uri: Some(CONTEXT_URI.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        queue: MessageField::some(Queue::default()),
+        ..Default::default()
+    };
+    let track = state.current_track_from_transfer(&transfer).unwrap();
+    state.set_track(track);
+    state.handle_initial_transfer(&mut transfer, Some(CONTEXT_URI.to_string()));
+    state
+        .update_context(playlist, ContextType::Default)
+        .unwrap();
+    state.finish_transfer(transfer).unwrap();
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid239");
+    assert_eq!(next_uids(&state)[0], "uid240");
+    assert_eq!(prev_uids(&state).last().map(String::as_str), Some("uid238"));
+}
