@@ -376,6 +376,40 @@ impl StreamLoaderController {
             file_size: file_size as usize,
         }
     }
+
+    // SPOTIFYGOOD: for the vendored player's tests (a stream they can't open)
+    /// A streamed file whose first `downloaded` bytes are there and whose requests go nowhere
+    /// (the loader isn't gone, the rest never comes)
+    #[doc(hidden)]
+    pub fn stalled_for_tests(file_size: usize, downloaded: usize) -> Self {
+        let mut status = AudioFileDownloadStatus {
+            requested: RangeSet::new(),
+            downloaded: RangeSet::new(),
+        };
+        if downloaded > 0 {
+            status
+                .downloaded
+                .add_range(&Range::new(0, downloaded.min(file_size)));
+        }
+        Self {
+            channel_tx: None,
+            stream_shared: Some(Arc::new(AudioFileShared {
+                cdn_url: String::new(),
+                file_size,
+                bytes_per_second: 40_000,
+                cond: Condvar::new(),
+                download_status: Mutex::new(status),
+                download_streaming: AtomicBool::new(true),
+                download_slots: Semaphore::new(1),
+                ping_time_ms: AtomicUsize::new(0),
+                read_position: AtomicUsize::new(0),
+                throughput: AtomicUsize::new(0),
+                fail_fast: AtomicBool::new(false),
+                missed: AtomicUsize::new(usize::MAX),
+            })),
+            file_size,
+        }
+    }
 }
 
 pub struct AudioFileStreaming {
@@ -835,8 +869,11 @@ mod spotifygood_tests {
             .expect("runtime")
     }
 
+    /// A status of the CDN below: no answer at all
+    const HANG: u16 = 0;
+
     /// A CDN on localhost: a range from the start of the file is served, every other one gets
-    /// `status` (206: served too). Counts the requests.
+    /// `status` (206: served too, HANG: nothing). Counts the requests.
     struct Cdn {
         url: String,
         requests: Arc<AtomicUsize>,
@@ -883,6 +920,10 @@ mod spotifygood_tests {
                     } else {
                         status.load(Ordering::SeqCst)
                     };
+                    if status == HANG {
+                        // a network that drops the packets: the socket stays, nothing comes
+                        std::future::pending::<()>().await;
+                    }
                     let response = if status == 206 {
                         let mut response = format!(
                             "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{FILE_SIZE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -982,6 +1023,27 @@ mod spotifygood_tests {
             assert!((1..=2).contains(&asked), "{asked}");
 
             // a 5xx doesn't end it
+            assert!(!controller.is_loader_gone());
+        });
+    }
+
+    #[test]
+    fn a_request_that_gets_no_answer_gives_up_and_frees_the_slot() {
+        params();
+        runtime().block_on(async {
+            let cdn = cdn(HANG).await;
+            let session = Session::new(SessionConfig::default(), None);
+            let (_file, controller) = open(&session, &cdn, false).await;
+            let before = cdn.requests();
+            controller.fetch_range(200_000, 65_536);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(cdn.requests() - before, 1);
+            // after its idle timeout (download_timeout) and the backoff another range is asked
+            // for: the hung request held the file's only download slot for good
+            tokio::time::sleep(DOWNLOAD_TIMEOUT + Duration::from_millis(800)).await;
+            controller.fetch_range(400_000, 65_536);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(cdn.requests() - before, 2);
             assert!(!controller.is_loader_gone());
         });
     }
