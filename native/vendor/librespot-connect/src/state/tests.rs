@@ -511,6 +511,79 @@ fn positions_follow_the_playback_speed_across_puts() {
     }
 }
 
+// SPOTIFYGOOD: PATCHES.md "Stalls" (c) of the vendored player: nothing extrapolates while no
+// audio is produced
+#[test]
+fn a_stall_stays_where_it_was_heard_across_puts() {
+    let (_rt, mut state) = state(3);
+    state.set_playback_speed(2.);
+    let t = 1_000_000;
+    // playing at 2x, the stream stalls: Spirc anchors the position heard (its Stalled arm)
+    state.update_position(41_000, t);
+    let stalled = SpircPlayStatus::LoadingPlay {
+        position_ms: 41_000,
+    };
+    // its put times out on the dead network, the retries come 7 s and 22 s later (StatePuts),
+    // and a disconnect re-anchors too
+    for at in [t + 200, t + 7_000, t + 22_000] {
+        state.prepare_put(&stalled, at);
+        assert_eq!(state.player().position_as_of_timestamp, 41_000, "at {at}");
+        // other clients see it buffering, not playing on at 2x
+        assert_eq!(state.player().playback_speed, 0.);
+        assert!(state.player().is_playing && state.player().is_buffering);
+        assert!(!state.player().is_paused);
+        assert_eq!(state.extrapolated_position(at + 10_000), 41_000);
+    }
+    state.set_status(&stalled);
+    state.update_position_in_relation(t + 25_000);
+    assert_eq!(state.player().position_as_of_timestamp, 41_000);
+    // the snapshot (the app's seek bar, its -15 s base) and Spirc's own position stay there too
+    let snapshot = state.snapshot(SnapshotPlayStatus::LoadingPlay, 0, None);
+    assert_eq!(
+        (snapshot.position_ms, snapshot.playback_speed),
+        (41_000, 0.)
+    );
+
+    // the data comes: the first packet's PositionCorrection re-anchors as Playing, on at 2x
+    state.update_position(41_000, t + 30_000);
+    state.prepare_put(&playing(), t + 31_000);
+    assert_eq!(state.player().position_as_of_timestamp, 43_000);
+    assert_eq!(state.player().playback_speed, 2.);
+}
+
+// SPOTIFYGOOD: see Spirc's loading_status
+#[test]
+fn a_reopen_while_playing_loads_at_its_position() {
+    use crate::spirc::loading_status;
+    let (_rt, mut state) = state(3);
+    state.set_playback_speed(1.5);
+    let t = 1_000_000;
+    // paused by the stall at 41:10 (2_470_000), then the user's play: Spirc goes Playing there
+    state.update_position(2_470_000, t);
+    let status = SpircPlayStatus::Playing {
+        nominal_start_time: t - 2_470_000,
+        preloading_of_next_track_triggered: false,
+    };
+    state.prepare_put(&status, t);
+    // the player opens the track again by itself: its Loading at the position played
+    let (status, position) = loading_status(&status, 2_470_000);
+    assert!(matches!(
+        status,
+        SpircPlayStatus::LoadingPlay {
+            position_ms: 2_470_000
+        }
+    ));
+    state.update_position(position, t + 50);
+    // while it loads (a slow network: puts, their retries), nothing moves; never 0:00
+    for at in [t + 250, t + 5_000, t + 20_000] {
+        state.prepare_put(&status, at);
+        assert_eq!(state.player().position_as_of_timestamp, 2_470_000);
+        assert_eq!(state.player().playback_speed, 0.);
+    }
+    let snapshot = state.snapshot(SnapshotPlayStatus::LoadingPlay, 0, None);
+    assert_eq!(snapshot.position_ms, 2_470_000);
+}
+
 #[test]
 fn audio_output_only_changes_once() {
     let (_rt, mut state) = state(1);

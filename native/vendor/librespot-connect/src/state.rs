@@ -417,10 +417,15 @@ impl ConnectState {
                 | SpircPlayStatus::Stopped
         );
 
-        if player.is_paused {
-            player.playback_speed = 0.;
-        } else {
+        // SPOTIFYGOOD: the speed only while it plays: also 0 while it loads or a stream stalls
+        // (LoadingPlay, PATCHES.md "Stalls" (c) of the vendored player). It was the playing speed
+        // then: every put built meanwhile (and its retries, the stall's own put on a dead network
+        // among them) moved the position on (update_position_in_relation), and the other clients
+        // extrapolated through the stall.
+        if matches!(status, SpircPlayStatus::Playing { .. }) {
             player.playback_speed = speed;
+        } else {
+            player.playback_speed = 0.;
         }
 
         // desktop and mobile require all 'states' set to true, when we are paused,
@@ -634,7 +639,8 @@ impl ConnectState {
     /// playing (on the line of its speed, see update_position_in_relation), and the time
     pub(crate) fn prepare_put(&mut self, status: &SpircPlayStatus, now: i64) {
         self.set_status(status);
-        if self.is_playing() {
+        // SPOTIFYGOOD: only Playing moves on (see set_status); stock re-anchored LoadingPlay too
+        if matches!(status, SpircPlayStatus::Playing { .. }) {
             self.update_position_in_relation(now);
         }
         self.set_now(now as u64);
