@@ -1619,12 +1619,17 @@ plain-list rule of §4.6 (`planListPlay`), since a track list loaded while the s
 goes to the offline queue: a tapped song that is downloaded plays the list's downloads from
 exactly there, one that isn't is sent alone while connecting ("not available offline" offline,
 never the next download); Play plays the list's downloads from the first. Liked Songs rows that
-can't start then are dimmed, as on playlists. The last sorted play (its list and URIs) is kept for
-the session outside the page, so a reopened page's Play button still toggles (resumes) it while
-one of its tracks plays with no catalog context; in a new process, a context-less play of one of
-the shown songs counts. The default order keeps the context load (Connect shows the playlist),
-and Shuffle always loads the context, its order doesn't matter. Offline, the downloaded rows sort
-the same way and already play as a track list. Likes and unlikes made in the app
+can't start then are dimmed, as on playlists. The Play/Pause button of Liked Songs and a playlist
+toggles when the list is what plays (`isListPlaying`), else starts it: its own context in any order
+(Shuffle, started before a sort, from Auto or another device), or the last track list the app
+started for it (a sorted order, Liked Songs' downloads offline). That list (its key and tracks, in
+order) is kept for the session outside the page, so a reopened page still knows it, and counts
+only while playback is still that load: the current track is in it and, unless shuffled, the
+context's next (else previous) track is its neighbour there; it is dropped once playback moved to
+anything else. A context-less play of one of its songs from elsewhere (Downloads, a single track,
+another client) is not it. The default order keeps the context load (Connect shows the
+playlist), and Shuffle always loads the context, its order doesn't matter. Offline, the
+downloaded rows sort the same way and already play as a track list. Likes and unlikes made in the app
 (`LibraryEdit.LikedTracks`) patch a fully loaded Liked Songs (unliked songs dropped, liked ones
 looked up and put first, then sorted again) instead of paging it all again; other library edits
 don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet reloads.

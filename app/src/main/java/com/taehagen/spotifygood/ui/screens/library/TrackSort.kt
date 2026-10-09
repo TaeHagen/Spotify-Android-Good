@@ -1,16 +1,25 @@
 package com.taehagen.spotifygood.ui.screens.library
 
 import android.content.Context
+import androidx.compose.runtime.Immutable
+import com.taehagen.spotifygood.AppGraph
+import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaylistItem
 import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.model.TrackProvider
 import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import com.taehagen.spotifygood.ui.components.isPlaceholder
+import com.taehagen.spotifygood.ui.screens.album.isSameContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.CollationKey
 import java.text.Collator
@@ -177,44 +186,125 @@ fun planSortedPlay(uris: List<String>, startUri: String?, reach: EngineReach, do
     }
 }
 
+/** What plays, as far as "is this list playing" goes ([isListPlaying]). */
+@Immutable
+data class ListPlayback(
+    val trackUri: String? = null,
+    val contextUri: String? = null,
+    val isPlaying: Boolean = false,
+    val shuffle: Boolean = false,
+    /** The context's next / previous track (not the user queue, autoplay or suggestions). */
+    val next: String? = null,
+    val previous: String? = null,
+)
+
+fun PlaybackSnapshot.toListPlayback(): ListPlayback =
+    if (!isActive) {
+        ListPlayback()
+    } else {
+        ListPlayback(
+            trackUri = track?.uri,
+            contextUri = context?.uri,
+            isPlaying = isPlaying,
+            shuffle = shuffle || smartShuffle,
+            next = nextTracks.firstOrNull { it.provider == TrackProvider.CONTEXT }?.uri,
+            previous = prevTracks.lastOrNull { it.provider == TrackProvider.CONTEXT }?.uri,
+        )
+    }
+
+internal fun AppGraph.listPlaybackFlow(): Flow<ListPlayback> =
+    playback.snapshot.map { it.toListPlayback() }.distinctUntilChanged()
+
 /**
- * The last sorted list played in this session: its list key ([ListSortStore.LIKED_SONGS],
- * [ListSortStore.playlist]) and the URIs sent. Kept outside the pages, so a page opened again
- * still knows its list is playing (its Play button resumes it instead of starting it over).
+ * The last track list this app started for a list (Liked Songs, a playlist: a sorted order, or
+ * Liked Songs' downloads offline), for the session: its list key ([ListSortStore.LIKED_SONGS],
+ * [ListSortStore.playlist]) and the tracks sent, in order. Kept outside the pages, so a page
+ * opened again still knows its list is playing; dropped as soon as playback moves to anything
+ * else ([Entry.after]).
  */
 internal object SortedPlays {
-    internal data class Entry(val list: String, val uris: Set<String>, val generation: Int)
+    internal data class Entry(
+        val list: String,
+        val order: List<String>,
+        val generation: Int,
+        /** One of its tracks has played since it was sent (until then the previous playback shows). */
+        val landed: Boolean = false,
+    ) {
+        private val positions: Map<String, Int> by lazy {
+            HashMap<String, Int>(order.size * 2).also { map -> order.forEachIndexed { i, uri -> map.putIfAbsent(uri, i) } }
+        }
+
+        operator fun contains(uri: String): Boolean = uri in positions
+
+        /**
+         * [playback] is this load: its track is in the list and, unless shuffled, the context's next
+         * (else previous) track is its neighbour in the order sent (the wrap of repeat-all too).
+         * Another list holding the same song has other neighbours.
+         */
+        fun matches(playback: ListPlayback): Boolean {
+            val track = playback.trackUri ?: return false
+            val i = positions[track] ?: return false
+            if (playback.shuffle) return playback.next == null || playback.next in this
+            playback.next?.let { return it == (order.getOrNull(i + 1) ?: order.first()) }
+            playback.previous?.let { return it == (order.getOrNull(i - 1) ?: order.last()) }
+            return true
+        }
+    }
 
     private val entry = MutableStateFlow<Entry?>(null)
+    private var watcher: Job? = null
 
-    /** The last sorted play of this session (a logout ends it), or null. */
+    /** The last such play of this session (a logout ends it), or null. */
     val last: Flow<Entry?> = entry.map { it?.takeIf { e -> e.generation == BackgroundMessages.currentGeneration() } }
 
-    fun record(list: String, request: PlayRequest) {
-        entry.value = Entry(list, request.trackUris.orEmpty().toSet(), BackgroundMessages.currentGeneration())
+    /** [request] (a track list for [list]) was just sent. */
+    @Synchronized
+    fun record(graph: AppGraph, list: String, request: PlayRequest) {
+        val order = request.trackUris.orEmpty()
+        entry.value = if (order.isEmpty()) null else Entry(list, order, BackgroundMessages.currentGeneration())
+        if (watcher?.isActive != true) {
+            watcher = graph.appScope.launch {
+                graph.playback.snapshot.collect { snapshot -> entry.update { it?.after(snapshot.toListPlayback()) } }
+            }
+        }
     }
 }
 
 /**
- * The URIs of list [list] whose playback counts as this sorted list playing: what was sent for it
- * when the last sorted play ([last]) was this list's; nothing when it was another list's. With no
- * sorted play recorded (a new process, e.g. a resumed session), the list as [shown]: a context-less
- * play of one of its songs is taken for it.
+ * The record once playback is [now]: landed when one of its tracks plays as this load; dropped
+ * when, after that, playback moved to anything else (another list, a context, a single track).
+ * Nothing playing (stopped, a load on its way) keeps it.
  */
-internal fun sortedListUris(list: String, last: SortedPlays.Entry?, shown: () -> List<String>): Set<String> = when {
-    last == null -> shown().toHashSet()
-    last.list == list -> last.uris
-    else -> emptySet()
+internal fun SortedPlays.Entry.after(now: ListPlayback): SortedPlays.Entry? {
+    if (now.trackUri == null) return this
+    val ours = !isCatalogContext(now.contextUri) && matches(now)
+    return when {
+        ours -> if (landed) this else copy(landed = true)
+        !landed -> this
+        else -> null
+    }
 }
 
 /**
- * Whether what plays is a sorted list this page sent ([sent]): its track, and no catalog context
- * (a track-list load has none; the same track played from an album or playlist doesn't count).
+ * Whether [playback] is the list [listKey] (catalog context [listContextUri]: the playlist, Liked
+ * Songs): its own context, in any order (Shuffle, started before a sort, from Auto or another
+ * device), or the track list this app last started for it ([last]) while playback is still that
+ * load ([SortedPlays.Entry.matches]). A context-less play of one of its songs from elsewhere
+ * (Downloads, a single track, another client) is not it. Used for the Play/Pause button of
+ * Liked Songs and playlists: toggle when true, start the list otherwise.
  */
-fun isSortedPlayback(trackUri: String?, contextUri: String?, sent: Set<String>): Boolean {
-    if (trackUri == null || trackUri !in sent) return false
-    val context = contextUri?.takeIf { it.isNotBlank() } ?: return true
-    return CATALOG_CONTEXTS.none { context.startsWith(it) } && !context.endsWith(":collection")
+internal fun isListPlaying(listKey: String, listContextUri: String?, playback: ListPlayback, last: SortedPlays.Entry?): Boolean {
+    if (playback.trackUri == null) return false
+    val context = playback.contextUri?.takeIf { it.isNotBlank() }
+    if (context != null && listContextUri != null && isSameContext(context, listContextUri)) return true
+    if (last == null || last.list != listKey || isCatalogContext(context)) return false
+    return last.matches(playback)
+}
+
+/** A context of the catalog (a track list's context is none, or a placeholder such as spotify:web-api). */
+private fun isCatalogContext(context: String?): Boolean {
+    val uri = context?.takeIf { it.isNotBlank() } ?: return false
+    return CATALOG_CONTEXTS.any { uri.startsWith(it) } || uri.endsWith(":collection")
 }
 
 private val CATALOG_CONTEXTS = listOf("spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:show:", "spotify:station:")
