@@ -697,7 +697,11 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                when Spotify may know better (nothing is saved below the point until the seek lands
                or the lookup answers). Tapping the episode that is playing (here or on a Connect
                device) toggles it. Offline, the episode page's Play of an episode that isn't
-               downloaded says so (a show load would start another, downloaded one).
+               downloaded says so (a show load would start another, downloaded one); so do Your
+               Episodes rows (a plain list the engine would hand to its offline queue, which starts
+               the next download), where a downloaded one starts among the list's downloads and,
+               while the session is connecting, one that isn't is sent alone to wait for it (the
+               Downloads entries likewise).
              * The stored session's resumes (Media3 / Bluetooth / Auto resumption, Tap to resume,
                "play something", the in-app Play fallback, and a transfer that starts it on a device
                while nothing is loaded, `DevicesRepository.episodeResume`) take the same decision: their position
