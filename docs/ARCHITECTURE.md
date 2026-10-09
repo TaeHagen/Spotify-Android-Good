@@ -1447,6 +1447,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   that stopped after getting somewhere is tried again after 5 min; a stopped move restarts from its
   row in Settings > Storage, also for the same location. The cover maps and the session
   artwork follow the moved covers at once.
+  The engine-start index snapshot reads the rows before a switch may run: a stale path it pushes
+  is superseded natively by the switch's later-numbered `offline.add`, and it fails a download
+  whose file it found gone only under the lock the switch takes, only while the row still names
+  the file it checked (same path and `completedAt`) and the file is still gone, and never while a
+  move runs (the next start checks again).
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
 * A card that is removed or unmounted (the system's media broadcasts): its downloads stay COMPLETED

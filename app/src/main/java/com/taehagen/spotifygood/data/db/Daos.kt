@@ -382,6 +382,17 @@ interface DownloadDao {
     )
     suspend fun markMissing(uris: List<String>, error: String, at: Long)
 
+    /**
+     * [markMissing] for one row, only while it is still the download that was checked: the same
+     * [path] (a move between locations switches it to a copy) and [completedAt] (not removed and
+     * downloaded again since). `IS` matches a null path too.
+     */
+    @Query(
+        "UPDATE downloads SET state = 'failed', error = :error, lastValidatedAt = :at, path = NULL, sizeBytes = 0, bytesDone = 0 " +
+            "WHERE uri = :uri AND state = 'completed' AND path IS :path AND completedAt IS :completedAt",
+    )
+    suspend fun markMissingIfUnchanged(uri: String, path: String?, completedAt: Long?, error: String, at: Long): Int
+
     @Query("UPDATE downloads SET metadataJson = :metadataJson WHERE uri = :uri AND metadataJson IS NULL")
     suspend fun fillMetadata(uri: String, metadataJson: String)
 }

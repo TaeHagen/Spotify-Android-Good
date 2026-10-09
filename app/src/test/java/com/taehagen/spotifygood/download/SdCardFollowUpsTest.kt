@@ -310,4 +310,35 @@ class SdCardFollowUpsTest {
         assertEquals(RunOutcome.RESCHEDULE, DownloadRules.storageOutcome(DownloadRules.StorageCheck.INTERNAL_FULL))
         assertNull(DownloadRules.storageOutcome(DownloadRules.StorageCheck.OK))
     }
+
+    // ---- the engine-start index snapshot against a running move -------------------------------------------
+
+    @Test
+    fun aSnapshotNeverFailsADownloadAMoveSwitchedToItsCopy() {
+        val internal = "/data/user/0/pkg/no_backup/offline/audio"
+        val card = "/storage/1234-ABCD/Android/data/pkg/files/offline/audio"
+        // What the snapshot read and checked (outside the lock): every file looked gone, because the
+        // move deleted the originals right after switching the rows to the copies.
+        val checked = listOf("a", "b", "c", "d", "e").mapIndexed { i, name ->
+            DownloadRules.CheckedFile("t-$name", "$internal/$name", "$internal/$name", i + 1L)
+        }
+        val onDisk = mutableSetOf("$card/a", "$internal/c")
+        // The rows under the lock, after the move's switch.
+        val current = mapOf(
+            "t-a" to ("$card/a" to 1L), // switched to its copy on the card
+            "t-b" to ("$internal/b" to 2L), // unchanged, and really gone
+            "t-c" to ("$internal/c" to 3L), // its file is back
+            "t-e" to ("$internal/e" to 99L), // removed and downloaded again since
+        ) // t-d: removed (no longer a completed row)
+        val failed = DownloadRules.stillMissing(checked, current, exists = { it in onDisk }, relocating = false)
+        assertEquals(listOf("t-b"), failed.map { it.uri })
+        assertEquals("$internal/b", failed.single().rowPath)
+
+        // While a move runs nothing is failed: the rows may be switched under it at any time.
+        assertTrue(DownloadRules.stillMissing(checked, current, exists = { false }, relocating = true).isEmpty())
+        // A row whose path is null is still matched as null (the record's path was checked).
+        val legacy = DownloadRules.CheckedFile("t-l", null, "$internal/l", 7L)
+        assertEquals(listOf(legacy), DownloadRules.stillMissing(listOf(legacy), mapOf("t-l" to (null to 7L)), { false }, false))
+        assertTrue(DownloadRules.stillMissing(listOf(legacy), mapOf("t-l" to ("$card/l" to 7L)), { false }, false).isEmpty())
+    }
 }
