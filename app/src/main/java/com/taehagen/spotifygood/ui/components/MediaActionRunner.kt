@@ -147,9 +147,10 @@ internal class MediaActionRunner(
 
     /**
      * Adds [uris] to the playlist [playlistUri] ([playlistName]), as Spotify does: it looks at what
-     * the playlist holds first (bounded; when that fails everything is added, the server keeping its
-     * own limit), asks "Already added" when some are in it already
-     * ([AppNavigator.confirmPlaylistAdd]), and stops at the playlist's item limit.
+     * the playlist holds first (its item URIs, bounded), asks "Already added" when some are in it
+     * already, or "Add anyway?" when that couldn't be checked ([AppNavigator.confirmPlaylistAdd]),
+     * and stops at the playlist's item limit. Without a connection it says so (nothing could be
+     * added either).
      */
     fun addToPlaylist(playlistUri: String, playlistName: String, uris: List<String>) {
         if (uris.isEmpty()) return
@@ -159,6 +160,7 @@ internal class MediaActionRunner(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                if (isNetworkClassError(e)) throw e // the friendly "offline" message, nothing added
                 Log.w(TAG, "Items of $playlistUri unavailable", e)
                 null
             }
@@ -199,7 +201,10 @@ internal class MediaActionRunner(
     companion object {
         private const val TAG = "MediaActions"
         private const val LOAD_TIMEOUT_MS = 20_000L
-        /** Longest look at what a playlist holds before an add (then it adds without). */
+        /**
+         * Longest look at what a playlist holds before an add (URIs only: a few small requests,
+         * so rarely reached; then the user is asked whether to add anyway).
+         */
         private const val CONTENTS_TIMEOUT_MS = 20_000L
 
         /** First non-loading value of a stale-while-revalidate flow (cached data if offline). */

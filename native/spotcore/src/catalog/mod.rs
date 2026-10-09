@@ -7,6 +7,7 @@
 //! |---|---|---|
 //! | `catalog.tracks/episodes/album/artist/show` | extended-metadata `*_V4` (batched, cached) | show episodes: `SHOW_V4_EPISODES_ASSOC`, context-resolve |
 //! | `catalog.playlist` | `GET playlist/v2/playlist/{id}?from&length` (protobuf) | whole list sliced locally |
+//! | `catalog.playlistUris` | the same list, items only (no metadata) | whole list sliced locally |
 //! | `library.playlists` | `playlist/v2/user/{u}/rootlist` (decorated) | per-playlist header lookups |
 //! | `library.*` | `collection/v2/paging|contains|write` (JSON, as the web player) | protobuf collection2v2; Liked Songs via context-resolve |
 //! | `playlist.*` | JSON `ListChanges`/`Delta` to `playlist/v2` | protobuf encoding |
@@ -90,6 +91,7 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
         "catalog.artist" => pages::artist(args).await,
         "catalog.show" => pages::show(args).await,
         "catalog.playlist" => playlist::playlist(args).await,
+        "catalog.playlistUris" => playlist::playlist_uris(args).await,
         "catalog.search" => search::rpc(args).await,
         "catalog.home" => home::rpc(args).await,
         "catalog.lyrics" => lyrics::lyrics(args).await,

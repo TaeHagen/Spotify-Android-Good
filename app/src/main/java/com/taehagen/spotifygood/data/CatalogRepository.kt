@@ -57,11 +57,18 @@ class CatalogRepository(
         playlistItems(uri, ::playlistPage).mapNotNull { it.uri }.filter(SpotifyUris::isPlayableItem)
 
     /**
+     * A window of a playlist's item URIs (and uids) without their metadata
+     * (`catalog.playlistUris`): what an add needs, a small fraction of a [playlistPage].
+     */
+    suspend fun playlistUrisPage(uri: String, offset: Int, limit: Int = PLAYLIST_MAX_ITEMS): PlaylistUris =
+        rpc.callOffMain("catalog.playlistUris", rpcArgs { put("uri", uri); put("offset", offset); put("limit", limit) })
+
+    /**
      * A playlist's items to add to another playlist: at most [PLAYLIST_MAX_ITEMS] (no playlist
-     * holds more), in a bounded number of requests ([pagePlaylist]).
+     * holds more), URIs only, in a bounded number of requests ([pagePlaylist]).
      */
     suspend fun playlistItemUrisToAdd(uri: String): List<String> =
-        pagePlaylist(uri, ::playlistPage).items.filter(SpotifyUris::isPlayableItem)
+        pagePlaylist(uri, ::playlistUrisPage).items.filter(SpotifyUris::isPlayableItem)
 
     /**
      * The show's first page. Spotify's played state (resume points) only comes with a fresh answer:
