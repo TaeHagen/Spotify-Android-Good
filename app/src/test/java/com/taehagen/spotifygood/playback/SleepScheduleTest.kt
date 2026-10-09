@@ -78,6 +78,21 @@ class SleepScheduleTest {
     }
 
     @Test
+    fun theSameItemIsItsUriWithThePositionGoingOn() {
+        val track = "spotify:track:1"
+        // The same uid: the same item, a seek back included.
+        assertTrue(SleepSchedule.sameItem(track, "u1", 100_000, track, "u1", 100_400))
+        assertTrue(SleepSchedule.sameItem(track, "u1", 100_000, track, "u1", 10_000))
+        // A uid the engine re-made (offline hand-off o<i>, a restore's q<n>), the position going on.
+        assertTrue(SleepSchedule.sameItem(track, "c7", 100_000, track, "o0", 100_300))
+        assertTrue(SleepSchedule.sameItem(track, "q3", 100_000, track, "q1", 97_000))
+        // A new uid from the start: repeat-one, or the same track reached again.
+        assertFalse(SleepSchedule.sameItem(track, "u1", 100_000, track, "u2", 0))
+        // Another uri.
+        assertFalse(SleepSchedule.sameItem(track, "u1", 100_000, "spotify:track:2", "u1", 100_400))
+    }
+
+    @Test
     fun trackEndFollowsThePodcastSpeed() {
         // 150 s of media left: 75 s at 2x, 300 s at 0.5x, 187.5 s at 0.8x; the margin is wall time.
         assertEquals(now + 75_000 - 400, SleepSchedule.trackEndsAt(now, durationMs = 200_000, positionMs = 50_000, speed = 2.0))
