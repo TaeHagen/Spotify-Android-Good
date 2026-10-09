@@ -2168,6 +2168,10 @@ impl SpircTask {
         if autoplay {
             ctx_uri = ctx_uri.map(|c| c.replace("station:", ""));
         }
+        // SPOTIFYGOOD: an autoplay track (see ConnectState::current_track_from_transfer) goes on
+        // in autoplay while autoplay is on (Spirc::set_autoplay), else after the default context
+        // (ConnectState::finish_transfer)
+        let resolves_autoplay = autoplay && self.autoplay();
 
         let fallback = self.connect_state.current_track(|t| &t.uri).clone();
         let load_from_context_uri = ctx_uri.is_some();
@@ -2209,7 +2213,8 @@ impl SpircTask {
         state.handle_initial_transfer(&mut transfer, ctx_uri.clone());
 
         // adjust active context, so resolve knows for which context it should set up the state
-        state.active_context = if autoplay {
+        // SPOTIFYGOOD: resolves_autoplay
+        state.active_context = if resolves_autoplay {
             ContextType::Autoplay
         } else {
             ContextType::Default
@@ -2237,7 +2242,8 @@ impl SpircTask {
         // SPOTIFYGOOD: start_paused
         let is_playing = !start_paused && !transfer.playback.is_paused();
 
-        if self.connect_state.current_track(|t| t.is_autoplay()) || autoplay {
+        // SPOTIFYGOOD: resolves_autoplay
+        if resolves_autoplay {
             if let Some(ctx_uri) = ctx_uri {
                 debug!("currently in autoplay context, async resolving autoplay for {ctx_uri}");
                 self.context_resolver.add(ResolveContext::from_uri(

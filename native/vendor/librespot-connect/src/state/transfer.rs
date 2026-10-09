@@ -20,7 +20,8 @@ impl ConnectState {
         &self,
         transfer: &TransferState,
     ) -> Result<ProvidedTrack, Error> {
-        let track = if transfer.queue.is_playing_queue.unwrap_or_default() {
+        let from_queue = transfer.queue.is_playing_queue.unwrap_or_default();
+        let track = if from_queue {
             debug!("transfer track was used from the queue");
             transfer.queue.tracks.first()
         } else {
@@ -29,16 +30,26 @@ impl ConnectState {
         }
         .ok_or(StateError::CouldNotResolveTrackFromTransfer)?;
 
+        // SPOTIFYGOOD: a track the other device played from autoplay (its metadata says so, a
+        // librespot device's autoplay tracks and Spotify's) is an autoplay track here too:
+        // Spirc's handle_transfer goes by the provider (it strips `station:`, resolves the
+        // autoplay context and makes it the active one), finish_transfer by the metadata. It was
+        // a context track, so the autoplay context was never resolved, and finish_transfer
+        // failed without it (see there).
+        let provider = if from_queue {
+            Some(Provider::Queue)
+        } else if track.is_from_autoplay() {
+            Some(Provider::Autoplay)
+        } else {
+            None
+        };
+
         self.context_to_provided_track(
             track,
             transfer.current_session.context.uri.as_deref(),
             None,
             None,
-            transfer
-                .queue
-                .is_playing_queue
-                .unwrap_or_default()
-                .then_some(Provider::Queue),
+            provider,
         )
     }
 
@@ -177,7 +188,23 @@ impl ConnectState {
             Some(track) => track.clone(),
         };
 
-        let context_ty = if self.current_track(|t| t.is_from_autoplay()) {
+        // SPOTIFYGOOD: the current track and the transferred queue come first, before anything
+        // that can fail: an error after them dropped the queue (the transfer state is taken, it
+        // never finishes again)
+        if self.player().track.is_none() {
+            self.set_track(track.clone());
+        }
+        self.add_transferred_queue(&transfer);
+
+        // SPOTIFYGOOD: a track played from autoplay goes on in the autoplay context only once
+        // that is there (its resolve may have failed, autoplay may be off, see Spirc's
+        // handle_transfer). The state was switched to it without one, and `get_context` failed
+        // with NoContext(Autoplay): no next tracks, the transferred queue dropped, the default
+        // context never set up after it (it wasn't the active one). Without it, the default
+        // context goes on after its end (the autoplay track isn't one of its tracks): it started
+        // the finished album over.
+        let autoplay = self.current_track(|t| t.is_from_autoplay());
+        let context_ty = if autoplay && self.get_context(ContextType::Autoplay).is_ok() {
             ContextType::Autoplay
         } else {
             ContextType::Default
@@ -188,10 +215,18 @@ impl ConnectState {
 
         let ctx = self.get_context(self.active_context)?;
 
-        let current_index = match transfer.current_session.current_uid.as_ref() {
+        let found = match transfer.current_session.current_uid.as_ref() {
             Some(uid) if track.is_queue() => Self::find_index_in_context(ctx, |c| &c.uid == uid)
                 .map(|i| if i > 0 { i - 1 } else { i }),
             _ => Self::find_index_in_context(ctx, |c| c.uri == track.uri || c.uid == track.uid),
+        };
+        // SPOTIFYGOOD: see above
+        let after_the_end =
+            autoplay && matches!(context_ty, ContextType::Default) && found.is_err();
+        let current_index = if after_the_end {
+            ctx.tracks.len().checked_sub(1)
+        } else {
+            found.ok()
         };
 
         debug!(
@@ -201,11 +236,6 @@ impl ConnectState {
             ctx.tracks.len()
         );
 
-        if self.player().track.is_none() {
-            self.set_track(track);
-        }
-
-        let current_index = current_index.ok();
         if let Some(current_index) = current_index {
             self.update_current_index(|i| i.track = current_index as u32);
         }
@@ -215,6 +245,36 @@ impl ConnectState {
             self.shuffling_context()
         );
 
+        // SPOTIFYGOOD: see above (a shuffle would play the context again)
+        if after_the_end {
+            self.transfer_shuffle = None;
+            self.reset_playback_to_position(current_index)?;
+        } else if self.shuffling_context() {
+            // SPOTIFYGOOD: a queued track, or one the context doesn't contain, stays the current
+            // track (handle_transfer already loaded it), like in reset_playback_to_position. It
+            // was replaced by a context track, so the state named another song than the one that
+            // played, and that one went to the prev tracks unplayed.
+            if !self.keeps_current_track() {
+                self.set_current_track(current_index.unwrap_or_default())?;
+            }
+            self.set_shuffle(true);
+
+            match self.transfer_shuffle.take() {
+                None => self.shuffle_new(),
+                Some(state) => self.shuffle_restore(state),
+            }?
+        } else {
+            self.reset_playback_to_position(current_index)?;
+        }
+
+        self.update_restrictions();
+
+        Ok(())
+    }
+
+    // SPOTIFYGOOD: moved out of finish_transfer (see there)
+    /// Adds the tracks the transfer brought in its queue to the queue
+    fn add_transferred_queue(&mut self, transfer: &TransferState) {
         for (i, track) in transfer.queue.tracks.iter().enumerate() {
             if transfer.queue.is_playing_queue.unwrap_or_default() && i == 0 {
                 // if we are currently playing from the queue,
@@ -236,27 +296,5 @@ impl ConnectState {
                 }
             }
         }
-
-        if self.shuffling_context() {
-            // SPOTIFYGOOD: a queued track, or one the context doesn't contain, stays the current
-            // track (handle_transfer already loaded it), like in reset_playback_to_position. It
-            // was replaced by a context track, so the state named another song than the one that
-            // played, and that one went to the prev tracks unplayed.
-            if !self.keeps_current_track() {
-                self.set_current_track(current_index.unwrap_or_default())?;
-            }
-            self.set_shuffle(true);
-
-            match self.transfer_shuffle.take() {
-                None => self.shuffle_new(),
-                Some(state) => self.shuffle_restore(state),
-            }?
-        } else {
-            self.reset_playback_to_position(current_index)?;
-        }
-
-        self.update_restrictions();
-
-        Ok(())
     }
 }
