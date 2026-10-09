@@ -182,6 +182,17 @@ class SettingsViewModel(private val graph: AppGraph) : ViewModel() {
     /** Moving downloads to a newly chosen location. */
     val relocation: StateFlow<DownloadRelocation> = graph.downloads.relocation
 
+    /** Downloads on an SD card that is no longer used (it died, or another card was chosen). */
+    val onUnusedCard: StateFlow<Int> = graph.downloads.onUnusedCard
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+
+    fun redownloadFromUnusedCard(onDone: (Int?) -> Unit) {
+        graph.appScope.launch {
+            val notice = runCatching { graph.downloads.redownloadFromUnusedCard().notice }.getOrNull()
+            withContext(Dispatchers.Main) { onDone(notice) }
+        }
+    }
+
     fun setDownloadLocation(id: String) {
         graph.appScope.launch { graph.downloads.setDownloadLocation(id) }
     }
@@ -276,6 +287,8 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
     val failedCounts by vm.failedCounts.collectAsStateWithLifecycle()
     val downloadLocations by vm.downloadLocations.collectAsStateWithLifecycle()
     val relocation by vm.relocation.collectAsStateWithLifecycle()
+    val onUnusedCard by vm.onUnusedCard.collectAsStateWithLifecycle()
+    val msgRedownloading = stringResource(R.string.shell_settings_unused_card_started)
     val sleepTimer by vm.sleepTimer.collectAsStateWithLifecycle()
     var dialog by remember { mutableStateOf<SettingsDialog?>(null) }
     // open.spotify.com links need the user's approval on Android 12+; checked again whenever the
@@ -556,6 +569,21 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
                         },
                         selected = settings.downloadLocation,
                         onSelect = { id -> vm.setDownloadLocation(id) },
+                    )
+                }
+            }
+            // Downloads left on a card that died or was replaced: downloaded again here on request.
+            if (onUnusedCard > 0) {
+                item(key = "unused_card") {
+                    PrefItem(
+                        title = stringResource(R.string.shell_settings_unused_card),
+                        summary = stringResource(R.string.shell_settings_unused_card_summary, onUnusedCard),
+                        icon = Icons.Rounded.SdCard,
+                        onClick = {
+                            vm.redownloadFromUnusedCard { notice ->
+                                navigator.showMessage(notice?.let { context.getString(it) } ?: msgRedownloading)
+                            }
+                        },
                     )
                 }
             }

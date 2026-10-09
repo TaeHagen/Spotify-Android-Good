@@ -119,6 +119,7 @@ import com.taehagen.spotifygood.ui.navigation.LocalOptionalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MainNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -568,7 +569,11 @@ private fun ItemDownloadAction(uri: String, state: DownloadState?, s: ActionScop
         if (active) {
             s.runner.launch(R.string.shell_msg_download_removed) { s.graph.downloads.removeItems(listOf(uri)) }
         } else {
-            s.runner.launch(R.string.shell_msg_download_started) { s.graph.downloads.downloadItems(listOf(uri)) }
+            // Says what really happened: nothing starts for a download on the chosen SD card while it is away.
+            s.runner.launch {
+                val request = s.graph.downloads.downloadItems(listOf(uri))
+                withContext(Dispatchers.Main) { s.runner.message(request.notice ?: R.string.shell_msg_download_started) }
+            }
         }
     }
 }
@@ -585,7 +590,10 @@ private fun CollectionDownloadAction(downloaded: Boolean, s: ActionScope, ref: (
         if (downloaded) {
             s.runner.launch(R.string.shell_msg_download_removed) { s.graph.downloads.removeCollection(collection.uri) }
         } else {
-            s.runner.launch(R.string.shell_msg_download_started) { s.graph.downloads.downloadCollection(collection) }
+            s.runner.launch {
+                val request = s.graph.downloads.downloadCollection(collection)
+                withContext(Dispatchers.Main) { s.runner.message(request.notice ?: R.string.shell_msg_download_started) }
+            }
         }
     }
 }

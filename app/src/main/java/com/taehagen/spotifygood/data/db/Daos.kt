@@ -268,6 +268,22 @@ interface DownloadDao {
     @Query("SELECT uri, path, imagePath FROM downloads WHERE state = 'completed'")
     suspend fun completedLocated(): List<LocatedRow>
 
+    @Query("SELECT uri, path, imagePath FROM downloads WHERE uri IN (:uris) AND state = 'completed'")
+    suspend fun completedLocatedOf(uris: List<String>): List<LocatedRow>
+
+    /**
+     * Downloads [uris] again: completed rows whose files are on an SD card that is no longer used
+     * (it died or was replaced) go back into the queue, without their old file references, key and
+     * record (the new download writes them). Metadata, membership and the individual flag stay.
+     */
+    @Query(
+        "UPDATE downloads SET state = 'queued', attempts = 0, retryAt = NULL, error = NULL, path = NULL, " +
+            "imagePath = NULL, fileId = NULL, recordJson = NULL, encryptedKey = NULL, keyVersion = 0, " +
+            "completedAt = NULL, lastValidatedAt = NULL, bytesDone = 0, sizeBytes = 0 " +
+            "WHERE uri IN (:uris) AND state = 'completed'",
+    )
+    suspend fun requeueFromUnusedCard(uris: List<String>): Int
+
     /** Points every row whose audio is [from] at its copy [to]; returns their URIs' count. */
     @Query("UPDATE downloads SET path = :to WHERE path = :from")
     suspend fun relocatePath(from: String, to: String): Int
