@@ -685,7 +685,8 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                device) toggles it. Offline, the episode page's Play of an episode that isn't
                downloaded says so (a show load would start another, downloaded one).
              * The stored session's resumes (Media3 / Bluetooth / Auto resumption, Tap to resume,
-               "play something", the in-app Play fallback) take the same decision: their position
+               "play something", the in-app Play fallback, and a transfer that starts it on a device
+               while nothing is loaded, `DevicesRepository.episodeResume`) take the same decision: their position
                carries when it dates from (`ResumeState.positionAt`: the save's time while it
                played, the snapshot's timestamp when paused — a remote device sitting paused keeps
                its old one; `PlayRequest.positionAt`), and it plays only when newer than the

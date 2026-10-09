@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.data
 
+import com.taehagen.spotifygood.connect.DevicesRepository
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.model.PlaybackSnapshot
@@ -28,6 +29,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -1302,5 +1304,38 @@ class EpisodeResumeOnPlayTest {
         assertEquals(1_000L, resumeItemLoad(storedSession(40, at = 1_000)).positionAt)
         assertNull(ResumeLoad(null, shuffle = false, smartShuffle = false, repeat = com.taehagen.spotifygood.model.RepeatMode.OFF).applyTo(PlayRequest(trackUris = listOf(EP))).positionAt)
         assertNull(PlayRequest(trackUris = listOf(EP), positionMs = 5_000).positionAt)
+    }
+
+    @Test
+    fun aTransferOfTheStoredSessionStartsItsEpisodeAtTheNewestPoint() = runTest {
+        val f = fixture()
+        val resolve = checkNotNull(f.controller.episodeResume) // the same decision the app graph installs on both
+        now = 2_000
+        f.store.record(EP, 55 * MIN, 2 * HOUR)
+        // Nothing plays anywhere; the stored session took the desktop's old pause: the speaker gets 55:00.
+        assertTrue(DevicesRepository.resumeMayStart(PlaybackSnapshot()))
+        val resolved = DevicesRepository.withEpisodeStart(storedSession(40, at = 1_000), resolve)
+        assertEquals(55 * MIN, resolved.positionMs)
+        assertEquals(55 * MIN, DevicesRepository.transferArgs("speaker", play = true, resume = resolved)["resume"]!!.jsonObject["positionMs"]!!.jsonPrimitive.content.toLong())
+        // Newer than the point: as stored.
+        assertEquals(40 * MIN, DevicesRepository.withEpisodeStart(storedSession(40, at = 3_000), resolve).positionMs)
+        assertEquals(0, lookups)
+        // A followed speaker's point: looked up first.
+        f.followedSpeakerLeft(30)
+        spotifySays = played(70)
+        assertEquals(70 * MIN, DevicesRepository.withEpisodeStart(storedSession(30, at = 1_000), resolve).positionMs)
+        assertEquals(1, lookups)
+        // A lookup that never answers delays the transfer by its bound at most.
+        f.followedSpeakerLeft(30)
+        spotifySays = null
+        val started = testScheduler.currentTime
+        assertEquals(30 * MIN, DevicesRepository.withEpisodeStart(storedSession(30, at = 1_000), resolve).positionMs)
+        assertEquals(EpisodeProgressStore.LOOKUP_TIMEOUT_MS, testScheduler.currentTime - started)
+        // Music: as stored, nothing asked.
+        val song = storedSession(40, at = 1_000).copy(contextUri = "spotify:album:a", trackUri = "spotify:track:t", isEpisode = false)
+        assertEquals(song, DevicesRepository.withEpisodeStart(song) { _, _ -> error("not asked") })
+        // Something loaded somewhere: the engine transfers that, the stored session isn't resolved.
+        val paused = PlaybackSnapshot(status = PlaybackStatus.PAUSED, track = PlaybackTrack(uri = EP, isEpisode = true))
+        assertFalse(DevicesRepository.resumeMayStart(paused))
     }
 }
