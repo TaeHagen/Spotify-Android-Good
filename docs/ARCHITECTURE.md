@@ -410,7 +410,8 @@ start that is not downloaded move on to the next download. Smart shuffle is not 
 { "source": "local|remote|none",        // local = this phone is the active device
   "offline": false,
   "activeDevice": {"id","name","type"},  // omitted when none
-  "status": "stopped|loading|playing|paused",
+  "status": "stopped|loading|playing|paused",  // loading: to play (also a stall while playing,
+                                         // at the position heard); a paused load is "paused"
   "positionMs": 0, "positionTimestampMs": 0,   // wall-clock epoch ms when positionMs was valid
   "playbackSpeed": 1.0, "durationMs": 0,
   "context": {"uri":"spotify:playlist:…","name":"…","type":"playlist|album|artist|collection|search|show|station|tracks|unknown"},
@@ -697,7 +698,11 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                when Spotify may know better (nothing is saved below the point until the seek lands
                or the lookup answers). Tapping the episode that is playing (here or on a Connect
                device) toggles it. Offline, the episode page's Play of an episode that isn't
-               downloaded says so (a show load would start another, downloaded one).
+               downloaded says so (a show load would start another, downloaded one); so do Your
+               Episodes rows (a plain list the engine would hand to its offline queue, which starts
+               the next download), where a downloaded one starts among the list's downloads and,
+               while the session is connecting, one that isn't is sent alone to wait for it (the
+               Downloads entries likewise).
              * The stored session's resumes (Media3 / Bluetooth / Auto resumption, Tap to resume,
                "play something", the in-app Play fallback, and a transfer that starts it on a device
                while nothing is loaded, `DevicesRepository.episodeResume`) take the same decision: their position
@@ -1398,8 +1403,15 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   renamed, then the rows and the offline index (`offline.add`, numbered) switched to the copy, then
   the original deleted. Every step is resumable: an interrupted move leaves the original in use or
   both copies with the rows on one of them, and the next pass (start, mount, change) carries on;
-  the files copied before a stop (no space, an I/O error) are switched all the same. The cover
-  maps and the session artwork follow the moved covers at once.
+  the files copied before a stop (no space, an error about the target, a cancellation) are switched
+  all the same. An original that cannot be read while its card is still there (a bad sector, a
+  short read: a damaged download) does not stop the move: it is skipped, its downloads go back into
+  the queue and are downloaded fresh to the chosen location (out of the offline index; an
+  unreadable cover is dropped for the CDN image), and Settings says how many. Three unreadable
+  originals in a row stop the move instead (the card itself is failing), as does a card that went.
+  The plan follows a stable order (`addedAt`, uri) with the files that failed before in this
+  process last, so one bad file never holds back the rest. The cover maps and the session
+  artwork follow the moved covers at once.
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
 * A card that is removed or unmounted (the system's media broadcasts): its downloads stay COMPLETED
@@ -1550,6 +1562,24 @@ reach becomes ONLINE, a page that failed, shows a stale cached copy (its refresh
 the download loads again, once a load still running has settled. A search or result page that
 failed before the session was ONLINE shows its error and runs again once it is (a connection
 error while ONLINE: after the next reconnect).
+
+Sorting Liked Songs and playlists (`ui/screens/library/TrackSort.kt`): Liked Songs offers Recently
+added (its own, newest-first order), Title, Artist and Album; a playlist Custom order (its own),
+Title, Artist, Album and Recently added. The choice is kept per list (Liked Songs, each playlist
+URI; non-default choices only, the 300 most recent lists) in app preferences. Another order
+needs every row, so the page fetches the remaining pages one at a time (the pages it already
+uses: 100 items, URIs with metadata; a playlist at most 200), showing "Loading songs… n of total",
+and sorts the loaded rows off the main thread on every new page (collation keys; case and
+accents ignored; rows that can't play last; ties keep the list order), then applies the filter
+("Find in playlist" / Liked Songs' filter). Edit mode always shows the playlist's own order
+(moves and removals use the row's playlist position). The trade-off is playback: a context load
+plays the server's order (Spirc resolves the context itself), so a non-default order plays as a
+`trackUris` list in the shown order, shuffle off, at most 500 tracks around the start item (50
+before it). That list has no context: Connect and the notification show no playlist, and it is
+a snapshot of what was loaded (later edits and likes don't reach it); the Play button toggles it
+while one of its tracks plays with no catalog context. The default order keeps the context load
+(Connect shows the playlist), and Shuffle always loads the context, its order doesn't matter.
+Offline, the downloaded rows sort the same way and already play as a track list.
 
 ### 9.9 UI
 

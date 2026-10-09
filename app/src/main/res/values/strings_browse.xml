@@ -98,6 +98,12 @@
     <string name="browse_library_sort_recently_added">Recently added</string>
     <string name="browse_library_sort_alphabetical">Alphabetical</string>
     <string name="browse_library_sort_creator">Creator</string>
+    <string name="browse_sort_custom">Custom order</string>
+    <string name="browse_sort_title">Title</string>
+    <string name="browse_sort_artist">Artist</string>
+    <string name="browse_sort_album">Album</string>
+    <string name="browse_sort_cd">Sort: %1$s</string>
+    <string name="browse_sort_loading">Loading songs… %1$d of %2$d</string>
     <string name="browse_library_show_grid">Show as grid</string>
     <string name="browse_library_show_list">Show as list</string>
     <string name="browse_library_your_episodes">Your Episodes</string>

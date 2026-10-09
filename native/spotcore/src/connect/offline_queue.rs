@@ -87,10 +87,16 @@ enum Current {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Event {
     RequestId(u64),
-    Loading(u64),
+    /// Its load starts, or a reopen of it (the stream's loader was gone) at `position_ms`.
+    Loading { id: u64, position_ms: u32 },
     Playing { id: u64, position_ms: u32 },
     Paused { id: u64, position_ms: u32 },
+    /// A seek landed (a stall may follow).
+    Seeked { id: u64, position_ms: u32 },
+    /// The Player corrects the position (the first packet after a stall reports it this way).
     Position { id: u64, position_ms: u32 },
+    /// The stream stalled: nothing plays from `position_ms` on until its data comes.
+    Stalled { id: u64, position_ms: u32 },
     Stopped(u64),
     TimeToPreload(u64),
     EndOfTrack(u64),
@@ -934,9 +940,28 @@ impl OfflineQueue {
         }
         match event {
             Event::RequestId(_) => {}
-            Event::Loading(id) if self.own(id) => {
+            Event::Loading { id, position_ms } if self.own(id) => {
                 out.changed = self.status != PlaybackStatus::Loading;
                 self.status = PlaybackStatus::Loading;
+                if self.pending_loads == 0 {
+                    // (also a reopen of the current item: it goes on from there)
+                    self.position_ms = position_ms as u64;
+                    self.position_ts = now_ms;
+                    out.changed = true;
+                }
+            }
+            // Like Spirc: a stall of the playing track shows it loading (to play) at the position
+            // heard, nothing extrapolates; its first packet (a correction) or a pause ends it.
+            Event::Stalled { id, position_ms } if self.own(id) && self.status == PlaybackStatus::Playing => {
+                self.status = PlaybackStatus::Loading;
+                self.position_ms = position_ms as u64;
+                self.position_ts = now_ms;
+                out.changed = true;
+            }
+            Event::Seeked { id, position_ms } if self.own(id) => {
+                self.position_ms = position_ms as u64;
+                self.position_ts = now_ms;
+                out.changed = true;
             }
             Event::Playing { id, position_ms } if self.own(id) => {
                 self.status = PlaybackStatus::Playing;
@@ -956,6 +981,10 @@ impl OfflineQueue {
                 out.changed = true;
             }
             Event::Position { id, position_ms } if self.own(id) => {
+                if self.status == PlaybackStatus::Loading && self.play_intent && self.pending_loads == 0 {
+                    // the stall (or reopen) is over
+                    self.status = PlaybackStatus::Playing;
+                }
                 self.position_ms = position_ms as u64;
                 self.position_ts = now_ms;
                 out.changed = true;
@@ -1103,7 +1132,8 @@ impl OfflineQueue {
             source: PlaybackSource::Local,
             offline: true,
             active_device: Some(device),
-            status: self.status,
+            // A paused load is paused for the app (resumable); internally it still loads.
+            status: if self.status == PlaybackStatus::Loading && !self.play_intent { PlaybackStatus::Paused } else { self.status },
             position_ms: self.position_ms,
             position_timestamp_ms: self.position_ts,
             playback_speed: if playing { self.speed_milli as f64 / 1000.0 } else { 0.0 },
@@ -2123,6 +2153,49 @@ mod tests {
         // a later load keeps it
         q.load(spec(2, 1, false, RepeatMode::Off), 8000);
         assert_eq!(q.speed_milli, 1500);
+    }
+
+    #[test]
+    fn a_stall_shows_loading_at_the_position_heard() {
+        let mut q = OfflineQueue::default();
+        q.load(spec(2, 0, false, RepeatMode::Off), 0);
+        q.on_event(Event::RequestId(1), 0);
+        q.on_event(Event::TrackChanged { uri: "spotify:track:0".into(), duration_ms: 600_000 }, 0);
+        q.on_event(Event::Playing { id: 1, position_ms: 0 }, 1_000);
+        // the stream stalls at 1:10: loading (to play), nothing extrapolates
+        assert!(q.on_event(Event::Stalled { id: 1, position_ms: 70_000 }, 71_000).changed);
+        assert_eq!(q.status(), PlaybackStatus::Loading);
+        assert!(q.is_playing(), "still meant to play");
+        assert_eq!(q.position_at(130_000), 70_000);
+        let s = q.snapshot(dev(), 0);
+        assert_eq!((s.status, s.playback_speed, s.position_ms), (PlaybackStatus::Loading, 0.0, 70_000));
+        // a seek meanwhile only moves the position
+        q.on_event(Event::Seeked { id: 1, position_ms: 60_000 }, 72_000);
+        assert_eq!((q.status(), q.position_at(90_000)), (PlaybackStatus::Loading, 60_000));
+        // the first packet: playing again from there
+        q.on_event(Event::Position { id: 1, position_ms: 60_000 }, 80_000);
+        assert_eq!((q.status(), q.position_at(81_000)), (PlaybackStatus::Playing, 61_000));
+        // a stall while paused changes nothing (the Player pauses a stall too)
+        q.on_event(Event::Paused { id: 1, position_ms: 62_000 }, 82_000);
+        q.on_event(Event::Stalled { id: 1, position_ms: 62_000 }, 83_000);
+        assert_eq!(q.status(), PlaybackStatus::Paused);
+        // a reopen of the track: loading at its position, shown paused (it won't play)
+        q.on_event(Event::Loading { id: 1, position_ms: 62_000 }, 90_000);
+        assert_eq!((q.status(), q.position_at(100_000)), (PlaybackStatus::Loading, 62_000));
+        let s = q.snapshot(dev(), 0);
+        assert_eq!((s.status, s.position_ms), (PlaybackStatus::Paused, 62_000));
+    }
+
+    #[test]
+    fn a_paused_load_is_published_paused() {
+        let mut q = OfflineQueue::default();
+        q.load(LoadSpec { play: false, ..spec(2, 0, false, RepeatMode::Off) }, 0);
+        assert_eq!(q.status(), PlaybackStatus::Loading);
+        assert_eq!(q.snapshot(dev(), 0).status, PlaybackStatus::Paused, "resumable");
+        // a load to play is loading
+        let mut q = OfflineQueue::default();
+        q.load(spec(2, 0, false, RepeatMode::Off), 0);
+        assert_eq!(q.snapshot(dev(), 0).status, PlaybackStatus::Loading);
     }
 
     #[test]
