@@ -1527,7 +1527,10 @@ list, at most 101; a source playlist the same way, at most 10,000 items; bounded
 already in it get Spotify's "Already added" question (one item, or none new: Add anyway / Don't
 add; some new: Add new ones / Add anyway / Cancel), and an add stops at a playlist's
 10,000-item limit, the snackbar saying how many went in. When the listing can't complete, the
-user is asked whether to add anyway (never a silent duplicate); offline, the add says so. Saved/liked state is cached in
+user is asked whether to add anyway (never a silent duplicate); offline, the add says so.
+A playlist's "Add to queue" lists its items the same way (URIs only, local files left out, at
+most 20 s; the queue takes the first 80 and the snackbar says so); offline, or when that fails
+or takes too long, it queues the downloaded members, and with none it says why. Saved/liked state is cached in
 memory (LRU) and looked up via `library.contains` (batched). It is unknown until looked up: a
 failed lookup (offline, the session still connecting, a network error) stays unknown, never
 "not saved", and is looked up again when the session comes online (with backoff if it fails

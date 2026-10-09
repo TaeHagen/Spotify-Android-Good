@@ -123,3 +123,12 @@ internal suspend fun pagePlaylist(
     }
     return PagedPlaylist(items.take(maxItems), total)
 }
+
+/**
+ * The tracks and episodes of the playlist [uri] in order ([pagePlaylist] over [fetchPage]): local
+ * files and other entries left out, which neither the queue nor another playlist takes.
+ */
+internal suspend fun playableItemUris(
+    uri: String,
+    fetchPage: suspend (uri: String, offset: Int, limit: Int) -> PlaylistUris,
+): List<String> = pagePlaylist(uri, fetchPage).items.filter(SpotifyUris::isPlayableItem)
