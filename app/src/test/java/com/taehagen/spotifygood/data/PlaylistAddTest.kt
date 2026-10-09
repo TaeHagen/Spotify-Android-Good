@@ -1,8 +1,5 @@
 package com.taehagen.spotifygood.data
 
-import com.taehagen.spotifygood.model.Playlist
-import com.taehagen.spotifygood.model.PlaylistItem
-import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.ui.components.PlaylistAddOutcome
 import com.taehagen.spotifygood.ui.components.PlaylistAddPrompt
 import com.taehagen.spotifygood.ui.components.playlistAddOutcome
@@ -68,37 +65,58 @@ class PlaylistAddTest {
     }
 
     @Test
-    fun aPlaylistThatCouldNotBeListedGetsEverythingAsBefore() {
+    fun aPlaylistThatCouldNotBeListedAsksAddAnyway() {
         val plan = planPlaylistAdd(listOf(t(1), t(2)), contents = null)
-        assertFalse(plan.asks)
+        assertFalse(plan.checked)
+        assertTrue("never a silent duplicate", plan.asks)
         assertNull(plan.room)
         assertFalse(plan.full)
+        val prompt = PlaylistAddPrompt("spotify:playlist:road", "Road trip", plan)
+        assertTrue(prompt.unchecked)
+        assertFalse("nobody knows which are new", prompt.offersNewOnes)
+        // "Add anyway": everything, the server keeping its own limit.
         assertEquals(PlaylistAddOutcome.Send(listOf(t(1), t(2)), left = 0), playlistAddOutcome(plan, PlaylistAddChoice.ALL))
+        // A checked plan is no such question.
+        assertFalse(PlaylistAddPrompt("p", "P", planPlaylistAdd(listOf(t(1)), contents(1, t(1)))).unchecked)
     }
 
     // ---- paging ------------------------------------------------------------------------------
 
-    /** A playlist of [size] items served [maxPage] (or what is asked, if fewer) at a time; counts requests. */
+    /**
+     * `catalog.playlistUris` of a playlist of [size] items, windows of [maxPage] (or what is asked,
+     * if fewer) at a time; counts requests.
+     */
     private class FakePlaylist(val size: Int, val maxPage: Int = Int.MAX_VALUE, val emptyFrom: Int = Int.MAX_VALUE) {
         var requests = 0
         val limits = mutableListOf<Int>()
 
-        fun page(uri: String, offset: Int, limit: Int): Playlist {
+        fun page(uri: String, offset: Int, limit: Int): PlaylistUris {
             requests++
             limits += limit
             val end = if (offset >= emptyFrom) offset else minOf(size, offset + minOf(limit, maxPage))
-            val items = (offset until end).map { PlaylistItem(track = Track(uri = "spotify:track:$it", name = "T$it")) }
-            return Playlist(uri = uri, name = "P", offset = offset, total = size, items = items)
+            return PlaylistUris(total = size, offset = offset, uris = (offset until end).map { "spotify:track:$it" })
         }
     }
 
     @Test
-    fun aPlaylistIsPagedThroughInLargePages() = runTest {
-        val fake = FakePlaylist(1_234)
+    fun aWholePlaylistsUrisComeInOneRequest() = runTest {
+        // URIs only: the largest playlist is one small request when the server answers it whole.
+        val full = FakePlaylist(PLAYLIST_MAX_ITEMS)
+        val paged = pagePlaylist("spotify:playlist:p", full::page)
+        assertEquals(1, full.requests)
+        assertEquals(PLAYLIST_MAX_ITEMS, paged.total)
+        assertEquals((0 until PLAYLIST_MAX_ITEMS).map { t(it) }, paged.items)
+    }
+
+    @Test
+    fun aPlaylistIsPagedThroughTheServersWindows() = runTest {
+        val fake = FakePlaylist(1_234, maxPage = 500)
         val paged = pagePlaylist("spotify:playlist:p", fake::page)
         assertEquals(3, fake.requests)
         assertEquals(1_234, paged.total)
         assertEquals((0 until 1_234).map { t(it) }, paged.items)
+        // Each request asks for what is still wanted.
+        assertEquals(listOf(PLAYLIST_MAX_ITEMS, PLAYLIST_MAX_ITEMS - 500, PLAYLIST_MAX_ITEMS - 1_000), fake.limits)
     }
 
     @Test
@@ -107,25 +125,41 @@ class PlaylistAddTest {
         val paged = pagePlaylist("spotify:playlist:p", huge::page)
         assertEquals(PLAYLIST_MAX_ITEMS, paged.items.size)
         assertEquals(25_000, paged.total)
-        assertEquals(PLAYLIST_MAX_ITEMS / ADD_PAGE_SIZE, huge.requests)
-        assertTrue(huge.limits.all { it <= ADD_PAGE_SIZE })
-        // A server answering short pages: still bounded.
+        assertEquals(1, huge.requests)
+        // A server answering windows of 100: 10,000 items in 100 small requests, and no more.
         val short = FakePlaylist(25_000, maxPage = 100)
         val shortPaged = pagePlaylist("spotify:playlist:p", short::page)
-        assertEquals(ADD_MAX_PAGES, short.requests)
-        assertEquals(ADD_MAX_PAGES * 100, shortPaged.items.size)
-        // The last page asks for no more than is wanted.
-        val capped = FakePlaylist(1_000)
+        assertEquals(PLAYLIST_MAX_ITEMS, shortPaged.items.size)
+        assertEquals(PLAYLIST_MAX_ITEMS / 100, short.requests)
+        assertTrue(short.requests <= ADD_MAX_PAGES)
+        // Even shorter windows stop at the bound.
+        val tiny = FakePlaylist(25_000, maxPage = 10)
+        assertEquals(ADD_MAX_PAGES * 10, pagePlaylist("spotify:playlist:p", tiny::page).items.size)
+        assertEquals(ADD_MAX_PAGES, tiny.requests)
+        // The last request asks for no more than is wanted.
+        val capped = FakePlaylist(1_000, maxPage = 500)
         assertEquals(700, pagePlaylist("spotify:playlist:p", capped::page, maxItems = 700).items.size)
-        assertEquals(listOf(500, 200), capped.limits)
+        assertEquals(listOf(700, 200), capped.limits)
     }
 
     @Test
     fun anEmptyPageBeforeTheEndStopsThePaging() = runTest {
-        val broken = FakePlaylist(2_000, emptyFrom = 500)
+        val broken = FakePlaylist(2_000, maxPage = 500, emptyFrom = 500)
         val paged = pagePlaylist("spotify:playlist:p", broken::page)
         assertEquals(2, broken.requests)
         assertEquals(500, paged.items.size)
         assertEquals(2_000, paged.total)
+    }
+
+    @Test
+    fun theUriOnlyAnswerDecodes() {
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val page = json.decodeFromString(
+            PlaylistUris.serializer(),
+            """{"total":3,"revision":"ab","offset":1,"uris":["spotify:track:a","spotify:local:x:y:z:1"],"uids":["dead",null]}""",
+        )
+        assertEquals(3, page.total)
+        assertEquals(listOf("spotify:track:a", "spotify:local:x:y:z:1"), page.uris)
+        assertEquals(listOf("dead", null), page.uids)
     }
 }

@@ -537,6 +537,7 @@ crosses the JNI boundary and is never logged.
 | `catalog.album` | `{"uri"}` | `Album` (with tracks) |
 | `catalog.artist` | `{"uri"}` | `Artist` |
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
+| `catalog.playlistUris` | `{"uri","offset":0,"limit":10000}` (limit ≤ 10000) | `{"total","revision","offset","uris":[…],"uids":[…]}`: the window's items as stored, without any metadata lookup (URIs keyed as `catalog.playlist` keys its items: tracks and episodes normalised, local files and others as stored; `uids` hex or null). One request for any playlist the server answers whole; for an add's "Already added" check and a whole playlist added to another |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
 | `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. `"partial": true` marks a degraded answer: a requested pathfinder section failed while others answered, or the tracks-only context-resolve answer to a request for other types too; clients show it but must not keep it as the query's answer. A pathfinder answer whose `searchV2` failed (`null` with a GraphQL field error, or every requested section nulled) counts as a failed source; an error inside one item only drops that item. Then searchview is asked, and context-resolve only when tracks were requested (it finds nothing else); if they fail (or do not apply) the call fails instead of returning "no results". "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
 | `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
@@ -1498,11 +1499,12 @@ until `total`; an empty page before `total` is an error, not the end. Library mu
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
 app scope, so they complete even if their screen closes. "Add to playlist" (a song, an episode,
 an album's tracks, another playlist's items — "Add to other playlist") lists the playlist picked
-first (`catalog.playlist` pages of 500, at most 41 requests; a source playlist the same way, at
-most 10,000 items): items already in it get Spotify's "Already added" question (one item, or
-none new: Add anyway / Don't add; some new: Add new ones / Add anyway / Cancel), and an add
-stops at a playlist's 10,000-item limit, the snackbar saying how many went in. When the listing
-fails, everything is added as asked. Saved/liked state is cached in
+first, item URIs only (`catalog.playlistUris`: one request when the server answers the whole
+list, at most 101; a source playlist the same way, at most 10,000 items; bounded at 20 s): items
+already in it get Spotify's "Already added" question (one item, or none new: Add anyway / Don't
+add; some new: Add new ones / Add anyway / Cancel), and an add stops at a playlist's
+10,000-item limit, the snackbar saying how many went in. When the listing can't complete, the
+user is asked whether to add anyway (never a silent duplicate); offline, the add says so. Saved/liked state is cached in
 memory (LRU) and looked up via `library.contains` (batched). It is unknown until looked up: a
 failed lookup (offline, the session still connecting, a network error) stays unknown, never
 "not saved", and is looked up again when the session comes online (with backoff if it fails
