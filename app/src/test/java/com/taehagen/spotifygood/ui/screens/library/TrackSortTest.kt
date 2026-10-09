@@ -6,6 +6,10 @@ import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.PlaylistItem
 import com.taehagen.spotifygood.model.ShowRef
 import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.model.TrackProvider
+import com.taehagen.spotifygood.model.PlaybackTrack
+import com.taehagen.spotifygood.model.PlaybackStatus
+import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.playback.EngineReach
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -127,12 +131,15 @@ class TrackSortTest {
 
     @Test
     fun theSortedListIsCurrentOnlyWithoutACatalogContext() {
-        val sent = setOf("spotify:track:a")
-        assertTrue(isSortedPlayback("spotify:track:a", null, sent))
-        assertTrue(isSortedPlayback("spotify:track:a", "spotify:internal:tracks", sent))
-        assertFalse("played from its album", isSortedPlayback("spotify:track:a", "spotify:album:x", sent))
-        assertFalse(isSortedPlayback("spotify:track:a", "spotify:user:me:collection", sent))
-        assertFalse(isSortedPlayback("spotify:track:z", null, sent))
+        val key = ListSortStore.LIKED_SONGS
+        val sent = SortedPlays.Entry(key, listOf("spotify:track:a"), generation = 0)
+        fun current(track: String, context: String?) =
+            isListPlaying(key, "spotify:user:me:collection", ListPlayback(trackUri = track, contextUri = context), sent)
+        assertTrue(current("spotify:track:a", null))
+        assertTrue(current("spotify:track:a", "spotify:internal:tracks"))
+        assertFalse("played from its album", current("spotify:track:a", "spotify:album:x"))
+        assertFalse("another user's collection", current("spotify:track:a", "spotify:user:other:collection"))
+        assertFalse(current("spotify:track:z", null))
     }
 
     @Test
@@ -186,17 +193,79 @@ class TrackSortTest {
         assertEquals(SortedStart.Nothing, planSortedPlay(emptyList(), null, EngineReach.ONLINE, emptySet()))
     }
 
+    // ---- round 22: one precise "is this list playing" for the Play/Pause button -----------------
+
+    private val playlistKey = ListSortStore.playlist("spotify:playlist:p")
+    private val order = listOf("t1", "t2", "t3", "t4")
+    private val entry = SortedPlays.Entry(playlistKey, order, generation = 0)
+
+    private fun playing(track: String, context: String? = null, next: String? = null, previous: String? = null, shuffle: Boolean = false) =
+        ListPlayback(trackUri = track, contextUri = context, isPlaying = true, shuffle = shuffle, next = next, previous = previous)
+
     @Test
-    fun aReopenedPageKnowsItsSortedListIsPlaying() {
-        val list = ListSortStore.playlist("spotify:playlist:p")
-        val sent = SortedPlays.Entry(list, setOf("spotify:track:a", "spotify:track:b"), generation = 0)
-        // The page's own view model is new: what was sent comes from the kept entry.
-        val uris = sortedListUris(list, sent) { error("not needed") }
-        assertTrue(isSortedPlayback("spotify:track:b", null, uris))
-        // Another list played sorted last: not this one.
-        assertEquals(emptySet<String>(), sortedListUris(ListSortStore.LIKED_SONGS, sent) { listOf("spotify:track:b") })
-        // Nothing recorded (a new process): the shown list counts.
-        assertTrue(isSortedPlayback("spotify:track:b", null, sortedListUris(list, null) { listOf("spotify:track:b") }))
+    fun theListsOwnContextIsItInAnyOrder() {
+        // Shuffle, started before the sort, from another device: the playlist context plays.
+        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("x", "spotify:playlist:p", shuffle = true), last = null))
+        assertTrue(isListPlaying(ListSortStore.LIKED_SONGS, "spotify:user:me:collection", playing("x", "spotify:user:me:collection"), null))
+        assertFalse(isListPlaying(playlistKey, "spotify:playlist:p", playing("t2", "spotify:album:a"), entry))
+    }
+
+    @Test
+    fun theTrackListStartedForItWhileStillThatLoad() {
+        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t2", next = "t3", previous = "t1"), entry))
+        // A track list's context placeholder (spotify:web-api) is no catalog context.
+        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t2", "spotify:web-api", next = "t3"), entry))
+        // The end of the window: autoplay next (not a context track), compare the previous one.
+        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t4", previous = "t3"), entry))
+        // Repeat-all wraps to the first.
+        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t4", next = "t1"), entry))
+        // Shuffled: the next is any of its tracks.
+        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t2", next = "t4", shuffle = true), entry))
+    }
+
+    @Test
+    fun anotherContextLessPlayOfOneOfItsSongsIsNotIt() {
+        // Downloads > Songs played t2 within its own section: other neighbours.
+        assertFalse(isListPlaying(playlistKey, "spotify:playlist:p", playing("t2", next = "d9", previous = "d1"), entry))
+        // A fresh page, nothing recorded: no fallback to "any shown song".
+        assertFalse(isListPlaying(playlistKey, "spotify:playlist:p", playing("t2", next = "t3"), last = null))
+        // The last such play was another list's.
+        assertFalse(isListPlaying(ListSortStore.LIKED_SONGS, null, playing("t2", next = "t3"), entry))
+    }
+
+    @Test
+    fun offlineLikedSongsDownloadsCountAsLikedSongs() {
+        // Default order offline: the downloads go as a track list (no context), recorded for Liked Songs.
+        val downloads = SortedPlays.Entry(ListSortStore.LIKED_SONGS, listOf("a", "b", "c"), generation = 0)
+        assertTrue(isListPlaying(ListSortStore.LIKED_SONGS, "spotify:user:me:collection", playing("b", next = "c", previous = "a"), downloads))
+    }
+
+    @Test
+    fun theRecordIsDroppedOncePlaybackMovesToAnythingElse() {
+        // Sent, but the previous playback still shows: kept, not landed.
+        val sent = entry.after(playing("old", "spotify:album:x"))
+        assertEquals(entry, sent)
+        val landed = sent!!.after(playing("t1", next = "t2"))!!
+        assertTrue(landed.landed)
+        assertEquals("a stop or a load on its way keeps it", landed, landed.after(ListPlayback()))
+        assertEquals(landed, landed.after(playing("t2", next = "t3")))
+        assertNull("another list", landed.after(playing("t2", next = "zz", previous = "yy")))
+        assertNull("a context", landed.after(playing("t3", "spotify:album:a")))
+    }
+
+    @Test
+    fun theNextAndPreviousAreTheContextsNotTheQueue() {
+        fun t(uri: String, provider: TrackProvider = TrackProvider.CONTEXT) = PlaybackTrack(uri = uri, provider = provider)
+        val snapshot = PlaybackSnapshot(
+            status = PlaybackStatus.PLAYING,
+            track = t("t2"),
+            nextTracks = listOf(t("q", TrackProvider.QUEUE), t("t3")),
+            prevTracks = listOf(t("t0"), t("t1")),
+        )
+        val playback = snapshot.toListPlayback()
+        assertEquals("t3", playback.next)
+        assertEquals("t1", playback.previous)
+        assertEquals(ListPlayback(), PlaybackSnapshot().toListPlayback())
     }
 
     @Test

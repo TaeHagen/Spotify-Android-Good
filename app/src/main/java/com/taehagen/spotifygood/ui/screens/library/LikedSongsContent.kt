@@ -307,7 +307,7 @@ private fun LikedActions(
         }
         Spacer(Modifier.size(8.dp))
         PlayFab(
-            isPlaying = state.nowPlaying.isPlayingContext(state.contextUri) || (state.sortedListIsCurrent && state.nowPlaying.isPlaying),
+            isPlaying = state.listIsCurrent && state.nowPlaying.isPlaying,
             onClick = onPlay,
         )
     }

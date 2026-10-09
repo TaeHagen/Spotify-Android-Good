@@ -113,6 +113,32 @@ internal object SleepSchedule {
      * its last sample: the media time left takes `left / speed` at [speed] (a podcast speed; one
      * that is not positive and finite counts as 1x).
      */
+    /**
+     * Whether the playing item ([uri], [uid] at [positionMs]) still is the one "end of track" waits
+     * for, last seen as [lastUri] / [lastUid] at [lastPositionMs] (extrapolated to now). Its uri
+     * names it: the engine re-makes the uid of the same item while it plays on (a hand-off to the
+     * offline queue, `o<i>`; a Spirc restore's queue and suggestion uids), so a changed uid only
+     * means another item when the position also starts over (it went back by more than
+     * [toleranceMs]): repeat-one, or the same track reached again in the queue. The same uid going
+     * back is a seek.
+     */
+    fun sameItem(
+        lastUri: String,
+        lastUid: String,
+        lastPositionMs: Long,
+        uri: String,
+        uid: String,
+        positionMs: Long,
+        toleranceMs: Long = RESTART_TOLERANCE_MS,
+    ): Boolean = when {
+        uri != lastUri -> false
+        uid == lastUid -> true
+        else -> positionMs >= lastPositionMs - toleranceMs
+    }
+
+    /** How far back a re-made uid's position may go and still be the same item ([sameItem]). */
+    const val RESTART_TOLERANCE_MS = 5_000L
+
     fun trackEndsAt(now: Long, durationMs: Long, positionMs: Long, speed: Double = 1.0, marginMs: Long = SleepTimer.END_MARGIN_MS): Long {
         val rate = speed.takeIf { it > 0 && it.isFinite() } ?: 1.0
         val left = ((durationMs - positionMs).coerceAtLeast(0) / rate).toLong()
@@ -170,19 +196,34 @@ class SleepTimer(
 
     fun endOfTrack() {
         launch(SleepTimerState.EndOfTrack) {
-            val first = playback.snapshot.value.track ?: return@launch
-            val key = first.uid.ifEmpty { first.uri }
+            val first = playback.snapshot.value
+            val uri = first.track?.uri ?: return@launch
+            // The item as last seen: its uri names it, the uid and position tell a restart of
+            // the same uri from the same item with a re-made uid (SleepSchedule.sameItem).
+            var last = first
             playback.snapshot.transformLatest { s ->
+                val previous = last
+                last = s
                 val track = s.track
-                if (track == null || track.uid.ifEmpty { track.uri } != key || s.status == PlaybackStatus.STOPPED) {
+                if (track == null || track.uri != uri || s.status == PlaybackStatus.STOPPED) {
                     // The track ended (or was skipped) before we could pause right at its end.
                     emit(Unit)
                     return@transformLatest
                 }
                 if (!s.isPlaying) {
-                    // Paused (manually) mid-fade: restore the gain, no wake-up until it resumes.
+                    // Paused (manually) mid-fade: restore the gain, no wake-up until it resumes. A
+                    // uid re-made meanwhile (a hand-off, a restore) does not end the wait.
                     setFade(1f)
                     disarm()
+                    return@transformLatest
+                }
+                val now = System.currentTimeMillis()
+                val previousTrack = previous.track
+                if (previousTrack != null &&
+                    !SleepSchedule.sameItem(previousTrack.uri, previousTrack.uid, previous.positionAt(now), track.uri, track.uid, s.positionAt(now))
+                ) {
+                    // The same uri again from the start (repeat-one, queued twice): the item ended.
+                    emit(Unit)
                     return@transformLatest
                 }
                 val durationMs = s.durationMs.takeIf { it > 0 } ?: track.durationMs ?: return@transformLatest

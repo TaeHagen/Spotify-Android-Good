@@ -211,13 +211,12 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   every 5 s instead, for at most 60 s after the loss (a suspended mobile network keeps the AP
   socket open, so librespot alone would notice only after its 80 s keep-alive). A load of
   downloads without a network ends that wait at once (the session goes offline without a
-  restore point, see §4.6). When the session goes away while this device plays or paused a
-  downloaded track (or a streamed one whose data is all in the Player), and its playback is meant
-  to come back (without a network, a dead session, an AP connection that stopped answering), or
-  Offline mode is turned on, that playback is not paused and frozen for the reconnect but handed
-  to the OfflineController (§4.6), which hands back to the new Spirc at the end of its window; any
-  other local playback is frozen and restored through Spirc. A dead Player while visible always
-  rebuilds Player and Spirc. The network changes when it comes back, or when Android makes
+  restore point, see §4.6). When the session goes away without a network, or Offline mode is
+  turned on, while this device plays or paused a downloaded track, that playback is not frozen
+  for the reconnect but handed to the OfflineController (§4.6); a session that dies while the
+  network is up is frozen and restored through Spirc (the phone stays the active Connect device,
+  autoplay and smart shuffle go on, a user load on its way is replayed). A dead Player while
+  visible always rebuilds Player and Spirc. The network changes when it comes back, or when Android makes
   another network the default while one stays available (the `network` handle of
   `session.setNetworkAvailable` changes, e.g. a Wi-Fi without internet stays connected and
   mobile data takes over: the sockets librespot opened on the Wi-Fi stay bound to it and fail
@@ -225,9 +224,9 @@ URIs (`spotify:track:<base62>`). Image URLs are absolute (`https://i.scdn.co/ima
   session that reads invalid reconnects at once; after an outage of more than 5 s (or another
   default network) the AP connection must first answer a Mercury request within 5 s: a
   connection that still answers is kept (a tunnel usually leaves the AP socket alive, and
-  downloads and a full buffer play on through the check), else the session reconnects (restoring
-  local playback as above; if the network went again meanwhile, the network-loss grace decides
-  instead). A shorter outage is taken as survived. Backoff
+  downloads and a full buffer play on through the check), else the session reconnects (local
+  playback frozen and restored through Spirc; if the network went again meanwhile, the
+  network-loss grace decides instead). A shorter outage is taken as survived. Backoff
   1→60 s, reset once a connection stayed up 60 s (or when the network changes), so a
   connection that drops right after connecting keeps backing off; at most one attempt in
   flight; no attempts while the network is known to be down. At most 10 attempts per
@@ -358,10 +357,9 @@ loaded as a list; a push to another device sends it after the window too.
 A streamed current track is frozen for the reconnect as before (§8), unless its data is all in
 the Player (the vendored `Player::fully_buffered`): it plays on to its end, then the downloaded
 tracks after it, and it isn't loaded again offline (the window around it is the downloads only).
-The same hand-off happens when a reconnect is needed while the network is up (the session died,
-or its AP connection stopped answering after an outage, §4.2): the music doesn't stop for the new
-login, the first cluster and the context resolve, and the queue hands back to the new Spirc at
-its window's end. Other playback is frozen for such a reconnect and restored through Spirc.
+Any playback is frozen when the session dies while the network is up (the reconnect follows
+within seconds, and the restore keeps it in Spotify Connect): the hand-off is only for a session
+lost without a network. A connection that survived an outage isn't torn down at all (§4.2).
 The OfflineController notices a Player whose thread died: the queue stops where it was (so its
 snapshot no longer shows playing), and the next control starts a new Player (a play loads the
 track there again at that position). A paused or finished
@@ -1303,7 +1301,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   allow-while-idle quota). A timer ending within 10 min while a remote device plays also holds the
   wake lock from the start (honoured outside Doze). "End of track" arms the snapshot's track end (the media time left
   divided by the snapshot's speed: an episode at a podcast speed ends sooner or later in wall
-  time) and re-arms on every snapshot (a speed change publishes one). Disarmed on cancel, replace, finish and manual pause (end of track).
+  time) and re-arms on every snapshot (a speed change publishes one). The item it waits for is
+  its uri (`SleepSchedule.sameItem`): the engine re-makes the uid of the same item while it plays
+  on (a hand-off to the offline queue, `o<i>`; a Spirc restore's queue and suggestion uids), so
+  a new uid ends the wait only when the position also starts over (back by more than 5 s:
+  repeat-one, the same track reached again), and never while paused. Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
 
@@ -1443,6 +1445,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   that stopped after getting somewhere is tried again after 5 min; a stopped move restarts from its
   row in Settings > Storage, also for the same location. The cover maps and the session
   artwork follow the moved covers at once.
+  The engine-start index snapshot reads the rows before a switch may run: a stale path it pushes
+  is superseded natively by the switch's later-numbered `offline.add`, and it fails a download
+  whose file it found gone only under the lock the switch takes, only while the row still names
+  the file it checked (same path and `completedAt`) and the file is still gone, and never while a
+  move runs (the next start checks again).
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
 * A card that is removed or unmounted (the system's media broadcasts): its downloads stay COMPLETED
@@ -1612,12 +1619,17 @@ plain-list rule of §4.6 (`planListPlay`), since a track list loaded while the s
 goes to the offline queue: a tapped song that is downloaded plays the list's downloads from
 exactly there, one that isn't is sent alone while connecting ("not available offline" offline,
 never the next download); Play plays the list's downloads from the first. Liked Songs rows that
-can't start then are dimmed, as on playlists. The last sorted play (its list and URIs) is kept for
-the session outside the page, so a reopened page's Play button still toggles (resumes) it while
-one of its tracks plays with no catalog context; in a new process, a context-less play of one of
-the shown songs counts. The default order keeps the context load (Connect shows the playlist),
-and Shuffle always loads the context, its order doesn't matter. Offline, the downloaded rows sort
-the same way and already play as a track list. Likes and unlikes made in the app
+can't start then are dimmed, as on playlists. The Play/Pause button of Liked Songs and a playlist
+toggles when the list is what plays (`isListPlaying`), else starts it: its own context in any order
+(Shuffle, started before a sort, from Auto or another device), or the last track list the app
+started for it (a sorted order, Liked Songs' downloads offline). That list (its key and tracks, in
+order) is kept for the session outside the page, so a reopened page still knows it, and counts
+only while playback is still that load: the current track is in it and, unless shuffled, the
+context's next (else previous) track is its neighbour there; it is dropped once playback moved to
+anything else. A context-less play of one of its songs from elsewhere (Downloads, a single track,
+another client) is not it. The default order keeps the context load (Connect shows the
+playlist), and Shuffle always loads the context, its order doesn't matter. Offline, the
+downloaded rows sort the same way and already play as a track list. Likes and unlikes made in the app
 (`LibraryEdit.LikedTracks`) patch a fully loaded Liked Songs (unliked songs dropped, liked ones
 looked up and put first, then sorted again) instead of paging it all again; other library edits
 don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet reloads.

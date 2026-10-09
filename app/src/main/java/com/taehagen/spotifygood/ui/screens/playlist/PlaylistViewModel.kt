@@ -43,14 +43,15 @@ import com.taehagen.spotifygood.ui.screens.album.searchText
 import com.taehagen.spotifygood.ui.screens.album.searchTokens
 import com.taehagen.spotifygood.ui.screens.album.statesFor
 import com.taehagen.spotifygood.ui.screens.library.explicitFilterChanges
-import com.taehagen.spotifygood.ui.screens.library.sortedListUris
+import com.taehagen.spotifygood.ui.screens.library.ListPlayback
+import com.taehagen.spotifygood.ui.screens.library.listPlaybackFlow
 import com.taehagen.spotifygood.ui.screens.library.planSortedPlay
 import com.taehagen.spotifygood.ui.screens.library.SortedStart
 import com.taehagen.spotifygood.ui.screens.library.SortedPlays
 import com.taehagen.spotifygood.ui.screens.library.sortedPlayRequest
 import com.taehagen.spotifygood.ui.screens.library.sortOrder
 import com.taehagen.spotifygood.ui.screens.library.sortKey
-import com.taehagen.spotifygood.ui.screens.library.isSortedPlayback
+import com.taehagen.spotifygood.ui.screens.library.isListPlaying
 import com.taehagen.spotifygood.ui.screens.library.attempt
 import com.taehagen.spotifygood.ui.screens.library.TrackSort
 import com.taehagen.spotifygood.ui.screens.library.ListSortStore
@@ -152,8 +153,11 @@ internal data class PlaylistUiState(
     val filterExplicit: Boolean = false,
     /** The chosen order (not applied in edit mode, which shows the playlist's own). */
     val sort: TrackSort = TrackSort.CUSTOM,
-    /** What plays is this sorted list (playing or paused), also when started before the page reopened. */
-    val sortedListIsCurrent: Boolean = false,
+    /**
+     * What plays is this playlist (playing or paused): its context in any order, or the sorted track
+     * list started for it, also before the page was reopened ([isListPlaying]).
+     */
+    val listIsCurrent: Boolean = false,
 )
 
 @Immutable
@@ -223,8 +227,14 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         .map { load -> load.dataOrNull()?.rows?.mapNotNullTo(HashSet()) { it.item.uri } ?: emptySet() }
         .distinctUntilChanged()
 
-    private val core: Flow<CoreState> = combine(data, listUi, paging, editMode, combine(sort, SortedPlays.last, ::Pair)) { load, list, paging, editing, (sort, last) ->
-        CoreState(load, list, paging, editing, sort, last)
+    private val core: Flow<CoreState> = combine(
+        data,
+        listUi,
+        paging,
+        editMode,
+        combine(sort, SortedPlays.last, graph.listPlaybackFlow(), ::Triple),
+    ) { load, list, paging, editing, (sort, last, listPlayback) ->
+        CoreState(load, list, paging, editing, sort, last, listPlayback)
     }
 
     val state: StateFlow<PlaylistUiState> = combine(
@@ -238,11 +248,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             core.load, core.list, core.paging, core.editMode, playback, following, download, rows,
             connectivity.offline, connectivity.online, connectivity.filterExplicit,
             sort = core.sort,
-            sortedListIsCurrent = core.sort != TrackSort.CUSTOM && !core.editMode && isSortedPlayback(
-                playback.trackUri,
-                playback.contextUri,
-                sortedListUris(ListSortStore.playlist(uri), core.lastSorted) { core.list.rows.mapNotNull { it.row.item.uri } },
-            ),
+            listIsCurrent = isListPlaying(ListSortStore.playlist(uri), uri, core.listPlayback, core.lastSorted),
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlaylistUiState())
 
@@ -546,7 +552,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             // reach as of now, after the sort).
             when (val plan = planSortedPlay(uris, startUri, graph.engineReach(), graph.downloads.downloadedUris.value)) {
                 is SortedStart.Load -> {
-                    SortedPlays.record(ListSortStore.playlist(uri), plan.request)
+                    SortedPlays.record(graph, ListSortStore.playlist(uri), plan.request)
                     graph.player.play(plan.request)
                 }
                 SortedStart.NotDownloaded -> message(R.string.playback_error_not_available_offline)
@@ -555,17 +561,15 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         }
     }
 
-    /** Play button: toggles the sorted list started here; sorted, plays it from the top. */
+    /** Play button: toggles this playlist's playback (either form, [isListPlaying]); else starts it. */
     override fun playContext() {
-        if (!sorted) {
-            super.playContext()
-            return
-        }
-        // Also after the page was reopened (the last sorted play is kept outside it).
-        if (state.value.sortedListIsCurrent) {
-            graph.player.togglePlayPause()
-        } else {
-            playSorted(startUri = null)
+        // This playlist plays: its context in any order (Shuffle, started before the sort, another
+        // device) or a sorted list started for it, also after the page was reopened: toggle it.
+        // Otherwise start it, sorted or as its context.
+        when {
+            state.value.listIsCurrent || currentPlayback().isContext(uri) -> graph.player.togglePlayPause()
+            sorted -> playSorted(startUri = null)
+            else -> super.playContext()
         }
     }
 
@@ -723,6 +727,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val editMode: Boolean,
         val sort: TrackSort,
         val lastSorted: SortedPlays.Entry?,
+        val listPlayback: ListPlayback,
     )
 
     private data class ListInput(val playlist: PlaylistData?, val query: String, val sort: TrackSort)
