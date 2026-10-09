@@ -9,8 +9,11 @@ import androidx.compose.ui.platform.LocalContext
 import com.taehagen.spotifygood.App
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.data.PlaylistAddChoice
+import com.taehagen.spotifygood.data.PlaylistAddPlan
 import com.taehagen.spotifygood.data.Resource
 import com.taehagen.spotifygood.data.dataOrNull
+import com.taehagen.spotifygood.data.planPlaylistAdd
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import com.taehagen.spotifygood.playback.EngineReach
@@ -130,12 +133,74 @@ internal class MediaActionRunner(
         }
     }
 
+    /**
+     * "Add to playlist" of a whole collection (an album, a playlist): its items ([resolve], fetched
+     * here so the sheet can close at once) go to the playlist picker, which leaves [excludeUri]
+     * (the playlist itself) out.
+     */
+    fun pickPlaylistFor(excludeUri: String? = null, resolve: suspend () -> List<String>) {
+        launch {
+            val uris = resolve()
+            if (uris.isEmpty()) message(R.string.shell_msg_nothing_to_add) else navigator?.addToPlaylist(uris, excludeUri)
+        }
+    }
+
+    /**
+     * Adds [uris] to the playlist [playlistUri] ([playlistName]), as Spotify does: it looks at what
+     * the playlist holds first (bounded; when that fails everything is added, the server keeping its
+     * own limit), asks "Already added" when some are in it already
+     * ([AppNavigator.confirmPlaylistAdd]), and stops at the playlist's item limit.
+     */
+    fun addToPlaylist(playlistUri: String, playlistName: String, uris: List<String>) {
+        if (uris.isEmpty()) return
+        launch {
+            val contents = try {
+                withTimeoutOrNull(CONTENTS_TIMEOUT_MS) { graph.playlists.contents(playlistUri) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Items of $playlistUri unavailable", e)
+                null
+            }
+            val plan = planPlaylistAdd(uris, contents)
+            val nav = navigator
+            when {
+                plan.asks && nav != null -> nav.confirmPlaylistAdd(PlaylistAddPrompt(playlistUri, playlistName, plan))
+                // Nobody to ask: no silent duplicates.
+                else -> sendPlaylistAdd(playlistUri, playlistName, plan, if (plan.asks) PlaylistAddChoice.NEW_ONES else PlaylistAddChoice.ALL)
+            }
+        }
+    }
+
+    /** The user's answer to "Already added" ([prompt]): [choice] is sent. */
+    fun addToPlaylist(prompt: PlaylistAddPrompt, choice: PlaylistAddChoice) {
+        launch { sendPlaylistAdd(prompt.playlistUri, prompt.playlistName, prompt.plan, choice) }
+    }
+
+    /** Sends [choice] of [plan] and says what was added (all of it, part of it for the limit, or none: full). */
+    private suspend fun sendPlaylistAdd(playlistUri: String, playlistName: String, plan: PlaylistAddPlan, choice: PlaylistAddChoice) {
+        when (val outcome = playlistAddOutcome(plan, choice)) {
+            PlaylistAddOutcome.Nothing -> Unit
+            PlaylistAddOutcome.Full -> message(R.string.shell_msg_playlist_full, playlistName)
+            is PlaylistAddOutcome.Send -> {
+                graph.playlists.addItems(playlistUri, outcome.items)
+                if (outcome.left == 0) {
+                    message(R.string.shell_msg_added_to_playlist, playlistName)
+                } else {
+                    message(R.string.shell_msg_added_some_to_playlist, outcome.items.size, outcome.items.size + outcome.left, playlistName)
+                }
+            }
+        }
+    }
+
     fun setSaved(uri: String, saved: Boolean, addedRes: Int, removedRes: Int) =
         launch(if (saved) addedRes else removedRes) { graph.library.setSaved(listOf(uri), saved) }
 
     companion object {
         private const val TAG = "MediaActions"
         private const val LOAD_TIMEOUT_MS = 20_000L
+        /** Longest look at what a playlist holds before an add (then it adds without). */
+        private const val CONTENTS_TIMEOUT_MS = 20_000L
 
         /** First non-loading value of a stale-while-revalidate flow (cached data if offline). */
         suspend fun <T> Flow<Resource<T>>.awaitData(): T? = withTimeoutOrNull(LOAD_TIMEOUT_MS) {
