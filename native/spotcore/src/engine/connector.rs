@@ -210,17 +210,23 @@ async fn stop_spirc(session: &Session, spirc: &Arc<Spirc>, mut task: JoinHandle<
     }
 }
 
-/// Whether a teardown hands downloaded playback to the OfflineController (see
-/// [`keep_playing_offline`]): only without a network. A session that dies while the network is up
-/// reconnects within seconds and is restored through Spirc (full context, Connect state).
-fn hands_off(restore: bool, network_available: bool) -> bool {
-    restore && !network_available
+/// Whether a teardown offers this device's playback to the OfflineController (see
+/// [`keep_playing_offline`]): whenever the playback is meant to come back (`restore`), with or
+/// without a network. A stop, a logout or offline mode doesn't restore (offline mode hands off by
+/// itself).
+fn hands_off(restore: bool) -> bool {
+    restore
 }
 
-/// No network: this device's downloaded playback goes on in the OfflineController instead of
-/// being frozen for the reconnect (decided before anything pauses the Player).
+/// A downloaded or fully buffered track this device plays (or paused) goes on in the
+/// OfflineController instead of being paused and frozen for the reconnect (decided before
+/// anything pauses the Player, `connect::hand_off_to_offline`). Without a network that is the
+/// only way it goes on. With one, a reconnect is still needed sometimes (the session died, or its
+/// AP connection stopped answering after an outage), and the music must not stop for the new
+/// login, first cluster and context resolve: the queue hands back to the new Spirc at the end of
+/// its window. Anything else (a streamed track not all in the Player) is frozen and restored.
 fn keep_playing_offline(live: &Live, restore: bool) -> bool {
-    hands_off(restore, state::network_available()) && connect::hand_off_to_offline(live.generation)
+    hands_off(restore) && connect::hand_off_to_offline(live.generation)
 }
 
 /// Shuts a live connection down. `restore`: remember the local playback for after the
@@ -228,7 +234,7 @@ fn keep_playing_offline(live: &Live, restore: bool) -> bool {
 /// when there is no network (see [`keep_playing_offline`]).
 pub(crate) async fn teardown(live: Live, restore: bool) {
     if keep_playing_offline(&live, restore) {
-        log::info!("the session is lost, the downloads keep playing offline");
+        log::info!("the session goes away: the downloaded or buffered track keeps playing");
     } else if restore {
         connect::prepare_reconnect();
     } else {
@@ -250,7 +256,7 @@ pub(crate) async fn teardown(live: Live, restore: bool) {
 /// Cleans up after the Spirc task ended by itself (lost connection, invalid session).
 pub(crate) async fn teardown_finished(live: Live, restore: bool) {
     if keep_playing_offline(&live, restore) {
-        log::info!("the session is lost, the downloads keep playing offline");
+        log::info!("the session goes away: the downloaded or buffered track keeps playing");
     } else if restore {
         connect::prepare_reconnect();
     } else {
@@ -282,12 +288,12 @@ mod tests {
     use librespot_core::{Error, SessionConfig};
 
     #[test]
-    fn downloads_are_handed_offline_only_without_a_network() {
-        assert!(hands_off(true, false));
-        // the session died with the network up: frozen and restored through Spirc
-        assert!(!hands_off(true, true));
-        // no restore (stop, logout): nothing is kept (offline mode hands off on its own)
-        assert!(!hands_off(false, false));
+    fn playback_meant_to_come_back_is_offered_to_the_offline_queue() {
+        // No network, or a reconnect with the network back (a dead session, an AP connection
+        // that stopped answering): a downloaded or fully buffered track plays on.
+        assert!(hands_off(true));
+        // No restore (stop, logout): nothing is kept (offline mode hands off on its own).
+        assert!(!hands_off(false));
     }
 
     #[tokio::test]

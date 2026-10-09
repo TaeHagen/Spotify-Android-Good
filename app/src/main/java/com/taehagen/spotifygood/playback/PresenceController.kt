@@ -27,7 +27,12 @@ import com.taehagen.spotifygood.engine.HolderType
  * ongoing. The service never leaves the foreground in between, so a remote "play on this phone"
  * can start audio from the background. Main thread only.
  */
-internal class PresenceController(private val service: Service, private val graph: AppGraph) {
+internal class PresenceController(
+    private val service: Service,
+    private val graph: AppGraph,
+    /** The app is visible (a visible app may go foreground although restricted). */
+    private val isAppVisible: () -> Boolean = { false },
+) {
     private val notifications = NotificationManagerCompat.from(service)
     private var holder: EngineHolder? = null
 
@@ -39,13 +44,20 @@ internal class PresenceController(private val service: Service, private val grap
     var isForeground: Boolean = false
         private set
 
+    /**
+     * The system ignored the last presence foreground without a word (a background-restricted
+     * app): the notification updates do not ask again ([showForeground]`(retry = false)`); the
+     * next start of presence ([enable]: the app visible again, the setting) does.
+     */
+    private var ignored = false
+
     /** Enables presence; [showNow] puts the presence notification in the foreground right away. */
     fun enable(showNow: Boolean) {
         if (!isEnabled) {
             isEnabled = true
             if (holder == null) holder = graph.engine.acquire(HolderType.PRESENCE)
         }
-        if (showNow && !isForeground) showForeground()
+        if (showNow && !isForeground) showForeground(retry = true)
     }
 
     /**
@@ -54,6 +66,7 @@ internal class PresenceController(private val service: Service, private val grap
      */
     fun disable(): Boolean {
         isEnabled = false
+        ignored = false
         holder?.release()
         holder = null
         if (!isForeground) return false
@@ -66,11 +79,14 @@ internal class PresenceController(private val service: Service, private val grap
 
     /**
      * Makes the presence notification the foreground notification (`connectedDevice`). Returns
-     * false if the system refused (background start restrictions); presence then waits for the
-     * next time the app is visible.
+     * false if the system refused (background start restrictions, with an exception or, for a
+     * background-restricted app, silently: [PresenceRestore.foregroundTookEffect]); presence then
+     * waits for the next time the app is visible, and holds no engine meanwhile. After a silent
+     * refusal only a [retry] (a new start of presence) asks again, not every notification update.
      */
-    fun showForeground(): Boolean {
+    fun showForeground(retry: Boolean = false): Boolean {
         if (!isEnabled) return false
+        if (ignored && !retry) return false
         ensureChannel()
         return try {
             ServiceCompat.startForeground(
@@ -79,6 +95,17 @@ internal class PresenceController(private val service: Service, private val grap
                 buildNotification(),
                 if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0,
             )
+            if (!tookEffect()) {
+                // Ignored (battery use "Restricted"): no foreground, nothing advertised on Connect
+                // for the minute until the system stops the service. Not up, so the app starts it
+                // again when it is visible.
+                Log.w(TAG, "Presence foreground ignored (background restricted)")
+                ignored = true
+                notForeground()
+                return false
+            }
+            ignored = false
+            if (holder == null) holder = graph.engine.acquire(HolderType.PRESENCE)
             isForeground = true
             PlaybackService.isPresenceForeground = true
             // Up again: the "open the app" notice of a refused restore is moot.
@@ -92,14 +119,36 @@ internal class PresenceController(private val service: Service, private val grap
         } catch (e: IllegalStateException) {
             // ForegroundServiceStartNotAllowedException (API 31+) is an IllegalStateException.
             Log.w(TAG, "Presence foreground not allowed now", e)
-            isForeground = false
-            PlaybackService.isPresenceForeground = false
+            notForeground()
             false
         } catch (e: SecurityException) {
             Log.w(TAG, "Presence foreground refused", e)
-            isForeground = false
-            PlaybackService.isPresenceForeground = false
+            notForeground()
             false
+        }
+    }
+
+    /** The system recorded the presence foreground ([PresenceRestore.foregroundTookEffect]). */
+    private fun tookEffect(): Boolean {
+        val recorded = if (Build.VERSION.SDK_INT >= 29) runCatching { service.foregroundServiceType }.getOrDefault(0) else 0
+        return PresenceRestore.foregroundTookEffect(
+            Build.VERSION.SDK_INT,
+            recorded,
+            PresenceRestore.isBackgroundRestricted(service),
+            isAppVisible(),
+        )
+    }
+
+    /**
+     * Presence is not in the foreground: the flags say so, and no engine is held for it unless
+     * the app is visible (the next start of presence takes it again).
+     */
+    private fun notForeground() {
+        isForeground = false
+        PlaybackService.isPresenceForeground = false
+        if (!isAppVisible()) {
+            holder?.release()
+            holder = null
         }
     }
 

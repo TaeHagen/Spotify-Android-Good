@@ -186,6 +186,9 @@ class SettingsViewModel(private val graph: AppGraph) : ViewModel() {
     val onUnusedCard: StateFlow<Int> = graph.downloads.onUnusedCard
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
 
+    /** Restarts a move of the downloads that stopped. */
+    fun retryMove() = graph.downloads.retryMove()
+
     fun redownloadFromUnusedCard(onDone: (Int?) -> Unit) {
         graph.appScope.launch {
             val notice = runCatching { graph.downloads.redownloadFromUnusedCard().notice }.getOrNull()
@@ -597,14 +600,15 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
                                 else -> R.string.shell_settings_download_moved
                             },
                         ),
-                        summary = relocation.error
+                        summary = relocation.error?.let { stringResource(R.string.shell_settings_download_move_stopped_summary, it) }
                             ?: if (!relocation.moving && relocation.unreadable > 0) {
                                 stringResource(R.string.shell_settings_download_move_unreadable, relocation.unreadable)
                             } else {
                                 stringResource(R.string.shell_settings_download_moving_summary, relocation.moved, relocation.total)
                             },
                         icon = Icons.Rounded.SdCard,
-                        onClick = { navigator.navigate(Route.Downloads) },
+                        // A move that stopped starts again from here, also for the same location.
+                        onClick = { if (relocation.error != null && !relocation.moving) vm.retryMove() else navigator.navigate(Route.Downloads) },
                     )
                 }
             }

@@ -949,9 +949,14 @@ class DownloadManager(
         val target = storage.target.value as? DownloadStorage.Target.Ready ?: return
         val available = storage.availability()
         moveParts(target.root)
-        // Files that failed before go last: one bad file never holds back the rest.
+        // Files whose copy stopped a pass before (an error about the target) go last. Unreadable
+        // originals are never in the plan again: they are downloaded again instead.
         val plan = DownloadRules.orderPlan(DownloadRules.relocationPlan(dao.locatedRows(), target.root.path, available), relocationFailures)
-        if (plan.isEmpty()) return
+        if (plan.isEmpty()) {
+            // Nothing left to move (or only what waits for a card): no stale "stopped" notice.
+            if (_relocation.value.error != null) _relocation.value = DownloadRelocation()
+            return
+        }
         Log.i(TAG, "Moving ${plan.size} download files to ${target.root}")
         // Under the commit lock, which garbage collection holds while it runs: it never sees a copy
         // that no row names yet.
@@ -959,14 +964,20 @@ class DownloadManager(
         _relocation.value = DownloadRelocation(moving = true, moved = 0, total = plan.size)
         var moved = 0
         var unreadable = 0
+        var copied = 0
+        // Whether the old card is failing as a whole (not a cluster of damaged files).
+        val health = SourceHealth()
         try {
             for (batch in plan.chunked(RELOCATE_BATCH)) {
                 if (storage.target.value != target) return // changed again: the next pass moves there
-                // The copies made before a stop (no space, an error about the target) are switched all
-                // the same; a damaged original is skipped and downloaded again.
+                // The copies made before a stop (no space, an error about the target, the card gone or
+                // failing) are switched all the same; a damaged original is skipped and downloaded again.
                 copyThenSwitch(
                     batch,
-                    copy = { move -> withContext(Dispatchers.IO) { copyMove(move) } },
+                    copy = { move ->
+                        withContext(Dispatchers.IO) { copyMove(move, health) }
+                        copied++
+                    },
                     onDone = {
                         moved++
                         _relocation.value = DownloadRelocation(moving = true, moved = moved, total = plan.size, unreadable = unreadable)
@@ -977,6 +988,7 @@ class DownloadManager(
                         unreadable += damaged.count { !it.image }
                     },
                     onFailed = { move -> relocationFailures += move.from },
+                    cardFailing = { health.failing },
                 )
             }
             _relocation.value = DownloadRelocation(moved = moved, total = plan.size, unreadable = unreadable)
@@ -986,9 +998,17 @@ class DownloadManager(
         } catch (e: NoSpaceException) {
             Log.w(TAG, "Moving downloads stopped: not enough space at ${e.dir}")
             _relocation.value = DownloadRelocation(moved = moved, total = plan.size, error = appContext.getString(R.string.data_dl_move_no_space), unreadable = unreadable)
+        } catch (e: CardGoneException) {
+            // Resumes when the card is mounted again (onVolumesChanged), or from Settings.
+            Log.w(TAG, "Moving downloads stopped: ${e.message}")
+            _relocation.value = DownloadRelocation(moved = moved, total = plan.size, error = appContext.getString(R.string.data_dl_move_card_gone), unreadable = unreadable)
         } catch (e: IOException) {
             Log.w(TAG, "Moving downloads stopped; retried later", e)
-            _relocation.value = DownloadRelocation(moved = moved, total = plan.size, error = appContext.getString(R.string.data_dl_move_failed), unreadable = unreadable)
+            val message = if (e is CardFailingException) R.string.data_dl_move_card_failing else R.string.data_dl_move_failed
+            _relocation.value = DownloadRelocation(moved = moved, total = plan.size, error = appContext.getString(message), unreadable = unreadable)
+            // A pass that got somewhere is tried again on its own (the files that stopped it last);
+            // one that stopped at once waits for a start, a mount, a change, or Settings.
+            if (copied + unreadable > 0) retryRelocationLater()
         } finally {
             // The damaged ones are queued: download them now.
             if (unreadable > 0) withContext(NonCancellable) { if (dao.pendingCount() > 0) scheduleExecution(kick = true) }
@@ -998,19 +1018,45 @@ class DownloadManager(
     /** Sources whose move failed in this process (unreadable, or a copy that stopped a pass): moved last. */
     private val relocationFailures: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
 
+    @Volatile private var relocateRetry: Job? = null
+
+    /** Tries the move again a while after a pass that stopped on its way. */
+    private fun retryRelocationLater() {
+        relocateRetry?.cancel()
+        relocateRetry = scope.launch {
+            delay(RELOCATE_RETRY_MS)
+            relocate()
+        }
+    }
+
     /**
-     * Blocking. Copies one file of a move ([copyVerified]). An original that cannot be read while its
-     * location is still there is a damaged file ([SourceUnreadableException]: skipped); when the
-     * card itself went (removed meanwhile) the move stops instead, and resumes when it is back.
+     * Restarts a move that stopped (Settings > Storage), also for the same location: whatever is
+     * still not on the chosen location is moved, a damaged original downloaded again.
      */
-    private fun copyMove(move: DownloadRules.FileMove) {
+    fun retryMove() {
+        relocateRetry?.cancel()
+        relocate()
+    }
+
+    /**
+     * Blocking. Copies one file of a move ([copyVerified]) and tells [health] how it went. An
+     * original that cannot be read while its card is there and readable is a damaged file
+     * ([SourceUnreadableException]: skipped, downloaded again); a card that went (unmounted,
+     * removed) or whose folder cannot be read stops the move instead ([CardGoneException]), and it
+     * resumes when the card is back.
+     */
+    private fun copyMove(move: DownloadRules.FileMove, health: SourceHealth) {
         try {
             copyVerified(File(move.from), File(move.to), storage::freeBytes, DownloadRules.MIN_FREE_BYTES)
+            health.copied()
         } catch (e: SourceUnreadableException) {
-            val root = DownloadRules.rootOf(move.from)
-            val there = root != null && storage.locations.isAvailable(root) && File(move.from).parentFile?.isDirectory == true
-            if (!there) throw IOException("The location of ${move.from} went", e)
+            val root = DownloadRules.rootOf(move.from) ?: throw CardGoneException("No location for ${move.from}", e)
+            if (!storage.locations.isAvailable(root)) throw CardGoneException("The location of ${move.from} went", e)
+            if (File(root).list() == null || File(move.from).parentFile?.list() == null) {
+                throw CardGoneException("The folder of ${move.from} cannot be read", e)
+            }
             Log.w(TAG, "Could not read ${move.from}; it is downloaded again", e)
+            health.unreadable()
             throw e
         }
     }
@@ -1959,6 +2005,7 @@ class DownloadManager(
         private const val COVERS_SETTLE_MS = 1_000L
         private const val MOUNT_SETTLE_MS = 500L
         private const val RELOCATE_BATCH = 50
+        private const val RELOCATE_RETRY_MS = 5 * 60_000L
 
         /** Collections that change on other devices (likes, playlist edits). */
         private val REMOTE_TYPES = setOf(CollectionType.LIKED_SONGS.wire, CollectionType.PLAYLIST.wire)
