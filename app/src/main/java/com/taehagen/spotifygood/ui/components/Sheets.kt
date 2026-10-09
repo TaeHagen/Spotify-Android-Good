@@ -34,6 +34,7 @@ import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Album
+import androidx.compose.material.icons.rounded.CheckCircleOutline
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.DownloadForOffline
@@ -54,6 +55,7 @@ import androidx.compose.material.icons.rounded.Podcasts
 import androidx.compose.material.icons.rounded.Public
 import androidx.compose.material.icons.rounded.Radio
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
+import androidx.compose.material.icons.rounded.RemoveDone
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -294,6 +296,9 @@ private fun EpisodeActions(t: MediaActionTarget.EpisodeTarget, s: ActionScope) {
     val episode = t.episode
     val saved by remember(episode.uri) { s.graph.library.isSaved(episode.uri) }.collectAsStateWithLifecycle(null)
     val download by remember(episode.uri) { s.graph.downloads.state(episode.uri) }.collectAsStateWithLifecycle(null)
+    // As its rows show it: this phone's point, else Spotify's state the episode carries.
+    val progress by s.graph.episodeProgress.version.collectAsStateWithLifecycle()
+    val played = remember(episode, progress) { s.graph.episodeProgress.overlay(episode).fullyPlayed == true }
     SheetHeader(
         imageUrl = episode.images.best(160) ?: episode.show?.images?.best(160),
         title = episode.name,
@@ -313,6 +318,14 @@ private fun EpisodeActions(t: MediaActionTarget.EpisodeTarget, s: ActionScope) {
         s.runner.setSaved(episode.uri, !shown, R.string.shell_msg_saved_episode, R.string.shell_msg_removed_episode)
     }
     ItemDownloadAction(episode.uri, download, s)
+    SheetAction(
+        if (played) Icons.Rounded.RemoveDone else Icons.Rounded.CheckCircleOutline,
+        stringResource(if (played) R.string.shell_action_mark_unplayed else R.string.shell_action_mark_played),
+    ) {
+        s.dismiss()
+        s.graph.episodeProgress.markPlayed(episode.uri, played = !played)
+        s.runner.message(if (played) R.string.shell_msg_marked_unplayed else R.string.shell_msg_marked_played)
+    }
     episode.show?.takeIf { it.uri.isNotBlank() }?.let { show ->
         SheetAction(Icons.Rounded.Podcasts, stringResource(R.string.shell_action_go_to_show)) { s.go(Route.Show(show.uri)) }
     }

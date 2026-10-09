@@ -2,6 +2,7 @@ package com.taehagen.spotifygood.playback
 
 import android.util.Log
 import com.taehagen.spotifygood.connect.DevicesRepository
+import com.taehagen.spotifygood.data.StoredPosition
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
@@ -41,7 +42,13 @@ import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 
-/** What to play (maps to `player.load`, docs/ARCHITECTURE.md §6.2). */
+/**
+ * What to play (maps to `player.load`, docs/ARCHITECTURE.md §6.2). [positionAt]: when
+ * [positionMs] dates from (wall time; 0: unknown) for a stored session's position
+ * ([ResumeState.toPlayRequest], a resume item), which an episode's resume point newer than it
+ * overrides ([PlayerController.episodeResume]); null for a position that always holds (a seek, a
+ * chosen start). Not sent to the engine.
+ */
 data class PlayRequest(
     val contextUri: String? = null,
     val trackUris: List<String>? = null,
@@ -53,6 +60,7 @@ data class PlayRequest(
     val smartShuffle: Boolean? = null,
     val repeat: RepeatMode? = null,
     val play: Boolean = true,
+    val positionAt: Long? = null,
 )
 
 /**
@@ -180,13 +188,15 @@ class PlayerController internal constructor(
     @Volatile var environment: PlaybackEnvironment? = null
 
     /**
-     * Where a play of an episode resumes when the request names no position (0), null for none:
-     * decided in one place, just before the load is sent ([withEpisodeResume]) — this phone's
-     * podcast progress, looked up on Spotify first when it may know better
-     * (`EpisodeProgressStore.resumeOrLookUp`, bounded; docs §6.5). A request naming a position (a
-     * resumption, a seek-to load) keeps it. Installed by the app graph.
+     * Where a play of an episode resumes, null for none: decided in one place, just before the load
+     * is sent ([withEpisodeResume]), also for the stored session's loads — this phone's podcast
+     * progress, looked up on Spotify first when it may know better
+     * (`EpisodeProgressStore.resumeOrLookUp`, bounded; docs §6.5). A stored session's position
+     * ([PlayRequest.positionAt], the `stored` argument) wins only when newer than that point; a
+     * request naming any other position (a seek-to load, a chosen start) keeps it. Installed by
+     * the app graph.
      */
-    @Volatile var episodeResume: (suspend (episodeUri: String) -> Long?)? = null
+    @Volatile var episodeResume: (suspend (episodeUri: String, stored: StoredPosition?) -> Long?)? = null
 
     private class Command(
         val name: String,
@@ -660,7 +670,7 @@ class PlayerController internal constructor(
     private suspend fun sendLoad(command: Command) {
         val queued = synchronized(lock) { checkNotNull(command.request) }
         // An episode's start is decided here, not when the play is queued: the lookup comes first.
-        val initial = episodeResume?.let { withEpisodeResume(queued, it) } ?: queued
+        val initial = withEpisodeStart(queued)
         val prepared = prepare(withLoadableContext(keepingModes(initial)))
         val play = synchronized(lock) {
             command.sent = true
@@ -773,10 +783,15 @@ class PlayerController internal constructor(
             method = method,
             call = { m, args -> call(m, args) },
             fallBackOn = { code -> shouldResumeLast(code, snapshot.value.source == PlaybackSource.REMOTE, environment?.reach()) },
-            prepare = ::prepareLoad,
+            // The stored session's episode starts as any play of it does ([episodeResume]).
+            prepare = { prepareLoad(withEpisodeStart(it)) },
             last = lastSession,
         )
     }
+
+    /** [request] starting where [episodeResume] says when it starts at an episode. */
+    private suspend fun withEpisodeStart(request: PlayRequest): PlayRequest =
+        episodeResume?.let { withEpisodeResume(request, it) } ?: request
 
     /**
      * Play after a load that may not have activated this device yet (the engine activates
@@ -941,19 +956,24 @@ class PlayerController internal constructor(
 
     internal companion object {
         /**
-         * [request] starting at [resumeOf]'s position when its start item is an episode and it
-         * names no position (0): every way of starting an episode (a show or episode page, the
-         * downloads, search, Android Auto, voice) resumes where it was left ([episodeResume]).
+         * [request] starting at [resumeOf]'s position when its start item is an episode: every way
+         * of starting an episode (a show or episode page, the downloads, search, Android Auto,
+         * voice, the stored session) resumes where it was left ([episodeResume]). A request naming
+         * a position keeps it, unless it is a stored session's ([PlayRequest.positionAt]), which is
+         * weighed against the episode's point instead (a stored 0 is no position: as none).
+         * [resumeOf] gives null to keep the request's position.
          */
-        suspend fun withEpisodeResume(request: PlayRequest, resumeOf: suspend (String) -> Long?): PlayRequest {
-            if (request.positionMs > 0) return request
+        suspend fun withEpisodeResume(request: PlayRequest, resumeOf: suspend (String, StoredPosition?) -> Long?): PlayRequest {
+            val storedAt = request.positionAt
+            if (request.positionMs > 0 && storedAt == null) return request
             val start = request.startUri
                 ?: request.trackUris?.getOrNull(request.startIndex ?: 0)?.takeIf { request.startUid == null }
                 ?: request.contextUri?.takeIf { request.trackUris == null && request.startUid == null }
                 ?: return request
             if (!start.startsWith(EPISODE_PREFIX)) return request
-            val position = resumeOf(start)?.takeIf { it > 0 } ?: return request
-            return request.copy(positionMs = position)
+            val stored = storedAt?.takeIf { request.positionMs > 0 }?.let { StoredPosition(request.positionMs, it) }
+            val position = resumeOf(start, stored) ?: return request
+            return request.copy(positionMs = position.coerceAtLeast(0))
         }
 
         private const val EPISODE_PREFIX = "spotify:episode:"

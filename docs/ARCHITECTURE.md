@@ -684,8 +684,24 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                or the lookup answers). Tapping the episode that is playing (here or on a Connect
                device) toggles it. Offline, the episode page's Play of an episode that isn't
                downloaded says so (a show load would start another, downloaded one).
+             * The stored session's resumes (Media3 / Bluetooth / Auto resumption, Tap to resume,
+               "play something", the in-app Play fallback) take the same decision: their position
+               carries when it dates from (`ResumeState.positionAt`: the save's time while it
+               played, the snapshot's timestamp when paused — a remote device sitting paused keeps
+               its old one; `PlayRequest.positionAt`), and it plays only when newer than the
+               episode's point (else the point, or the start of a finished episode), after the same
+               lookup when Spotify may know better. Other positions a request names (a seek-to
+               load) are kept.
+             * "Mark as played" / "Mark as unplayed" (the episode sheet, so every row's More and
+               long press, and the episode page's check button): this phone's newest point,
+               finished or 0 (kept as an entry, so no lookup brings an old point back). Spotify's
+               last state stays the reference (an unchanged one keeps the mark, a changed one is
+               news), the Connect marks end, and an answer requested before the mark is ignored.
+               The episode playing while marked keeps the mark until the user seeks in it, it ends,
+               or playback moves on. Not sent to Spotify: no write endpoint for the played state
+               is verified (Pathfinder's operations here are read-only, `catalog/played.rs`).
              Nothing is reported back to Spotify: progress made on this phone, offline above all,
-             is not synced to other devices.
+             and its marks are not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
               "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
@@ -1525,7 +1541,7 @@ normalisation, streaming quality, playlists (view, create, edit, reorder, delete
 follow), Liked Songs, saved albums/artists/podcasts, follow artists, search (all types,
 recent searches), home feed, album/artist/playlist/show/episode pages, podcast resume
 points (this phone's progress, kept on the phone and not synced to other devices; Spotify's
-when its web API provides them, §6.5), lyrics (synced),
+when its web API provides them; mark as played / unplayed, §6.5), lyrics (synced),
 podcast playback speed (0.5×–3.5×, on this phone), radio, share links, deep links, downloads (track/album/playlist/liked/podcast, Wi-Fi only
 option, storage management, auto-sync), offline mode, sleep timer, explicit-content
 filter, system equalizer, settings, adaptive layouts, accessibility (content
