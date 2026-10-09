@@ -482,7 +482,11 @@ impl ContextResolver {
             Some(next) if next.update == ContextType::Default => {
                 next.action == ContextAction::Replace
             }
-            // an autoplay resolve: nothing waits for it
+            // SPOTIFYGOOD: the autoplay resolve of a transfer of an autoplay track (see Spirc's
+            // handle_transfer): the transfer is finished with the default context (see
+            // ConnectState::finish_transfer); it was never finished
+            Some(next) if next.update == ContextType::Autoplay && transfer_state.is_some() => false,
+            // an autoplay resolve: nothing else waits for it
             _ => return false,
         };
 
