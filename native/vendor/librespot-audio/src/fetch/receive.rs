@@ -30,10 +30,48 @@ enum ReceivedData {
     Throughput(usize),
     ResponseTime(Duration),
     Data(PartialFileData),
+    // SPOTIFYGOOD: a request failed: its error status, `None` for a transport error (see
+    // AudioFileFetch::retry_at)
+    Failed(Option<StatusCode>),
 }
 
 const ONE_SECOND: Duration = Duration::from_secs(1);
 const DOWNLOAD_STATUS_POISON_MSG: &str = "audio download status mutex should not be poisoned";
+
+// SPOTIFYGOOD: the loader never loops on errors. A failed request sent `ResponseTime` too (it was
+// sent before the status check), which woke the loop, and its prefetch requested the same range
+// again (the failed one was no longer pending): with an expired CDN URL (403) or a CDN outage
+// (5xx) it asked again every round trip on its own, playing, stalled or paused, until it drained
+// the per-domain rate limit (which ended the loader) or the track was unloaded. Now a failed
+// request sends no `ResponseTime`, the prefetch stays off until data comes again, and every
+// request (also the reader's and the player's) waits out a backoff after a failure.
+/// The backoff after the first failed request in a row; it doubles with each one after it
+const RETRY_BACKOFF_FIRST: Duration = Duration::from_millis(500);
+// SPOTIFYGOOD: see RETRY_BACKOFF_FIRST
+/// The longest backoff (the player's waits for data make one request each, this long apart)
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+// SPOTIFYGOOD: see RETRY_BACKOFF_FIRST
+/// How long the loader waits before its next request after `failures` failed ones in a row
+fn retry_backoff(failures: u32) -> Duration {
+    match failures {
+        0 => Duration::ZERO,
+        n => RETRY_BACKOFF_FIRST
+            .saturating_mul(1 << (n - 1).min(16))
+            .min(RETRY_BACKOFF_MAX),
+    }
+}
+
+// SPOTIFYGOOD: a CDN URL that is expired (403) or invalid (401, 404, 410) never delivers again:
+// the loader ends, so that a read gets `BrokenPipe` and the vendored player opens the file again
+// (with a new URL) instead of asking the dead one for a minute
+/// Whether a response's status means that its URL can't deliver any more
+fn url_is_dead(code: StatusCode) -> bool {
+    matches!(
+        code,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE
+    )
+}
 
 async fn receive_data(
     shared: Arc<AudioFileShared>,
@@ -48,6 +86,8 @@ async fn receive_data(
     let request_time = Instant::now();
     let mut measure_ping_time = true;
     let mut measure_throughput = true;
+    // SPOTIFYGOOD: see ReceivedData::Failed
+    let mut status = None;
 
     let result: Result<_, Error> = loop {
         let response = match request.initial_response.take() {
@@ -72,15 +112,6 @@ async fn receive_data(
             },
         };
 
-        if measure_ping_time {
-            let duration = Instant::now().duration_since(request_time);
-            // may be zero if we are handling an initial response
-            if duration.as_millis() > 0 {
-                file_data_tx.send(ReceivedData::ResponseTime(duration))?;
-                measure_ping_time = false;
-            }
-        }
-
         let code = response.status();
         if code != StatusCode::PARTIAL_CONTENT {
             if code == StatusCode::TOO_MANY_REQUESTS {
@@ -95,7 +126,19 @@ async fn receive_data(
                 }
             }
 
+            status = Some(code);
             break Err(AudioFileError::StatusCode(code).into());
+        }
+
+        // SPOTIFYGOOD: only for a response with data (see RETRY_BACKOFF_FIRST), it was sent
+        // before the status check
+        if measure_ping_time {
+            let duration = Instant::now().duration_since(request_time);
+            // may be zero if we are handling an initial response
+            if duration.as_millis() > 0 {
+                file_data_tx.send(ReceivedData::ResponseTime(duration))?;
+                measure_ping_time = false;
+            }
         }
 
         let body = response.into_body();
@@ -141,6 +184,8 @@ async fn receive_data(
             "Streamer error requesting range {} +{}: {:?}",
             request.offset, request.length, e
         );
+        // SPOTIFYGOOD: see ReceivedData::Failed (a loader that is gone doesn't need it)
+        let _ = file_data_tx.send(ReceivedData::Failed(status));
         return Err(e);
     }
 
@@ -157,6 +202,16 @@ struct AudioFileFetch {
     network_response_times: Vec<Duration>,
 
     params: AudioFetchParams,
+
+    // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST
+    /// failed requests in a row
+    failures: u32,
+    /// no request before this, after a failure
+    retry_at: Option<tokio::time::Instant>,
+    /// what was asked for during the backoff, requested when it ends
+    deferred: RangeSet,
+    /// no prefetch after a failure, until data comes again
+    prefetch_paused: bool,
 }
 
 // Might be replaced by enum from std once stable
@@ -202,6 +257,15 @@ impl AudioFileFetch {
         ranges_to_request.subtract_range_set(&download_status.downloaded);
         ranges_to_request.subtract_range_set(&download_status.requested);
 
+        // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST
+        if self
+            .retry_at
+            .is_some_and(|at| tokio::time::Instant::now() < at)
+        {
+            self.deferred.add_range_set(&ranges_to_request);
+            return Ok(());
+        }
+
         // TODO : refresh cdn_url when the token expired
 
         for range in ranges_to_request.iter() {
@@ -227,6 +291,16 @@ impl AudioFileFetch {
             ));
         }
 
+        Ok(())
+    }
+
+    // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST
+    /// Requests what was asked for during the backoff
+    fn request_deferred(&mut self) -> AudioFileResult {
+        let deferred = std::mem::replace(&mut self.deferred, RangeSet::new());
+        for range in deferred.iter() {
+            self.download_range(range.start, range.length)?;
+        }
         Ok(())
     }
 
@@ -360,6 +434,14 @@ impl AudioFileFetch {
 
                 let received_range = Range::new(data.offset, data.data.len());
 
+                // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST, the CDN delivers again
+                self.failures = 0;
+                self.retry_at = None;
+                self.prefetch_paused = false;
+                if !self.deferred.is_empty() {
+                    self.request_deferred()?;
+                }
+
                 let full = {
                     let mut download_status = self
                         .shared
@@ -377,6 +459,18 @@ impl AudioFileFetch {
                     self.finish()?;
                     return Ok(ControlFlow::Break);
                 }
+            }
+            // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST and url_is_dead
+            ReceivedData::Failed(status) => {
+                if status.is_some_and(url_is_dead) {
+                    warn!(
+                        "The file's CDN URL can't deliver any more ({status:?}), its loader ends"
+                    );
+                    return Ok(ControlFlow::Break);
+                }
+                self.failures = self.failures.saturating_add(1);
+                self.retry_at = Some(tokio::time::Instant::now() + retry_backoff(self.failures));
+                self.prefetch_paused = true;
             }
         }
 
@@ -456,9 +550,17 @@ pub(super) async fn audio_file_fetch(
         network_response_times: Vec::with_capacity(3),
 
         params: params.clone(),
+
+        // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST
+        failures: 0,
+        retry_at: None,
+        deferred: RangeSet::new(),
+        prefetch_paused: false,
     };
 
     loop {
+        // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST
+        let deferred_at = fetch.retry_at.filter(|_| !fetch.deferred.is_empty());
         tokio::select! {
             cmd = stream_loader_command_rx.recv() => {
                 match cmd {
@@ -480,10 +582,18 @@ pub(super) async fn audio_file_fetch(
                     None => break,
                 }
             },
+            // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST
+            _ = tokio::time::sleep_until(deferred_at.unwrap_or_else(tokio::time::Instant::now)), if deferred_at.is_some() => {
+                fetch.request_deferred()?;
+            },
             else => (),
         }
 
-        if fetch.shared.is_download_streaming() && fetch.has_download_slots_available() {
+        // SPOTIFYGOOD: no prefetch after a failure until data comes (see RETRY_BACKOFF_FIRST)
+        if fetch.shared.is_download_streaming()
+            && fetch.has_download_slots_available()
+            && !fetch.prefetch_paused
+        {
             let bytes_pending: usize = {
                 let download_status = fetch
                     .shared
@@ -514,4 +624,40 @@ pub(super) async fn audio_file_fetch(
     }
 
     Ok(())
+}
+
+// SPOTIFYGOOD: see RETRY_BACKOFF_FIRST and url_is_dead
+#[cfg(test)]
+mod spotifygood_tests {
+    use super::*;
+
+    #[test]
+    fn the_backoff_doubles_up_to_its_bound() {
+        let ms = Duration::from_millis;
+        let backoffs: Vec<_> = (0..8).map(retry_backoff).collect();
+        assert_eq!(
+            backoffs,
+            [
+                ms(0),
+                ms(500),
+                ms(1_000),
+                ms(2_000),
+                ms(4_000),
+                ms(8_000),
+                ms(8_000),
+                ms(8_000)
+            ]
+        );
+        assert_eq!(retry_backoff(u32::MAX), RETRY_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn only_an_expired_or_invalid_url_is_dead() {
+        for code in [401, 403, 404, 410] {
+            assert!(url_is_dead(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+        for code in [206, 416, 429, 500, 502, 503, 504] {
+            assert!(!url_is_dead(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+    }
 }

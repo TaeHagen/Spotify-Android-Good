@@ -171,15 +171,18 @@ const SINK_FILL_MS: i64 = 250;
 
 /// The position of `s` at `now_ms`, no further than what was heard: a stalled stream keeps Spirc
 /// (or the offline queue) Playing, with its position going on from its last anchor while nothing
-/// plays, until the data comes back or the Player pauses after a minute. A restore point frozen
-/// meanwhile (a reconnect after an outage, the network-loss cap) resumed that far ahead. A
-/// playing track is capped at the Player's last packet of it (`decoded`) plus what the sink can
-/// play after it; the decoder runs ahead of the audio, so an ordinary playback isn't touched.
+/// plays, until the first wait for the data times out (the Player's `Stalled`: Spirc shows it
+/// loading at the position played) or the data comes back. A restore point frozen meanwhile (a
+/// reconnect after an outage, the network-loss cap) resumed that far ahead. A playing or loading
+/// track is capped at the Player's last packet of it (`decoded`, also the position of a load,
+/// a seek or a reopen) plus what the sink can play after it at the snapshot's speed (0 while
+/// loading); the decoder runs ahead of the audio, so an ordinary playback isn't touched.
 pub(crate) fn position_heard(s: &ConnectSnapshot, now_ms: i64, decoded: Option<&Decoded>) -> i64 {
     let position = position_now(s, now_ms);
     let track = s.track.as_ref().map(|t| t.uri.as_str());
+    let heard = matches!(s.status, SnapshotPlayStatus::Playing | SnapshotPlayStatus::LoadingPlay);
     match decoded {
-        Some(d) if s.status == SnapshotPlayStatus::Playing && track == Some(d.uri.as_str()) => {
+        Some(d) if heard && track == Some(d.uri.as_str()) => {
             let after = (d.ago_ms.clamp(0, SINK_FILL_MS) as f64 * s.playback_speed.max(0.0)) as i64;
             position.min(d.position_ms + after).max(0)
         }
@@ -986,6 +989,28 @@ mod tests {
         // an ordinary playback: the decoder is ahead of the audio, nothing changes
         let playing = Decoded { uri: "spotify:track:cur".into(), position_ms: 55_400, ago_ms: 15 };
         assert_eq!(freeze_heard(s, 1_030_000, Instant::now(), Some(&playing)).position_ms, 55_000);
+    }
+
+    #[test]
+    fn a_stall_shown_as_loading_is_frozen_where_it_was_heard() {
+        // the Player's Stalled: Spirc shows it loading (speed 0) at what it took as the position
+        // heard; one that went ahead of the last packet (a put of before the vendored fix moved
+        // it on, a seek's target past what was decoded) is capped at that packet, no sink allowance
+        let mut s = snap("spotify:album:a", SpircProvider::Context);
+        s.status = SnapshotPlayStatus::LoadingPlay;
+        s.playback_speed = 0.0;
+        s.duration_ms = 3_600_000;
+        s.position_ms = 2_474_000;
+        let decoded = Decoded { uri: "spotify:track:cur".into(), position_ms: 2_460_000, ago_ms: 30_000 };
+        let f = freeze_heard(s.clone(), 1_030_000, Instant::now(), Some(&decoded));
+        assert_eq!(f.position_ms, 2_460_000);
+        assert!(f.was_playing, "it resumes playing");
+        // where it was heard (or a reopen at it: the Player's last_decoded is its position)
+        let at = Decoded { position_ms: 2_474_000, ..decoded.clone() };
+        assert_eq!(freeze_heard(s.clone(), 1_030_000, Instant::now(), Some(&at)).position_ms, 2_474_000);
+        // the load of another track: as shown
+        let other = Decoded { uri: "spotify:track:n".into(), ..decoded };
+        assert_eq!(freeze_heard(s, 1_030_000, Instant::now(), Some(&other)).position_ms, 2_474_000);
     }
 
     #[test]

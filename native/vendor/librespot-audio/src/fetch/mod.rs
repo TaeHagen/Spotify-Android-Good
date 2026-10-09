@@ -9,7 +9,8 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     sync::{Condvar, Mutex},
-    time::Duration,
+    // SPOTIFYGOOD: Instant, see AudioFileStreaming::read
+    time::{Duration, Instant},
 };
 
 use futures_util::{StreamExt, TryFutureExt, future::IntoStream};
@@ -226,6 +227,41 @@ impl StreamLoaderController {
         self.range_available(Range::new(start, length))
     }
 
+    // SPOTIFYGOOD: for the vendored player's seeks. symphonia's Ogg seek bisects the whole file,
+    // and each of its probes into data that isn't there waited `download_timeout` for it on the
+    // player thread (the failed probes were then taken as the end of the stream). While this is
+    // on, a read of data that isn't there fails at once (`TimedOut`) and requests nothing; the
+    // first offset such a read missed is kept (`missed`). The player waits for that data (one
+    // bounded wait that a command interrupts) and seeks again.
+    /// While `on`, reads of data that isn't there fail at once; turning it on forgets the offset
+    /// missed before
+    pub fn set_fail_fast(&self, on: bool) {
+        if let Some(ref shared) = self.stream_shared {
+            if on {
+                shared.missed.store(usize::MAX, Ordering::Release);
+            }
+            shared.fail_fast.store(on, Ordering::Release);
+        }
+    }
+
+    // SPOTIFYGOOD: see set_fail_fast
+    /// The first offset a read missed since fail-fast was turned on
+    pub fn missed(&self) -> Option<usize> {
+        let shared = self.stream_shared.as_ref()?;
+        let missed = shared.missed.load(Ordering::Acquire);
+        (missed != usize::MAX).then_some(missed)
+    }
+
+    // SPOTIFYGOOD: the loader ends after an expired or invalid CDN URL (a 403, 404, 410; see
+    // receive.rs) or when its rate limit or file failed: nothing it was asked for comes any
+    // more, the vendored player opens the file again (a new URL) instead of waiting for it
+    /// Whether the file's loader ended (requests go nowhere); also when the file is all there
+    pub fn is_loader_gone(&self) -> bool {
+        self.channel_tx
+            .as_ref()
+            .is_some_and(|channel| channel.is_closed())
+    }
+
     fn send_stream_loader_command(&self, command: StreamLoaderCommand) {
         if let Some(ref channel) = self.channel_tx {
             // Ignore the error in case the channel has been closed already.
@@ -365,6 +401,10 @@ struct AudioFileShared {
     ping_time_ms: AtomicUsize,
     read_position: AtomicUsize,
     throughput: AtomicUsize,
+    // SPOTIFYGOOD: see StreamLoaderController::set_fail_fast
+    fail_fast: AtomicBool,
+    // SPOTIFYGOOD: see StreamLoaderController::missed (`usize::MAX`: none)
+    missed: AtomicUsize,
 }
 
 impl AudioFileShared {
@@ -474,12 +514,22 @@ impl AudioFileStreaming {
         bytes_per_second: usize,
     ) -> Result<AudioFileStreaming, Error> {
         let cdn_url = CdnUrl::new(file_id).resolve_audio(&session).await?;
+        let urls = cdn_url.try_get_urls()?;
+        // SPOTIFYGOOD: the rest is open_urls (the tests open a local server's URL)
+        Self::open_urls(session, &urls, complete_tx, bytes_per_second).await
+    }
 
+    // SPOTIFYGOOD: split off open
+    async fn open_urls(
+        session: Session,
+        urls: &[&str],
+        complete_tx: oneshot::Sender<NamedTempFile>,
+        bytes_per_second: usize,
+    ) -> Result<AudioFileStreaming, Error> {
         let minimum_download_size = AudioFetchParams::get().minimum_download_size;
 
         let mut response_streamer_url = None;
-        let urls = cdn_url.try_get_urls()?;
-        for url in &urls {
+        for url in urls {
             // When the audio file is really small, this `download_size` may turn out to be
             // larger than the audio file we're going to stream later on. This is OK; requesting
             // `Content-Range` > `Content-Length` will return the complete file with status code
@@ -553,6 +603,9 @@ impl AudioFileStreaming {
             ping_time_ms: AtomicUsize::new(0),
             read_position: AtomicUsize::new(0),
             throughput: AtomicUsize::new(0),
+            // SPOTIFYGOOD: see StreamLoaderController::set_fail_fast
+            fail_fast: AtomicBool::new(false),
+            missed: AtomicUsize::new(usize::MAX),
         });
 
         let write_file = NamedTempFile::new_in(session.config().tmp_dir.clone())?;
@@ -615,29 +668,59 @@ impl Read for AudioFileStreaming {
             .lock()
             .expect(DOWNLOAD_STATUS_POISON_MSG);
 
-        ranges_to_request.subtract_range_set(&download_status.downloaded);
-        ranges_to_request.subtract_range_set(&download_status.requested);
-
-        for &range in ranges_to_request.iter() {
-            self.stream_loader_command_tx
-                .send(StreamLoaderCommand::Fetch(range))
-                .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err))?;
-        }
-
-        let download_timeout = AudioFetchParams::get().download_timeout;
-        while !download_status.downloaded.contains(offset) {
-            let (new_download_status, wait_result) = self
-                .shared
-                .cond
-                .wait_timeout(download_status, download_timeout)
-                .expect(DOWNLOAD_STATUS_POISON_MSG);
-
-            download_status = new_download_status;
-            if wait_result.timed_out() {
+        // SPOTIFYGOOD: see StreamLoaderController::set_fail_fast
+        if self.shared.fail_fast.load(Ordering::Acquire) {
+            if !download_status.downloaded.contains(offset) {
+                let _ = self.shared.missed.compare_exchange(
+                    usize::MAX,
+                    offset,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     Error::deadline_exceeded(AudioFileError::WaitTimeout),
                 ));
+            }
+        } else {
+            ranges_to_request.subtract_range_set(&download_status.downloaded);
+            ranges_to_request.subtract_range_set(&download_status.requested);
+
+            // SPOTIFYGOOD: a loader that is gone fails the read only when its data isn't there
+            // (stock failed it also when only the read-ahead was missing, with data to play)
+            let mut gone = false;
+            for &range in ranges_to_request.iter() {
+                gone |= self
+                    .stream_loader_command_tx
+                    .send(StreamLoaderCommand::Fetch(range))
+                    .is_err();
+            }
+            if gone && !download_status.downloaded.contains(offset) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    AudioFileError::Channel,
+                ));
+            }
+
+            // SPOTIFYGOOD: one deadline from the start of the read. Every notify (also the one of
+            // a range whose request failed) started the timeout anew: requests that failed again
+            // and again kept the read, and the player thread with it, from ever returning.
+            let deadline = Instant::now() + AudioFetchParams::get().download_timeout;
+            while !download_status.downloaded.contains(offset) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        Error::deadline_exceeded(AudioFileError::WaitTimeout),
+                    ));
+                }
+                let (new_download_status, _) = self
+                    .shared
+                    .cond
+                    .wait_timeout(download_status, left)
+                    .expect(DOWNLOAD_STATUS_POISON_MSG);
+
+                download_status = new_download_status;
             }
         }
         let available_length = download_status
@@ -717,5 +800,276 @@ impl Seek for AudioFile {
             AudioFile::Cached(ref mut file) => file.seek(pos),
             AudioFile::Streaming(ref mut file) => file.seek(pos),
         }
+    }
+}
+
+// SPOTIFYGOOD: tests of the local patches, with a CDN on localhost that fails as asked
+#[cfg(test)]
+mod spotifygood_tests {
+    use super::*;
+    use librespot_core::SessionConfig;
+    use std::sync::atomic::AtomicU16;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    const FILE_SIZE: usize = 1 << 20;
+    const DOWNLOAD_TIMEOUT: Duration = Duration::from_millis(1_000);
+
+    /// A short `download_timeout` for every test of this binary
+    fn params() {
+        let _ = AudioFetchParams::set(AudioFetchParams {
+            download_timeout: DOWNLOAD_TIMEOUT,
+            ..Default::default()
+        });
+        assert_eq!(AudioFetchParams::get().download_timeout, DOWNLOAD_TIMEOUT);
+    }
+
+    // the crate isn't a workspace member, so it can't have dev-dependencies: the tokio features
+    // used here (rt, net, io-util, time) are the ones librespot-core enables
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// A CDN on localhost: a range from the start of the file is served, every other one gets
+    /// `status` (206: served too). Counts the requests.
+    struct Cdn {
+        url: String,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl Cdn {
+        fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    fn range_of(request: &str) -> (usize, usize) {
+        let range = request
+            .lines()
+            .find_map(|line| line.strip_prefix("range: bytes="))
+            .expect("a range");
+        let (start, end) = range.trim().split_once('-').expect("start-end");
+        (start.parse().expect("start"), end.parse().expect("end"))
+    }
+
+    async fn cdn(status: u16) -> Cdn {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}/audio", listener.local_addr().expect("addr"));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let status = Arc::new(AtomicU16::new(status));
+        let counted = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let (counted, status) = (counted.clone(), status.clone());
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let (start, end) = range_of(&String::from_utf8_lossy(&request).to_lowercase());
+                    let end = end.min(FILE_SIZE - 1);
+                    let status = if start == 0 {
+                        206
+                    } else {
+                        status.load(Ordering::SeqCst)
+                    };
+                    let response = if status == 206 {
+                        let mut response = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{FILE_SIZE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            end - start + 1
+                        )
+                        .into_bytes();
+                        response.resize(response.len() + end - start + 1, 0);
+                        response
+                    } else {
+                        format!("HTTP/1.1 {status} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .into_bytes()
+                    };
+                    let _ = socket.write_all(&response).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        Cdn { url, requests }
+    }
+
+    /// The file streamed from `cdn` (its first 64 KiB are there) and its controller; in stream
+    /// mode as the player plays it, else nothing is fetched ahead
+    async fn open(
+        session: &Session,
+        cdn: &Cdn,
+        stream: bool,
+    ) -> (AudioFile, StreamLoaderController) {
+        let (complete_tx, _) = oneshot::channel();
+        let file = AudioFileStreaming::open_urls(
+            session.clone(),
+            &[cdn.url.as_str()],
+            complete_tx,
+            40_000,
+        )
+        .await
+        .expect("open");
+        let file = AudioFile::Streaming(file);
+        let controller = file.get_stream_loader_controller().expect("controller");
+        if stream {
+            controller.set_stream_mode();
+        }
+        for _ in 0..100 {
+            if controller.range_available_at(0, 65_536) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(controller.range_available_at(0, 65_536));
+        // the loader's own prefetch after it (it fails here) is over
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        (file, controller)
+    }
+
+    /// A blocking read of `length` bytes at `offset` (as the decoder reads), and how long it took
+    async fn read_at(
+        mut file: AudioFile,
+        offset: u64,
+        length: usize,
+    ) -> (AudioFile, io::Result<usize>, Duration) {
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let result = file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| file.read(&mut vec![0; length]));
+            (file, result, started.elapsed())
+        })
+        .await
+        .expect("read")
+    }
+
+    #[test]
+    fn a_failing_cdn_is_not_asked_again_and_again() {
+        params();
+        runtime().block_on(async {
+            let cdn = cdn(503).await;
+            let session = Session::new(SessionConfig::default(), None);
+            let (_file, controller) = open(&session, &cdn, true).await;
+            // its prefetch failed: it didn't ask again every round trip until the per-domain
+            // rate limit ended it
+            assert!(!controller.is_loader_gone());
+            assert!(cdn.requests() <= 2, "{}", cdn.requests());
+
+            // asked once, it fails: the loader doesn't ask again by itself
+            let before = cdn.requests();
+            controller.fetch_range(200_000, 65_536);
+            tokio::time::sleep(Duration::from_millis(2_000)).await;
+            assert_eq!(cdn.requests() - before, 1);
+
+            // asked again and again: once now, then once more after the backoff
+            let before = cdn.requests();
+            for _ in 0..20 {
+                controller.fetch_range(200_000, 65_536);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(3_000)).await;
+            let asked = cdn.requests() - before;
+            assert!((1..=2).contains(&asked), "{asked}");
+
+            // a 5xx doesn't end it
+            assert!(!controller.is_loader_gone());
+        });
+    }
+
+    #[test]
+    fn an_expired_url_ends_the_loader() {
+        params();
+        runtime().block_on(async {
+            let cdn = cdn(403).await;
+            let session = Session::new(SessionConfig::default(), None);
+            let (file, controller) = open(&session, &cdn, true).await;
+            controller.fetch_range(200_000, 65_536);
+            for _ in 0..100 {
+                if controller.is_loader_gone() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(controller.is_loader_gone());
+
+            // a read of data that isn't there fails at once (the player opens the file again)
+            let (file, result, took) = read_at(file, 200_000, 4_096).await;
+            assert_eq!(
+                result.map_err(|e| e.kind()).err(),
+                Some(io::ErrorKind::BrokenPipe)
+            );
+            assert!(took < Duration::from_millis(500), "{took:?}");
+            // the data that is there can still be played (stock failed it with BrokenPipe too,
+            // for the read-ahead it couldn't request)
+            let (_, result, _) = read_at(file, 1_000, 4_096).await;
+            assert_eq!(result.expect("read"), 4_096);
+        });
+    }
+
+    #[test]
+    fn a_read_waits_once() {
+        params();
+        runtime().block_on(async {
+            let cdn = cdn(503).await;
+            let session = Session::new(SessionConfig::default(), None);
+            let (file, _controller) = open(&session, &cdn, true).await;
+            // its requests fail (and wake it), it returns at its deadline
+            let (_, result, took) = read_at(file, 300_000, 4_096).await;
+            assert_eq!(
+                result.map_err(|e| e.kind()).err(),
+                Some(io::ErrorKind::TimedOut)
+            );
+            assert!(
+                took >= DOWNLOAD_TIMEOUT && took < DOWNLOAD_TIMEOUT + Duration::from_millis(500),
+                "{took:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_fail_fast_read_misses_at_once_without_a_request() {
+        params();
+        runtime().block_on(async {
+            let cdn = cdn(206).await;
+            let session = Session::new(SessionConfig::default(), None);
+            let (file, controller) = open(&session, &cdn, false).await;
+            let before = cdn.requests();
+
+            controller.set_fail_fast(true);
+            let (file, result, took) = read_at(file, 300_000, 4_096).await;
+            assert_eq!(
+                result.map_err(|e| e.kind()).err(),
+                Some(io::ErrorKind::TimedOut)
+            );
+            assert!(took < Duration::from_millis(100), "{took:?}");
+            assert_eq!(controller.missed(), Some(300_000));
+            // the first one missed is kept
+            let (file, _, _) = read_at(file, 500_000, 4_096).await;
+            assert_eq!(controller.missed(), Some(300_000));
+            // the data that is there is read
+            let (file, result, _) = read_at(file, 1_000, 4_096).await;
+            assert_eq!(result.expect("read"), 4_096);
+            // nothing was requested
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(cdn.requests(), before);
+
+            // on again: nothing missed yet; off: a read waits for its data (and gets it)
+            controller.set_fail_fast(true);
+            assert_eq!(controller.missed(), None);
+            controller.set_fail_fast(false);
+            let (_, result, _) = read_at(file, 300_000, 4_096).await;
+            assert_eq!(result.expect("read"), 4_096);
+            assert!(cdn.requests() > before);
+        });
     }
 }

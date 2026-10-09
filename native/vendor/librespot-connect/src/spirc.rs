@@ -1598,22 +1598,14 @@ impl SpircTask {
 
                 self.handle_next(next_track)?
             }
-            PlayerEvent::Loading { .. } => match self.play_status {
-                SpircPlayStatus::LoadingPlay { position_ms } => {
-                    self.connect_state
-                        .update_position(position_ms, self.now_ms());
-                    trace!("==> LoadingPlay");
-                }
-                SpircPlayStatus::LoadingPause { position_ms } => {
-                    self.connect_state
-                        .update_position(position_ms, self.now_ms());
-                    trace!("==> LoadingPause");
-                }
-                _ => {
-                    self.connect_state.update_position(0, self.now_ms());
-                    trace!("==> Loading");
-                }
-            },
+            // SPOTIFYGOOD: see loading_status
+            PlayerEvent::Loading { position_ms, .. } => {
+                trace!("==> Loading");
+                let (status, position_ms) = loading_status(&self.play_status, position_ms);
+                self.connect_state
+                    .update_position(position_ms, self.now_ms());
+                self.play_status = status;
+            }
             // SPOTIFYGOOD: the stream stalled (see the vendored player's stall_action): buffering
             // at the position played until its data comes (the PositionCorrection of its first
             // packet then goes on as Playing), so nothing extrapolates past what was heard. It
@@ -3562,6 +3554,34 @@ fn continues_playing(status: &SpircPlayStatus) -> bool {
     )
 }
 
+// SPOTIFYGOOD: a load Spirc didn't ask for: the vendored player opens a track again by itself (a
+// play after a stall paused it, a loader that is gone; see its PlayerInternal::reopen). Spirc's
+// own loads set LoadingPlay or LoadingPause first, so stock only expected those and anchored any
+// other status at 0: right after Spirc's play it was Playing, so the seek bar, the snapshot (the
+// app saved the episode's resume point near 0) and the other clients went from 0:00, and the
+// reopen's Unavailable skipped the episode. Now Playing goes buffering at the event's position,
+// Paused loading paused there (nothing extrapolates, PATCHES.md "Stalls" (c), (d)).
+/// The status (and the position to anchor) when the player starts loading the current track at
+/// `position_ms`
+pub(crate) fn loading_status(status: &SpircPlayStatus, position_ms: u32) -> (SpircPlayStatus, u32) {
+    match *status {
+        // its own load: as stock, at the position it loads at
+        SpircPlayStatus::LoadingPlay { position_ms } => {
+            (SpircPlayStatus::LoadingPlay { position_ms }, position_ms)
+        }
+        SpircPlayStatus::LoadingPause { position_ms } => {
+            (SpircPlayStatus::LoadingPause { position_ms }, position_ms)
+        }
+        SpircPlayStatus::Playing { .. } => {
+            (SpircPlayStatus::LoadingPlay { position_ms }, position_ms)
+        }
+        SpircPlayStatus::Paused { .. } => {
+            (SpircPlayStatus::LoadingPause { position_ms }, position_ms)
+        }
+        SpircPlayStatus::Stopped => (SpircPlayStatus::Stopped, position_ms),
+    }
+}
+
 fn pauses_on_drop(owns_player: bool, pause_on_drop: bool, stopped: bool) -> bool {
     owns_player && (pause_on_drop || !stopped)
 }
@@ -3591,8 +3611,62 @@ impl Drop for SpircTask {
 mod tests {
     use super::{
         PlayAction, SpircPlayStatus, StatePut, StatePutResult, StatePuts, SuggestionFetch,
-        continues_playing, pauses_on_drop, play_action,
+        continues_playing, loading_status, pauses_on_drop, play_action,
     };
+
+    // SPOTIFYGOOD: see loading_status (the vendored player's reopen)
+    #[test]
+    fn a_load_while_playing_is_loading_at_its_position() {
+        const P: u32 = 2_470_000;
+        // Spirc's play after the stall pause, then the player's own reopen: buffering at P, it
+        // went Playing from 0:00 (the app saved the episode near 0, a failed reopen skipped it)
+        let playing = SpircPlayStatus::Playing {
+            nominal_start_time: 1_000_000 - i64::from(P),
+            preloading_of_next_track_triggered: false,
+        };
+        let (status, position) = loading_status(&playing, P);
+        assert!(matches!(
+            status,
+            SpircPlayStatus::LoadingPlay { position_ms: P }
+        ));
+        assert_eq!(position, P);
+        assert!(continues_playing(&status), "Next still plays the next item");
+        assert_eq!(
+            play_action(&status, true, true),
+            PlayAction::Pause,
+            "a pause while it loads"
+        );
+        // paused (a seek after a reopen that failed): loading paused at the target
+        let paused = SpircPlayStatus::Paused {
+            position_ms: 1_000,
+            preloading_of_next_track_triggered: false,
+        };
+        let (status, position) = loading_status(&paused, P);
+        assert!(matches!(
+            status,
+            SpircPlayStatus::LoadingPause { position_ms: P }
+        ));
+        assert_eq!(position, P);
+        // its own loads keep the position they load at (stock)
+        let (status, position) =
+            loading_status(&SpircPlayStatus::LoadingPlay { position_ms: 5 }, P);
+        assert!(matches!(
+            status,
+            SpircPlayStatus::LoadingPlay { position_ms: 5 }
+        ));
+        assert_eq!(position, 5);
+        let (status, position) =
+            loading_status(&SpircPlayStatus::LoadingPause { position_ms: 7 }, P);
+        assert!(matches!(
+            status,
+            SpircPlayStatus::LoadingPause { position_ms: 7 }
+        ));
+        assert_eq!(position, 7);
+        // stopped: stays stopped, at the event's position (was 0)
+        let (status, position) = loading_status(&SpircPlayStatus::Stopped, P);
+        assert!(matches!(status, SpircPlayStatus::Stopped));
+        assert_eq!(position, P);
+    }
     use futures_util::FutureExt;
     use std::time::Duration;
 
