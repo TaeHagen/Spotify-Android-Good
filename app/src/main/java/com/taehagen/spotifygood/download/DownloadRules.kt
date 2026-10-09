@@ -733,6 +733,33 @@ internal object DownloadRules {
         else -> DownloadRequest.Outcome.NOTHING
     }
 
+    /**
+     * A completed download whose file an index snapshot found gone: its row's [rowPath] and
+     * [completedAt] when it was read, and the file that was checked ([checkedPath]: the row's path,
+     * else the record's).
+     */
+    data class CheckedFile(val uri: String, val rowPath: String?, val checkedPath: String, val completedAt: Long?)
+
+    /**
+     * Of the downloads a snapshot found without their file ([checked], checked outside the lock),
+     * those to fail as missing now, under the lock: the row is still the one that was checked
+     * ([current]: uri → its path and completedAt now; absent when no longer completed), and the file
+     * is still gone ([exists]). A row a move switched to its copy meanwhile names another path and is
+     * left alone; nothing is failed while a move runs ([relocating]): the next push checks again.
+     */
+    fun stillMissing(
+        checked: List<CheckedFile>,
+        current: Map<String, Pair<String?, Long?>>,
+        exists: (String) -> Boolean,
+        relocating: Boolean,
+    ): List<CheckedFile> {
+        if (relocating) return emptyList()
+        return checked.filter { file ->
+            val now = current[file.uri] ?: return@filter false
+            now.first == file.rowPath && now.second == file.completedAt && !exists(file.checkedPath)
+        }
+    }
+
     /** Where a download run stands with its location ([storageCheck]). */
     enum class StorageCheck { OK, LOCATION_MISSING, CARD_FULL, INTERNAL_FULL }
 

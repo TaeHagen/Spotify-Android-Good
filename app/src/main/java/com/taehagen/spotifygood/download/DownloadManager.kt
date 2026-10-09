@@ -665,7 +665,7 @@ class DownloadManager(
         val (seq, rows) = mutex.withLock { index.last() to dao.completedIndexRows() }
         val records = ArrayList<OfflineTrackRecord>(rows.size)
         val undecryptable = ArrayList<String>()
-        val missing = ArrayList<String>()
+        val missing = ArrayList<DownloadRules.CheckedFile>()
         val keystoreBusy = ArrayList<String>()
         val legacy = ArrayList<Pair<IndexRow, String>>()
         val available = storage.availability()
@@ -678,7 +678,7 @@ class DownloadManager(
                     if (result.legacyKey) legacy += row to result.record.keyHex
                 }
                 RecordResult.Unreadable -> undecryptable += row.uri
-                RecordResult.Missing -> missing += row.uri
+                RecordResult.Missing -> missing += DownloadRules.CheckedFile(row.uri, row.path, row.path ?: storedPath(row), row.completedAt)
                 // Not failed: registered when the card is back (onVolumesChanged).
                 RecordResult.Unmounted -> unmounted++
                 RecordResult.KeystoreBusy -> {
@@ -690,7 +690,8 @@ class DownloadManager(
         }
         val now = System.currentTimeMillis()
         undecryptable.chunked(SQL_CHUNK).forEach { dao.markUnavailable(it, appContext.getString(R.string.data_dl_error_key), now) }
-        missing.chunked(SQL_CHUNK).forEach { dao.markMissing(it, appContext.getString(R.string.data_dl_error_missing_file), now) }
+        // Not from this (stale) read: a move may have switched the row to its copy meanwhile.
+        markMissingIfUnchanged(missing, now)
         if (undecryptable.isNotEmpty() || missing.isNotEmpty() || keystoreBusy.isNotEmpty() || unmounted > 0) {
             Log.w(
                 TAG,
@@ -729,6 +730,32 @@ class DownloadManager(
             moved += sealed.size
         }
         if (moved > 0) Log.i(TAG, "Moved $moved download keys to the data key")
+    }
+
+    /** The path the record of [row] names (where offlineRecord checks when the row has none). */
+    private fun storedPath(row: IndexRow): String =
+        row.recordJson?.let { runCatching { json.decodeFromString(OfflineTrackRecord.serializer(), it).path }.getOrNull() }.orEmpty()
+
+    /**
+     * Fails the downloads a snapshot found without their file ([missing]: checked outside the lock)
+     * only while each row is still the one checked and its file is still gone, under [mutex], which
+     * a move's switch to the copies holds too ([DownloadRules.stillMissing]; the update is guarded by
+     * path and completedAt as well). Nothing is failed while a move runs.
+     */
+    private suspend fun markMissingIfUnchanged(missing: List<DownloadRules.CheckedFile>, now: Long) {
+        if (missing.isEmpty()) return
+        val error = appContext.getString(R.string.data_dl_error_missing_file)
+        mutex.withLock {
+            val current = missing.map { it.uri }.chunked(SQL_CHUNK).flatMap { dao.completedIndexRows(it) }
+                .associate { it.uri to (it.path to it.completedAt) }
+            val gone = withContext(Dispatchers.IO) {
+                DownloadRules.stillMissing(missing, current, exists = { it.isNotEmpty() && File(it).isFile }, relocating = storage.relocating)
+            }
+            if (gone.isEmpty()) return@withLock
+            database.withTransaction {
+                gone.forEach { dao.markMissingIfUnchanged(it.uri, it.rowPath, it.completedAt, error, now) }
+            }
+        }
     }
 
     private sealed interface RecordResult {
