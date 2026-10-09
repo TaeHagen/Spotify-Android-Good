@@ -1576,10 +1576,20 @@ accents ignored; rows that can't play last; ties keep the list order), then appl
 plays the server's order (Spirc resolves the context itself), so a non-default order plays as a
 `trackUris` list in the shown order, shuffle off, at most 500 tracks around the start item (50
 before it). That list has no context: Connect and the notification show no playlist, and it is
-a snapshot of what was loaded (later edits and likes don't reach it); the Play button toggles it
-while one of its tracks plays with no catalog context. The default order keeps the context load
-(Connect shows the playlist), and Shuffle always loads the context, its order doesn't matter.
-Offline, the downloaded rows sort the same way and already play as a track list.
+a snapshot of what was loaded (later edits and likes don't reach it). Its start follows the
+plain-list rule of §4.6 (`planListPlay`), since a track list loaded while the session isn't ONLINE
+goes to the offline queue: a tapped song that is downloaded plays the list's downloads from
+exactly there, one that isn't is sent alone while connecting ("not available offline" offline,
+never the next download); Play plays the list's downloads from the first. Liked Songs rows that
+can't start then are dimmed, as on playlists. The last sorted play (its list and URIs) is kept for
+the session outside the page, so a reopened page's Play button still toggles (resumes) it while
+one of its tracks plays with no catalog context; in a new process, a context-less play of one of
+the shown songs counts. The default order keeps the context load (Connect shows the playlist),
+and Shuffle always loads the context, its order doesn't matter. Offline, the downloaded rows sort
+the same way and already play as a track list. Likes and unlikes made in the app
+(`LibraryEdit.LikedTracks`) patch a fully loaded Liked Songs (unliked songs dropped, liked ones
+looked up and put first, then sorted again) instead of paging it all again; other library edits
+don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet reloads.
 
 ### 9.9 UI
 
