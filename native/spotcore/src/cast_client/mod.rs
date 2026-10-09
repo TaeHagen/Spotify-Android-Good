@@ -12,8 +12,9 @@
 //! 2. `getInfo` on the Spotify namespace with the device's identity (its friendly name, the
 //!    Connect device id derived from it, group or not); the `getInfoResponse` carries the
 //!    receiver's `clientID` (and `deviceID`).
-//! 3. `addUser {blob: <access token for that clientID>, tokenType: "accesstoken"}` ([`token`]),
-//!    until `addUserResponse`; an `addUserError` makes the next token source try.
+//! 3. `addUser {blob: <access token for that clientID>, tokenType: "accesstoken"}`
+//!    ([`device_token`], shared with the ZeroConf `accesstoken` login), until `addUserResponse`; an
+//!    `addUserError` makes the next token source try.
 //! 4. Close the socket. Then, like `connect.localLogin`, wait (≤ 10 s) for the device to appear
 //!    in the cluster and return its Connect device id for `connect.transfer`.
 //!
@@ -25,7 +26,6 @@
 mod channel;
 mod frame;
 mod tls;
-mod token;
 
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::rpc::{parse_args, to_value};
@@ -40,7 +40,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use token::TokenSource;
+use crate::device_token::{self, TokenPlan, TokenSource};
 
 /// Spotify's Cast receiver application.
 pub(crate) const SPOTIFY_APP_ID: &str = "CC32E753";
@@ -67,7 +67,7 @@ pub(crate) const TIMEOUTS: Timeouts = Timeouts {
     launch: Duration::from_secs(15),
     message: Duration::from_secs(10),
     add_user: Duration::from_secs(15),
-    token: Duration::from_secs(10),
+    token: device_token::MINT_TIMEOUT,
 };
 
 #[derive(Debug, Deserialize)]
@@ -164,7 +164,7 @@ async fn cast_login(args: LoginArgs) -> AppResult<Value> {
     log::info!("cast: signing in '{}'", identity.name);
     let exchange = async {
         let stream = tls::connect(addr).await?;
-        login_flow(stream, &identity, &token::TOKEN_SOURCES, TIMEOUTS, token::mint).await
+        login_flow(stream, &identity, &device_token::CAST_SOURCES, TIMEOUTS, device_token::mint).await
     };
     let receiver = tokio::time::timeout(LOGIN_BOUND, exchange)
         .await
@@ -253,25 +253,15 @@ where
         .wait_for(timeouts.message, "Spotify on the device did not answer", |m| get_info_reply(m, &transport, identity))
         .await?;
 
-    let mut last_error = None;
-    for &source in sources {
-        let minted = channel
-            .drive(tokio::time::timeout(timeouts.token, mint(source, info.client_id.clone(), info.device_id.clone())))
-            .await?;
-        let token = match minted {
-            Ok(Ok(token)) if !token.is_empty() => token,
-            Ok(Ok(_)) => {
-                last_error = Some(AppError::unavailable("Spotify did not issue a sign-in token for the device"));
-                continue;
-            }
-            Ok(Err(e)) => {
-                log::info!("cast: no {source:?} token: {e}");
-                last_error = Some(e);
-                continue;
-            }
-            Err(_) => {
-                log::info!("cast: the {source:?} token timed out");
-                last_error = Some(AppError::new(ErrorCode::Network, "Spotify did not answer in time"));
+    // The same token plan as the ZeroConf `accesstoken` login (`device_token`); the heartbeat is
+    // answered while each token is minted.
+    let mut plan = TokenPlan::new("cast", sources, &info.client_id);
+    while let Some(source) = plan.next_source() {
+        let minted = mint(source, info.client_id.clone(), info.device_id.clone());
+        let token = match channel.drive(device_token::bounded(timeouts.token, minted)).await? {
+            Ok(token) => token,
+            Err(e) => {
+                plan.failed(source, e);
                 continue;
             }
         };
@@ -282,13 +272,10 @@ where
             .await?
         {
             AddUser::Accepted => return Ok(info),
-            AddUser::Refused(detail) => {
-                log::info!("cast: the receiver refused the {source:?} token ({detail})");
-                last_error = Some(refused(&detail));
-            }
+            AddUser::Refused(detail) => plan.refused(source, refused(&detail)),
         }
     }
-    Err(last_error.unwrap_or_else(|| AppError::unavailable("Spotify did not issue a sign-in token for the device")))
+    Err(plan.finish())
 }
 
 fn text(v: &Value, keys: &[&str]) -> Option<String> {

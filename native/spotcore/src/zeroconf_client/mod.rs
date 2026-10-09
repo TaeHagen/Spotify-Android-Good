@@ -6,11 +6,12 @@
 //! happens in Kotlin (`NsdManager`), which hands us the device URL `http://host:port/<CPath>`
 //! (plus the interface index for a link-local IPv6 host, which a URL cannot carry); we GET
 //! `?action=getInfo`, then POST `?action=addUser` with the credentials blob ([`blob`]) encrypted
-//! to the device's Diffie-Hellman public key. A device whose ZeroConf service is not loaded
-//! (`availability` NOT-LOADED, `publicKey` "INVALID") first gets a wake-up `addUser` without
-//! credentials. After a successful `addUser` we wait a bounded time for the device to appear in
-//! the Connect cluster and return its Connect device id, which Kotlin passes to
-//! `connect.transfer`.
+//! to the device's Diffie-Hellman public key, or, for a device that advertises `accesstoken`, an
+//! access token minted for the device's own client id ([`device_token`], shared with the Cast
+//! client). A device whose ZeroConf service is not loaded (`availability` NOT-LOADED,
+//! `publicKey` "INVALID") first gets a wake-up `addUser` without credentials. After a successful
+//! `addUser` we wait a bounded time for the device to appear in the Connect cluster and return its
+//! Connect device id, which Kotlin passes to `connect.transfer`.
 //!
 //! RPC methods:
 //! * `connect.localInfo {"url","scopeId"?}` → the parsed getInfo (no key material leaves Rust).
@@ -29,6 +30,7 @@ pub(crate) use http::is_local_ip;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::StoredCredentials;
 use crate::rpc::{parse_args, to_value};
+use crate::device_token::{self, TokenPlan, TokenSource};
 use crate::{connect, engine, runtime};
 use info::{AddUserReply, LocalDeviceInfo};
 use librespot_protocol::authentication::AuthenticationType;
@@ -43,6 +45,9 @@ use url::Url;
 const GET_INFO_TIMEOUT: Duration = Duration::from_secs(8);
 /// addUser makes the device talk to Spotify, so it is allowed longer.
 const ADD_USER_TIMEOUT: Duration = Duration::from_secs(20);
+/// The device-facing part of a login (getInfo, wake-up, every addUser and token mint) as a whole:
+/// each step is bounded, and a device that refuses token after token still ends in time.
+const LOGIN_BOUND: Duration = Duration::from_secs(90);
 /// How long to wait for the device to join the cluster after a successful addUser.
 const CLUSTER_WAIT: Duration = Duration::from_secs(10);
 /// Without a cluster push by then, the cluster is fetched again once (`connect.refreshDevices`).
@@ -174,20 +179,17 @@ fn wake_up_form(info: &LocalDeviceInfo, account: &Account) -> Vec<(String, Strin
     ]
 }
 
-/// Builds the `addUser` form for `info`, choosing the token type.
+/// Builds the `addUser` form for `info`.
 ///
-/// * `accesstoken` (when the device advertises it): a fresh login5 access token sent as the blob,
-///   with the device's client id as `clientKey`, as Spotify's own clients do.
+/// * `token` (a device that advertises `accesstoken`): the access token as the blob, with the
+///   device's client id as `clientKey`, as Spotify's own clients do. The token is minted for that
+///   client id ([`device_token`], see [`token_login`]).
 /// * otherwise `default`: the stored reusable credentials, encrypted into the ZeroConf blob
 ///   ([`blob`]), with our DH public key as `clientKey`.
-async fn add_user_form<T, F>(info: &LocalDeviceInfo, account: &Account, mint_token: &T) -> AppResult<Vec<(String, String)>>
-where
-    T: Fn() -> F,
-    F: Future<Output = AppResult<String>>,
-{
-    let (token_type, client_key, payload) = if info.supports_access_token {
+fn add_user_form(info: &LocalDeviceInfo, account: &Account, token: Option<&str>) -> AppResult<Vec<(String, String)>> {
+    let (token_type, client_key, payload) = if let Some(token) = token {
         // Spotify's clients echo the device's own client id here for this token type.
-        (info::TOKEN_TYPE_ACCESS_TOKEN.to_string(), info.client_id.clone(), mint_token().await?)
+        (info::TOKEN_TYPE_ACCESS_TOKEN.to_string(), info.client_id.clone(), token.to_string())
     } else {
         let creds = account
             .credentials
@@ -243,17 +245,100 @@ async fn await_loaded(endpoint: &Endpoint, mut info: LocalDeviceInfo) -> LocalDe
     info
 }
 
+/// How an `addUser` ended when the device didn't refuse it.
+enum Sent {
+    Accepted,
+    /// 203 ERROR-INVALID-PUBLICKEY: the device's service was reloading.
+    InvalidPublicKey(AddUserReply),
+}
+
+/// Sorts an `addUser` answer: accepted, asked for a new public key, or refused (the error).
+fn settle(reply: AddUserReply) -> AppResult<Sent> {
+    if reply.ok() {
+        Ok(Sent::Accepted)
+    } else if reply.status == info::STATUS_INVALID_PUBLIC_KEY {
+        Ok(Sent::InvalidPublicKey(reply))
+    } else {
+        Err(info::refused(&reply))
+    }
+}
+
+/// The `addUser` of an `accesstoken` device: a token per source of `sources`
+/// ([`device_token::TokenPlan`], the same plan as the Cast login: the device's client first,
+/// this session's own token last), each minted within [`device_token::MINT_TIMEOUT`] for the
+/// client id and device id of `info`, until the device takes one. A refused token (any status but
+/// OK or 203) hands over to the next source; a network failure ends the login.
+async fn token_login<M, F>(
+    endpoint: &Endpoint,
+    info: &LocalDeviceInfo,
+    account: &Account,
+    sources: &[TokenSource],
+    mint: &M,
+) -> AppResult<Sent>
+where
+    M: Fn(TokenSource, String, String) -> F,
+    F: Future<Output = AppResult<String>>,
+{
+    let mut plan = TokenPlan::new("zeroconf", sources, &info.client_id);
+    while let Some(source) = plan.next_source() {
+        let minted = mint(source, info.client_id.clone(), info.device_id.clone());
+        let token = match device_token::bounded(device_token::MINT_TIMEOUT, minted).await {
+            Ok(token) => token,
+            Err(e) => {
+                plan.failed(source, e);
+                continue;
+            }
+        };
+        let reply = match endpoint.add_user(&add_user_form(info, account, Some(&token))?).await {
+            Ok(reply) => reply,
+            // An answer without a status (an HTTP error page) is a refusal too.
+            Err(e) if e.code == ErrorCode::Unavailable => {
+                plan.refused(source, e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        match settle(reply) {
+            Ok(sent) => return Ok(sent),
+            Err(e) => plan.refused(source, e),
+        }
+    }
+    Err(plan.finish())
+}
+
+/// One `addUser` round for `info`: tokens for an `accesstoken` device, the stored credentials
+/// otherwise.
+async fn log_in<M, F>(
+    endpoint: &Endpoint,
+    info: &LocalDeviceInfo,
+    account: &Account,
+    sources: &[TokenSource],
+    mint: &M,
+) -> AppResult<Sent>
+where
+    M: Fn(TokenSource, String, String) -> F,
+    F: Future<Output = AppResult<String>>,
+{
+    if info.supports_access_token {
+        token_login(endpoint, info, account, sources, mint).await
+    } else {
+        settle(endpoint.add_user(&add_user_form(info, account, None)?).await?)
+    }
+}
+
 /// The device-facing part of `connect.localLogin`: getInfo, the wake-up for a NOT-LOADED device,
-/// `addUser` (with one retry after 203 ERROR-INVALID-PUBLICKEY). Returns the device's latest
+/// `addUser` (tokens from `sources` for an `accesstoken` device, see [`token_login`]; one more
+/// round with a fresh getInfo after 203 ERROR-INVALID-PUBLICKEY). Returns the device's latest
 /// getInfo once it accepted the login.
-async fn add_user_flow<T, F>(
+async fn add_user_flow<M, F>(
     endpoint: &Endpoint,
     expected_device_id: Option<&str>,
     account: &Account,
-    mint_token: T,
+    sources: &[TokenSource],
+    mint: M,
 ) -> AppResult<LocalDeviceInfo>
 where
-    T: Fn() -> F,
+    M: Fn(TokenSource, String, String) -> F,
     F: Future<Output = AppResult<String>>,
 {
     let mut info = endpoint.info().await?;
@@ -277,15 +362,16 @@ where
     }
 
     log::info!("zeroconf addUser to '{}' ({})", info.remote_name, info.device_id);
-    let mut reply = endpoint.add_user(&add_user_form(&info, account, &mint_token).await?).await?;
-    // The device asked for a fresh public key (its service was reloading): re-read getInfo and
-    // retry once. Never a second wake-up.
-    if reply.status == info::STATUS_INVALID_PUBLIC_KEY {
+    let mut sent = log_in(endpoint, &info, account, sources, &mint).await?;
+    // The device asked for a fresh public key (its service was reloading): re-read getInfo
+    // (a token is then minted for its client id as it reads now) and retry once. Never a second
+    // wake-up.
+    if let Sent::InvalidPublicKey(_) = sent {
         log::info!("zeroconf device asked for a new public key; retrying once");
         info = await_loaded(endpoint, endpoint.info().await?).await;
-        reply = endpoint.add_user(&add_user_form(&info, account, &mint_token).await?).await?;
+        sent = log_in(endpoint, &info, account, sources, &mint).await?;
     }
-    if !reply.ok() {
+    if let Sent::InvalidPublicKey(reply) = sent {
         return Err(info::refused(&reply));
     }
     log::info!("zeroconf addUser accepted by '{}'", info.remote_name);
@@ -298,7 +384,10 @@ async fn local_login(args: LoginArgs) -> AppResult<Value> {
     }
     let endpoint = Endpoint::parse(&args.url, args.scope_id)?;
     let account = Account::current()?;
-    let info = add_user_flow(&endpoint, args.device_id.as_deref(), &account, engine::access_token).await?;
+    let flow = add_user_flow(&endpoint, args.device_id.as_deref(), &account, &device_token::ZEROCONF_SOURCES, device_token::mint);
+    let info = tokio::time::timeout(LOGIN_BOUND, flow)
+        .await
+        .map_err(|_| AppError::new(ErrorCode::Network, "The device did not answer in time"))??;
     let device_id = wait_for_cluster(&info.device_id).await.unwrap_or_else(|| info.device_id.clone());
     to_value(&json!({ "deviceId": device_id }))
 }
