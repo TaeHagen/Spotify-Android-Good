@@ -28,7 +28,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -75,6 +74,9 @@ import com.taehagen.spotifygood.ui.screens.album.DownloadedCopyNotice
 import com.taehagen.spotifygood.ui.screens.album.ExpandableText
 import com.taehagen.spotifygood.ui.screens.album.HeaderMetaText
 import com.taehagen.spotifygood.ui.screens.album.LoadMoreEffect
+import com.taehagen.spotifygood.ui.screens.library.TrackSortButton
+import com.taehagen.spotifygood.ui.screens.library.TrackSort
+import com.taehagen.spotifygood.ui.screens.library.LoadingAllProgress
 import com.taehagen.spotifygood.ui.screens.album.LoadState
 import com.taehagen.spotifygood.ui.screens.album.LoadStateContent
 import com.taehagen.spotifygood.ui.screens.album.MoreButton
@@ -113,7 +115,8 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
     }
     LoadMoreEffect(
         listState = listState,
-        enabled = state.load is LoadState.Ready && !state.paging.failed && !state.list.filterActive,
+        // A filter or a sort fetches every page itself.
+        enabled = state.load is LoadState.Ready && !state.paging.failed && !state.list.filterActive && !state.list.sortActive,
         onLoadMore = viewModel::loadMore,
     )
     val exitEditMode = {
@@ -127,6 +130,7 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
             onSmartShuffle = viewModel::smartShuffleContext,
             onRetryPartial = viewModel::retryPartial,
             onRetry = viewModel::retry,
+            onSort = viewModel::setSort,
             onToggleFollow = viewModel::toggleFollow,
             onDownload = viewModel::download,
             onRemoveDownload = { viewModel.removeCollectionDownload() },
@@ -233,6 +237,7 @@ private class PlaylistActions(
     val onRetryPartial: () -> Unit,
     /** Fetches the playlist again (e.g. to replace the downloaded copy). */
     val onRetry: () -> Unit,
+    val onSort: (TrackSort) -> Unit,
     val onToggleFollow: () -> Unit,
     val onDownload: () -> Unit,
     val onRemoveDownload: () -> Unit,
@@ -294,17 +299,21 @@ private fun PlaylistList(
         }
         if (!state.editMode && playlist.total > 0) {
             item(key = "filter", contentType = "filter") {
-                Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-                    SearchField(
-                        value = query,
-                        onValueChange = onQueryChange,
-                        placeholder = stringResource(R.string.detail_find_in_playlist),
-                    )
+                Column(Modifier.padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        SearchField(
+                            value = query,
+                            onValueChange = onQueryChange,
+                            placeholder = stringResource(R.string.detail_find_in_playlist),
+                            modifier = Modifier.weight(1f),
+                        )
+                        TrackSortButton(sort = state.sort, options = TrackSort.PLAYLIST, onSort = actions.onSort)
+                    }
                     if (state.paging.loadingAll) {
-                        LinearProgressIndicator(
-                            Modifier
-                                .fillMaxWidth()
-                                .padding(top = 4.dp),
+                        LoadingAllProgress(
+                            loaded = playlist.rows.size,
+                            total = playlist.total,
+                            modifier = Modifier.padding(top = 8.dp, end = 12.dp),
                         )
                     }
                 }
@@ -449,7 +458,10 @@ private fun PlaylistHeader(
                                 active = isContext && state.playback.shuffle && !state.playback.smartShuffle,
                                 onClick = actions.onShuffle,
                             )
-                            PlayFab(isPlaying = state.playback.isPlayingContext(meta.uri), onClick = actions.onPlay)
+                            PlayFab(
+                                isPlaying = state.playback.isPlayingContext(meta.uri) || (state.sortedListIsCurrent && state.playback.isPlaying),
+                                onClick = actions.onPlay,
+                            )
                         },
                     )
                 }

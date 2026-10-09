@@ -43,6 +43,13 @@ import com.taehagen.spotifygood.ui.screens.album.searchText
 import com.taehagen.spotifygood.ui.screens.album.searchTokens
 import com.taehagen.spotifygood.ui.screens.album.statesFor
 import com.taehagen.spotifygood.ui.screens.library.explicitFilterChanges
+import com.taehagen.spotifygood.ui.screens.library.sortedPlayRequest
+import com.taehagen.spotifygood.ui.screens.library.sortOrder
+import com.taehagen.spotifygood.ui.screens.library.sortKey
+import com.taehagen.spotifygood.ui.screens.library.isSortedPlayback
+import com.taehagen.spotifygood.ui.screens.library.attempt
+import com.taehagen.spotifygood.ui.screens.library.TrackSort
+import com.taehagen.spotifygood.ui.screens.library.ListSortStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
@@ -115,6 +122,8 @@ internal data class VisibleRow(val index: Int, val row: PlaylistRow)
 internal data class PlaylistListUi(
     val rows: List<VisibleRow> = emptyList(),
     val filterActive: Boolean = false,
+    /** Rows are shown in another order than the playlist's own ([VisibleRow.index] keeps theirs). */
+    val sortActive: Boolean = false,
     /** Total duration, known once every item is loaded. */
     val totalDurationMs: Long? = null,
 )
@@ -137,6 +146,10 @@ internal data class PlaylistUiState(
     /** The session is ONLINE: rows that aren't downloaded can start ([canStartNow]). */
     val online: Boolean = true,
     val filterExplicit: Boolean = false,
+    /** The chosen order (not applied in edit mode, which shows the playlist's own). */
+    val sort: TrackSort = TrackSort.CUSTOM,
+    /** What plays is a sorted list this page started (playing or paused). */
+    val sortedListIsCurrent: Boolean = false,
 )
 
 @Immutable
@@ -169,6 +182,10 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     private val data = MutableStateFlow<LoadState<PlaylistData>>(LoadState.Loading)
     private val paging = MutableStateFlow(PagingUi())
     private val filter = MutableStateFlow("")
+    private val sortStore = ListSortStore(graph.app)
+    private val sort = MutableStateFlow(TrackSort.CUSTOM)
+    /** Track URIs of the last sorted list this page started ([isSortedPlayback]). */
+    private val sortedSent = MutableStateFlow<Set<String>>(emptySet())
     private val editMode = MutableStateFlow(false)
     private val addQuery = MutableStateFlow("")
     private val addedFromSheet = MutableStateFlow<Set<String>>(emptySet())
@@ -195,14 +212,18 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     private val listUi: Flow<PlaylistListUi> = combine(
         data,
         filter.debounce { if (it.isBlank()) 0L else FILTER_DEBOUNCE_MS },
-    ) { load, query -> load.dataOrNull() to query }
-        .mapLatest { (playlist, query) -> buildListUi(playlist, query) }
+        sort,
+        editMode,
+    ) { load, query, sort, editing -> ListInput(load.dataOrNull(), query, if (editing) TrackSort.CUSTOM else sort) }
+        .mapLatest { (playlist, query, sort) -> buildListUi(playlist, query, sort) }
 
     private val itemUris: Flow<Set<String>> = data
         .map { load -> load.dataOrNull()?.rows?.mapNotNullTo(HashSet()) { it.item.uri } ?: emptySet() }
         .distinctUntilChanged()
 
-    private val core: Flow<CoreState> = combine(data, listUi, paging, editMode, ::CoreState)
+    private val core: Flow<CoreState> = combine(data, listUi, paging, editMode, combine(sort, sortedSent, ::Pair)) { load, list, paging, editing, (sort, sent) ->
+        CoreState(load, list, paging, editing, sort, sent)
+    }
 
     val state: StateFlow<PlaylistUiState> = combine(
         core,
@@ -214,6 +235,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         PlaylistUiState(
             core.load, core.list, core.paging, core.editMode, playback, following, download, rows,
             connectivity.offline, connectivity.online, connectivity.filterExplicit,
+            sort = core.sort,
+            sortedListIsCurrent = isSortedPlayback(playback.trackUri, playback.contextUri, core.sortedSent),
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlaylistUiState())
 
@@ -235,6 +258,14 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         // Session ONLINE after the page failed, showed a stale copy or the download: fetch the
         // server's rows (they replace it).
         reloadWhenOnline(data, showingDownload = { data.value.dataOrNull()?.downloadedCopy == true })
+        // The sort chosen for this playlist last time (every row is fetched for it, with progress).
+        viewModelScope.launch {
+            val stored = sortStore.get(ListSortStore.playlist(uri))?.takeIf { it in TrackSort.PLAYLIST } ?: return@launch
+            if (sort.value == TrackSort.CUSTOM && stored != TrackSort.CUSTOM) {
+                sort.value = stored
+                ensureAllLoaded()
+            }
+        }
         // Loaded rows carry the playable flags of the old explicit filter; the revision doesn't
         // change, so the live page alone wouldn't replace them.
         graph.explicitFilterChanges()
@@ -329,8 +360,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
                 }
             }
         }
-        if (filter.value.isNotBlank()) ensureAllLoaded()
+        if (needsAllRows()) ensureAllLoaded()
     }
+
+    /** A filter or a sort needs every row (fetched page by page, with progress). */
+    private fun needsAllRows(): Boolean = filter.value.isNotBlank() || sort.value != TrackSort.CUSTOM
 
     /** Owner: shows the playlist on the profile, or not. The page reloads with the new state. */
     fun setPublic(public: Boolean) {
@@ -430,7 +464,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         return true
     }
 
-    /** Loads every remaining page (used by the in-playlist filter). */
+    /** Loads every remaining page (used by the in-playlist filter and a sort). */
     private fun ensureAllLoaded() {
         if (loadAllJob?.isActive == true) return
         loadAllJob = viewModelScope.launch {
@@ -438,7 +472,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             try {
                 pageJob?.join()
                 var pages = 0
-                while (pages++ < MAX_PAGES && filter.value.isNotBlank()) {
+                while (pages++ < MAX_PAGES && needsAllRows()) {
                     val playlist = data.value.dataOrNull() ?: break
                     if (playlist.allLoaded || !loadNextPage()) break
                 }
@@ -450,25 +484,76 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
 
     fun retryPage() {
         paging.update { it.copy(failed = false) }
-        if (filter.value.isNotBlank()) ensureAllLoaded() else loadMore()
+        if (needsAllRows()) ensureAllLoaded() else loadMore()
     }
 
     private fun buildRows(items: List<PlaylistItem>, used: MutableSet<String> = HashSet()): List<PlaylistRow> =
         assignRowKeys(items, used).zip(items, ::PlaylistRow)
 
-    private suspend fun buildListUi(playlist: PlaylistData?, query: String): PlaylistListUi {
+    private suspend fun buildListUi(playlist: PlaylistData?, query: String, sort: TrackSort): PlaylistListUi {
         if (playlist == null) return PlaylistListUi()
         val tokens = searchTokens(query)
         val duration = if (playlist.allLoaded) playlist.rows.sumOf { it.durationMs } else null
-        if (tokens.isEmpty()) {
+        val sortActive = sort != TrackSort.CUSTOM
+        if (tokens.isEmpty() && !sortActive) {
             return PlaylistListUi(playlist.rows.mapIndexed(::VisibleRow), filterActive = false, totalDurationMs = duration)
         }
+        // Sorted, then filtered, off the main thread; rows keep their playlist index (edits).
         val rows = withContext(Dispatchers.Default) {
-            playlist.rows.mapIndexedNotNull { index, row ->
-                if (matchesTokens(row.searchText, tokens)) VisibleRow(index, row) else null
-            }
+            sortedRows(playlist, sort).filter { tokens.isEmpty() || matchesTokens(it.row.searchText, tokens) }
         }
-        return PlaylistListUi(rows, filterActive = true, totalDurationMs = duration)
+        return PlaylistListUi(rows, filterActive = tokens.isNotEmpty(), sortActive = sortActive, totalDurationMs = duration)
+    }
+
+    /** Every loaded row in [sort] order, with its playlist index. */
+    private fun sortedRows(playlist: PlaylistData, sort: TrackSort): List<VisibleRow> =
+        sortOrder(playlist.rows.map { it.item.sortKey() }, sort, default = TrackSort.CUSTOM)
+            .map { VisibleRow(it, playlist.rows[it]) }
+
+    /** Shows (and plays) the rows in [value] order; remembered for this playlist. */
+    fun setSort(value: TrackSort) {
+        if (value !in TrackSort.PLAYLIST || value == sort.value) return
+        sort.value = value
+        graph.appScope.launch { attempt { sortStore.set(ListSortStore.playlist(uri), value, default = TrackSort.CUSTOM) } }
+        if (value != TrackSort.CUSTOM) ensureAllLoaded()
+    }
+
+    /** The playlist is shown in another order than its own (not in edit mode). */
+    private val sorted: Boolean get() = sort.value != TrackSort.CUSTOM && !editMode.value
+
+    /**
+     * Plays the loaded rows in the shown order from [startUri] (else the first) as a track list: the
+     * playlist context plays its own order ([sortedPlayRequest]). Sorted off the main thread.
+     */
+    private fun playSorted(startUri: String?) {
+        val playlist = data.value.dataOrNull() ?: return
+        val order = sort.value
+        viewModelScope.launch {
+            val uris = withContext(Dispatchers.Default) {
+                sortedRows(playlist, order).mapNotNull { visible ->
+                    val item = visible.row.item
+                    val playable = item.track?.let { it.playable && !it.isPlaceholder } ?: item.episode?.let { it.playable && !it.isPlaceholder } ?: false
+                    item.uri?.takeIf { playable && !it.startsWith("spotify:local:") }
+                }
+            }
+            val request = sortedPlayRequest(uris, startUri?.let { uris.indexOf(it).coerceAtLeast(0) } ?: 0) ?: return@launch
+            sortedSent.value = request.trackUris.orEmpty().toSet()
+            graph.player.play(request)
+        }
+    }
+
+    /** Play button: toggles the sorted list started here; sorted, plays it from the top. */
+    override fun playContext() {
+        if (!sorted) {
+            super.playContext()
+            return
+        }
+        val playback = currentPlayback()
+        if (isSortedPlayback(playback.trackUri, playback.contextUri, sortedSent.value)) {
+            graph.player.togglePlayPause()
+        } else {
+            playSorted(startUri = null)
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -479,6 +564,10 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val item = row.row.item
         // Placeholders (metadata failed) are not played; the row does not offer it either.
         if (item.track?.isPlaceholder == true || item.episode?.isPlaceholder == true) return
+        if (sorted) {
+            playSorted(item.uri)
+            return
+        }
         graph.player.play(
             PlayRequest(contextUri = uri, startUri = item.uri, startIndex = row.index, startUid = item.uid),
         )
@@ -619,7 +708,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val list: PlaylistListUi,
         val paging: PagingUi,
         val editMode: Boolean,
+        val sort: TrackSort,
+        val sortedSent: Set<String>,
     )
+
+    private data class ListInput(val playlist: PlaylistData?, val query: String, val sort: TrackSort)
 
     private fun mutate(change: (PlaylistData) -> Mutation?) {
         val playlist = data.value.dataOrNull() ?: return
