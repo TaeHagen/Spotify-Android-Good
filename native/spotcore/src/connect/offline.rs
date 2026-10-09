@@ -189,6 +189,7 @@ pub(crate) fn handoff_with(
             start_uri: None,
             smart_shuffle: s.smart_shuffle,
             order: None,
+            tracks: None,
         }),
         streamed,
     })
@@ -198,23 +199,34 @@ pub(crate) fn handoff_with(
 /// (not downloaded, or the end of Spirc's full list): Spirc continues there when the session is
 /// back (see `HandBack`), a shuffled session in its `order`. At the first context track from
 /// there, before the context's end (suggestions are skipped: with smart shuffle on Spirc adds
-/// new ones; the user queue comes before the context's tracks, so it is in the window). `None`
-/// for a context that can't be loaded again.
+/// new ones; the user queue comes before the context's tracks, so it is in the window). A plain
+/// track list, whose context can't be loaded again, goes on as the rest of it Spirc listed (in
+/// play order, kept as its shuffled order). `None` when nothing of it comes after the window.
 fn continuation(s: &ConnectSnapshot, from: usize, order: Option<Vec<String>>) -> Option<Continuation> {
-    if !uri::is_resolvable_context(&s.context_uri) {
-        return None;
-    }
+    let resolvable = uri::is_resolvable_context(&s.context_uri);
+    let mut list = Vec::new();
     for t in &s.next_tracks[from..] {
         if t.uri == uri::DELIMITER_URI {
             // The context's end (repeat-all wraps there, else autoplay follows).
-            return None;
+            break;
         }
-        if !t.hidden && t.provider == TrackProvider::Context {
+        if t.hidden || t.provider != TrackProvider::Context {
+            continue;
+        }
+        if resolvable {
             let (context_uri, start_uri) = (s.context_uri.clone(), Some(t.uri.clone()));
-            return Some(Continuation { context_uri, start_uri, smart_shuffle: s.smart_shuffle, order });
+            return Some(Continuation { context_uri, start_uri, smart_shuffle: s.smart_shuffle, order, tracks: None });
         }
+        list.push(t.uri.clone());
     }
-    None
+    (!resolvable && !list.is_empty()).then(|| Continuation {
+        context_uri: s.context_uri.clone(),
+        start_uri: None,
+        smart_shuffle: s.smart_shuffle,
+        // (by uri: a list's uids come from its positions)
+        order: (s.shuffle || s.smart_shuffle).then(|| list.clone()),
+        tracks: Some(list),
+    })
 }
 
 /// The end of a handed-over window while a visible session is up: Spirc goes on with the
@@ -234,15 +246,17 @@ fn hand_back(back: HandBack) -> AppResult<()> {
             smart_shuffle: back.smart_shuffle,
             shuffle_order: back.order.clone(),
         };
-        let request = LoadRequest::from_context_uri(
-            back.context_uri.clone(),
-            LoadRequestOptions {
-                start_playing: back.play,
-                seek_to: 0,
-                playing_track: back.start_uri.clone().map(PlayingTrack::Uri),
-                context_options: Some(LoadContextOptions::Options(options)),
-            },
-        );
+        let options = |playing_track| LoadRequestOptions {
+            start_playing: back.play,
+            seek_to: 0,
+            playing_track,
+            context_options: Some(LoadContextOptions::Options(options.clone())),
+        };
+        let request = match &back.tracks {
+            // A plain track list goes on as the rest of it.
+            Some(tracks) => LoadRequest::from_tracks(tracks.clone(), options(Some(PlayingTrack::Index(0)))),
+            None => LoadRequest::from_context_uri(back.context_uri.clone(), options(back.start_uri.clone().map(PlayingTrack::Uri))),
+        };
         hub::set_handing_back(view);
         if let Some(player) = engine::player_host::player() {
             player.stop();
@@ -909,10 +923,42 @@ mod tests {
         // the context's end before any of its tracks: none
         s.next_tracks = vec![st("t:sx", Suggestion), st(uri::DELIMITER_URI, Context), st("t:auto", Context)];
         assert_eq!(handoff(&s, downloaded, 0).expect("handed over").continuation, None);
-        // a context that can't be loaded again: none
+        // a plain track list: the rest of it as listed
         s.context_uri = "spotify:web-api".into();
         s.next_tracks = vec![st("t:1x", Context)];
-        assert_eq!(handoff(&s, downloaded, 0).expect("handed over").continuation, None);
+        let c = handoff(&s, downloaded, 0).expect("handed over").continuation.expect("continuation");
+        assert_eq!((c.start_uri, c.tracks.as_deref()), (None, Some(["t:1x".to_string()].as_slice())));
+    }
+
+    #[test]
+    fn a_track_list_goes_on_as_the_rest_of_it() {
+        use librespot_connect::TrackProvider::{Autoplay, Context};
+        let downloaded = |u: &str| !u.ends_with('x');
+        // Your Episodes as a list: a streamed episode handed over alone
+        let mut s = playing(&["t:1"], "t:2x", &[]);
+        s.context_uri = "spotify:web-api".into();
+        s.repeat_context = false;
+        s.next_tracks = vec![
+            st("t:3x", Context),
+            st("t:4", Context),
+            SnapshotTrack { hidden: true, ..st("t:hidden", Context) },
+            st("t:5x", Context),
+            st(uri::DELIMITER_URI, Context),
+            st("t:auto", Autoplay),
+        ];
+        let a = handoff_with(&s, downloaded, Some("t:2x"), 0).expect("handed over");
+        assert_eq!(a.uris, ["t:1", "t:2x"]);
+        let c = a.continuation.expect("continuation");
+        let rest = ["t:3x", "t:4", "t:5x"].map(String::from).to_vec();
+        assert_eq!((c.start_uri, c.tracks.as_ref(), c.order), (None, Some(&rest), None), "up to the list's end");
+        assert!(a.restart.is_none(), "its start isn't known");
+        // shuffled: that order is kept (by uri)
+        s.shuffle = true;
+        let c = handoff_with(&s, downloaded, Some("t:2x"), 0).and_then(|a| a.continuation).expect("continuation");
+        assert_eq!(c.order.as_ref(), Some(&rest));
+        // nothing of it after the window: none
+        s.next_tracks.clear();
+        assert!(handoff_with(&s, downloaded, Some("t:2x"), 0).is_some_and(|a| a.continuation.is_none()));
     }
 
     #[test]

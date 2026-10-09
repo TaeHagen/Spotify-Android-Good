@@ -343,6 +343,9 @@ before the session is back (no network, no visible session) stops there and keep
 context goes on: once the session and its first cluster are back it hands back by itself
 (playing if it ended playing less than 120 s ago, else paused), and a play hands back too; a
 play while still offline says "Nothing more to play offline" instead of replaying the window.
+A plain track list (`spotify:web-api`, whose context can't be loaded again) goes on the same way
+as the rest of it Spirc listed after the window (in play order, kept as its shuffled order),
+loaded as a list; a push to another device sends it after the window too.
 A streamed current track is frozen for the reconnect as before (§8), unless its data is all in
 the Player (the vendored `Player::fully_buffered`): it plays on to its end, then the downloaded
 tracks after it, and it isn't loaded again offline (the window around it is the downloads only).

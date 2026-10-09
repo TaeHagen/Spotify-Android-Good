@@ -47,6 +47,9 @@ pub(crate) struct Continuation {
     pub smart_shuffle: bool,
     /// A shuffled session's order to keep (see `Options::shuffle_order`).
     pub order: Option<Vec<String>>,
+    /// A plain track list (its context can't be loaded again): the rest of it as it was listed,
+    /// in play order, loaded as a list (from its first track) instead of the context.
+    pub tracks: Option<Vec<String>>,
 }
 
 /// Spirc loads the context at the continuation (online again): the end of the handed-over window
@@ -63,6 +66,8 @@ pub(crate) struct HandBack {
     pub repeat_track: bool,
     /// See [`Continuation::order`].
     pub order: Option<Vec<String>>,
+    /// See [`Continuation::tracks`].
+    pub tracks: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +522,7 @@ impl OfflineQueue {
             repeat_context: self.repeat_context,
             repeat_track: self.repeat == RepeatMode::Track,
             order: c.order.clone(),
+            tracks: c.tracks.clone(),
         };
         self.window_ended = None;
         self.notice = None;
@@ -1023,6 +1029,11 @@ impl OfflineQueue {
     pub fn handover(&self, now_ms: i64, max_next: usize) -> Handover {
         let mut uris: Vec<String> = self.current_uri().map(str::to_string).into_iter().collect();
         uris.extend(self.next_tracks().into_iter().take(max_next).map(|t| t.uri));
+        // A plain track list goes on after the window as it was listed (without repeat-all,
+        // which wraps the window).
+        let rest = self.continuation.as_ref().and_then(|c| c.tracks.as_ref()).filter(|_| !self.repeat_context);
+        let room = max_next.saturating_sub(uris.len().saturating_sub(1));
+        uris.extend(rest.into_iter().flatten().take(room).cloned());
         let context = match &self.current {
             Some(Current::Context(i)) if !self.outside.contains(i) => self
                 .context_uri
@@ -1582,6 +1593,7 @@ mod tests {
             start_uri: Some("spotify:track:gap".into()),
             smart_shuffle: false,
             order: None,
+            tracks: None,
         };
         for repeat_context in [false, true] {
             let mut q = OfflineQueue::default();
@@ -1628,6 +1640,7 @@ mod tests {
             start_uri: Some("spotify:track:next".into()),
             smart_shuffle: false,
             order: None,
+            tracks: None,
         };
         // a streamed song handed over alone, the playlist goes on after it
         let ended = || {
@@ -1673,8 +1686,36 @@ mod tests {
     }
 
     #[test]
+    fn a_track_list_window_goes_on_as_its_rest() {
+        let rest = vec!["spotify:track:a".to_string(), "spotify:track:b".to_string()];
+        let continuation = Continuation {
+            context_uri: "spotify:web-api".into(),
+            start_uri: None,
+            smart_shuffle: false,
+            order: None,
+            tracks: Some(rest.clone()),
+        };
+        let adopt = || {
+            let mut q = OfflineQueue::default();
+            q.on_event(Event::RequestId(7), 0);
+            let a = Adoption { context_uri: Some("spotify:web-api".into()), continuation: Some(continuation.clone()), ..adoption(1, 0) };
+            q.adopt(a, 0);
+            q
+        };
+        // pushed to another device: the window, then the rest of the list
+        assert_eq!(adopt().handover(0, 50).uris, ["spotify:track:0", "spotify:track:a", "spotify:track:b"]);
+        // its end offline, then the session is back: the rest of the list goes on in Spirc
+        let mut q = adopt();
+        q.on_event(Event::Playing { id: 7, position_ms: 0 }, 0);
+        assert_eq!(q.on_event(Event::EndOfTrack(7), 1_000).action, Some(Action::Stop));
+        q.set_hand_back(true);
+        let Some(Action::HandBack(back)) = q.resume_window_end(2_000) else { panic!("hand back") };
+        assert_eq!((back.tracks, back.start_uri, back.play), (Some(rest), None, true));
+    }
+
+    #[test]
     fn a_restart_hands_back_only_where_the_window_wraps() {
-        let restart = Continuation { context_uri: "spotify:playlist:p".into(), start_uri: None, smart_shuffle: false, order: None };
+        let restart = Continuation { context_uri: "spotify:playlist:p".into(), start_uri: None, smart_shuffle: false, order: None, tracks: None };
         let adopted = |repeat_context| {
             let mut q = OfflineQueue::default();
             q.on_event(Event::RequestId(7), 0);
