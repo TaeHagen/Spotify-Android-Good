@@ -67,6 +67,7 @@ import com.taehagen.spotifygood.ui.components.PlayFab
 import com.taehagen.spotifygood.ui.components.TrackRow
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import com.taehagen.spotifygood.ui.screens.album.canStartNow
 
 @Composable
 internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier = Modifier) {
@@ -181,6 +182,8 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
                         downloadState = state.downloadStates[track.uri],
                         onMoreClick = { navigator.showActions(target) },
                         onLongClick = { navigator.showActions(target) },
+                        // Not downloaded while the session isn't online: it can't start (as on playlists).
+                        enabled = canStartNow(track.playable, state.online, state.downloadStates[track.uri]),
                     )
                 }
                 if (state.isLoadingMore) {

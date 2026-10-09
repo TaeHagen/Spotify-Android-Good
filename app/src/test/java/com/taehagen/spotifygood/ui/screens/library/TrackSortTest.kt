@@ -6,6 +6,7 @@ import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.PlaylistItem
 import com.taehagen.spotifygood.model.ShowRef
 import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.playback.EngineReach
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -141,5 +142,77 @@ class TrackSortTest {
         val stored = mapOf("old" to "TITLE|1", "new" to "ALBUM|3", "mid" to "ARTIST|2")
         assertEquals(listOf("old"), sortsToForget(stored, max = 2))
         assertEquals(emptyList<String>(), sortsToForget(stored, max = 3))
+    }
+
+    // ---- round 21: the plain-list rule, the kept marker, like patches -------------------------
+
+    private fun load(start: SortedStart): PlayRequestView {
+        val request = (start as SortedStart.Load).request
+        return PlayRequestView(request.trackUris.orEmpty(), request.startIndex ?: 0)
+    }
+
+    private data class PlayRequestView(val uris: List<String>, val index: Int)
+
+    @Test
+    fun whileConnectingATappedSongThatIsntDownloadedIsSentAlone() {
+        // Only c is downloaded; tapping b must not start c (the offline queue's next download).
+        val plan = planSortedPlay(listOf("a", "b", "c"), "b", EngineReach.CONNECTING, downloaded = setOf("c"))
+        assertEquals(PlayRequestView(listOf("b"), 0), load(plan))
+    }
+
+    @Test
+    fun aDownloadedStartPlaysTheListsDownloadsFromExactlyThere() {
+        val plan = planSortedPlay(listOf("a", "b", "c", "d"), "c", EngineReach.CONNECTING, downloaded = setOf("a", "c", "d"))
+        assertEquals(PlayRequestView(listOf("a", "c", "d"), 1), load(plan))
+    }
+
+    @Test
+    fun offlineATappedSongThatIsntDownloadedDoesntStart() {
+        assertEquals(SortedStart.NotDownloaded, planSortedPlay(listOf("a", "b"), "b", EngineReach.OFFLINE, downloaded = setOf("a")))
+    }
+
+    @Test
+    fun onlineTheWholeSortedWindowPlays() {
+        assertEquals(PlayRequestView(listOf("a", "b", "c"), 1), load(planSortedPlay(listOf("a", "b", "c"), "b", EngineReach.ONLINE, emptySet())))
+        assertEquals(PlayRequestView(listOf("a", "b", "c"), 0), load(planSortedPlay(listOf("a", "b", "c"), null, EngineReach.ONLINE, emptySet())))
+    }
+
+    @Test
+    fun playWhileNotOnlinePlaysTheListsDownloads() {
+        assertEquals(PlayRequestView(listOf("b", "c"), 0), load(planSortedPlay(listOf("a", "b", "c"), null, EngineReach.OFFLINE, setOf("c", "b"))))
+        // Nothing downloaded: connecting waits for the session with the list; offline nothing plays.
+        assertEquals(PlayRequestView(listOf("a", "b"), 0), load(planSortedPlay(listOf("a", "b"), null, EngineReach.CONNECTING, emptySet())))
+        assertEquals(SortedStart.NotDownloaded, planSortedPlay(listOf("a", "b"), null, EngineReach.OFFLINE, emptySet()))
+        assertEquals(SortedStart.Nothing, planSortedPlay(emptyList(), null, EngineReach.ONLINE, emptySet()))
+    }
+
+    @Test
+    fun aReopenedPageKnowsItsSortedListIsPlaying() {
+        val list = ListSortStore.playlist("spotify:playlist:p")
+        val sent = SortedPlays.Entry(list, setOf("spotify:track:a", "spotify:track:b"), generation = 0)
+        // The page's own view model is new: what was sent comes from the kept entry.
+        val uris = sortedListUris(list, sent) { error("not needed") }
+        assertTrue(isSortedPlayback("spotify:track:b", null, uris))
+        // Another list played sorted last: not this one.
+        assertEquals(emptySet<String>(), sortedListUris(ListSortStore.LIKED_SONGS, sent) { listOf("spotify:track:b") })
+        // Nothing recorded (a new process): the shown list counts.
+        assertTrue(isSortedPlayback("spotify:track:b", null, sortedListUris(list, null) { listOf("spotify:track:b") }))
+    }
+
+    @Test
+    fun likesPatchAFullyLoadedListWithoutPagingItAgain() {
+        val a = track("A", "x", "y")
+        val b = track("B", "x", "y")
+        val c = track("C", "x", "y")
+        val loaded = listOf(a, b, c)
+        val unliked = LikedPatch().unliked(listOf(b.uri))
+        assertEquals(listOf(a, c) to 2, applyLikedPatch(loaded, 3, unliked))
+        val n = track("New", "x", "y")
+        val liked = unliked.liked(listOf(n))
+        assertEquals(listOf(n, a, c) to 3, applyLikedPatch(loaded, 3, liked))
+        // Liked again: it moves to the top, the count stays.
+        val again = liked.liked(listOf(c))
+        assertEquals(listOf(c, n, a) to 3, applyLikedPatch(loaded, 3, again))
+        assertEquals(loaded to 3, applyLikedPatch(loaded, 3, LikedPatch()))
     }
 }
