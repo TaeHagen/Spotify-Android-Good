@@ -537,6 +537,7 @@ crosses the JNI boundary and is never logged.
 | `catalog.album` | `{"uri"}` | `Album` (with tracks) |
 | `catalog.artist` | `{"uri"}` | `Artist` |
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
+| `catalog.playlistUris` | `{"uri","offset":0,"limit":10000}` (limit ≤ 10000) | `{"total","revision","offset","uris":[…],"uids":[…]}`: the window's items as stored, without any metadata lookup (URIs keyed as `catalog.playlist` keys its items: tracks and episodes normalised, local files and others as stored; `uids` hex or null). One request for any playlist the server answers whole; for an add's "Already added" check and a whole playlist added to another |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
 | `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. `"partial": true` marks a degraded answer: a requested pathfinder section failed while others answered, or the tracks-only context-resolve answer to a request for other types too; clients show it but must not keep it as the query's answer. A pathfinder answer whose `searchV2` failed (`null` with a GraphQL field error, or every requested section nulled) counts as a failed source; an error inside one item only drops that item. Then searchview is asked, and context-resolve only when tracks were requested (it finds nothing else); if they fail (or do not apply) the call fails instead of returning "no results". "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
 | `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
@@ -847,9 +848,19 @@ For a remote active device, smart shuffle is not supported (the command reports
     `clientKey`. The inner blob is the inverse of `Credentials::with_blob`
     (`0x49,bytes(user),0x50,int(authType),0x51,bytes(authData)`, block-padded, the XOR-with-prior-
     block step, AES-192-ECB under a PBKDF2 key from `SHA1(deviceId)` and the username, then base64).
-    When `getInfo` advertises `tokenType` `accesstoken`, a fresh login5 access token (keymaster,
-    `streaming` scope) is sent as the blob with the device's client id as `clientKey`; otherwise the
-    stored reusable credentials blob is used. A `default`-token device whose service is not
+    When `getInfo` advertises `tokenType` `accesstoken`, an access token is sent as the blob with
+    the device's client id as `clientKey`; otherwise the stored reusable credentials blob is used.
+    The token is minted by **`device_token`**, the module the Cast login uses too, from the
+    `clientID` and `deviceID` of the current getInfo (re-read after a wake-up or a 203). Sources in
+    order: spclient `POST /device-auth/v1/refresh {"clientId","deviceId"}`, then a keymaster
+    request for that client id with the Connect playback scopes (both skipped when `clientID` is
+    empty or not alphanumeric), then this session's own login5 token as the last resort (what
+    such devices were sent before, so one that took it still signs in). Each mint is bounded
+    (10 s); a source that mints nothing, or whose token the device refuses (any status but 101 or
+    203, or an error page), hands over to the next, and the last refusal is the error; a network
+    failure ends the login. The token never leaves native code and is never logged (only the
+    source's name). The device-facing part of the login is capped at 90 s as a whole. A
+    `default`-token device whose service is not
     loaded (`availability` NOT-LOADED, `publicKey` "INVALID") first gets a **wake-up `addUser`**
     with empty `blob` and `clientKey` (no credential material; origin `deviceName`/`deviceId`);
     it loads and answers 203 ERROR-INVALID-PUBLICKEY, the engine polls getInfo (≤ 5 s) until it is
@@ -890,7 +901,8 @@ For a remote active device, smart shuffle is not supported (the command reports
     `deviceID`); send `addUser {blob: <access token>, tokenType: "accesstoken"}` and wait for
     `addUserResponse` (`addUserError` is a refusal). PINGs on `urn:x-cast:com.google.cast.tp.heartbeat`
     are answered with PONG throughout, also while the token is minted. The token must be issued for
-    the receiver's `clientID`; it is minted on the live session, first with spclient
+    the receiver's `clientID`; `device_token` mints it on the live session (shared with the ZeroConf
+    `accesstoken` login above, without its last-resort session token), first with spclient
     `POST /device-auth/v1/refresh {"clientId","deviceId"}` (what open-source Cast senders use), then,
     if that fails or the receiver refuses it, with a keymaster token request
     (`hm://keymaster/token/authenticated`, the receiver's client id, scopes `streaming,
@@ -1208,7 +1220,19 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   foreground as `connectedDevice` with a low-importance "Available on Spotify Connect"
   notification (Stop action), so remote "play on this phone" works. Uses
   `onUpdateNotificationAsync` override as described in research; off by default because of
-  the battery cost (~2 radio wake-ups per minute).
+  the battery cost (~2 radio wake-ups per minute). Started while the app is visible (FGS start
+  rules), and restored after a reboot (`BOOT_COMPLETED`, after the first unlock: the
+  credentials and settings are in credential-encrypted storage, so `LOCKED_BOOT_COMPLETED` is
+  not used) and an app update (`MY_PACKAGE_REPLACED`) by the non-exported
+  `PresenceRestoreReceiver` (`PresenceRestore`): both broadcasts exempt the app from the
+  background FGS-start ban, and `connectedDevice` is allowed from boot also on Android 15 (which
+  refuses `mediaPlayback` and `dataSync` there). It reads the setting and the stored login
+  (bounded, inside the broadcast; nothing held awake) and starts the service with
+  `startForegroundService` (`EXTRA_FOREGROUND_START`: the service meets that contract as
+  `connectedDevice` even when presence cannot come up). A refused start (a restricted app, OEM
+  limits), or a login not read in time, posts one "Open SpotifyGood to stay available for
+  Spotify Connect" notification (tap: the app), gone once presence is up again; presence then
+  waits for the app to be visible, as before.
 * Audio focus (`AudioFocusController`, AudioManagerCompat): requested when local playback
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
@@ -1486,11 +1510,12 @@ until `total`; an empty page before `total` is an error, not the end. Library mu
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
 app scope, so they complete even if their screen closes. "Add to playlist" (a song, an episode,
 an album's tracks, another playlist's items — "Add to other playlist") lists the playlist picked
-first (`catalog.playlist` pages of 500, at most 41 requests; a source playlist the same way, at
-most 10,000 items): items already in it get Spotify's "Already added" question (one item, or
-none new: Add anyway / Don't add; some new: Add new ones / Add anyway / Cancel), and an add
-stops at a playlist's 10,000-item limit, the snackbar saying how many went in. When the listing
-fails, everything is added as asked. Saved/liked state is cached in
+first, item URIs only (`catalog.playlistUris`: one request when the server answers the whole
+list, at most 101; a source playlist the same way, at most 10,000 items; bounded at 20 s): items
+already in it get Spotify's "Already added" question (one item, or none new: Add anyway / Don't
+add; some new: Add new ones / Add anyway / Cancel), and an add stops at a playlist's
+10,000-item limit, the snackbar saying how many went in. When the listing can't complete, the
+user is asked whether to add anyway (never a silent duplicate); offline, the add says so. Saved/liked state is cached in
 memory (LRU) and looked up via `library.contains` (batched). It is unknown until looked up: a
 failed lookup (offline, the session still connecting, a network error) stays unknown, never
 "not saved", and is looked up again when the session comes online (with backoff if it fails
@@ -1553,7 +1578,7 @@ error while ONLINE: after the next reconnect).
 | Paused ≥ 10 min, app background | hidden and stopped when the service lets go (other releases: hidden after 20 s, stopped after 60 s, both wall time) | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
-| Presence opt-in, idle | Online | yes | connectedDevice (low-importance) | none |
+| Presence opt-in, idle (also restored after a reboot or an app update) | Online | yes | connectedDevice (low-importance) | none |
 | Nothing | stopped | no | none | none |
 
 ## 11. Feature checklist

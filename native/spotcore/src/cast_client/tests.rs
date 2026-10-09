@@ -6,7 +6,7 @@
 
 use super::channel::{NS_CONNECTION, NS_HEARTBEAT, NS_RECEIVER};
 use super::frame::{take_frame, CastMessage};
-use super::token::TokenSource;
+use crate::device_token::TokenSource;
 use super::*;
 use crate::error::ErrorCode;
 use bytes::BytesMut;
@@ -382,7 +382,7 @@ async fn a_failed_mint_tries_the_next_source() {
     let (result, fake) = run(Script::default(), &BOTH, |source, client_id, device_id, fake| async move {
         match source {
             TokenSource::DeviceAuth => Err(AppError::unavailable("device-auth refused")),
-            TokenSource::Keymaster => token_for(source, client_id, device_id, fake).await,
+            _ => token_for(source, client_id, device_id, fake).await,
         }
     })
     .await;

@@ -81,6 +81,8 @@ internal class PresenceController(private val service: Service, private val grap
             )
             isForeground = true
             PlaybackService.isPresenceForeground = true
+            // Up again: the "open the app" notice of a refused restore is moot.
+            PresenceRestore.cancelNotice(service)
             // The media notification (if any) is replaced while idle.
             notifications.cancel(Notifications.ID_PLAYBACK)
             // Keep the service started: it must outlive unbinding controllers.

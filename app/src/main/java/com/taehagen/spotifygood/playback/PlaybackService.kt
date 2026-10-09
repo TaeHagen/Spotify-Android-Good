@@ -201,6 +201,14 @@ class PlaybackService : MediaLibraryService() {
             ACTION_START_PRESENCE -> {
                 if (isPresenceWanted()) presence.enable(showNow = !mediaForeground)
                 updatePausedIdle()
+                if (intent?.getBooleanExtra(EXTRA_FOREGROUND_START, false) == true && !presence.isForeground && !mediaForeground) {
+                    // The restore after a reboot or an update (PresenceRestore) is a
+                    // startForegroundService: meet that contract even when presence did not come
+                    // up, as connectedDevice (Android 15 refuses mediaPlayback from boot), and
+                    // tell the user it waits for the app.
+                    satisfyForegroundContract(if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0)
+                    if (isPresenceWanted()) PresenceRestore.postNotice(this)
+                }
                 if (!presence.isEnabled && !mediaForeground && !player.isPlaying) stopSelf(startId)
             }
             ACTION_RESUME -> {
@@ -678,7 +686,9 @@ class PlaybackService : MediaLibraryService() {
      * foreground even when nothing plays; enter and leave it immediately (like Media3's own
      * shutdown path), with a notification of its own so a (paused) media notification stays.
      */
-    private fun satisfyForegroundContract() {
+    private fun satisfyForegroundContract(
+        type: Int = if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0,
+    ) {
         if (mediaForeground || presence.isForeground) return
         try {
             val notifications = NotificationManagerCompat.from(this)
@@ -694,12 +704,7 @@ class PlaybackService : MediaLibraryService() {
                 .setSilent(true)
                 .setVisibility(NotificationCompat.VISIBILITY_SECRET)
                 .build()
-            ServiceCompat.startForeground(
-                this,
-                CONTRACT_NOTIFICATION_ID,
-                notification,
-                if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0,
-            )
+            ServiceCompat.startForeground(this, CONTRACT_NOTIFICATION_ID, notification, type)
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         } catch (e: IllegalStateException) {
             Log.w(TAG, "Foreground not allowed", e)
@@ -992,6 +997,12 @@ class PlaybackService : MediaLibraryService() {
 
         /** Start (while the app is visible) to bring up the opt-in Connect presence. */
         const val ACTION_START_PRESENCE = "com.taehagen.spotifygood.playback.START_PRESENCE"
+        /**
+         * Boolean extra of an [ACTION_START_PRESENCE] sent with `startForegroundService` (the
+         * restore after a reboot or an update, [PresenceRestore]): the service reaches the
+         * foreground even when presence cannot come up.
+         */
+        const val EXTRA_FOREGROUND_START = "com.taehagen.spotifygood.playback.extra.FOREGROUND_START"
         /** "Tap to resume" after a refused background start (forwarded by [PlaybackActionReceiver]). */
         const val ACTION_RESUME = "com.taehagen.spotifygood.playback.RESUME"
         /**

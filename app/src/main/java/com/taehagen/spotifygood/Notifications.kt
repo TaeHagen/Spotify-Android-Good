@@ -16,4 +16,6 @@ object Notifications {
     const val ID_DOWNLOADS = 1003
     const val ID_DOWNLOADS_DONE = 1004
     const val ID_RESUME_ALERT = 1005
+    /** Connect presence could not be restored after a reboot / update: open the app. */
+    const val ID_PRESENCE_RESTORE = 1006
 }
