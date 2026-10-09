@@ -11,6 +11,7 @@ import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.playback.EngineReach
+import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -132,7 +133,7 @@ class TrackSortTest {
     @Test
     fun theSortedListIsCurrentOnlyWithoutACatalogContext() {
         val key = ListSortStore.LIKED_SONGS
-        val sent = SortedPlays.Entry(key, listOf("spotify:track:a"), generation = 0)
+        val sent = SortedPlays.Entry(key, listOf("spotify:track:a"))
         fun current(track: String, context: String?) =
             isListPlaying(key, "spotify:user:me:collection", ListPlayback(trackUri = track, contextUri = context), sent)
         assertTrue(current("spotify:track:a", null))
@@ -197,10 +198,16 @@ class TrackSortTest {
 
     private val playlistKey = ListSortStore.playlist("spotify:playlist:p")
     private val order = listOf("t1", "t2", "t3", "t4")
-    private val entry = SortedPlays.Entry(playlistKey, order, generation = 0)
+    private val entry = SortedPlays.Entry(playlistKey, order)
 
-    private fun playing(track: String, context: String? = null, next: String? = null, previous: String? = null, shuffle: Boolean = false) =
-        ListPlayback(trackUri = track, contextUri = context, isPlaying = true, shuffle = shuffle, next = next, previous = previous)
+    private fun playing(
+        track: String,
+        context: String? = null,
+        next: String? = null,
+        previous: String? = null,
+        shuffle: Boolean = false,
+        repeatAll: Boolean = false,
+    ) = ListPlayback(trackUri = track, contextUri = context, isPlaying = true, shuffle = shuffle, next = next, previous = previous, repeatAll = repeatAll)
 
     @Test
     fun theListsOwnContextIsItInAnyOrder() {
@@ -217,8 +224,9 @@ class TrackSortTest {
         assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t2", "spotify:web-api", next = "t3"), entry))
         // The end of the window: autoplay next (not a context track), compare the previous one.
         assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t4", previous = "t3"), entry))
-        // Repeat-all wraps to the first.
-        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t4", next = "t1"), entry))
+        // Repeat-all wraps to the first (without it, an earlier next is another list).
+        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t4", next = "t1", repeatAll = true), entry))
+        assertFalse(isListPlaying(playlistKey, "spotify:playlist:p", playing("t4", next = "t1"), entry))
         // Shuffled: the next is any of its tracks.
         assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t2", next = "t4", shuffle = true), entry))
     }
@@ -236,7 +244,7 @@ class TrackSortTest {
     @Test
     fun offlineLikedSongsDownloadsCountAsLikedSongs() {
         // Default order offline: the downloads go as a track list (no context), recorded for Liked Songs.
-        val downloads = SortedPlays.Entry(ListSortStore.LIKED_SONGS, listOf("a", "b", "c"), generation = 0)
+        val downloads = SortedPlays.Entry(ListSortStore.LIKED_SONGS, listOf("a", "b", "c"))
         assertTrue(isListPlaying(ListSortStore.LIKED_SONGS, "spotify:user:me:collection", playing("b", next = "c", previous = "a"), downloads))
     }
 
@@ -283,5 +291,65 @@ class TrackSortTest {
         val again = liked.liked(listOf(c))
         assertEquals(listOf(c, n, a) to 3, applyLikedPatch(loaded, 3, again))
         assertEquals(loaded to 3, applyLikedPatch(loaded, 3, LikedPatch()))
+    }
+
+    // ---- round 23: the record is the login session's; interludes and removed rows -------------
+
+    @Test
+    fun theRecordOutlivesTheActivity() {
+        // A swipe from Recents finishes the activity (the snackbar bus starts a new UI session)
+        // while music plays on: the record stays until logout or another account.
+        SortedPlays.put(entry)
+        BackgroundMessages.clear()
+        assertEquals(entry, SortedPlays.last.value)
+        SortedPlays.clear()
+        assertNull(SortedPlays.last.value)
+        val mine = entry.copy(account = "me")
+        assertTrue(mine.belongsTo("me"))
+        assertTrue("the user isn't known yet", mine.belongsTo(null))
+        assertFalse("another account", mine.belongsTo("other"))
+    }
+
+    @Test
+    fun aQueuedSongIsAnInterludeOfTheSameLoad() {
+        val landed = entry.after(playing("t2", next = "t3", previous = "t1"))!!
+        assertTrue(landed.landed)
+        val queued = PlaybackSnapshot(
+            status = PlaybackStatus.PLAYING,
+            track = PlaybackTrack(uri = "q", provider = TrackProvider.QUEUE),
+            nextTracks = listOf(PlaybackTrack(uri = "t3")),
+            prevTracks = listOf(PlaybackTrack(uri = "t2")),
+        ).toListPlayback()
+        assertTrue(queued.queued)
+        val kept = landed.after(queued)
+        assertEquals(landed, kept)
+        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", queued, kept))
+        // The list goes on after it.
+        val back = kept!!.after(playing("t3", next = "t4", previous = "t2"))
+        assertEquals(landed, back)
+        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", playing("t3", next = "t4", previous = "t2"), back))
+    }
+
+    @Test
+    fun aQueuedSongOverSomethingElseStillDropsTheRecord() {
+        val landed = entry.after(playing("t2", next = "t3", previous = "t1"))!!
+        assertNull("over a catalog context", landed.after(ListPlayback(trackUri = "q", contextUri = "spotify:album:x", queued = true, next = "t3")))
+        assertNull("over another list", landed.after(ListPlayback(trackUri = "q", queued = true, next = "zz", previous = "t2")))
+        // Not landed yet: a queued song doesn't count for it either way.
+        assertEquals(entry, entry.after(ListPlayback(trackUri = "q", queued = true, next = "t3")))
+        assertFalse(isListPlaying(playlistKey, "spotify:playlist:p", ListPlayback(trackUri = "q", queued = true, next = "t3"), entry))
+    }
+
+    @Test
+    fun aRemovedUpNextRowKeepsTheRecord() {
+        val landed = entry.after(playing("t1", next = "t2"))!!
+        // The user removed t3 from up next: t4 follows t2.
+        val now = playing("t2", next = "t4", previous = "t1")
+        assertEquals(landed, landed.after(now))
+        assertTrue(isListPlaying(playlistKey, "spotify:playlist:p", now, landed))
+        // Backwards is not this load.
+        assertFalse(isListPlaying(playlistKey, "spotify:playlist:p", playing("t3", next = "t1", previous = "t4"), landed))
+        // Another list holding the same song still has other neighbours.
+        assertNull(landed.after(playing("t2", next = "zz", previous = "yy")))
     }
 }

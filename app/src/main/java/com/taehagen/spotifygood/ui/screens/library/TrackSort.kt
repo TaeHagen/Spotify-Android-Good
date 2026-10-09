@@ -5,17 +5,20 @@ import androidx.compose.runtime.Immutable
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaylistItem
+import com.taehagen.spotifygood.model.RepeatMode
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.model.TrackProvider
 import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.playback.PlayRequest
-import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.isSameContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
@@ -196,6 +199,13 @@ data class ListPlayback(
     /** The context's next / previous track (not the user queue, autoplay or suggestions). */
     val next: String? = null,
     val previous: String? = null,
+    /**
+     * The current track is an interlude of the load, not one of its own: a user-queued song or a
+     * smart-shuffle suggestion. The load goes on after it.
+     */
+    val queued: Boolean = false,
+    /** Repeat-all: after the last track the list starts over (the next can be an earlier one). */
+    val repeatAll: Boolean = false,
 )
 
 fun PlaybackSnapshot.toListPlayback(): ListPlayback =
@@ -209,6 +219,8 @@ fun PlaybackSnapshot.toListPlayback(): ListPlayback =
             shuffle = shuffle || smartShuffle,
             next = nextTracks.firstOrNull { it.provider == TrackProvider.CONTEXT }?.uri,
             previous = prevTracks.lastOrNull { it.provider == TrackProvider.CONTEXT }?.uri,
+            queued = track?.provider == TrackProvider.QUEUE || track?.provider == TrackProvider.SUGGESTION,
+            repeatAll = repeat == RepeatMode.CONTEXT,
         )
     }
 
@@ -216,17 +228,26 @@ internal fun AppGraph.listPlaybackFlow(): Flow<ListPlayback> =
     playback.snapshot.map { it.toListPlayback() }.distinctUntilChanged()
 
 /**
+ * How far from the expected neighbour a context track may be and still be this load: up-next rows
+ * the user removed in the Queue screen are skipped. Bounded, so another list holding a few of the
+ * same songs in the same order is still not taken for it.
+ */
+private const val MAX_SKIPPED_ROWS = 20
+
+/**
  * The last track list this app started for a list (Liked Songs, a playlist: a sorted order, or
- * Liked Songs' downloads offline), for the session: its list key ([ListSortStore.LIKED_SONGS],
- * [ListSortStore.playlist]) and the tracks sent, in order. Kept outside the pages, so a page
- * opened again still knows its list is playing; dropped as soon as playback moves to anything
- * else ([Entry.after]).
+ * Liked Songs' downloads offline), for the login session: its list key
+ * ([ListSortStore.LIKED_SONGS], [ListSortStore.playlist]) and the tracks sent, in order. Kept
+ * outside the pages and the activity (music plays on after the app is swiped away), so a page
+ * opened again still knows its list is playing; dropped as soon as playback moves to anything else
+ * ([Entry.after]), on logout and on an account change.
  */
 internal object SortedPlays {
     internal data class Entry(
         val list: String,
         val order: List<String>,
-        val generation: Int,
+        /** The account it was played for (null: not known yet). */
+        val account: String? = null,
         /** One of its tracks has played since it was sent (until then the previous playback shows). */
         val landed: Boolean = false,
     ) {
@@ -237,49 +258,91 @@ internal object SortedPlays {
         operator fun contains(uri: String): Boolean = uri in positions
 
         /**
-         * [playback] is this load: its track is in the list and, unless shuffled, the context's next
-         * (else previous) track is its neighbour in the order sent (the wrap of repeat-all too).
-         * Another list holding the same song has other neighbours.
+         * [playback] is this load: unless shuffled, the context's next track comes after the
+         * current one in the order sent and the previous one before it, within [MAX_SKIPPED_ROWS]
+         * (removed up-next rows; the wrap of repeat-all too). Another list holding the same song has
+         * other neighbours. During an interlude ([ListPlayback.queued]) the context's neighbours
+         * are judged instead of the queued song.
          */
         fun matches(playback: ListPlayback): Boolean {
+            if (playback.queued) return underneath(playback)
             val track = playback.trackUri ?: return false
             val i = positions[track] ?: return false
             if (playback.shuffle) return playback.next == null || playback.next in this
-            playback.next?.let { return it == (order.getOrNull(i + 1) ?: order.first()) }
-            playback.previous?.let { return it == (order.getOrNull(i - 1) ?: order.last()) }
-            return true
+            val next = playback.next?.let { positions[it] ?: return false }
+            val previous = playback.previous?.let { positions[it] ?: return false }
+            return (next == null || ahead(i, next, playback.repeatAll)) && (previous == null || ahead(previous, i, playback.repeatAll))
+        }
+
+        /** The load underneath an interlude is this one: its context neighbours are ours, in order. */
+        private fun underneath(playback: ListPlayback): Boolean {
+            if (playback.shuffle) return playback.next == null || playback.next in this
+            val next = playback.next?.let { positions[it] ?: return false }
+            val previous = playback.previous?.let { positions[it] ?: return false }
+            return next == null || previous == null || ahead(previous, next, playback.repeatAll)
+        }
+
+        /**
+         * [to] follows [from] in the order sent, within the skipped rows; past the end and from the
+         * start again only with repeat-all ([wrap]).
+         */
+        private fun ahead(from: Int, to: Int, wrap: Boolean): Boolean {
+            // One song (repeated): it is its own neighbour.
+            if (order.size == 1) return true
+            val distance = when {
+                to > from -> to - from
+                wrap -> order.size - from + to
+                else -> return false
+            }
+            return distance in 1..(MAX_SKIPPED_ROWS + 1)
         }
     }
 
     private val entry = MutableStateFlow<Entry?>(null)
     private var watcher: Job? = null
 
-    /** The last such play of this session (a logout ends it), or null. */
-    val last: Flow<Entry?> = entry.map { it?.takeIf { e -> e.generation == BackgroundMessages.currentGeneration() } }
+    /** The last such play of this login session, or null. */
+    val last: StateFlow<Entry?> = entry.asStateFlow()
 
     /** [request] (a track list for [list]) was just sent. */
     @Synchronized
     fun record(graph: AppGraph, list: String, request: PlayRequest) {
         val order = request.trackUris.orEmpty()
-        entry.value = if (order.isEmpty()) null else Entry(list, order, BackgroundMessages.currentGeneration())
+        put(if (order.isEmpty()) null else Entry(list, order, account = graph.engine.user.value?.username))
         if (watcher?.isActive != true) {
             watcher = graph.appScope.launch {
-                graph.playback.snapshot.collect { snapshot -> entry.update { it?.after(snapshot.toListPlayback()) } }
+                launch { graph.playback.snapshot.collect { snapshot -> entry.update { it?.after(snapshot.toListPlayback()) } } }
+                // Tied to the login session, not the UI's: logout or another account ends it.
+                launch {
+                    combine(graph.engine.isLoggedIn, graph.engine.user) { loggedIn, user -> loggedIn to user?.username }
+                        .collect { (loggedIn, account) -> entry.update { it?.takeIf { e -> loggedIn && e.belongsTo(account) } } }
+                }
             }
         }
     }
+
+    internal fun put(value: Entry?) {
+        entry.value = value
+    }
+
+    internal fun clear() = put(null)
 }
+
+/** Whether the record is for [account] (the signed-in user; unknown on either side counts). */
+internal fun SortedPlays.Entry.belongsTo(account: String?): Boolean = this.account == null || account == null || this.account == account
 
 /**
  * The record once playback is [now]: landed when one of its tracks plays as this load; dropped
  * when, after that, playback moved to anything else (another list, a context, a single track).
- * Nothing playing (stopped, a load on its way) keeps it.
+ * Nothing playing (stopped, a load on its way) keeps it, and so does an interlude (a queued song,
+ * a suggestion) while the load is still underneath it.
  */
 internal fun SortedPlays.Entry.after(now: ListPlayback): SortedPlays.Entry? {
     if (now.trackUri == null) return this
+    if (now.queued && !landed) return this
     val ours = !isCatalogContext(now.contextUri) && matches(now)
     return when {
-        ours -> if (landed) this else copy(landed = true)
+        ours -> if (landed || now.queued) this else copy(landed = true)
         !landed -> this
         else -> null
     }
@@ -289,15 +352,16 @@ internal fun SortedPlays.Entry.after(now: ListPlayback): SortedPlays.Entry? {
  * Whether [playback] is the list [listKey] (catalog context [listContextUri]: the playlist, Liked
  * Songs): its own context, in any order (Shuffle, started before a sort, from Auto or another
  * device), or the track list this app last started for it ([last]) while playback is still that
- * load ([SortedPlays.Entry.matches]). A context-less play of one of its songs from elsewhere
- * (Downloads, a single track, another client) is not it. Used for the Play/Pause button of
- * Liked Songs and playlists: toggle when true, start the list otherwise.
+ * load ([SortedPlays.Entry.matches]; an interlude only once it landed). A context-less play of one
+ * of its songs from elsewhere (Downloads, a single track, another client) is not it. Used for the
+ * Play/Pause button of Liked Songs and playlists: toggle when true, start the list otherwise.
  */
 internal fun isListPlaying(listKey: String, listContextUri: String?, playback: ListPlayback, last: SortedPlays.Entry?): Boolean {
     if (playback.trackUri == null) return false
     val context = playback.contextUri?.takeIf { it.isNotBlank() }
     if (context != null && listContextUri != null && isSameContext(context, listContextUri)) return true
     if (last == null || last.list != listKey || isCatalogContext(context)) return false
+    if (playback.queued && !last.landed) return false
     return last.matches(playback)
 }
 
