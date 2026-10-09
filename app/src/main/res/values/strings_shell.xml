@@ -76,6 +76,8 @@
     <string name="shell_already_added_one">This is already in %1$s.</string>
     <string name="shell_already_added_all">These are already in %1$s.</string>
     <string name="shell_already_added_some">Some of these are already in %1$s.</string>
+    <string name="shell_add_unchecked_title">Couldn\'t check for duplicates</string>
+    <string name="shell_add_unchecked_message">%1$s couldn\'t be checked for items already in it. Add anyway?</string>
     <string name="shell_action_mark_played">Mark as played</string>
     <string name="shell_action_mark_unplayed">Mark as unplayed</string>
     <string name="shell_action_start_radio">Go to radio</string>

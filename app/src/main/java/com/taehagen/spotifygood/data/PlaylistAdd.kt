@@ -1,6 +1,6 @@
 package com.taehagen.spotifygood.data
 
-import com.taehagen.spotifygood.model.Playlist
+import kotlinx.serialization.Serializable
 
 // "Add to playlist" (docs §9.8): what an add of songs, an album, a playlist or an episode does to
 // the playlist picked — Spotify's "Already added" question, and its item limit.
@@ -8,14 +8,31 @@ import com.taehagen.spotifygood.model.Playlist
 /** Spotify's playlist item limit: an add never goes past it. */
 const val PLAYLIST_MAX_ITEMS = 10_000
 
-/** Items per page when paging through a playlist for an add (the engine's largest page). */
-internal const val ADD_PAGE_SIZE = 500
+/**
+ * Items asked for per request when listing a playlist for an add (`catalog.playlistUris`, item
+ * URIs only): any playlist in one request when the server answers the whole window.
+ */
+internal const val ADD_PAGE_SIZE = PLAYLIST_MAX_ITEMS
 
 /**
- * Most page requests one listing for an add makes: [PLAYLIST_MAX_ITEMS] at full pages, with room
- * for a server that answers shorter ones.
+ * Most requests one listing for an add makes: enough for [PLAYLIST_MAX_ITEMS] even when the server
+ * answers windows of only 100 items (each a small list of URIs).
  */
-internal const val ADD_MAX_PAGES = 2 * (PLAYLIST_MAX_ITEMS / ADD_PAGE_SIZE) + 1
+internal const val ADD_MAX_PAGES = PLAYLIST_MAX_ITEMS / 100 + 1
+
+/**
+ * A window of a playlist's items without their metadata (`catalog.playlistUris`): their URIs (as
+ * playlist pages key them) and uids, in order from [offset], with the playlist's [total] and
+ * [revision].
+ */
+@Serializable
+data class PlaylistUris(
+    val total: Int = 0,
+    val revision: String? = null,
+    val offset: Int = 0,
+    val uris: List<String> = emptyList(),
+    val uids: List<String?> = emptyList(),
+)
 
 /** A playlist before an add: its item count ([total]) and the items it lists ([uris]). */
 data class PlaylistContents(val total: Int, val uris: Set<String>)
@@ -32,16 +49,21 @@ enum class PlaylistAddChoice {
 /**
  * How adding [requested] (in order) to a playlist goes: [fresh] are those it doesn't list yet
  * (each once), [duplicates] how many of [requested] it already lists, [room] how many more items
- * fit (null: unknown, the server decides).
+ * fit (null: unknown, the server decides). Not [checked]: the playlist couldn't be listed, so
+ * nobody knows whether some are in it.
  */
 data class PlaylistAddPlan(
     val requested: List<String>,
     val fresh: List<String>,
     val duplicates: Int,
     val room: Int?,
+    val checked: Boolean = true,
 ) {
-    /** Some are in the playlist already: the user is asked ("Already added"). */
-    val asks: Boolean get() = duplicates > 0
+    /**
+     * The user is asked: some are in the playlist already ("Already added"), or that couldn't be
+     * checked ("Add anyway?") — never a silent duplicate.
+     */
+    val asks: Boolean get() = duplicates > 0 || !checked
 
     /** Nothing fits any more. */
     val full: Boolean get() = room != null && room <= 0
@@ -58,10 +80,10 @@ data class PlaylistAddPlan(
 
 /**
  * The plan for adding [requested] to a playlist holding [contents] (null when they couldn't be
- * listed: everything is added, as before the check, and the server keeps its own limit).
+ * listed: unchecked, the user is asked whether to add them anyway; the server keeps its own limit).
  */
 fun planPlaylistAdd(requested: List<String>, contents: PlaylistContents?): PlaylistAddPlan {
-    if (contents == null) return PlaylistAddPlan(requested, requested.distinct(), duplicates = 0, room = null)
+    if (contents == null) return PlaylistAddPlan(requested, requested.distinct(), duplicates = 0, room = null, checked = false)
     val fresh = requested.filter { it !in contents.uris }.distinct()
     return PlaylistAddPlan(
         requested = requested,
@@ -75,13 +97,13 @@ fun planPlaylistAdd(requested: List<String>, contents: PlaylistContents?): Playl
 internal class PagedPlaylist(val items: List<String>, val total: Int)
 
 /**
- * The item URIs of the playlist [uri] in order, paged through [fetchPage] ([pageSize] per
- * request): at most [maxItems] items and [maxRequests] requests, so a huge playlist costs a
- * bounded number of requests (what is beyond is left out).
+ * The item URIs of the playlist [uri] in order, paged through [fetchPage] (`catalog.playlistUris`:
+ * URIs only, [pageSize] asked per request): at most [maxItems] items and [maxRequests] requests,
+ * so a huge playlist costs a bounded number of small requests (what is beyond is left out).
  */
 internal suspend fun pagePlaylist(
     uri: String,
-    fetchPage: suspend (uri: String, offset: Int, limit: Int) -> Playlist,
+    fetchPage: suspend (uri: String, offset: Int, limit: Int) -> PlaylistUris,
     pageSize: Int = ADD_PAGE_SIZE,
     maxItems: Int = PLAYLIST_MAX_ITEMS,
     maxRequests: Int = ADD_MAX_PAGES,
@@ -93,10 +115,10 @@ internal suspend fun pagePlaylist(
     while (items.size < maxItems && requests < maxRequests) {
         val page = fetchPage(uri, offset, pageSize.coerceAtMost(maxItems - items.size))
         requests++
-        total = maxOf(page.total, offset + page.items.size)
-        if (page.items.isEmpty()) break
-        page.items.mapNotNullTo(items) { it.uri }
-        offset += page.items.size
+        total = maxOf(page.total, offset + page.uris.size)
+        if (page.uris.isEmpty()) break
+        items += page.uris
+        offset += page.uris.size
         if (offset >= page.total) break
     }
     return PagedPlaylist(items.take(maxItems), total)

@@ -958,7 +958,8 @@ fun AddToPlaylistSheet(uris: List<String>, onDismiss: () -> Unit, excludeUri: St
 
 /**
  * Spotify's "Already added": some of the items of an add are in the playlist already. One item, or
- * none new: "Add anyway" / "Don't add"; some new: "Add new ones" / "Add anyway" / "Cancel".
+ * none new: "Add anyway" / "Don't add"; some new: "Add new ones" / "Add anyway" / "Cancel". When
+ * the playlist couldn't be checked: "Add anyway" / "Cancel".
  */
 @Composable
 fun AlreadyAddedDialog(prompt: PlaylistAddPrompt, onDismiss: () -> Unit) {
@@ -971,13 +972,14 @@ fun AlreadyAddedDialog(prompt: PlaylistAddPrompt, onDismiss: () -> Unit) {
         runner.addToPlaylist(prompt, choice)
     }
     val message = when {
+        prompt.unchecked -> R.string.shell_add_unchecked_message
         prompt.offersNewOnes -> R.string.shell_already_added_some
         prompt.plan.requested.size == 1 -> R.string.shell_already_added_one
         else -> R.string.shell_already_added_all
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.shell_already_added_title)) },
+        title = { Text(stringResource(if (prompt.unchecked) R.string.shell_add_unchecked_title else R.string.shell_already_added_title)) },
         text = { Text(stringResource(message, prompt.playlistName)) },
         confirmButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -989,7 +991,7 @@ fun AlreadyAddedDialog(prompt: PlaylistAddPrompt, onDismiss: () -> Unit) {
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text(stringResource(if (prompt.offersNewOnes) R.string.shell_cancel else R.string.shell_action_dont_add))
+                Text(stringResource(if (prompt.offersNewOnes || prompt.unchecked) R.string.shell_cancel else R.string.shell_action_dont_add))
             }
         },
     )
