@@ -8,6 +8,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
+import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.Resource
 import com.taehagen.spotifygood.data.dataOrNull
 import com.taehagen.spotifygood.data.settings.LibrarySort
@@ -21,6 +22,7 @@ import com.taehagen.spotifygood.model.SavedArtist
 import com.taehagen.spotifygood.model.SavedShow
 import com.taehagen.spotifygood.model.User
 import com.taehagen.spotifygood.playback.EngineReach
+import com.taehagen.spotifygood.ui.components.SessionMessenger
 import com.taehagen.spotifygood.ui.screens.album.engineReach
 import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
 import com.taehagen.spotifygood.ui.screens.album.resourceOnceConnected
@@ -70,6 +72,8 @@ data class LibraryUiState(
     /** Some loaded Your Episodes pages hold placeholders: offer a retry. */
     val episodesPartial: Boolean = false,
     val nowPlaying: NowPlaying = NowPlaying(),
+    /** Completed downloads: the Your Episodes rows' download indicators. */
+    val downloadedUris: Set<String> = emptySet(),
 )
 
 private data class LibrarySources(
@@ -137,6 +141,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
     private val recentRank = MutableStateFlow<Map<String, Int>>(emptyMap())
     private val likedCount = MutableStateFlow<Int?>(null)
     private val offline = graph.offlineFlow()
+    private val messenger = SessionMessenger(graph.app)
 
     private val episodePartialPages = PartialPages()
     private val episodesLoader = PagedLoader(viewModelScope, EPISODE_PAGE, Episode::uri) { offset, limit ->
@@ -228,7 +233,8 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
         extras,
         episodes,
         episodePartialPages.partial,
-    ) { (listing, data, presentation, downloaded, collections), extras, episodes, episodesPartial ->
+        graph.downloads.downloadedUris,
+    ) { (listing, data, presentation, downloaded, collections), extras, episodes, episodesPartial, downloadedUris ->
         val nothing = data.playlists.isEmpty() && data.albums.isEmpty() && data.artists.isEmpty() && data.shows.isEmpty()
         LibraryUiState(
             user = extras.user,
@@ -258,6 +264,7 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
             episodes = episodes,
             episodesPartial = episodesPartial,
             nowPlaying = extras.nowPlaying,
+            downloadedUris = downloadedUris,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LibraryUiState())
 
@@ -386,15 +393,23 @@ class LibraryViewModel(private val graph: AppGraph) : ViewModel() {
     fun downloadState(uri: String): Flow<DownloadState?> =
         graph.downloads.collectionStatus(uri).map { it.toIndicatorState() }.catch { emit(null) }.distinctUntilChanged()
 
-    /** A Your Episodes row: the episode playing toggles; any other starts at its resume point (the player's lookup). */
+    /**
+     * A Your Episodes row: the episode playing toggles; any other starts at its resume point (the
+     * player's lookup), in the list — unless the session isn't ONLINE, then as [planListPlay] says:
+     * never another, downloaded episode instead of the one tapped.
+     */
     fun playEpisode(episode: Episode) {
         if (graph.playback.snapshot.value.track?.uri == episode.uri) {
             graph.player.togglePlayPause()
             return
         }
-        val episodes = episodesLoader.state.value.items
-        val index = episodes.indexOfFirst { it.uri == episode.uri }
-        if (index >= 0) graph.player.playTracks(episodes.map { it.uri }, index) else graph.player.playTracks(listOf(episode.uri))
+        val listed = episodesLoader.state.value.items.map { it.uri }
+        val index = listed.indexOf(episode.uri)
+        val uris = if (index >= 0) listed else listOf(episode.uri)
+        when (val plan = planListPlay(uris, index.coerceAtLeast(0), graph.engineReach(), graph.downloads.downloadedUris.value)) {
+            is ListPlay.Tracks -> graph.player.playTracks(plan.uris, plan.index)
+            ListPlay.NotDownloaded -> messenger.post(R.string.playback_error_not_available_offline)
+        }
     }
 
     private fun LibrarySources.toData(): LibraryData {

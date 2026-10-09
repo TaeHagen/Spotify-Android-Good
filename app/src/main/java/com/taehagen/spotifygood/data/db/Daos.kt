@@ -257,9 +257,32 @@ interface DownloadDao {
 
     // ---- download locations ------------------------------------------------------------------------
 
-    /** Every row's files (moving downloads to another location). */
-    @Query("SELECT uri, path, imagePath FROM downloads WHERE path IS NOT NULL OR imagePath IS NOT NULL")
+    /** Every row's files (moving downloads to another location), in a stable order. */
+    @Query("SELECT uri, path, imagePath FROM downloads WHERE path IS NOT NULL OR imagePath IS NOT NULL ORDER BY addedAt, uri")
     suspend fun locatedRows(): List<LocatedRow>
+
+    @Query("SELECT uri FROM downloads WHERE path = :path AND state = 'completed'")
+    suspend fun completedUrisWithPath(path: String): List<String>
+
+    /**
+     * Downloads again the completed rows whose audio [path] cannot be read (a damaged file met
+     * while moving downloads): back into the queue without their file references, key and record.
+     */
+    @Query(
+        "UPDATE downloads SET state = 'queued', attempts = 0, retryAt = NULL, error = NULL, path = NULL, " +
+            "imagePath = NULL, fileId = NULL, recordJson = NULL, encryptedKey = NULL, keyVersion = 0, " +
+            "completedAt = NULL, lastValidatedAt = NULL, bytesDone = 0, sizeBytes = 0 " +
+            "WHERE path = :path AND state = 'completed'",
+    )
+    suspend fun requeueUnreadable(path: String): Int
+
+    /** Unfinished rows (failed by re-validation, the key check) no longer own the unreadable [path]. */
+    @Query("UPDATE downloads SET path = NULL WHERE path = :path AND state != 'completed'")
+    suspend fun forgetUnreadable(path: String): Int
+
+    /** Rows whose cover [imagePath] cannot be read show the CDN image instead. */
+    @Query("UPDATE downloads SET imagePath = NULL WHERE imagePath = :imagePath")
+    suspend fun dropImage(imagePath: String): Int
 
     /** Completed downloads' files (which ones are on a location that is not mounted). */
     @Query("SELECT uri, path, imagePath FROM downloads WHERE state = 'completed'")

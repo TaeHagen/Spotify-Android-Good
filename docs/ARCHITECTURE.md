@@ -410,7 +410,8 @@ start that is not downloaded move on to the next download. Smart shuffle is not 
 { "source": "local|remote|none",        // local = this phone is the active device
   "offline": false,
   "activeDevice": {"id","name","type"},  // omitted when none
-  "status": "stopped|loading|playing|paused",
+  "status": "stopped|loading|playing|paused",  // loading: to play (also a stall while playing,
+                                         // at the position heard); a paused load is "paused"
   "positionMs": 0, "positionTimestampMs": 0,   // wall-clock epoch ms when positionMs was valid
   "playbackSpeed": 1.0, "durationMs": 0,
   "context": {"uri":"spotify:playlist:…","name":"…","type":"playlist|album|artist|collection|search|show|station|tracks|unknown"},
@@ -697,7 +698,11 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                when Spotify may know better (nothing is saved below the point until the seek lands
                or the lookup answers). Tapping the episode that is playing (here or on a Connect
                device) toggles it. Offline, the episode page's Play of an episode that isn't
-               downloaded says so (a show load would start another, downloaded one).
+               downloaded says so (a show load would start another, downloaded one); so do Your
+               Episodes rows (a plain list the engine would hand to its offline queue, which starts
+               the next download), where a downloaded one starts among the list's downloads and,
+               while the session is connecting, one that isn't is sent alone to wait for it (the
+               Downloads entries likewise).
              * The stored session's resumes (Media3 / Bluetooth / Auto resumption, Tap to resume,
                "play something", the in-app Play fallback, and a transfer that starts it on a device
                while nothing is loaded, `DevicesRepository.episodeResume`) take the same decision: their position
@@ -1398,8 +1403,15 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   renamed, then the rows and the offline index (`offline.add`, numbered) switched to the copy, then
   the original deleted. Every step is resumable: an interrupted move leaves the original in use or
   both copies with the rows on one of them, and the next pass (start, mount, change) carries on;
-  the files copied before a stop (no space, an I/O error) are switched all the same. The cover
-  maps and the session artwork follow the moved covers at once.
+  the files copied before a stop (no space, an error about the target, a cancellation) are switched
+  all the same. An original that cannot be read while its card is still there (a bad sector, a
+  short read: a damaged download) does not stop the move: it is skipped, its downloads go back into
+  the queue and are downloaded fresh to the chosen location (out of the offline index; an
+  unreadable cover is dropped for the CDN image), and Settings says how many. Three unreadable
+  originals in a row stop the move instead (the card itself is failing), as does a card that went.
+  The plan follows a stable order (`addedAt`, uri) with the files that failed before in this
+  process last, so one bad file never holds back the rest. The cover maps and the session
+  artwork follow the moved covers at once.
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
 * A card that is removed or unmounted (the system's media broadcasts): its downloads stay COMPLETED

@@ -705,6 +705,8 @@ private fun YourEpisodesList(
                 onClick = { onPlay(episode) },
                 isCurrent = state.nowPlaying.isCurrent(episode.uri),
                 isPlaying = state.nowPlaying.isPlaying,
+                // Which ones play offline (a tap of another says it isn't available offline).
+                downloadState = DownloadState.COMPLETED.takeIf { episode.uri in state.downloadedUris },
                 onLongClick = { onActions(episode) },
                 onMoreClick = { onActions(episode) },
             )

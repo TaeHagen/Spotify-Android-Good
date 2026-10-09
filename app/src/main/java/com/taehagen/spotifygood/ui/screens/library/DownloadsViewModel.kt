@@ -123,8 +123,9 @@ class DownloadsViewModel(private val graph: AppGraph) : ViewModel() {
     fun playEntry(entry: DownloadEntry) {
         val current = state.value
         val section = if (entry.isEpisode) current.content.episodes else current.content.songs
-        val online = graph.engineReach() == EngineReach.ONLINE
-        when (val plan = planEntryPlay(entry, section, online, current.filterExplicit)) {
+        val reach = graph.engineReach()
+        val online = reach == EngineReach.ONLINE
+        when (val plan = planEntryPlay(entry, section, online, current.filterExplicit, connecting = reach == EngineReach.CONNECTING)) {
             is EntryPlay.Tracks -> graph.player.playTracks(plan.uris, plan.index)
             EntryPlay.Unavailable -> messenger.post(R.string.player_unavailable)
             EntryPlay.NotDownloaded -> messages.trySend(LibraryMessage.NOTHING_TO_PLAY)

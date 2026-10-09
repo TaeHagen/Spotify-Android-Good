@@ -108,11 +108,20 @@ class DownloadsLogicTest {
     private val e = entry("spotify:track:e", DownloadState.COMPLETED, explicit = true)
 
     @Test
-    fun whileConnectingATapOnAnEntryThatIsntDownloadedLoadsNothing() {
+    fun offlineATapOnAnEntryThatIsntDownloadedLoadsNothing() {
         // The offline queue would skip b and start c.
         assertEquals(EntryPlay.NotDownloaded, planEntryPlay(b, listOf(a, b, c), online = false, filterExplicit = false))
         assertEquals(EntryPlay.Tracks(listOf(a.uri, c.uri), 1), planEntryPlay(c, listOf(a, b, c), online = false, filterExplicit = false))
         assertEquals(EntryPlay.Tracks(listOf(a.uri, b.uri, c.uri), 1), planEntryPlay(b, listOf(a, b, c), online = true, filterExplicit = false))
+    }
+
+    @Test
+    fun whileConnectingAnEntryThatIsntDownloadedIsSentAlone() {
+        // Alone it waits for the session (or the engine says it isn't available offline); in the
+        // section the offline queue would start c instead.
+        assertEquals(EntryPlay.Tracks(listOf(b.uri), 0), planEntryPlay(b, listOf(a, b, c), online = false, filterExplicit = false, connecting = true))
+        // A downloaded one still starts among the downloads.
+        assertEquals(EntryPlay.Tracks(listOf(a.uri, c.uri), 1), planEntryPlay(c, listOf(a, b, c), online = false, filterExplicit = false, connecting = true))
     }
 
     @Test
