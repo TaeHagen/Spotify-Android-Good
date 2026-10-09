@@ -651,6 +651,8 @@ fn on_cluster(generation: u64, cluster: Arc<Cluster>) {
     changed();
     // A paused or finished offline queue gives way to a device that took over.
     offline::on_cluster(&cluster);
+    // A window that ended offline goes on in Spirc now (see `offline::resume_window_end`).
+    offline::resume_window_end();
     publish_devices();
     publish();
 }

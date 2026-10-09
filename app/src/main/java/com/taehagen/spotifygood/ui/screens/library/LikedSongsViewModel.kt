@@ -396,13 +396,14 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         graph.appScope.launch {
             attempt {
                 if (download) {
-                    graph.downloads.downloadCollection(CollectionRef(uri, CollectionType.LIKED_SONGS, name, null))
+                    graph.downloads.downloadCollection(CollectionRef(uri, CollectionType.LIKED_SONGS, name, null)).notice
                 } else {
                     graph.downloads.removeCollection(uri)
+                    null
                 }
-            }.onSuccess {
+            }.onSuccess { notice ->
                 // Shown also when the page was left meanwhile (resolving Liked Songs takes a while).
-                messenger.post((if (download) LibraryMessage.DOWNLOAD_STARTED else LibraryMessage.DOWNLOAD_REMOVED).messageRes())
+                messenger.post(notice ?: (if (download) LibraryMessage.DOWNLOAD_STARTED else LibraryMessage.DOWNLOAD_REMOVED).messageRes())
             }.onFailure {
                 messenger.post(LibraryMessage.DOWNLOAD_FAILED.messageRes())
             }

@@ -57,6 +57,13 @@ class CatalogRepository(
         playlistItems(uri, ::playlistPage).mapNotNull { it.uri }.filter(SpotifyUris::isPlayableItem)
 
     /**
+     * A playlist's items to add to another playlist: at most [PLAYLIST_MAX_ITEMS] (no playlist
+     * holds more), in a bounded number of requests ([pagePlaylist]).
+     */
+    suspend fun playlistItemUrisToAdd(uri: String): List<String> =
+        pagePlaylist(uri, ::playlistPage).items.filter(SpotifyUris::isPlayableItem)
+
+    /**
      * The show's first page. Spotify's played state (resume points) only comes with a fresh answer:
      * cached copies (fresh within the TTL, or shown while revalidating / offline) carry none, so
      * an old state can never stand for the current one (docs §6.5, [EpisodeProgressStore.observe]).

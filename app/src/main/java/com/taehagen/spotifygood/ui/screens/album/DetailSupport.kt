@@ -364,7 +364,7 @@ internal abstract class DetailViewModel(
 
     fun downloadCollection(ref: CollectionRef) {
         launchWrite(successRes = null, failureRes = R.string.detail_download_failed) {
-            graph.downloads.downloadCollection(ref)
+            graph.downloads.downloadCollection(ref).notice?.let { message(it) }
         }
     }
 

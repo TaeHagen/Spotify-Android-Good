@@ -338,7 +338,11 @@ Spirc: the queue's track stops, and the context loads at its first track after t
 on after the handoff), at the context's start for a new pass; with its options as now, unless the
 user changed the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
 stays shown (loading), so the notification and the media session stay; a failed load makes
-this phone inactive (nothing plays, the app's own resume is the fallback).
+this phone inactive (nothing plays, the app's own resume is the fallback). A window that ends
+before the session is back (no network, no visible session) stops there and keeps where the
+context goes on: once the session and its first cluster are back it hands back by itself
+(playing if it ended playing less than 120 s ago, else paused), and a play hands back too; a
+play while still offline says "Nothing more to play offline" instead of replaying the window.
 A streamed current track is frozen for the reconnect as before (§8), unless its data is all in
 the Player (the vendored `Player::fully_buffered`): it plays on to its end, then the downloaded
 tracks after it, and it isn't loaded again offline (the window around it is the downloads only).
@@ -1364,6 +1368,17 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   shown as not available (FAILED with "On an SD card that isn't available", left out of the
   playable downloads and the "Retry" count) and taken out of the offline index; the index snapshot
   leaves them out. On remount they are registered again, and whatever waited for the card moves.
+  A card that never comes back (it died, or another card with another UUID, or internal storage,
+  is chosen): its downloads are on a card that is no longer the download location ("On an SD card
+  that's no longer used"). They still wait (the card may be inserted again), but "Download" on
+  them, "Retry" (the row's, and "Retry failed", which counts them), downloading their collection
+  again and Settings > Storage "Downloads on an SD card no longer used" download them again to the
+  chosen location: the rows go back into the queue without their old file references, key and
+  record (`requeueFromUnusedCard`, out of the index with a numbered change), and their old files
+  are collected if that card is ever mounted again. Downloads on the chosen card while it is away
+  just wait: "Download" and "Retry" say so instead of claiming to start (`DownloadRequest`, also
+  "queued" while the chosen card is missing). Retrying a collection member never makes it an
+  individual download.
 * Covers (`OfflineCovers`, a Coil interceptor): lists built from downloads and the online pages
   of downloaded items name the CDN image URLs of the stored metadata. Every size of a completed
   download's album images (an episode's own images, else its show's) is served from the download's
@@ -1466,7 +1481,13 @@ refetched twice while on screen (after 15 s and 30 s). The home feed is treated 
 when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
-app scope, so they complete even if their screen closes. Saved/liked state is cached in
+app scope, so they complete even if their screen closes. "Add to playlist" (a song, an episode,
+an album's tracks, another playlist's items — "Add to other playlist") lists the playlist picked
+first (`catalog.playlist` pages of 500, at most 41 requests; a source playlist the same way, at
+most 10,000 items): items already in it get Spotify's "Already added" question (one item, or
+none new: Add anyway / Don't add; some new: Add new ones / Add anyway / Cancel), and an add
+stops at a playlist's 10,000-item limit, the snackbar saying how many went in. When the listing
+fails, everything is added as asked. Saved/liked state is cached in
 memory (LRU) and looked up via `library.contains` (batched). It is unknown until looked up: a
 failed lookup (offline, the session still connecting, a network error) stays unknown, never
 "not saved", and is looked up again when the session comes online (with backoff if it fails
