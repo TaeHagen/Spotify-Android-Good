@@ -2893,14 +2893,16 @@ fn a_restored_shuffle_of_a_context_without_uids_keeps_its_order() {
 
 /// What handle_transfer sets up for a transfer from a device that plays autoplay after the
 /// context (CONTEXT_URI, an album) ended: its track `r1` has the autoplay metadata, two tracks
-/// are queued after it; `resolves_autoplay`: Spirc's autoplay is on
+/// are queued after it; `resolves_autoplay`: Spirc's autoplay is on; `shuffled`: the device
+/// shuffled the context (its option stays on while autoplay plays)
 fn transferred_from_autoplay(
     state: &mut ConnectState,
     resolves_autoplay: bool,
+    shuffled: bool,
 ) -> crate::protocol::transfer_state::TransferState {
     use crate::protocol::{
-        playback::Playback, queue::Queue, session::Session as PlayingSession,
-        transfer_state::TransferState,
+        context_player_options::ContextPlayerOptions, playback::Playback, queue::Queue,
+        session::Session as PlayingSession, transfer_state::TransferState,
     };
 
     state.reset_context(ResetContext::Completely);
@@ -2932,6 +2934,14 @@ fn transferred_from_autoplay(
             is_playing_queue: Some(false),
             ..Default::default()
         }),
+        options: if shuffled {
+            MessageField::some(ContextPlayerOptions {
+                shuffling_context: Some(true),
+                ..Default::default()
+            })
+        } else {
+            MessageField::none()
+        },
         ..Default::default()
     };
     let track = state.current_track_from_transfer(&transfer).unwrap();
@@ -2964,7 +2974,7 @@ fn a_transfer_of_an_autoplay_track_keeps_its_queue_and_goes_on_after_the_context
 
     // the album resolves, then the autoplay context: the queue, then autoplay
     let (rt, mut state) = state(3);
-    let transfer = transferred_from_autoplay(&mut state, true);
+    let transfer = transferred_from_autoplay(&mut state, true, false);
     state
         .update_context(context(10, 0), ContextType::Default)
         .unwrap();
@@ -2980,7 +2990,7 @@ fn a_transfer_of_an_autoplay_track_keeps_its_queue_and_goes_on_after_the_context
     // the autoplay resolve fails for good: the transfer is finished all the same, after the
     // end of the album (it isn't played again)
     let (_rt, mut state) = self::state(3);
-    let transfer = transferred_from_autoplay(&mut state, true);
+    let transfer = transferred_from_autoplay(&mut state, true, false);
     state
         .update_context(context(10, 0), ContextType::Default)
         .unwrap();
@@ -3001,7 +3011,7 @@ fn a_transfer_of_an_autoplay_track_keeps_its_queue_and_goes_on_after_the_context
 
     // autoplay is off: the album's resolve finishes it, the same way
     let (_rt, mut state) = self::state(3);
-    let transfer = transferred_from_autoplay(&mut state, false);
+    let transfer = transferred_from_autoplay(&mut state, false, false);
     let mut resolver = self::resolver(&rt);
     resolver.add(ResolveContext::from_uri(
         CONTEXT_URI,
@@ -3017,4 +3027,74 @@ fn a_transfer_of_an_autoplay_track_keeps_its_queue_and_goes_on_after_the_context
     assert_eq!(state.current_track(|t| t.uid.clone()), "r1");
     assert_eq!(queued_and_not(&state), (2, vec![]));
     assert_eq!(prev_uids(&state).last().map(String::as_str), Some("uid9"));
+}
+
+// SPOTIFYGOOD: see ConnectState::finish_transfer (continues_autoplay)
+#[test]
+fn a_shuffled_transfer_of_an_autoplay_track_goes_on_in_autoplay() {
+    // the device shuffled the album before autoplay took over: autoplay goes on after the
+    // queue, the finished album isn't shuffled and played again; also when the autoplay context
+    // doesn't allow shuffling (the transfer failed then)
+    for restricted in [false, true] {
+        let (_rt, mut state) = state(3);
+        let transfer = transferred_from_autoplay(&mut state, true, true);
+        assert!(state.shuffling_context());
+        state
+            .update_context(context(10, 0), ContextType::Default)
+            .unwrap();
+        let mut autoplay = autoplay_context(5);
+        if restricted {
+            autoplay.restrictions =
+                MessageField::some(crate::protocol::restrictions::Restrictions {
+                    disallow_toggling_shuffle_reasons: vec!["autoplay".to_string()],
+                    ..Default::default()
+                });
+        }
+        state
+            .update_context(autoplay, ContextType::Autoplay)
+            .unwrap();
+        state.finish_transfer(transfer).expect("finished");
+        assert_eq!(state.current_track(|t| t.uid.clone()), "r1");
+        assert_eq!(state.active_context, ContextType::Autoplay);
+        let autoplay = (0..5).map(|i| format!("a{i}")).collect::<Vec<_>>();
+        assert_eq!(
+            queued_and_not(&state),
+            (2, autoplay),
+            "restricted: {restricted}"
+        );
+        assert!(state.shuffling_context(), "the option stays");
+    }
+}
+
+// SPOTIFYGOOD: see ContextResolver::add_requested and Spirc's handle_transfer
+#[test]
+fn a_transfer_asks_again_for_a_context_that_failed_a_moment_ago() {
+    use crate::context_resolver::{ContextAction, ResolveContext};
+    let resolve = || {
+        ResolveContext::from_uri(
+            CONTEXT_URI,
+            track_uri(2, 0),
+            ContextType::Default,
+            ContextAction::Replace,
+        )
+    };
+
+    // the first transfer's resolve failed for good a moment ago (a 4xx, a plain track list)
+    let (rt, mut state) = state(3);
+    let mut resolver = resolver(&rt);
+    resolver.mark_unavailable(&resolve());
+    // `add` drops it for a minute: the transfer waited for good
+    resolver.add(resolve());
+    assert!(!resolver.has_next());
+    // the second transfer asks again
+    assert!(resolver.add_requested(resolve()));
+    assert!(resolver.has_next());
+    // it fails again, and the transfer is finished with what it brought
+    let mut transfer_state = transferred(&mut state, 2, false);
+    assert!(resolver.finish_after_failure(&mut state, &mut transfer_state));
+    assert!(transfer_state.is_none());
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid2");
+    assert_eq!(state.queued_count(), 1, "the transferred queue");
+    // asked twice, queued once
+    assert!(resolver.add_requested(resolve()));
 }
