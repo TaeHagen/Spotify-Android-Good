@@ -184,6 +184,15 @@ pub struct Player {
     thread_handle: Option<thread::JoinHandle<()>>,
     // SPOTIFYGOOD: see Player::last_decoded
     decoded: SharedDecoded,
+    // SPOTIFYGOOD: see Player::fully_buffered
+    buffered: SharedBuffered,
+}
+
+// SPOTIFYGOOD: see Player::fully_buffered
+type SharedBuffered = Arc<Mutex<Option<SpotifyUri>>>;
+
+fn lock_buffered(buffered: &SharedBuffered) -> MutexGuard<'_, Option<SpotifyUri>> {
+    buffered.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 // SPOTIFYGOOD: see Player::last_decoded
@@ -265,6 +274,8 @@ struct PlayerInternal {
     stream_stall: Option<StreamStall>,
     // SPOTIFYGOOD: see Player::last_decoded
     decoded: SharedDecoded,
+    // SPOTIFYGOOD: see Player::fully_buffered
+    buffered: SharedBuffered,
     // SPOTIFYGOOD: a track whose loader can't deliver (it stalled for STREAM_STALL_MAX, or its
     // loader is gone): its next play or load opens it again (load_track: a new CDN URL, a new
     // loader) at the position played, instead of reusing its decoder
@@ -849,6 +860,9 @@ impl Player {
         // SPOTIFYGOOD: see Player::last_decoded
         let decoded = SharedDecoded::default();
         let internal_decoded = decoded.clone();
+        // SPOTIFYGOOD: see Player::fully_buffered
+        let buffered = SharedBuffered::default();
+        let internal_buffered = buffered.clone();
 
         if config.normalisation {
             debug!("Normalisation Type: {:?}", config.normalisation_type);
@@ -927,6 +941,8 @@ impl Player {
                 stream_stall: None,
                 // SPOTIFYGOOD: see Player::last_decoded
                 decoded: internal_decoded,
+                // SPOTIFYGOOD: see Player::fully_buffered
+                buffered: internal_buffered,
                 // SPOTIFYGOOD: see PlayerInternal::reopen
                 reopen: None,
             };
@@ -954,7 +970,16 @@ impl Player {
             commands: Some(cmd_tx),
             thread_handle: Some(handle),
             decoded,
+            buffered,
         })
+    }
+
+    // SPOTIFYGOOD: the engine hands a playing track over to its offline queue when the session
+    // goes away: a downloaded one, or a streamed one whose data is all there
+    /// The playing (or paused) track if its file is all there (downloaded, or streamed to its
+    /// end); read without a command
+    pub fn fully_buffered(&self) -> Option<SpotifyUri> {
+        lock_buffered(&self.buffered).clone()
     }
 
     // SPOTIFYGOOD: Connect's position of a playing track is extrapolated from its last anchor;
@@ -2274,6 +2299,8 @@ impl Future for PlayerInternal {
                 };
             }
 
+            // SPOTIFYGOOD: see Player::fully_buffered
+            let buffered = self.buffered.clone();
             if let PlayerState::Playing {
                 ref track_id,
                 play_request_id,
@@ -2294,6 +2321,11 @@ impl Future for PlayerInternal {
             } = self.state
             {
                 let track_id = track_id.clone();
+                // SPOTIFYGOOD: see Player::fully_buffered (its data stays once it is all there)
+                let marked = lock_buffered(&buffered).as_ref() == Some(&track_id);
+                if !marked && stream_loader_controller.range_to_end_available() {
+                    *lock_buffered(&buffered) = Some(track_id.clone());
+                }
 
                 if (!*suggested_to_preload_next_track)
                     && ((duration_ms as i64 - stream_position_ms as i64)
@@ -2404,8 +2436,9 @@ impl PlayerInternal {
                     play_request_id,
                 });
                 self.state = PlayerState::Stopped;
-                // SPOTIFYGOOD: see Player::last_decoded and PlayerInternal::reopen
+                // SPOTIFYGOOD: see Player::last_decoded, fully_buffered and PlayerInternal::reopen
                 *lock_decoded(&self.decoded) = None;
+                *lock_buffered(&self.buffered) = None;
                 self.reopen = None;
             }
             PlayerState::Stopped => (),
@@ -2776,12 +2809,14 @@ impl PlayerInternal {
     ) -> PlayerResult {
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
-        // SPOTIFYGOOD: see PlayerInternal::reopen (any other load forgets it)
+        // SPOTIFYGOOD: see PlayerInternal::reopen (any other load forgets it); and see
+        // Player::fully_buffered
         let reopen = self.reopen.take().is_some_and(|reopen| reopen == track_id);
         if reopen {
             info!("Opening <{track_id:?}> again");
             self.stream_stall = None;
         }
+        *lock_buffered(&self.buffered) = None;
 
         self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
 

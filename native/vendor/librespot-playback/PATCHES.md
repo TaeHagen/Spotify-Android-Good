@@ -83,6 +83,7 @@ impl Player {
     pub fn set_gapless(&self, gapless: bool);
     pub fn set_playback_speed(&self, speed: f64);   // the sink's speed; not finite or <= 0 => 1
     pub fn last_decoded(&self) -> Option<DecodedPosition>;  // without a command, see below
+    pub fn fully_buffered(&self) -> Option<SpotifyUri>;     // the track if its file is all there
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedPosition {
@@ -155,6 +156,7 @@ arm), which needed no change.
 | `PlayerInternal::reopen`, `DecoderError::LoaderGone`, `handle_play`, `handle_command_load` | A track that stalled for `STREAM_STALL_MAX`, or whose read found its loader gone (BrokenPipe: it pauses then), is opened again on its next play or load of it (`load_track` at the position played: a new CDN URL, a new loader) instead of reusing its decoder, which could never get data again. Any other load forgets it. |
 | `PlayerEvent::Stalled` | Sent when a stall starts (also when a resumed one stalls again), with the position played: the vendored Spirc shows it as buffering there instead of extrapolating (see the connect crate's item V). |
 | `handle_command_seek` (stalled) | A seek while the track stalls doesn't touch the decoder: the target becomes the stall's position (the decoder is seeked there once the data is back), `Seeked` is sent. The Ogg seek bisects the whole file, and without data each probe waited `download_timeout`: every command waited tens of seconds and the seek was dropped. A seek that fails puts `last_decoded` back to the position played (`Player::seek` set it to the target). |
+| `SharedBuffered`, `Player::fully_buffered` | The playing or paused track once its file is all there (`range_to_end_available`: downloaded, or streamed to its end), cleared at a load or stop; read without a command. The engine hands such a streamed track to its offline queue when the session goes away. |
 | `DecodedPosition`, `SharedDecoded`, `Player::last_decoded`, `set_decoded` | The last packet decoded (track, position, when), written by the packet loop and at a load, seek and pause (also when `Player::load` / `Player::seek` are called, before the player thread gets to them), cleared at a stop. The engine reads it without a command (the player thread may be blocked in a read) to cap a restore point that Connect's extrapolation put past a stall. |
 | `handle_command_seek` (stall) | The line is cleared also when the wait for the data times out (the seek's error is returned after it), and the seek starts any stall afresh. |
 | `mod spotifygood_tests` (stall) | `stall_action` (retry, pause after the bound, skip a broken track or without a session), a stall lasting across attempts until a packet past it (`StreamStall::again`, `after_packet`), the shared last packet, and the mapping of a timed-out read to `Stalled`. |
@@ -203,6 +205,7 @@ arm), which needed no change.
   (or with a loader that is gone) the next play opens the track again. A `Stalled` event tells
   Spirc to show it as buffering at the position played. Downloaded and cached files never time
   out.
+* **`fully_buffered`** like `last_decoded`: a lock, never a command.
 * **`last_decoded`** takes a lock the packet loop holds for a moment per packet; call it from
   any thread, it never waits for the player thread.
 * **`set_normalisation`** applies from the next packet: the config and knee factor are updated,
