@@ -81,7 +81,8 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
     LaunchedEffect(viewModel) {
         viewModel.events.collect { navigator.showMessage(resources.getString(it.messageRes())) }
     }
-    LoadMoreEffect(listState, enabled = state.canLoadMore && state.tracks.isNotEmpty() && state.filter.isEmpty()) {
+    // A filter or a sort fetches every page itself.
+    LoadMoreEffect(listState, enabled = state.canLoadMore && state.tracks.isNotEmpty() && state.filter.isEmpty() && state.sort == TrackSort.RECENTLY_ADDED) {
         viewModel.loadMore()
     }
     val collapsed by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 } }
@@ -107,7 +108,23 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
                     )
                 }
                 item(key = "filter", contentType = "filter") {
-                    FilterField(value = viewModel.filterText, onValueChange = viewModel::onFilterChange)
+                    Column(Modifier.padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            FilterField(
+                                value = viewModel.filterText,
+                                onValueChange = viewModel::onFilterChange,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TrackSortButton(sort = state.sort, options = TrackSort.LIKED_SONGS, onSort = viewModel::setSort)
+                        }
+                        if (state.loadingAll) {
+                            LoadingAllProgress(
+                                loaded = state.loadedCount,
+                                total = state.total,
+                                modifier = Modifier.padding(top = 8.dp, end = 12.dp),
+                            )
+                        }
+                    }
                 }
                 if (state.partial) {
                     item(key = "partial", contentType = "banner") {
@@ -286,12 +303,15 @@ private fun LikedActions(
             Icon(Icons.Rounded.Shuffle, contentDescription = stringResource(R.string.browse_shuffle_play))
         }
         Spacer(Modifier.size(8.dp))
-        PlayFab(isPlaying = state.nowPlaying.isPlayingContext(state.contextUri), onClick = onPlay)
+        PlayFab(
+            isPlaying = state.nowPlaying.isPlayingContext(state.contextUri) || (state.sortedListIsCurrent && state.nowPlaying.isPlaying),
+            onClick = onPlay,
+        )
     }
 }
 
 @Composable
-private fun FilterField(value: String, onValueChange: (String) -> Unit) {
+private fun FilterField(value: String, onValueChange: (String) -> Unit, modifier: Modifier = Modifier) {
     TextField(
         value = value,
         onValueChange = onValueChange,
@@ -314,7 +334,7 @@ private fun FilterField(value: String, onValueChange: (String) -> Unit) {
             focusedIndicatorColor = Color.Transparent,
             unfocusedIndicatorColor = Color.Transparent,
         ),
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        modifier = modifier,
     )
 }
 

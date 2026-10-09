@@ -1563,6 +1563,24 @@ the download loads again, once a load still running has settled. A search or res
 failed before the session was ONLINE shows its error and runs again once it is (a connection
 error while ONLINE: after the next reconnect).
 
+Sorting Liked Songs and playlists (`ui/screens/library/TrackSort.kt`): Liked Songs offers Recently
+added (its own, newest-first order), Title, Artist and Album; a playlist Custom order (its own),
+Title, Artist, Album and Recently added. The choice is kept per list (Liked Songs, each playlist
+URI; non-default choices only, the 300 most recent lists) in app preferences. Another order
+needs every row, so the page fetches the remaining pages one at a time (the pages it already
+uses: 100 items, URIs with metadata; a playlist at most 200), showing "Loading songs… n of total",
+and sorts the loaded rows off the main thread on every new page (collation keys; case and
+accents ignored; rows that can't play last; ties keep the list order), then applies the filter
+("Find in playlist" / Liked Songs' filter). Edit mode always shows the playlist's own order
+(moves and removals use the row's playlist position). The trade-off is playback: a context load
+plays the server's order (Spirc resolves the context itself), so a non-default order plays as a
+`trackUris` list in the shown order, shuffle off, at most 500 tracks around the start item (50
+before it). That list has no context: Connect and the notification show no playlist, and it is
+a snapshot of what was loaded (later edits and likes don't reach it); the Play button toggles it
+while one of its tracks plays with no catalog context. The default order keeps the context load
+(Connect shows the playlist), and Shuffle always loads the context, its order doesn't matter.
+Offline, the downloaded rows sort the same way and already play as a track list.
+
 ### 9.9 UI
 
 * Material 3, dark-first theme (Spotify-like near-black, green accent); optional dynamic
