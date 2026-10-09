@@ -1301,7 +1301,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   allow-while-idle quota). A timer ending within 10 min while a remote device plays also holds the
   wake lock from the start (honoured outside Doze). "End of track" arms the snapshot's track end (the media time left
   divided by the snapshot's speed: an episode at a podcast speed ends sooner or later in wall
-  time) and re-arms on every snapshot (a speed change publishes one). Disarmed on cancel, replace, finish and manual pause (end of track).
+  time) and re-arms on every snapshot (a speed change publishes one). The item it waits for is
+  its uri (`SleepSchedule.sameItem`): the engine re-makes the uid of the same item while it plays
+  on (a hand-off to the offline queue, `o<i>`; a Spirc restore's queue and suggestion uids), so
+  a new uid ends the wait only when the position also starts over (back by more than 5 s:
+  repeat-one, the same track reached again), and never while paused. Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
 
@@ -1441,6 +1445,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   that stopped after getting somewhere is tried again after 5 min; a stopped move restarts from its
   row in Settings > Storage, also for the same location. The cover maps and the session
   artwork follow the moved covers at once.
+  The engine-start index snapshot reads the rows before a switch may run: a stale path it pushes
+  is superseded natively by the switch's later-numbered `offline.add`, and it fails a download
+  whose file it found gone only under the lock the switch takes, only while the row still names
+  the file it checked (same path and `completedAt`) and the file is still gone, and never while a
+  move runs (the next start checks again).
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
 * A card that is removed or unmounted (the system's media broadcasts): its downloads stay COMPLETED
