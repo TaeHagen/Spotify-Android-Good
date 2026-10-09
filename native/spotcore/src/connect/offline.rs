@@ -472,10 +472,6 @@ pub(crate) fn resolve(args: &LoadArgs) -> super::offline_queue::Selection {
     selection
 }
 
-pub(crate) fn has_downloaded(args: &LoadArgs) -> bool {
-    !resolve(args).items.is_empty()
-}
-
 pub(crate) async fn load(args: &LoadArgs) -> AppResult<()> {
     let selection = resolve(args);
     let (uris, start) = (selection.items, selection.start);

@@ -1134,6 +1134,7 @@ impl OfflineQueue {
             active_device: Some(device),
             // A paused load is paused for the app (resumable); internally it still loads.
             status: if self.status == PlaybackStatus::Loading && !self.play_intent { PlaybackStatus::Paused } else { self.status },
+            loading: self.status == PlaybackStatus::Loading,
             position_ms: self.position_ms,
             position_timestamp_ms: self.position_ts,
             playback_speed: if playing { self.speed_milli as f64 / 1000.0 } else { 0.0 },
@@ -2191,11 +2192,19 @@ mod tests {
         let mut q = OfflineQueue::default();
         q.load(LoadSpec { play: false, ..spec(2, 0, false, RepeatMode::Off) }, 0);
         assert_eq!(q.status(), PlaybackStatus::Loading);
-        assert_eq!(q.snapshot(dev(), 0).status, PlaybackStatus::Paused, "resumable");
+        let s = q.snapshot(dev(), 0);
+        assert_eq!(s.status, PlaybackStatus::Paused, "resumable");
+        assert!(s.loading, "not a settled pause yet");
+        q.on_event(Event::RequestId(1), 0);
+        q.on_event(Event::TrackChanged { uri: "spotify:track:0".into(), duration_ms: 60_000 }, 0);
+        q.on_event(Event::Paused { id: 1, position_ms: 0 }, 0);
+        let s = q.snapshot(dev(), 0);
+        assert_eq!((s.status, s.loading), (PlaybackStatus::Paused, false), "settled");
         // a load to play is loading
         let mut q = OfflineQueue::default();
         q.load(spec(2, 0, false, RepeatMode::Off), 0);
-        assert_eq!(q.snapshot(dev(), 0).status, PlaybackStatus::Loading);
+        let s = q.snapshot(dev(), 0);
+        assert_eq!((s.status, s.loading), (PlaybackStatus::Loading, true));
     }
 
     #[test]
