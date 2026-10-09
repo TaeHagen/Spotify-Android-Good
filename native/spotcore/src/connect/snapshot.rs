@@ -26,7 +26,9 @@ const SUGGESTION_KEY: &str = "smart_shuffle.suggested";
 pub(crate) fn status_from(status: SnapshotPlayStatus) -> PlaybackStatus {
     match status {
         SnapshotPlayStatus::Stopped => PlaybackStatus::Stopped,
-        SnapshotPlayStatus::LoadingPlay | SnapshotPlayStatus::LoadingPause => PlaybackStatus::Loading,
+        SnapshotPlayStatus::LoadingPlay => PlaybackStatus::Loading,
+        // A paused load is paused for the app ("loading" means it will play): resumable.
+        SnapshotPlayStatus::LoadingPause => PlaybackStatus::Paused,
         SnapshotPlayStatus::Playing => PlaybackStatus::Playing,
         SnapshotPlayStatus::Paused => PlaybackStatus::Paused,
     }
@@ -361,7 +363,7 @@ mod tests {
         let mut snap = base_snapshot();
         snap.status = SnapshotPlayStatus::Paused;
         assert_eq!(map_local(&snap, device()).playback_speed, 0.0);
-        assert_eq!(status_from(SnapshotPlayStatus::LoadingPause), PlaybackStatus::Loading);
+        assert_eq!(status_from(SnapshotPlayStatus::LoadingPause), PlaybackStatus::Paused);
         assert_eq!(status_from(SnapshotPlayStatus::LoadingPlay), PlaybackStatus::Loading);
         assert_eq!(status_from(SnapshotPlayStatus::Stopped), PlaybackStatus::Stopped);
         assert_eq!(repeat_mode(true, true), RepeatMode::Track);

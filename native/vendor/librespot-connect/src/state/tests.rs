@@ -400,6 +400,39 @@ fn paused(position_ms: u32) -> SpircPlayStatus {
 }
 
 #[test]
+fn the_announce_after_a_reconnect_carries_the_status_of_now() {
+    let (_rt, mut state) = state(3);
+    state.update_position(10_000, 1_000_000);
+    state.prepare_put(&playing(), 1_000_000);
+    // paused 5 s later (handle_pause anchors it), its put waits behind one in flight, and the
+    // reconnect drops it
+    state.update_position(15_000, 1_005_000);
+    assert!(!state.is_pause(), "still the status of the last put");
+    // the announce (handle_connection_id_update) is prepared like a put
+    state.prepare_put(&paused(15_000), 1_009_000);
+    assert!(state.is_pause());
+    assert_eq!(state.player().playback_speed, 0.);
+    assert_eq!(state.player().position_as_of_timestamp, 15_000);
+}
+
+#[test]
+fn a_position_off_the_line_of_the_speed_is_a_change() {
+    let (_rt, mut state) = state(3);
+    state.set_playback_speed(2.);
+    state.update_position(10_000, 1_000_000);
+    state.prepare_put(&playing(), 1_000_000);
+    // the player's correction where the playback is at 2x: nothing changes (no put)
+    assert!(state.on_playing_line(18_300, 1_004_000, 500));
+    assert!(state.on_playing_line(17_700, 1_004_000, 500));
+    // after a 2 s stall (4 s of media behind) Spirc re-anchors there, on at 2x from it
+    assert!(!state.on_playing_line(14_000, 1_004_000, 500));
+    state.update_position(14_000, 1_004_000);
+    state.prepare_put(&playing(), 1_006_000);
+    assert_eq!(state.player().position_as_of_timestamp, 18_000);
+    assert!(state.on_playing_line(18_000, 1_006_000, 500));
+}
+
+#[test]
 fn positions_follow_the_playback_speed_across_puts() {
     for speed in [1.5, 0.5] {
         // `ms` of wall time played at the speed
@@ -476,6 +509,124 @@ fn positions_follow_the_playback_speed_across_puts() {
             60_000 + at(10_000)
         );
     }
+}
+
+// SPOTIFYGOOD: PATCHES.md "Stalls" (c) of the vendored player: nothing extrapolates while no
+// audio is produced
+#[test]
+fn a_stall_stays_where_it_was_heard_across_puts() {
+    let (_rt, mut state) = state(3);
+    state.set_playback_speed(2.);
+    let t = 1_000_000;
+    // playing at 2x, the stream stalls: Spirc anchors the position heard (its Stalled arm)
+    state.update_position(41_000, t);
+    let stalled = SpircPlayStatus::LoadingPlay {
+        position_ms: 41_000,
+    };
+    // its put times out on the dead network, the retries come 7 s and 22 s later (StatePuts),
+    // and a disconnect re-anchors too
+    for at in [t + 200, t + 7_000, t + 22_000] {
+        state.prepare_put(&stalled, at);
+        assert_eq!(state.player().position_as_of_timestamp, 41_000, "at {at}");
+        // other clients see it buffering, not playing on at 2x
+        assert_eq!(state.player().playback_speed, 0.);
+        assert!(state.player().is_playing && state.player().is_buffering);
+        assert!(!state.player().is_paused);
+        assert_eq!(state.extrapolated_position(at + 10_000), 41_000);
+    }
+    state.set_status(&stalled);
+    state.update_position_in_relation(t + 25_000);
+    assert_eq!(state.player().position_as_of_timestamp, 41_000);
+    // the snapshot (the app's seek bar, its -15 s base) and Spirc's own position stay there too
+    let snapshot = state.snapshot(SnapshotPlayStatus::LoadingPlay, 0, None);
+    assert_eq!(
+        (snapshot.position_ms, snapshot.playback_speed),
+        (41_000, 0.)
+    );
+
+    // the data comes: the first packet's PositionCorrection re-anchors as Playing, on at 2x
+    state.update_position(41_000, t + 30_000);
+    state.prepare_put(&playing(), t + 31_000);
+    assert_eq!(state.player().position_as_of_timestamp, 43_000);
+    assert_eq!(state.player().playback_speed, 2.);
+}
+
+// SPOTIFYGOOD: see ConnectState::forget_filtered_unavailable
+#[test]
+fn tracks_the_explicit_filter_refused_play_again_once_it_is_off() {
+    let (_rt, mut state) = state(6);
+    let uri = |n| SpotifyUri::from_uri(&track_uri(n, 0)).unwrap();
+    let next_uris = |s: &ConnectState| -> Vec<String> {
+        s.next_tracks().iter().map(|t| t.uri.clone()).collect()
+    };
+    // while the filter is on: the track after the current one is refused (explicit), another one
+    // for another reason
+    state.mark_unavailable(&uri(1)).unwrap();
+    state.note_filtered_unavailable(&uri(1)).unwrap();
+    state.mark_unavailable(&uri(3)).unwrap();
+    assert!(!next_uris(&state).contains(&track_uri(1, 0)));
+    // a playlist update meanwhile marks it in the context too
+    update_same_context(&mut state, context(6, 0));
+    assert!(
+        state
+            .get_context(ContextType::Default)
+            .unwrap()
+            .tracks
+            .iter()
+            .any(|t| t.uri == track_uri(1, 0) && t.is_unavailable())
+    );
+    assert!(!next_uris(&state).contains(&track_uri(1, 0)));
+
+    // the filter is off: it is the next track again; the other refusal stays
+    assert!(state.forget_filtered_unavailable().unwrap());
+    let next = next_uris(&state);
+    assert_eq!(next.first(), Some(&track_uri(1, 0)), "{next:?}");
+    assert!(!next.contains(&track_uri(3, 0)));
+    assert!(!state.forget_filtered_unavailable().unwrap(), "only once");
+    // it plays, and a fill up after it keeps it (the context has its provider back)
+    assert_eq!(play_through(&mut state, 1), uids(1..2));
+    update_same_context(&mut state, context(6, 0));
+    assert!(
+        state
+            .get_context(ContextType::Default)
+            .unwrap()
+            .tracks
+            .iter()
+            .all(|t| t.uri != track_uri(1, 0) || !t.is_unavailable())
+    );
+}
+
+// SPOTIFYGOOD: see Spirc's loading_status
+#[test]
+fn a_reopen_while_playing_loads_at_its_position() {
+    use crate::spirc::loading_status;
+    let (_rt, mut state) = state(3);
+    state.set_playback_speed(1.5);
+    let t = 1_000_000;
+    // paused by the stall at 41:10 (2_470_000), then the user's play: Spirc goes Playing there
+    state.update_position(2_470_000, t);
+    let status = SpircPlayStatus::Playing {
+        nominal_start_time: t - 2_470_000,
+        preloading_of_next_track_triggered: false,
+    };
+    state.prepare_put(&status, t);
+    // the player opens the track again by itself: its Loading at the position played
+    let (status, position) = loading_status(&status, 2_470_000);
+    assert!(matches!(
+        status,
+        SpircPlayStatus::LoadingPlay {
+            position_ms: 2_470_000
+        }
+    ));
+    state.update_position(position, t + 50);
+    // while it loads (a slow network: puts, their retries), nothing moves; never 0:00
+    for at in [t + 250, t + 5_000, t + 20_000] {
+        state.prepare_put(&status, at);
+        assert_eq!(state.player().position_as_of_timestamp, 2_470_000);
+        assert_eq!(state.player().playback_speed, 0.);
+    }
+    let snapshot = state.snapshot(SnapshotPlayStatus::LoadingPlay, 0, None);
+    assert_eq!(snapshot.position_ms, 2_470_000);
 }
 
 #[test]
@@ -2738,4 +2889,212 @@ fn a_restored_shuffle_of_a_context_without_uids_keeps_its_order() {
     assert_eq!(prev_uids(&restored), prev_uids(&state));
     let next = next_uids(&state);
     assert_eq!(next_uids(&restored)[..next.len()], next[..]);
+}
+
+/// What handle_transfer sets up for a transfer from a device that plays autoplay after the
+/// context (CONTEXT_URI, an album) ended: its track `r1` has the autoplay metadata, two tracks
+/// are queued after it; `resolves_autoplay`: Spirc's autoplay is on; `shuffled`: the device
+/// shuffled the context (its option stays on while autoplay plays)
+fn transferred_from_autoplay(
+    state: &mut ConnectState,
+    resolves_autoplay: bool,
+    shuffled: bool,
+) -> crate::protocol::transfer_state::TransferState {
+    use crate::protocol::{
+        context_player_options::ContextPlayerOptions, playback::Playback, queue::Queue,
+        session::Session as PlayingSession, transfer_state::TransferState,
+    };
+
+    state.reset_context(ResetContext::Completely);
+    let mut current = ContextTrack {
+        uri: Some(track_uri(0, 6)),
+        uid: Some("r1".to_string()),
+        ..Default::default()
+    };
+    current.set_from_autoplay(true);
+    let mut transfer = TransferState {
+        playback: MessageField::some(Playback {
+            current_track: MessageField::some(current),
+            ..Default::default()
+        }),
+        current_session: MessageField::some(PlayingSession {
+            context: MessageField::some(Context {
+                uri: Some(CONTEXT_URI.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        queue: MessageField::some(Queue {
+            tracks: (0..2)
+                .map(|i| ContextTrack {
+                    uri: Some(track_uri(i, 9)),
+                    ..Default::default()
+                })
+                .collect(),
+            is_playing_queue: Some(false),
+            ..Default::default()
+        }),
+        options: if shuffled {
+            MessageField::some(ContextPlayerOptions {
+                shuffling_context: Some(true),
+                ..Default::default()
+            })
+        } else {
+            MessageField::none()
+        },
+        ..Default::default()
+    };
+    let track = state.current_track_from_transfer(&transfer).unwrap();
+    // handle_transfer goes by the provider: it resolves the autoplay context for it
+    assert!(track.is_autoplay(), "{}", track.provider);
+    state.set_track(track);
+    state.handle_initial_transfer(&mut transfer, Some(CONTEXT_URI.to_string()));
+    state.active_context = if resolves_autoplay {
+        ContextType::Autoplay
+    } else {
+        ContextType::Default
+    };
+    transfer
+}
+
+/// How many of the next tracks are queued, and the uids of the others
+fn queued_and_not(state: &ConnectState) -> (usize, Vec<String>) {
+    let queued = state.queued_count();
+    let rest = state.next_tracks()[queued..]
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect();
+    (queued, rest)
+}
+
+// SPOTIFYGOOD: see ConnectState::finish_transfer and current_track_from_transfer
+#[test]
+fn a_transfer_of_an_autoplay_track_keeps_its_queue_and_goes_on_after_the_context() {
+    use crate::context_resolver::{ContextAction, ResolveContext};
+
+    // the album resolves, then the autoplay context: the queue, then autoplay
+    let (rt, mut state) = state(3);
+    let transfer = transferred_from_autoplay(&mut state, true, false);
+    state
+        .update_context(context(10, 0), ContextType::Default)
+        .unwrap();
+    state
+        .update_context(autoplay_context(5), ContextType::Autoplay)
+        .unwrap();
+    state.finish_transfer(transfer).expect("finished");
+    assert_eq!(state.current_track(|t| t.uid.clone()), "r1");
+    let autoplay = (0..5).map(|i| format!("a{i}")).collect::<Vec<_>>();
+    assert_eq!(queued_and_not(&state), (2, autoplay));
+    assert_eq!(state.active_context, ContextType::Autoplay);
+
+    // the autoplay resolve fails for good: the transfer is finished all the same, after the
+    // end of the album (it isn't played again)
+    let (_rt, mut state) = self::state(3);
+    let transfer = transferred_from_autoplay(&mut state, true, false);
+    state
+        .update_context(context(10, 0), ContextType::Default)
+        .unwrap();
+    let mut resolver = resolver(&rt);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Autoplay,
+        ContextAction::Replace,
+    ));
+    let mut transfer_state = Some(transfer);
+    assert!(resolver.finish_after_failure(&mut state, &mut transfer_state));
+    assert!(transfer_state.is_none());
+    assert_eq!(state.current_track(|t| t.uid.clone()), "r1");
+    assert_eq!(queued_and_not(&state), (2, vec![]));
+    assert_eq!(state.active_context, ContextType::Default);
+    assert_eq!(prev_uids(&state).last().map(String::as_str), Some("uid9"));
+
+    // autoplay is off: the album's resolve finishes it, the same way
+    let (_rt, mut state) = self::state(3);
+    let transfer = transferred_from_autoplay(&mut state, false, false);
+    let mut resolver = self::resolver(&rt);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Default,
+        ContextAction::Replace,
+    ));
+    state
+        .update_context(context(10, 0), ContextType::Default)
+        .unwrap();
+    let mut transfer_state = Some(transfer);
+    assert!(resolver.finish_transfer_early(&mut state, &mut transfer_state));
+    assert_eq!(state.current_track(|t| t.uid.clone()), "r1");
+    assert_eq!(queued_and_not(&state), (2, vec![]));
+    assert_eq!(prev_uids(&state).last().map(String::as_str), Some("uid9"));
+}
+
+// SPOTIFYGOOD: see ConnectState::finish_transfer (continues_autoplay)
+#[test]
+fn a_shuffled_transfer_of_an_autoplay_track_goes_on_in_autoplay() {
+    // the device shuffled the album before autoplay took over: autoplay goes on after the
+    // queue, the finished album isn't shuffled and played again; also when the autoplay context
+    // doesn't allow shuffling (the transfer failed then)
+    for restricted in [false, true] {
+        let (_rt, mut state) = state(3);
+        let transfer = transferred_from_autoplay(&mut state, true, true);
+        assert!(state.shuffling_context());
+        state
+            .update_context(context(10, 0), ContextType::Default)
+            .unwrap();
+        let mut autoplay = autoplay_context(5);
+        if restricted {
+            autoplay.restrictions =
+                MessageField::some(crate::protocol::restrictions::Restrictions {
+                    disallow_toggling_shuffle_reasons: vec!["autoplay".to_string()],
+                    ..Default::default()
+                });
+        }
+        state
+            .update_context(autoplay, ContextType::Autoplay)
+            .unwrap();
+        state.finish_transfer(transfer).expect("finished");
+        assert_eq!(state.current_track(|t| t.uid.clone()), "r1");
+        assert_eq!(state.active_context, ContextType::Autoplay);
+        let autoplay = (0..5).map(|i| format!("a{i}")).collect::<Vec<_>>();
+        assert_eq!(
+            queued_and_not(&state),
+            (2, autoplay),
+            "restricted: {restricted}"
+        );
+        assert!(state.shuffling_context(), "the option stays");
+    }
+}
+
+// SPOTIFYGOOD: see ContextResolver::add_requested and Spirc's handle_transfer
+#[test]
+fn a_transfer_asks_again_for_a_context_that_failed_a_moment_ago() {
+    use crate::context_resolver::{ContextAction, ResolveContext};
+    let resolve = || {
+        ResolveContext::from_uri(
+            CONTEXT_URI,
+            track_uri(2, 0),
+            ContextType::Default,
+            ContextAction::Replace,
+        )
+    };
+
+    // the first transfer's resolve failed for good a moment ago (a 4xx, a plain track list)
+    let (rt, mut state) = state(3);
+    let mut resolver = resolver(&rt);
+    resolver.mark_unavailable(&resolve());
+    // `add` drops it for a minute: the transfer waited for good
+    resolver.add(resolve());
+    assert!(!resolver.has_next());
+    // the second transfer asks again
+    assert!(resolver.add_requested(resolve()));
+    assert!(resolver.has_next());
+    // it fails again, and the transfer is finished with what it brought
+    let mut transfer_state = transferred(&mut state, 2, false);
+    assert!(resolver.finish_after_failure(&mut state, &mut transfer_state));
+    assert!(transfer_state.is_none());
+    assert_eq!(state.current_track(|t| t.uid.clone()), "uid2");
+    assert_eq!(state.queued_count(), 1, "the transferred queue");
+    // asked twice, queued once
+    assert!(resolver.add_requested(resolve()));
 }

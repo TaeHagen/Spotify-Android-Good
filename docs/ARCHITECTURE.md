@@ -65,7 +65,7 @@ app/src/main/java/com/taehagen/spotifygood/
                   AudioFocusController.kt BecomingNoisyReceiver.kt OutputRouteManager.kt
                   VolumeSync.kt LibraryTree.kt SessionCommands.kt SleepTimer.kt ResumeStore.kt
                   ArtworkProvider.kt (content:// artwork for Auto/notification)
-  connect/        DevicesRepository.kt
+  connect/        DevicesRepository.kt LocalDeviceDiscovery.kt (ZeroConf + Google Cast LAN discovery)
   data/           CatalogRepository.kt LibraryRepository.kt SearchRepository.kt HomeRepository.kt
                   LyricsRepository.kt PlaylistEditor.kt ResponseCache.kt
   data/db/        AppDatabase.kt Entities.kt Daos.kt
@@ -338,9 +338,22 @@ Spirc: the queue's track stops, and the context loads at its first track after t
 on after the handoff), at the context's start for a new pass; with its options as now, unless the
 user changed the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
 stays shown (loading), so the notification and the media session stay; a failed load makes
-this phone inactive (nothing plays, the app's own resume is the fallback).
-A streamed current track is frozen for the reconnect as before (§8), and so is any playback
-when the session dies while the network is up (the reconnect follows within seconds).
+this phone inactive (nothing plays, the app's own resume is the fallback). A window that ends
+before the session is back (no network, no visible session) stops there and keeps where the
+context goes on: once the session and its first cluster are back it hands back by itself
+(playing if it ended playing less than 120 s ago, else paused), and a play hands back too; a
+play while still offline plays what the queue itself still has (a user queue added since, the
+window again with repeat-all), else says "Nothing more to play offline" instead of replaying the
+window. A user queue at that end plays before the hand-back (also when the session returns).
+While the session is back, Next on the window's last track is offered: it hands back.
+A plain track list (`spotify:web-api`, whose context can't be loaded again) goes on the same way
+as the rest of it Spirc listed after the window (in play order, kept as its shuffled order),
+loaded as a list; a push to another device sends it after the window too.
+A streamed current track is frozen for the reconnect as before (§8), unless its data is all in
+the Player (the vendored `Player::fully_buffered`): it plays on to its end, then the downloaded
+tracks after it, and it isn't loaded again offline (the window around it is the downloads only).
+Any playback is frozen when the session dies while the network is up (the reconnect follows
+within seconds).
 The OfflineController notices a Player whose thread died: the queue stops where it was (so its
 snapshot no longer shows playing), and the next control starts a new Player (a play loads the
 track there again at that position). A paused or finished
@@ -397,7 +410,8 @@ start that is not downloaded move on to the next download. Smart shuffle is not 
 { "source": "local|remote|none",        // local = this phone is the active device
   "offline": false,
   "activeDevice": {"id","name","type"},  // omitted when none
-  "status": "stopped|loading|playing|paused",
+  "status": "stopped|loading|playing|paused",  // loading: to play (also a stall while playing,
+                                         // at the position heard); a paused load is "paused"
   "positionMs": 0, "positionTimestampMs": 0,   // wall-clock epoch ms when positionMs was valid
   "playbackSpeed": 1.0, "durationMs": 0,
   "context": {"uri":"spotify:playlist:…","name":"…","type":"playlist|album|artist|collection|search|show|station|tracks|unknown"},
@@ -485,7 +499,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 | `player.setRepeat` | `{"mode":"off|context|track"}` |
 | `player.setVolume` | `{"volume":0..65535,"fromSystem":false}` |
 | `player.setAudioOutput` | `{"type":"speaker|bluetooth|line_out|car|unknown","name":"…"}` (local only; reported to Connect) |
-| `player.setSpeed` | `{"speed":0.5..3.5}` (the app's podcast speed as the sink plays it, never a speed the output refused; it sends 1 for music and while another device plays). The app's sink plays at that speed (AudioTrack `PlaybackParams`, pitch kept), the decoder is throttled by it, so the player's position stays media time. Stored and applied to every later Spirc: the Spirc reports it as `playback_speed` while playing (other clients and the snapshot extrapolate at the real rate) and every state put re-anchors the position at that speed, so above 1x the state's position follows the speed alone; the player's position corrections only arrive below 1x, and one that matches the extrapolation (within 500 ms) causes no state put. The offline queue extrapolates with it. A device receiving a transfer from here gets no speed (Connect has no speed command). Invalid outside the range |
+| `player.setSpeed` | `{"speed":0.5..3.5}` (the app's podcast speed as the sink plays it, never a speed the output refused; it sends 1 for music and while another device plays). The app's sink plays at that speed (AudioTrack `PlaybackParams`, pitch kept), the decoder is throttled by it, so the player's position stays media time. Stored and applied to every later Spirc: the Spirc reports it as `playback_speed` while playing (other clients and the snapshot extrapolate at the real rate) and every state put re-anchors the position at that speed. The Player gets it too (`player_host::set_playback_speed`, also every later Player) and measures its position corrections against the line of that speed, so one comes after a stall (a blocking read) or a seek at any speed; one that matches the extrapolation (within 500 ms) causes no state put, any other re-anchors the state. The offline queue extrapolates with it (and re-anchors on the corrections). A device receiving a transfer from here gets no speed (Connect has no speed command). Invalid outside the range |
 | `player.applySettings` | `EngineSettings` subset (`bitrate`, `normalize`, `normalizePregain`, `gapless`), applied to the running Player (§4.3) |
 | `queue.add` | `{"uri":"spotify:track:…"}` — on this device at most 80 tracks can be queued (Connect's next-tracks window); a further add fails with `UNAVAILABLE` "The queue is full" |
 | `queue.remove` | `{"uid":"…"}` |
@@ -496,6 +510,7 @@ OR-ed into the account's own explicit filter (see §4.3); it can never turn the 
 | `connect.refreshDevices` | `{}` → `DeviceList`: fetches the device list from Spotify again (at most every 2.5 s, waits ≤ 3 s), emits `devices` and returns it; the cached list when debounced or offline |
 | `connect.localInfo` | `{"url":"http://host:port/<CPath>","scopeId"?:n}` → `LocalDeviceInfo` (ZeroConf `getInfo` of a local-network device; see §8) |
 | `connect.localLogin` | `{"url":"…","deviceId"?:"…","scopeId"?:n}` → `{"deviceId":"…"}` (ZeroConf `addUser`: logs the local device into this account; the returned id is the Connect device id to `connect.transfer` to) |
+| `connect.castLogin` | `{"host":"192.168.1.30","port"?:8009,"name":"…","isGroup"?:false,"scopeId"?:n}` → `{"deviceId":"…"}` (Google Cast: launches Spotify's Cast receiver on the device at `host:port` and signs it in to this account, see §8; `name` is the device's friendly name, TXT `fn`; the returned id is the Connect device id to `connect.transfer` to) |
 
 `scopeId` is the interface index for a link-local IPv6 host (`fe80::/10`), which a URL cannot
 carry; such a host is connected through that interface and rejected (`INVALID_ARGUMENT`) without
@@ -508,6 +523,14 @@ Key material (the device's DH public key, client id) never crosses the JNI bound
 for the `addUser` call. `connect.localInfo`/`connect.localLogin` are routed by `rpc.rs` to the
 `zeroconf_client` module (a `connect.local` prefix match ahead of the generic `connect.` route),
 not to the `connect` playback module. `connect.localLogin` requires an online session.
+`connect.castLogin` is routed the same way to `cast_client` (a `connect.cast` prefix match). It
+requires an online session; `host` is an IP address literal that passes the same local-network
+allowlist (with `scopeId` for a link-local IPv6 host). Its errors use the same codes and the app
+the same messages as `connect.localLogin`: `NOT_CONNECTED` without a session, `NETWORK` when the
+device can't be reached or sends nothing within a step's timeout, `UNAVAILABLE` when it answers but
+refuses (LAUNCH_ERROR, `addUserError`, a malformed frame, no answer from the Spotify app),
+`INVALID_ARGUMENT` for an address outside the allowlist. The access token sent to the device never
+crosses the JNI boundary and is never logged.
 
 ### 6.3 Catalog (Spotify internal APIs, JSON shaped for the UI)
 
@@ -518,6 +541,7 @@ not to the `connect` playback module. `connect.localLogin` requires an online se
 | `catalog.album` | `{"uri"}` | `Album` (with tracks) |
 | `catalog.artist` | `{"uri"}` | `Artist` |
 | `catalog.playlist` | `{"uri","offset":0,"limit":100}` | `Playlist` (items page) |
+| `catalog.playlistUris` | `{"uri","offset":0,"limit":10000}` (limit ≤ 10000) | `{"total","revision","offset","uris":[…],"uids":[…]}`: the window's items as stored, without any metadata lookup (URIs keyed as `catalog.playlist` keys its items: tracks and episodes normalised, local files and others as stored; `uids` hex or null). One request for any playlist the server answers whole; for an add's "Already added" check and a whole playlist added to another |
 | `catalog.show` | `{"uri","offset":0,"limit":50}` | `Show` (episodes page) |
 | `catalog.search` | `{"query","types":["track","artist","album","playlist","show","episode"],"offset":0,"limit":20}` (limit ≤ 50) | `SearchResults`: at most `limit` per type. The engine asks the server for more than `limit` so that entities it cannot parse do not shorten the page; the next page (`offset += returned`) may repeat a few results, which clients deduplicate. `totals` carries the server's per-type counts when known. `"partial": true` marks a degraded answer: a requested pathfinder section failed while others answered, or the tracks-only context-resolve answer to a request for other types too; clients show it but must not keep it as the query's answer. A pathfinder answer whose `searchV2` failed (`null` with a GraphQL field error, or every requested section nulled) counts as a failed source; an error inside one item only drops that item. Then searchview is asked, and context-resolve only when tracks were requested (it finds nothing else); if they fail (or do not apply) the call fails instead of returning "no results". "Hide explicit content" applies as on every page: explicit tracks/episodes come back `playable:false`, and an explicit track/episode top result is dropped |
 | `catalog.home` | `{"timeZone"?}` (IANA id; defaults to UTC) | `{"sections":[HomeSection],"partial"?:true}` (`partial`: the local fallback feed misses sections whose source failed; when pathfinder and every local source fail, the call fails with a retryable `NETWORK`/`RATE_LIMITED`/`UNAVAILABLE` instead of returning an empty feed) |
@@ -631,7 +655,10 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                device and every 15 s while playing; within 30 s of the end it is played. That is
                this phone's playback and a remote device's this phone follows (it is its remote, or
                handed it over): the phone's view of the account's progress. A remote position near
-               the start doesn't replace a point further on.
+               the start doesn't replace a point further on. A remote device sitting paused saves
+               with the time its position dates from (its snapshot's timestamp; "long ago" without
+               one, unless this phone saw it play), so an old pause — a paused device stays the
+               account's active one for hours (§4.6) — can't replace a newer point.
              * Only a fresh answer carries Spotify's state: cached show pages (fresh hits, copies
                shown while revalidating or offline) and download metadata are stripped (when
                emitted / stored / decoded). Fresh answers are observed once, where they arrive
@@ -639,29 +666,62 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                `LibraryRepository.episodes`); an answer
                requested before the last one seen is ignored, so an older page can't undo a newer
                one. Everything that shows an episode only overlays the point (no side effects).
-             * A fresh state is news only when it differs from the last one seen (nothing is
-               reported to Spotify, so otherwise its state lags this phone's progress); then it
-               replaces an older point (a not-started one keeps none). With no reference yet (the
-               phone played it, nothing fresh seen since) the furthest point wins. A partly played
-               state is kept when nothing is.
-             * Connect: after a remote device's position is saved, Spotify's next state is news
-               when partly or fully played (that device may have played on after the phone stopped
-               following); a not-started one (a device that reports nothing, e.g. librespot)
-               changes nothing. When this phone takes an episode over (seen remote just before, or
-               arriving far from the kept point), the next state (the other device's, older than
-               this phone's progress) only becomes the reference.
-             * Every play path resumes from the point: the app's pages (rows and the show's Play),
+             * The reference is the last real (fresh) state seen. Every fresh state is remembered
+               in memory (also finished and not-started ones, which keep no entry), and a new entry
+               starts with it, so a re-listen here of an episode Spotify has as finished has one.
+               Decision table (`observeSpotify`): a state equal to the reference is never news,
+               whatever the mark; with a plain reference a changed state is news (nothing is
+               reported to Spotify, so otherwise its state lags this phone's progress); news
+               replaces an older point (a not-started state keeps none). A partly played state is
+               kept when nothing is.
+             * Connect marks (each lasts until the next fresh answer, whose state then becomes the
+               reference; the reference is kept under them): after a followed remote device's
+               save, a changed state is news when partly or fully played; a not-started one (a
+               device that reports nothing, e.g. a librespot receiver) changes nothing. Once this
+               phone saved its own progress after that, after it took an episode over (seen remote
+               just before, or arriving far from the kept point), and with no reference at all,
+               Spotify's state is at best another device's older one: only a state beyond the point
+               is news (the furthest point wins). A finished state is beyond any unfinished point,
+               except this phone's own progress while no real state was ever seen (Spotify's
+               finish may predate a re-listen here).
+             * Every play decides its start in one place, just before the load is sent:
+               `PlayerController.episodeResume` (`EpisodeProgressStore.resumeOrLookUp`) for a play
+               that names no position — the app's pages (rows, the show's and episode's Play),
                Your Episodes, Downloads, search, Android Auto / Assistant / media browsers (their
-               rows also carry the completion status) via `PlayerController.episodeResume` for a
-               play with no position. With no point known and the session online (and no fresh
-               answer about it in the last 10 min), the load first looks Spotify's up
-               (`episodeResumeLookup`: `catalog.episodes`, at most 3.5 s). Auto-advance, next and
-               context loads (Spirc, the offline queue) seek once when local playback arrives near
-               the start of a partly played episode, after the same lookup when nothing is known
-               (nothing is saved below the point until the seek lands or the lookup answers).
-               Tapping the episode that is playing (here or on a Connect device) toggles it.
+               rows also carry the completion status); the pages pass none. It is the kept point,
+               looked up on Spotify first (`catalog.episodes`, at most 3.5 s, then the kept point)
+               when Spotify may know better and the session is online: no point is kept, or it came
+               from a followed remote device (that device may have played on after the phone
+               stopped following); and no fresh answer told its state in the last 10 min.
+               Auto-advance, next and context loads (Spirc, the offline queue) seek once when local
+               playback arrives near the start of a partly played episode, after the same lookup
+               when Spotify may know better (nothing is saved below the point until the seek lands
+               or the lookup answers). Tapping the episode that is playing (here or on a Connect
+               device) toggles it. Offline, the episode page's Play of an episode that isn't
+               downloaded says so (a show load would start another, downloaded one); so do Your
+               Episodes rows (a plain list the engine would hand to its offline queue, which starts
+               the next download), where a downloaded one starts among the list's downloads and,
+               while the session is connecting, one that isn't is sent alone to wait for it (the
+               Downloads entries likewise).
+             * The stored session's resumes (Media3 / Bluetooth / Auto resumption, Tap to resume,
+               "play something", the in-app Play fallback, and a transfer that starts it on a device
+               while nothing is loaded, `DevicesRepository.episodeResume`) take the same decision: their position
+               carries when it dates from (`ResumeState.positionAt`: the save's time while it
+               played, the snapshot's timestamp when paused — a remote device sitting paused keeps
+               its old one; `PlayRequest.positionAt`), and it plays only when newer than the
+               episode's point (else the point, or the start of a finished episode), after the same
+               lookup when Spotify may know better. Other positions a request names (a seek-to
+               load) are kept.
+             * "Mark as played" / "Mark as unplayed" (the episode sheet, so every row's More and
+               long press, and the episode page's check button): this phone's newest point,
+               finished or 0 (kept as an entry, so no lookup brings an old point back). Spotify's
+               last state stays the reference (an unchanged one keeps the mark, a changed one is
+               news), the Connect marks end, and an answer requested before the mark is ignored.
+               The episode playing while marked keeps the mark until the user seeks in it, it ends,
+               or playback moves on. Not sent to Spotify: no write endpoint for the played state
+               is verified (Pathfinder's operations here are read-only, `catalog/played.rs`).
              Nothing is reported back to Spotify: progress made on this phone, offline above all,
-             is not synced to other devices.
+             and its marks are not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
               "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
@@ -796,9 +856,19 @@ For a remote active device, smart shuffle is not supported (the command reports
     `clientKey`. The inner blob is the inverse of `Credentials::with_blob`
     (`0x49,bytes(user),0x50,int(authType),0x51,bytes(authData)`, block-padded, the XOR-with-prior-
     block step, AES-192-ECB under a PBKDF2 key from `SHA1(deviceId)` and the username, then base64).
-    When `getInfo` advertises `tokenType` `accesstoken`, a fresh login5 access token (keymaster,
-    `streaming` scope) is sent as the blob with the device's client id as `clientKey`; otherwise the
-    stored reusable credentials blob is used. A `default`-token device whose service is not
+    When `getInfo` advertises `tokenType` `accesstoken`, an access token is sent as the blob with
+    the device's client id as `clientKey`; otherwise the stored reusable credentials blob is used.
+    The token is minted by **`device_token`**, the module the Cast login uses too, from the
+    `clientID` and `deviceID` of the current getInfo (re-read after a wake-up or a 203). Sources in
+    order: spclient `POST /device-auth/v1/refresh {"clientId","deviceId"}`, then a keymaster
+    request for that client id with the Connect playback scopes (both skipped when `clientID` is
+    empty or not alphanumeric), then this session's own login5 token as the last resort (what
+    such devices were sent before, so one that took it still signs in). Each mint is bounded
+    (10 s); a source that mints nothing, or whose token the device refuses (any status but 101 or
+    203, or an error page), hands over to the next, and the last refusal is the error; a network
+    failure ends the login. The token never leaves native code and is never logged (only the
+    source's name). The device-facing part of the login is capped at 90 s as a whole. A
+    `default`-token device whose service is not
     loaded (`availability` NOT-LOADED, `publicKey` "INVALID") first gets a **wake-up `addUser`**
     with empty `blob` and `clientKey` (no credential material; origin `deviceName`/`deviceId`);
     it loads and answers 203 ERROR-INVALID-PUBLICKEY, the engine polls getInfo (≤ 5 s) until it is
@@ -808,6 +878,51 @@ For a remote active device, smart shuffle is not supported (the command reports
     `connect.transfer`. Only local-network hosts (loopback / private / link-local / `.local`) over
     plain HTTP are accepted; all timeouts are bounded. mDNS browsing is Kotlin's `NsdManager`, so
     Rust only ever sees the URL.
+* **Google Cast devices (the "send" side for Cast speakers and TVs)**: Nest speakers, Chromecast,
+  Google TV and soundbars with Chromecast built-in advertise `_googlecast._tcp`, not
+  `_spotify-connect._tcp`, and join the account's cluster only once a sender has launched
+  Spotify's Cast receiver app (`CC32E753`) on them and signed it in. The app does this itself,
+  without the Cast SDK or Play services (it works on phones without GMS).
+  * **Kotlin (`LocalDeviceDiscovery`)** browses `_googlecast._tcp` in the same run as
+    `_spotify-connect._tcp`: same sheet-driven start / pause / stop, same `MulticastLock`, same
+    API 34+ service-info callbacks, and below API 34 the same one-resolve-at-a-time queue (the
+    platform's slot is shared by both types). A Cast service is not probed: its TXT record gives
+    `fn` (friendly name), `md` (model; "Google Cast Group" for a group), `id` (its Cast id, the
+    entry's key) and `ca` (capabilities: video out → TV icon). Its Connect id is
+    `md5(fn)` in lowercase hex (`CastServices.connectDeviceId`, the id the receiver is given, see
+    below). `CastServices.visible` hides an entry that is already in the cluster (that id, or a
+    cluster device with the same name) or that is the Cast side of a device also found as a
+    ZeroConf device (same id, same name, or, except for a group, which runs on one of its members,
+    the same address): the ZeroConf login is the device's native one. Cast rows say "Google Cast".
+  * **Rust (`cast_client/`)**, `connect.castLogin`: TLS to `host:port` (8009; a group announces
+    its own port) with rustls/ring. Cast devices present self-signed certificates, so this
+    connector, and only it, accepts any certificate (the handshake signature is still checked
+    against the presented key when webpki can parse the certificate); every other connection keeps
+    normal verification. Cast v2 frames are a 4-byte big-endian length (≤ 64 KiB) and a
+    hand-written protobuf `CastMessage`. The exchange: CONNECT `receiver-0`
+    (`urn:x-cast:com.google.cast.tp.connection`); LAUNCH `CC32E753` on
+    `urn:x-cast:com.google.cast.receiver` and wait for a RECEIVER_STATUS listing it with a
+    `transportId` (LAUNCH_ERROR fails); CONNECT to the transport; on
+    `urn:x-cast:com.spotify.chromecast.secure.v1` send `getInfo {remoteName: fn, deviceID: md5(fn),
+    deviceAPI_isGroup}` (the receiver's identity, as open-source Cast senders send it; never this
+    phone's id, which the receiver would register under) and read `getInfoResponse` (`clientID`,
+    `deviceID`); send `addUser {blob: <access token>, tokenType: "accesstoken"}` and wait for
+    `addUserResponse` (`addUserError` is a refusal). PINGs on `urn:x-cast:com.google.cast.tp.heartbeat`
+    are answered with PONG throughout, also while the token is minted. The token must be issued for
+    the receiver's `clientID`; `device_token` mints it on the live session (shared with the ZeroConf
+    `accesstoken` login above, without its last-resort session token), first with spclient
+    `POST /device-auth/v1/refresh {"clientId","deviceId"}` (what open-source Cast senders use), then,
+    if that fails or the receiver refuses it, with a keymaster token request
+    (`hm://keymaster/token/authenticated`, the receiver's client id, scopes `streaming,
+    user-read-playback-state, user-modify-playback-state, user-read-private`) sent directly over
+    Mercury, not through librespot's `TokenProvider` (whose cache is keyed by scope only). Bounds:
+    TCP connect 5 s, TLS handshake 5 s, launch 15 s, getInfo 10 s, each token 10 s, addUser 15 s, the
+    whole exchange 60 s. A step that times out is `NETWORK` if the device sent nothing meanwhile,
+    else `UNAVAILABLE`. The socket is closed right after (TLS close_notify, no CLOSE message: a
+    "requested by sender" close lets an idle receiver stop itself); no heartbeat or task outlives
+    the call. Then, as for `connect.localLogin`, the engine waits up to 10 s for the device to appear
+    in the cluster (the reported `deviceID`, `md5(fn)`, or a new device with that name) and returns
+    its id; Kotlin transfers to it, or keeps it as the pending target when nothing plays.
 
 ## 9. Android app
 
@@ -1052,17 +1167,19 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `ctx|` rows (the offline load plays them in that order), without waiting for or starting the
   session; online it lists the catalog's copy, all of it, and its downloads when the catalog has
   nothing for it (no session, a failed or empty answer, a cleared cache). Voice "play X"
-  (Assistant, Auto: `LibraryTree.resolveVoiceQuery`, `VoiceMatch`) matches the user's own
+  has one resolver (`LibraryTree.resolveVoice`, `VoiceRequest`, `VoiceMatch`) for both of its
+  entries: the media session (Assistant, Auto: a set item with a search query) and the activity
+  (`MEDIA_PLAY_FROM_SEARCH` through `LinkActivity`, `ShellViewModel.playFromSearch`, §9.9). It matches the user's own
   collections by name first (case, accents and punctuation aside; "my", "the", "playlist", ...
   dropped), honouring `EXTRA_MEDIA_FOCUS` and the `EXTRA_MEDIA_*` names: Liked Songs and the
   downloaded collections, then online Library's playlists, albums, artists and podcasts. The
   same or loosely the same name wins over the catalog's search (the user's own, maybe private,
   playlist over a stranger's); a name that only starts so is used when the search has nothing.
   Offline only the downloads count: their collections, then the downloaded songs and episodes
-  by title, else all of an artist's, album's or show's, played as a list. A request that finds
-  nothing (also "play something" with no stored session) fails with the player's error (Not
-  found, or Not available offline) instead of an empty answer, which Media3 would still prepare
-  and play, resuming whatever was loaded. Auto's search offline lists the downloads whose names
+  by title, else all of an artist's, album's or show's, played as a list. On the session, a
+  request that finds nothing (also "play something" with no stored session) fails with the
+  player's error (Not found, or Not available offline) instead of an empty answer, which Media3
+  would still prepare and play, resuming whatever was loaded. Auto's search offline lists the downloads whose names
   have the query's words; `onPlaybackResumption` from `ResumeStore` (DataStore:
   context, track, position, metadata, shuffle / smart shuffle / repeat) persisted on pause,
   on a mode change and every 15 s while playing (`ResumeSaver`): the account's last session as
@@ -1111,7 +1228,28 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   foreground as `connectedDevice` with a low-importance "Available on Spotify Connect"
   notification (Stop action), so remote "play on this phone" works. Uses
   `onUpdateNotificationAsync` override as described in research; off by default because of
-  the battery cost (~2 radio wake-ups per minute).
+  the battery cost (~2 radio wake-ups per minute). Started while the app is visible (FGS start
+  rules), and restored after an app update (`MY_PACKAGE_REPLACED`) and, up to Android 14, a
+  reboot (`BOOT_COMPLETED`, after the first unlock: the credentials and settings are in
+  credential-encrypted storage, so `LOCKED_BOOT_COMPLETED` is not used) by the non-exported
+  `PresenceRestoreReceiver` (`PresenceRestore`): both broadcasts exempt the app from the
+  background FGS-start ban. Not from boot on Android 15+: a service started from
+  `BOOT_COMPLETED` keeps that start reason on its record for as long as it stays in the
+  foreground (only leaving the foreground resets it), and every later `startForeground` of it is
+  checked against the boot allowlist of types (`connectedDevice` passes, `mediaPlayback` does
+  not); presence keeps the service in the foreground, so Media3's media foreground would be
+  refused for good. There the "open the app" notification below is posted instead, and opening
+  the app starts presence with the app's own start reason (`MY_PACKAGE_REPLACED` records a reason
+  of its own, which that check does not restrict). It reads the setting and the stored login
+  (bounded, inside the broadcast; nothing held awake) and starts the service with
+  `startForegroundService` (`EXTRA_FOREGROUND_START`: the service meets that contract as
+  `connectedDevice` even when presence cannot come up). A refused start (a restricted app, OEM
+  limits), or a login not read in time, posts one "Open SpotifyGood to stay available for
+  Spotify Connect" notification (tap: the app), gone once presence is up again; presence then
+  waits for the app to be visible, as before. A media foreground the system refuses
+  (`onForegroundStartNotAllowed`) pauses local playback with "Tap to resume" only when neither
+  the app is visible nor presence keeps the service in the foreground: then the process stays,
+  the audio plays on and Media3 asks again on its next update.
 * Audio focus (`AudioFocusController`, AudioManagerCompat): requested when local playback
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
@@ -1154,10 +1292,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   over), the engine stops or logs out, or the user picks "Automatic". "More devices…" opens the
   system output switcher via `androidx.mediarouter.app.SystemOutputSwitcherDialogController
   .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — lists Bluetooth and
-  other system audio outputs not yet connected (the app does not cast). Never use `setCommunicationDevice` for media.
+  other system audio outputs not yet connected (the system switcher does not cast for this app:
+  Google Cast devices are signed in from the sheet's local-network section instead, §8). Never use
+  `setCommunicationDevice` for media.
 * Device sheet (one UI for everything, like Spotify's): **This phone** (with current output
   name + icon and local output choices), then **Spotify Connect devices**, then
-  "More devices…". Selecting a Connect device → `connect.transfer`. With nothing playing
+  "More devices…", then **Other devices on your network**: ZeroConf speakers and Google Cast
+  devices not yet in the account (§8; a tap signs one in, then transfers). Selecting a Connect
+  device → `connect.transfer`. With nothing playing
   anywhere and no session to resume, the picked device becomes the pending target
   (`DevicesRepository.pendingTarget`): the next in-app play goes there (`player.load
   {deviceId}`), the standard Connect "send" (§8). It is used once, expires 10 minutes after the
@@ -1261,8 +1403,15 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   renamed, then the rows and the offline index (`offline.add`, numbered) switched to the copy, then
   the original deleted. Every step is resumable: an interrupted move leaves the original in use or
   both copies with the rows on one of them, and the next pass (start, mount, change) carries on;
-  the files copied before a stop (no space, an I/O error) are switched all the same. The cover
-  maps and the session artwork follow the moved covers at once.
+  the files copied before a stop (no space, an error about the target, a cancellation) are switched
+  all the same. An original that cannot be read while its card is still there (a bad sector, a
+  short read: a damaged download) does not stop the move: it is skipped, its downloads go back into
+  the queue and are downloaded fresh to the chosen location (out of the offline index; an
+  unreadable cover is dropped for the CDN image), and Settings says how many. Three unreadable
+  originals in a row stop the move instead (the card itself is failing), as does a card that went.
+  The plan follows a stable order (`addedAt`, uri) with the files that failed before in this
+  process last, so one bad file never holds back the rest. The cover maps and the session
+  artwork follow the moved covers at once.
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
 * A card that is removed or unmounted (the system's media broadcasts): its downloads stay COMPLETED
@@ -1270,6 +1419,17 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   shown as not available (FAILED with "On an SD card that isn't available", left out of the
   playable downloads and the "Retry" count) and taken out of the offline index; the index snapshot
   leaves them out. On remount they are registered again, and whatever waited for the card moves.
+  A card that never comes back (it died, or another card with another UUID, or internal storage,
+  is chosen): its downloads are on a card that is no longer the download location ("On an SD card
+  that's no longer used"). They still wait (the card may be inserted again), but "Download" on
+  them, "Retry" (the row's, and "Retry failed", which counts them), downloading their collection
+  again and Settings > Storage "Downloads on an SD card no longer used" download them again to the
+  chosen location: the rows go back into the queue without their old file references, key and
+  record (`requeueFromUnusedCard`, out of the index with a numbered change), and their old files
+  are collected if that card is ever mounted again. Downloads on the chosen card while it is away
+  just wait: "Download" and "Retry" say so instead of claiming to start (`DownloadRequest`, also
+  "queued" while the chosen card is missing). Retrying a collection member never makes it an
+  individual download.
 * Covers (`OfflineCovers`, a Coil interceptor): lists built from downloads and the online pages
   of downloaded items name the CDN image URLs of the stored metadata. Every size of a completed
   download's album images (an episode's own images, else its show's) is served from the download's
@@ -1372,7 +1532,17 @@ refetched twice while on screen (after 15 s and 30 s). The home feed is treated 
 when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
-app scope, so they complete even if their screen closes. Saved/liked state is cached in
+app scope, so they complete even if their screen closes. "Add to playlist" (a song, an episode,
+an album's tracks, another playlist's items — "Add to other playlist") lists the playlist picked
+first, item URIs only (`catalog.playlistUris`: one request when the server answers the whole
+list, at most 101; a source playlist the same way, at most 10,000 items; bounded at 20 s): items
+already in it get Spotify's "Already added" question (one item, or none new: Add anyway / Don't
+add; some new: Add new ones / Add anyway / Cancel), and an add stops at a playlist's
+10,000-item limit, the snackbar saying how many went in. When the listing can't complete, the
+user is asked whether to add anyway (never a silent duplicate); offline, the add says so.
+A playlist's "Add to queue" lists its items the same way (URIs only, local files left out, at
+most 20 s; the queue takes the first 80 and the snackbar says so); offline, or when that fails
+or takes too long, it queues the downloaded members, and with none it says why. Saved/liked state is cached in
 memory (LRU) and looked up via `library.contains` (batched). It is unknown until looked up: a
 failed lookup (offline, the session still connecting, a network error) stays unknown, never
 "not saved", and is looked up again when the session comes online (with backoff if it fails
@@ -1392,6 +1562,24 @@ reach becomes ONLINE, a page that failed, shows a stale cached copy (its refresh
 the download loads again, once a load still running has settled. A search or result page that
 failed before the session was ONLINE shows its error and runs again once it is (a connection
 error while ONLINE: after the next reconnect).
+
+Sorting Liked Songs and playlists (`ui/screens/library/TrackSort.kt`): Liked Songs offers Recently
+added (its own, newest-first order), Title, Artist and Album; a playlist Custom order (its own),
+Title, Artist, Album and Recently added. The choice is kept per list (Liked Songs, each playlist
+URI; non-default choices only, the 300 most recent lists) in app preferences. Another order
+needs every row, so the page fetches the remaining pages one at a time (the pages it already
+uses: 100 items, URIs with metadata; a playlist at most 200), showing "Loading songs… n of total",
+and sorts the loaded rows off the main thread on every new page (collation keys; case and
+accents ignored; rows that can't play last; ties keep the list order), then applies the filter
+("Find in playlist" / Liked Songs' filter). Edit mode always shows the playlist's own order
+(moves and removals use the row's playlist position). The trade-off is playback: a context load
+plays the server's order (Spirc resolves the context itself), so a non-default order plays as a
+`trackUris` list in the shown order, shuffle off, at most 500 tracks around the start item (50
+before it). That list has no context: Connect and the notification show no playlist, and it is
+a snapshot of what was loaded (later edits and likes don't reach it); the Play button toggles it
+while one of its tracks plays with no catalog context. The default order keeps the context load
+(Connect shows the playlist), and Shuffle always loads the context, its order doesn't matter.
+Offline, the downloaded rows sort the same way and already play as a track list.
 
 ### 9.9 UI
 
@@ -1415,6 +1603,15 @@ error while ONLINE: after the next reconnect).
   Spotify app holds the domain, its "Open supported links" has to go off first. Shared links
   always work.
 * Offline: banner + downloaded-only filtering when offline mode or no network.
+* Voice search sent to the activity (`MEDIA_PLAY_FROM_SEARCH`, forwarded by `LinkActivity`):
+  `ShellViewModel.playFromSearch` holds the engine (a UI holder, taken at once: the request
+  arrives in onCreate / onNewIntent, before onStart's holder, and an idle-stopped session only
+  starts for a holder; released once the play went out), waits for the stored login, then,
+  unless offline (offline mode, or no network as of now: a stopped engine reads it from the
+  system), for the session as the media session does (`VoiceEntry`, bounded), and hands the request (query, focus and the `EXTRA_MEDIA_*` names, as
+  `VoiceRequest`) to the media session's resolver (§9.4), so both entries play the same thing:
+  a match plays as an in-app play (to the pending Connect target too), an empty request resumes
+  playback, no match shows "Nothing found for …" or, offline, "That isn't downloaded".
 
 ## 10. Lifecycle & battery policy (summary)
 
@@ -1426,7 +1623,7 @@ error while ONLINE: after the next reconnect).
 | Paused ≥ 10 min, app background | hidden and stopped when the service lets go (other releases: hidden after 20 s, stopped after 60 s, both wall time) | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
-| Presence opt-in, idle | Online | yes | connectedDevice (low-importance) | none |
+| Presence opt-in, idle (also restored after an app update, and after a reboot up to Android 14; from Android 15 a notification asks to open the app) | Online | yes | connectedDevice (low-importance) | none |
 | Nothing | stopped | no | none | none |
 
 ## 11. Feature checklist
@@ -1434,14 +1631,15 @@ error while ONLINE: after the next reconnect).
 Login (OAuth, other-device), Premium gate, logout, background play, notification &
 lock-screen controls, Bluetooth/headset buttons, Android Auto, playback resumption,
 audio focus & ducking, becoming-noisy pause, output switching (speaker/BT/wired/USB +
-system switcher), Connect send (device list, transfer, remote control incl. volume keys)
+system switcher), Connect send (device list, transfer, remote control incl. volume keys, signing
+in local-network ZeroConf speakers and Google Cast devices)
 and receive (phone as Connect device), shuffle, smart shuffle with suggestions, repeat
 all/one, queue (view, add, remove, reorder, clear, jump), autoplay, gapless,
 normalisation, streaming quality, playlists (view, create, edit, reorder, delete,
 follow), Liked Songs, saved albums/artists/podcasts, follow artists, search (all types,
 recent searches), home feed, album/artist/playlist/show/episode pages, podcast resume
 points (this phone's progress, kept on the phone and not synced to other devices; Spotify's
-when its web API provides them, §6.5), lyrics (synced),
+when its web API provides them; mark as played / unplayed, §6.5), lyrics (synced),
 podcast playback speed (0.5×–3.5×, on this phone), radio, share links, deep links, downloads (track/album/playlist/liked/podcast, Wi-Fi only
 option, storage management, auto-sync), offline mode, sleep timer, explicit-content
 filter, system equalizer, settings, adaptive layouts, accessibility (content

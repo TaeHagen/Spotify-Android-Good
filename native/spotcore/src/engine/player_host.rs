@@ -43,6 +43,9 @@ static OFFLINE: Mutex<Option<Session>> = parking_lot::const_mutex(None);
 static BOUND: Mutex<Option<Session>> = parking_lot::const_mutex(None);
 static MIXER: OnceLock<Arc<AndroidMixer>> = OnceLock::new();
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The speed the app's sink plays at (`player.setSpeed`, as f64 bits), for the Player's position
+/// corrections; every new Player gets it.
+static SPEED: AtomicU64 = AtomicU64::new(1.0f64.to_bits());
 /// Serialises Player creation (online bind vs. offline playback). The offline path must never
 /// rebind an existing Player: a connect attempt may have just bound it to the online session.
 static CREATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -66,6 +69,16 @@ pub(crate) fn mixer_or_default() -> Arc<AndroidMixer> {
 /// The current, healthy Player.
 pub(crate) fn player() -> Option<Arc<Player>> {
     HOST.lock().as_ref().filter(|h| !h.player.is_invalid()).map(|h| h.player.clone())
+}
+
+/// The speed the sink plays at (podcasts, 1 for music): the Player measures its position
+/// corrections against it (a stall above 1x went unreported), see the vendored
+/// `Player::set_playback_speed`.
+pub(crate) fn set_playback_speed(speed: f64) {
+    SPEED.store(speed.to_bits(), Ordering::Relaxed);
+    if let Some(player) = player() {
+        player.set_playback_speed(speed);
+    }
 }
 
 /// Generation of the current Player if its thread died.
@@ -141,6 +154,8 @@ fn create(session: &Session, settings: &EngineSettings) -> Arc<Player> {
     let events = player.get_player_event_channel();
     crate::runtime::handle().spawn(forward_events(generation, events));
     *HOST.lock() = Some(Host { player: player.clone(), generation });
+    // After HOST: a speed set meanwhile reaches this Player one way or the other.
+    player.set_playback_speed(f64::from_bits(SPEED.load(Ordering::Relaxed)));
     log::info!("player {generation} created");
     player
 }

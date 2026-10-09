@@ -55,4 +55,21 @@ class QueueAddsTest {
         assertEquals(11, queued.size)
         assertEquals(order - "spotify:track:3", queued)
     }
+
+    @Test
+    fun aCollectionQueuesTheServersListElseItsDownloads() {
+        val list = listOf("spotify:track:1", "spotify:track:2")
+        val downloads = listOf("spotify:track:9")
+        assertEquals(CollectionQueuePlan.Queue(list), collectionQueuePlan(list, downloaded = emptyList()))
+        assertEquals("an empty playlist, or local files only", CollectionQueuePlan.NothingToQueue, collectionQueuePlan(emptyList(), emptyList()))
+        // Not online, or it couldn't be fetched: its downloads.
+        assertEquals(CollectionQueuePlan.Queue(downloads), collectionQueuePlan(null, downloads))
+        val reset = java.io.IOException("reset")
+        assertEquals(CollectionQueuePlan.Queue(downloads), collectionQueuePlan(null, downloads, failure = reset))
+        assertEquals(CollectionQueuePlan.Queue(downloads), collectionQueuePlan(null, downloads, timedOut = true))
+        // Online, but it failed or took too long and nothing is downloaded: said as such.
+        assertEquals(CollectionQueuePlan.Failed(reset), collectionQueuePlan(null, emptyList(), failure = reset))
+        assertEquals(CollectionQueuePlan.Failed(null), collectionQueuePlan(null, emptyList(), timedOut = true))
+        assertEquals(CollectionQueuePlan.NothingDownloaded, collectionQueuePlan(null, emptyList()))
+    }
 }

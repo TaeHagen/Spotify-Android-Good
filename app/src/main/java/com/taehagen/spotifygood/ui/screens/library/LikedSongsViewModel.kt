@@ -39,6 +39,7 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -71,6 +72,14 @@ data class LikedSongsUiState(
     val nowPlaying: NowPlaying = NowPlaying(),
     /** Some loaded pages hold placeholders (metadata failed right now): offer a retry. */
     val partial: Boolean = false,
+    /** The shown order; [TrackSort.RECENTLY_ADDED] is the server's (newest first). */
+    val sort: TrackSort = TrackSort.RECENTLY_ADDED,
+    /** Songs loaded (before the filter): progress while every page is fetched to sort or filter. */
+    val loadedCount: Int = 0,
+    /** Every page is being fetched (a sort or a filter needs them all). */
+    val loadingAll: Boolean = false,
+    /** What plays is a sorted list this page started (playing or paused). */
+    val sortedListIsCurrent: Boolean = false,
 )
 
 /**
@@ -102,6 +111,8 @@ private data class LikedMeta(
     val refreshing: Boolean,
     val partial: Boolean,
     val offline: Boolean,
+    val sort: TrackSort,
+    val sortedSent: Set<String>,
 )
 
 /** What Liked Songs lists. */
@@ -174,6 +185,12 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     }
     private val reach = graph.engineReachFlow()
     private val refreshing = MutableStateFlow(false)
+    private val sortStore = ListSortStore(graph.app)
+    private val sort = MutableStateFlow(TrackSort.RECENTLY_ADDED)
+    /** Track URIs of the last sorted list this page started ([isSortedPlayback]). */
+    private val sortedSent = MutableStateFlow<Set<String>>(emptySet())
+    /** The loaded songs in the shown order (before the filter): what a sorted play plays. */
+    @Volatile private var sortedTracks: List<Track> = emptyList()
     private val messages = Channel<LibraryMessage>(Channel.BUFFERED)
     val events: Flow<LibraryMessage> = messages.receiveAsFlow()
     private val messenger = SessionMessenger(graph.app)
@@ -249,6 +266,12 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         }
     }
 
+    /** [source] in the chosen order, sorted off the main thread (lists of thousands). */
+    private val sortedSource: Flow<LikedSource> = combine(source, sort, ::Pair)
+        .mapLatest { (source, sort) -> source.copy(tracks = source.tracks.sortedFor(sort, default = TrackSort.RECENTLY_ADDED)) }
+        .flowOn(Dispatchers.Default)
+        .onEach { sortedTracks = it.tracks }
+
     private val download: Flow<LikedDownload> = contextUri.flatMapLatest { uri ->
         if (uri == null) {
             graph.downloadStatesFlow().map { LikedDownload(CollectionDownloadStatus.None, false, it) }
@@ -264,15 +287,17 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         .onStart { emit(LikedDownload(CollectionDownloadStatus.None, false, emptyMap())) }
 
     val state: StateFlow<LikedSongsUiState> = combine(
-        source,
+        sortedSource,
         filterQuery,
         contextUri,
-        combine(download, refreshing, partialPages.partial, reach) { download, refreshing, partial, reach ->
-            LikedMeta(download, refreshing, partial, offline = reach == EngineReach.OFFLINE)
+        combine(download, refreshing, partialPages.partial, reach, combine(sort, sortedSent, ::Pair)) { download, refreshing, partial, reach, (sort, sent) ->
+            LikedMeta(download, refreshing, partial, offline = reach == EngineReach.OFFLINE, sort = sort, sortedSent = sent)
         },
         graph.nowPlayingFlow(),
-    ) { source, filter, contextUri, (download, refreshing, partial, offline), nowPlaying ->
+    ) { source, filter, contextUri, meta, nowPlaying ->
+        val (download, refreshing, partial, offline, sort, sent) = meta
         val visible = if (filter.isEmpty()) source.tracks else source.tracks.filter { it.matches(filter) }
+        val needsAll = filter.isNotEmpty() || sort != TrackSort.RECENTLY_ADDED
         LikedSongsUiState(
             contextUri = contextUri,
             tracks = visible,
@@ -290,6 +315,10 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             downloadStates = download.states,
             nowPlaying = nowPlaying,
             partial = partial && !source.fromDownload,
+            sort = sort,
+            loadedCount = source.tracks.size,
+            loadingAll = needsAll && !source.fromDownload && source.tracks.isNotEmpty() && (source.canLoadMore || source.isLoading),
+            sortedListIsCurrent = isSortedPlayback(nowPlaying.trackUri, nowPlaying.contextUri, sent),
         )
     }.flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LikedSongsUiState())
@@ -306,10 +335,17 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             .onEach { if (graph.engineReach() == EngineReach.ONLINE) pager.reload() }
             .catch { }
             .launchIn(viewModelScope)
-        // While filtering, fetch the remaining pages so the filter covers every liked song.
-        combine(filterQuery, pager.state, reach) { filter, page, reach -> filter.isNotEmpty() && reach == EngineReach.ONLINE && page.canLoadMore }
+        // While filtering or sorted, fetch the remaining pages (one at a time, the pager's size) so
+        // the filter covers, and the sort orders, every liked song.
+        combine(filterQuery, pager.state, reach, sort) { filter, page, reach, sort ->
+            (filter.isNotEmpty() || sort != TrackSort.RECENTLY_ADDED) && reach == EngineReach.ONLINE && page.canLoadMore
+        }
             .onEach { if (it) pager.loadMore() }
             .launchIn(viewModelScope)
+        // The sort chosen last time.
+        viewModelScope.launch {
+            sortStore.get(ListSortStore.LIKED_SONGS)?.takeIf { it in TrackSort.LIKED_SONGS }?.let { sort.value = it }
+        }
         // Liked Songs pages are not cached: start over after library edits (likes/unlikes).
         graph.library.changes.debounce(CHANGE_DEBOUNCE_MS)
             .onEach { if (graph.engineReach() == EngineReach.ONLINE) pager.reload() }
@@ -327,6 +363,28 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
 
     fun onFilterChange(text: String) {
         filterText = text
+    }
+
+    /** Shows (and plays) the songs in [value] order; remembered for next time. */
+    fun setSort(value: TrackSort) {
+        if (value !in TrackSort.LIKED_SONGS || value == sort.value) return
+        sort.value = value
+        graph.appScope.launch { attempt { sortStore.set(ListSortStore.LIKED_SONGS, value, default = TrackSort.RECENTLY_ADDED) } }
+    }
+
+    private val sorted: Boolean get() = sort.value != TrackSort.RECENTLY_ADDED
+
+    /**
+     * Plays the loaded songs in the shown order from [startUri] (else the first) as a track list:
+     * the Liked Songs context plays the server's order ([sortedPlayRequest]). False when there is
+     * nothing to play.
+     */
+    private fun playSorted(startUri: String?): Boolean {
+        val uris = sortedTracks.filter { it.playable && !it.isPlaceholder }.map { it.uri }
+        val request = sortedPlayRequest(uris, startUri?.let { uris.indexOf(it).coerceAtLeast(0) } ?: 0) ?: return false
+        sortedSent.value = request.trackUris.orEmpty().toSet()
+        graph.player.play(request)
+        return true
     }
 
     fun loadMore() = pager.loadMore()
@@ -349,10 +407,11 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         tracks.filter { it.playable && !it.isPlaceholder }.map { it.uri }
     }
 
-    /** Play button: toggles when Liked Songs is already playing. */
+    /** Play button: toggles when Liked Songs (or a sorted list of it started here) is already playing. */
     fun playOrToggle() {
         val current = state.value
-        if (current.nowPlaying.contextUri != null && current.nowPlaying.contextUri == current.contextUri) {
+        val isContext = current.nowPlaying.contextUri != null && current.nowPlaying.contextUri == current.contextUri
+        if (isContext || current.sortedListIsCurrent) {
             graph.player.togglePlayPause()
         } else {
             play(shuffle = false)
@@ -364,6 +423,11 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     private fun play(shuffle: Boolean) {
         val current = state.value
         val context = current.contextUri
+        // Sorted: the shown order (shuffle has no order to keep: the context, below).
+        if (!current.fromDownload && sorted && !shuffle) {
+            if (!playSorted(startUri = null)) messages.trySend(LibraryMessage.NOTHING_TO_PLAY)
+            return
+        }
         if (!current.fromDownload && context != null) {
             graph.player.play(PlayRequest(contextUri = context, shuffle = shuffle))
             return
@@ -380,7 +444,9 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         if (track.isPlaceholder || !track.playable) return
         val current = state.value
         val context = current.contextUri
-        if (!current.fromDownload && context != null) {
+        if (!current.fromDownload && sorted) {
+            playSorted(track.uri)
+        } else if (!current.fromDownload && context != null) {
             graph.player.playContext(context, startUri = track.uri)
         } else {
             val uris = playableUris()
@@ -396,13 +462,14 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         graph.appScope.launch {
             attempt {
                 if (download) {
-                    graph.downloads.downloadCollection(CollectionRef(uri, CollectionType.LIKED_SONGS, name, null))
+                    graph.downloads.downloadCollection(CollectionRef(uri, CollectionType.LIKED_SONGS, name, null)).notice
                 } else {
                     graph.downloads.removeCollection(uri)
+                    null
                 }
-            }.onSuccess {
+            }.onSuccess { notice ->
                 // Shown also when the page was left meanwhile (resolving Liked Songs takes a while).
-                messenger.post((if (download) LibraryMessage.DOWNLOAD_STARTED else LibraryMessage.DOWNLOAD_REMOVED).messageRes())
+                messenger.post(notice ?: (if (download) LibraryMessage.DOWNLOAD_STARTED else LibraryMessage.DOWNLOAD_REMOVED).messageRes())
             }.onFailure {
                 messenger.post(LibraryMessage.DOWNLOAD_FAILED.messageRes())
             }

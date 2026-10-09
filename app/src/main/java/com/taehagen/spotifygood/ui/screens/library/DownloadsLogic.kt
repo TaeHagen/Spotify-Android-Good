@@ -153,14 +153,24 @@ sealed interface EntryPlay {
 }
 
 /**
- * Plays [entry] within its [section]. Unless the session is [online] only completed downloads can
- * start (a track list loaded while connecting goes to the offline queue, which starts the next
- * download after an item that isn't one); explicit entries are left out while [filterExplicit].
+ * Plays [entry] within its [section]. Unless the session is [online] only completed downloads play
+ * in the section (a track list loaded while not online goes to the offline queue, which starts the
+ * next download after an item that isn't one); one that isn't downloaded is sent alone while the
+ * session is [connecting] (the load waits for it), else it doesn't start ([planListPlay]'s rule).
+ * Explicit entries are left out while [filterExplicit].
  */
-fun planEntryPlay(entry: DownloadEntry, section: List<DownloadEntry>, online: Boolean, filterExplicit: Boolean): EntryPlay {
+fun planEntryPlay(
+    entry: DownloadEntry,
+    section: List<DownloadEntry>,
+    online: Boolean,
+    filterExplicit: Boolean,
+    connecting: Boolean = false,
+): EntryPlay {
     val skipped = { e: DownloadEntry -> filterExplicit && e.isExplicit }
     if (skipped(entry)) return EntryPlay.Unavailable
-    if (!online && entry.state != DownloadState.COMPLETED) return EntryPlay.NotDownloaded
+    if (!online && entry.state != DownloadState.COMPLETED) {
+        return if (connecting) EntryPlay.Tracks(listOf(entry.uri), 0) else EntryPlay.NotDownloaded
+    }
     val uris = section.filter { !skipped(it) && (online || it.state == DownloadState.COMPLETED) }.map { it.uri }
     val index = uris.indexOf(entry.uri)
     return if (index >= 0) EntryPlay.Tracks(uris, index) else EntryPlay.Tracks(listOf(entry.uri), 0)

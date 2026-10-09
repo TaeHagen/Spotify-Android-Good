@@ -15,6 +15,7 @@ import com.taehagen.spotifygood.data.LyricsRepository
 import com.taehagen.spotifygood.data.PlaylistEditor
 import com.taehagen.spotifygood.data.ResponseCache
 import com.taehagen.spotifygood.data.SearchRepository
+import com.taehagen.spotifygood.data.StoredPosition
 import com.taehagen.spotifygood.data.db.AppDatabase
 import com.taehagen.spotifygood.data.settings.SettingsRepository
 import com.taehagen.spotifygood.download.DownloadManager
@@ -87,15 +88,20 @@ class AppGraph(val app: Application) {
 
     val auth: AuthRepository by lazy { AuthRepository(app, appScope, engine, credentialStore, httpClient) }
 
+    /**
+     * Where a play of an episode starts (docs §6.5): every load of the player and a transfer of the
+     * stored session ([PlayerController.episodeResume], [DevicesRepository.episodeResume]).
+     */
+    private val episodeStart: suspend (String, StoredPosition?) -> Long? = { uri, stored ->
+        episodeProgress.resumeOrLookUp(uri, { engine.isOnline.value }, stored) { catalog.episodes(listOf(uri)) }
+    }
+
     val playback: PlaybackRepository by lazy { PlaybackRepository(appScope, events) }
     val podcastSpeed: PodcastSpeed by lazy { PodcastSpeed(app, appScope, playback, audioSink, rpc) }
     /** Last local session (playback resumption, cold-start play); one DataStore per process. */
     val resumeStore: ResumeStore by lazy { ResumeStore(app) }
     val player: PlayerController by lazy {
-        PlayerController(appScope, rpc, playback, resumeStore, devices).also {
-            it.episodeResume = episodeProgress::resumeMs
-            it.episodeResumeLookup = { uri -> episodeProgress.resumeOrLookUp(uri, { engine.isOnline.value }) { catalog.episodes(listOf(uri)) } }
-        }
+        PlayerController(appScope, rpc, playback, resumeStore, devices).also { it.episodeResume = episodeStart }
     }
     /** Podcast progress made on this phone (docs §6.5); records local episode playback. */
     val episodeProgress: EpisodeProgressStore by lazy {
@@ -112,6 +118,7 @@ class AppGraph(val app: Application) {
     }
     val devices: DevicesRepository by lazy {
         DevicesRepository(appScope, rpc, events, resumeStore::read).also { repo ->
+            repo.episodeResume = episodeStart
             // Coroutine timers don't count deep sleep: an expired pending target goes when the app
             // comes back.
             appScope.launch(Dispatchers.Main) {

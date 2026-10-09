@@ -8,6 +8,7 @@ import com.taehagen.spotifygood.model.MediaRef
 import com.taehagen.spotifygood.model.PlaylistRef
 import com.taehagen.spotifygood.model.ShowRef
 import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.ui.components.PlaylistAddPrompt
 import kotlinx.serialization.Serializable
 
 /** Type-safe navigation destinations (navigation-compose 2.10). */
@@ -67,7 +68,10 @@ interface AppNavigator {
     fun openLyrics()
     fun openDevices()
     fun showActions(target: MediaActionTarget)
-    fun addToPlaylist(uris: List<String>)
+    /** The playlist picker for [uris]; [excludeUri]: a playlist not to offer (the one they come from). */
+    fun addToPlaylist(uris: List<String>, excludeUri: String? = null)
+    /** Asks "Already added" ([prompt]) in a dialog of its own (the picker has closed). */
+    fun confirmPlaylistAdd(prompt: PlaylistAddPrompt)
     fun showMessage(message: String)
 }
 

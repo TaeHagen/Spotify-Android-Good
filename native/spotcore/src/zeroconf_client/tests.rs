@@ -157,7 +157,8 @@ fn rejects_unusable_public_key() {
 // ---------------------------------------------------------------------------------------------
 
 use super::{add_user_flow, needs_wake_up, wake_up_form, Account, Endpoint};
-use crate::error::{AppError, AppResult};
+use crate::device_token::{TokenSource, ZEROCONF_SOURCES};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::StoredCredentials;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -169,6 +170,7 @@ const FAKE_DEVICE_ID: &str = "fakedevice0001";
 const FAKE_CLIENT_ID: &str = "0123456789abcdef0123456789abcdef";
 const ADD_USER_OK: &str = r#"{"status":101,"spotifyError":0,"statusString":"OK"}"#;
 const ADD_USER_INVALID_KEY: &str = r#"{"status":203,"spotifyError":0,"statusString":"ERROR-INVALID-PUBLICKEY"}"#;
+const ADD_USER_LOGIN_FAILED: &str = r#"{"status":202,"spotifyError":0,"statusString":"ERROR-LOGIN-FAILED"}"#;
 
 fn account(auth_data: &[u8]) -> Account {
     Account {
@@ -179,8 +181,25 @@ fn account(auth_data: &[u8]) -> Account {
     }
 }
 
-async fn no_token() -> AppResult<String> {
+async fn no_token(_: TokenSource, _: String, _: String) -> AppResult<String> {
     Err(AppError::internal("this test mints no token"))
+}
+
+/// A token naming its source and what it was minted for.
+async fn token_for(source: TokenSource, client_id: String, device_id: String) -> AppResult<String> {
+    Ok(format!("token-{source:?}-{client_id}-{device_id}"))
+}
+
+type Minted = std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<String>> + Send>>;
+type MintCalls = Arc<Mutex<Vec<(TokenSource, String, String)>>>;
+
+/// A minter that records every request and answers like [`token_for`].
+fn recording_minter(calls: &MintCalls) -> impl Fn(TokenSource, String, String) -> Minted {
+    let calls = calls.clone();
+    move |source, client_id, device_id| {
+        calls.lock().unwrap().push((source, client_id.clone(), device_id.clone()));
+        Box::pin(token_for(source, client_id, device_id))
+    }
 }
 
 #[derive(Default)]
@@ -196,6 +215,8 @@ struct FakeState {
     add_users: Vec<BTreeMap<String, String>>,
     /// What a key-based addUser decoded to (through librespot's own `with_blob`).
     credentials: Option<Credentials>,
+    /// The first this many token addUsers are refused (202 ERROR-LOGIN-FAILED).
+    refuse_tokens: usize,
 }
 
 /// A ZeroConf device: getInfo / addUser handled like librespot-discovery 0.8.0's server (same
@@ -203,6 +224,8 @@ struct FakeState {
 struct FakeDevice {
     keys: DhLocalKeys,
     token_type: &'static str,
+    /// The getInfo `clientID`.
+    client_id: &'static str,
     state: Mutex<FakeState>,
 }
 
@@ -211,7 +234,18 @@ impl FakeDevice {
         Arc::new(Self {
             keys: DhLocalKeys::random(&mut rand::rng()),
             token_type,
+            client_id: FAKE_CLIENT_ID,
             state: Mutex::new(FakeState { needs_wake_up, loading_polls, ..Default::default() }),
+        })
+    }
+
+    /// An `accesstoken` device reporting `client_id` that refuses the first `refuse_tokens` tokens.
+    fn token_device(client_id: &'static str, refuse_tokens: usize) -> Arc<Self> {
+        Arc::new(Self {
+            keys: DhLocalKeys::random(&mut rand::rng()),
+            token_type: "accesstoken",
+            client_id,
+            state: Mutex::new(FakeState { refuse_tokens, ..Default::default() }),
         })
     }
 
@@ -238,7 +272,7 @@ impl FakeDevice {
                 serde_json::json!({
                     "status": 101, "statusString": "OK", "spotifyError": 0, "version": "2.9.0",
                     "deviceID": FAKE_DEVICE_ID, "deviceType": "SPEAKER", "remoteName": "Fake Speaker",
-                    "publicKey": key, "tokenType": self.token_type, "clientID": FAKE_CLIENT_ID,
+                    "publicKey": key, "tokenType": self.token_type, "clientID": self.client_id,
                     "availability": availability, "activeUser": ""
                 })
                 .to_string()
@@ -251,6 +285,10 @@ impl FakeDevice {
                     return ADD_USER_INVALID_KEY.into();
                 }
                 if params.get("tokenType").map(String::as_str) == Some("accesstoken") {
+                    if state.refuse_tokens > 0 {
+                        state.refuse_tokens -= 1;
+                        return ADD_USER_LOGIN_FAILED.into();
+                    }
                     return ADD_USER_OK.into();
                 }
                 let username = params.get("userName").cloned().unwrap_or_default();
@@ -364,7 +402,7 @@ async fn logs_into_a_loaded_device_over_http() {
     let device = FakeDevice::new("default", false, 0);
     let (endpoint, server) = serve(device.clone()).await;
     let auth_data: Vec<u8> = (0..150u8).collect();
-    let info = add_user_flow(&endpoint, Some(FAKE_DEVICE_ID), &account(&auth_data), no_token).await.expect("login");
+    let info = add_user_flow(&endpoint, Some(FAKE_DEVICE_ID), &account(&auth_data), &ZEROCONF_SOURCES, no_token).await.expect("login");
     server.abort();
     assert_eq!(info.device_id, FAKE_DEVICE_ID);
     let state = device.state.lock().unwrap();
@@ -382,7 +420,7 @@ async fn wakes_a_not_loaded_device_then_logs_in() {
     // Unloaded until the first addUser, then still loading for one more getInfo.
     let device = FakeDevice::new("default", true, 1);
     let (endpoint, server) = serve(device.clone()).await;
-    let info = add_user_flow(&endpoint, None, &account(b"reusable"), no_token).await.expect("login");
+    let info = add_user_flow(&endpoint, None, &account(b"reusable"), &ZEROCONF_SOURCES, no_token).await.expect("login");
     server.abort();
     assert!(!info.not_loaded());
     let state = device.state.lock().unwrap();
@@ -402,7 +440,7 @@ async fn wakes_a_not_loaded_device_then_logs_in() {
 async fn a_device_that_never_loads_gets_one_wake_up_and_a_clear_error() {
     let device = FakeDevice::new("default", true, u32::MAX);
     let (endpoint, server) = serve(device.clone()).await;
-    let err = add_user_flow(&endpoint, None, &account(b"reusable"), no_token).await.expect_err("never loads");
+    let err = add_user_flow(&endpoint, None, &account(b"reusable"), &ZEROCONF_SOURCES, no_token).await.expect_err("never loads");
     server.abort();
     assert!(err.message.contains("public key"), "{}", err.message);
     let state = device.state.lock().unwrap();
@@ -412,27 +450,98 @@ async fn a_device_that_never_loads_gets_one_wake_up_and_a_clear_error() {
 }
 
 #[tokio::test]
-async fn sends_a_fresh_token_to_accesstoken_devices() {
+async fn sends_accesstoken_devices_a_token_for_their_own_client() {
     let device = FakeDevice::new("accesstoken", false, 0);
     let (endpoint, server) = serve(device.clone()).await;
     let mut account = account(b"unused");
     account.credentials = None; // a token login must not need stored credentials
-    add_user_flow(&endpoint, None, &account, || async { Ok("fresh-token".to_string()) }).await.expect("login");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    add_user_flow(&endpoint, None, &account, &ZEROCONF_SOURCES, recording_minter(&calls)).await.expect("login");
     server.abort();
+    // One token, minted for the client id and device id the device's getInfo reported.
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [(TokenSource::DeviceAuth, FAKE_CLIENT_ID.to_string(), FAKE_DEVICE_ID.to_string())]
+    );
     let state = device.state.lock().unwrap();
     assert_eq!(state.add_users.len(), 1);
     let form = &state.add_users[0];
     assert_eq!(form["tokenType"], "accesstoken");
-    assert_eq!(form["blob"], "fresh-token");
+    assert_eq!(form["blob"], format!("token-DeviceAuth-{FAKE_CLIENT_ID}-{FAKE_DEVICE_ID}"));
     assert_eq!(form["clientKey"], FAKE_CLIENT_ID, "the device's own client id");
     assert!(state.credentials.is_none());
+}
+
+fn blobs(device: &FakeDevice) -> Vec<String> {
+    device.state.lock().unwrap().add_users.iter().map(|f| f["blob"].clone()).collect()
+}
+
+#[tokio::test]
+async fn a_refused_token_falls_back_in_order() {
+    // The device's client first (device-auth, then keymaster), this session's own token last.
+    let device = FakeDevice::token_device(FAKE_CLIENT_ID, 2);
+    let (endpoint, server) = serve(device.clone()).await;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    add_user_flow(&endpoint, None, &account(b"x"), &ZEROCONF_SOURCES, recording_minter(&calls)).await.expect("third token");
+    server.abort();
+    let sources: Vec<TokenSource> = calls.lock().unwrap().iter().map(|c| c.0).collect();
+    assert_eq!(sources, [TokenSource::DeviceAuth, TokenSource::Keymaster, TokenSource::Session]);
+    assert!(calls.lock().unwrap().iter().all(|c| c.1 == FAKE_CLIENT_ID && c.2 == FAKE_DEVICE_ID));
+    assert_eq!(
+        blobs(&device),
+        [
+            format!("token-DeviceAuth-{FAKE_CLIENT_ID}-{FAKE_DEVICE_ID}"),
+            format!("token-Keymaster-{FAKE_CLIENT_ID}-{FAKE_DEVICE_ID}"),
+            format!("token-Session-{FAKE_CLIENT_ID}-{FAKE_DEVICE_ID}"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_device_refusing_every_token_is_a_refusal() {
+    let device = FakeDevice::token_device(FAKE_CLIENT_ID, usize::MAX);
+    let (endpoint, server) = serve(device.clone()).await;
+    let err = add_user_flow(&endpoint, None, &account(b"x"), &ZEROCONF_SOURCES, token_for).await.expect_err("refused");
+    server.abort();
+    assert_eq!(err.code, ErrorCode::Unavailable);
+    assert_eq!(err.message, "The device could not sign in to Spotify (ERROR-LOGIN-FAILED)");
+    assert_eq!(blobs(&device).len(), 3, "one addUser per token source, then it gives up");
+}
+
+#[tokio::test]
+async fn a_source_that_mints_nothing_is_skipped() {
+    let device = FakeDevice::token_device(FAKE_CLIENT_ID, 0);
+    let (endpoint, server) = serve(device.clone()).await;
+    let minter = |source, client_id, device_id| async move {
+        match source {
+            TokenSource::DeviceAuth => Err(AppError::unavailable("device-auth refused")),
+            _ => token_for(source, client_id, device_id).await,
+        }
+    };
+    add_user_flow(&endpoint, None, &account(b"x"), &ZEROCONF_SOURCES, minter).await.expect("keymaster token");
+    server.abort();
+    assert_eq!(blobs(&device), [format!("token-Keymaster-{FAKE_CLIENT_ID}-{FAKE_DEVICE_ID}")], "no addUser without a token");
+}
+
+#[tokio::test]
+async fn without_a_usable_client_id_the_session_token_is_sent() {
+    for client_id in ["", "not a client id!"] {
+        let device = FakeDevice::token_device(client_id, 0);
+        let (endpoint, server) = serve(device.clone()).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        add_user_flow(&endpoint, None, &account(b"x"), &ZEROCONF_SOURCES, recording_minter(&calls)).await.expect("login");
+        server.abort();
+        let sources: Vec<TokenSource> = calls.lock().unwrap().iter().map(|c| c.0).collect();
+        assert_eq!(sources, [TokenSource::Session], "{client_id:?}: no token for an unusable client");
+        assert_eq!(blobs(&device), [format!("token-Session-{client_id}-{FAKE_DEVICE_ID}")], "{client_id:?}");
+    }
 }
 
 #[tokio::test]
 async fn refuses_a_different_device_at_the_address() {
     let device = FakeDevice::new("default", false, 0);
     let (endpoint, server) = serve(device.clone()).await;
-    let err = add_user_flow(&endpoint, Some("someone-else"), &account(b"x"), no_token).await.expect_err("mismatch");
+    let err = add_user_flow(&endpoint, Some("someone-else"), &account(b"x"), &ZEROCONF_SOURCES, no_token).await.expect_err("mismatch");
     server.abort();
     assert!(err.message.contains("different device"), "{}", err.message);
     assert!(device.state.lock().unwrap().add_users.is_empty(), "nothing sent to the wrong device");

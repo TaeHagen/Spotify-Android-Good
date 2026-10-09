@@ -2,8 +2,8 @@ use std::{io, time::Duration};
 
 use symphonia::core::{
     audio::SampleBuffer,
-    codecs::{Decoder, DecoderOptions},
-    errors::Error,
+    codecs::{CODEC_TYPE_MP3, Decoder, DecoderOptions}, // SPOTIFYGOOD: CODEC_TYPE_MP3
+    errors::{Error, SeekErrorKind},                    // SPOTIFYGOOD: SeekErrorKind
     formats::{FormatOptions, SeekMode, SeekTo},
     io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions},
     meta::{MetadataOptions, StandardTagKey, Value},
@@ -18,6 +18,8 @@ pub struct SymphoniaDecoder {
     probe_result: ProbeResult,
     decoder: Box<dyn Decoder>,
     sample_buffer: Option<SampleBuffer<f64>>,
+    // SPOTIFYGOOD: an MP3 seeks coarsely (see AudioDecoder::seek below)
+    coarse_seeks: bool,
 }
 
 #[derive(Default)]
@@ -83,12 +85,16 @@ impl SymphoniaDecoder {
             )));
         }
 
+        // SPOTIFYGOOD: see AudioDecoder::seek below
+        let coarse_seeks = decoder.codec_params().codec == CODEC_TYPE_MP3;
+
         Ok(Self {
             probe_result,
             decoder,
             // We set the sample buffer when decoding the first full packet,
             // whose duration is also the ideal sample buffer size.
             sample_buffer: None,
+            coarse_seeks,
         })
     }
 
@@ -201,14 +207,35 @@ impl AudioDecoder for SymphoniaDecoder {
             }
         }
 
+        // SPOTIFYGOOD: an MP3 seeks coarsely: symphonia jumps to the byte the target's share of
+        // the file says (exact for a constant bit rate, Spotify's MP3 files; approximate for a
+        // variable one), syncs strictly on the next two frame headers and parses a few frames.
+        // Its accurate seek reads every frame header from where its reader is (from the start of
+        // the file for a new decoder), and a seek that misses data (the vendored player's
+        // fail-fast reads at the end of the download, see seek_without_waiting) left that reader
+        // in the middle of a frame whose duration it never counted: the next attempt synced on
+        // from there, so every miss lost about a frame (a far load or skip landed seconds past
+        // its target, and every position after it was off by that), and a false sync on a frame
+        // body could fail the load (DecodeError: the episode was skipped and marked
+        // unavailable). A coarse seek starts over from its byte on every attempt. A seek to 0 is
+        // accurate (it reads the first frame only); an MP3 whose length or duration isn't known
+        // seeks accurately as before.
+        let mode = if self.coarse_seeks && position_ms > 0 {
+            SeekMode::Coarse
+        } else {
+            SeekMode::Accurate
+        };
+        let to = || SeekTo::Time {
+            time: target.into(),
+            track_id: None,
+        };
         // `track_id: None` implies the default track ID (of the container, not of Spotify).
-        let seeked_to_ts = self.probe_result.format.seek(
-            SeekMode::Accurate,
-            SeekTo::Time {
-                time: target.into(),
-                track_id: None,
-            },
-        )?;
+        let seeked_to_ts = match self.probe_result.format.seek(mode, to()) {
+            Err(Error::SeekError(SeekErrorKind::Unseekable)) if mode == SeekMode::Coarse => {
+                self.probe_result.format.seek(SeekMode::Accurate, to())?
+            }
+            seeked => seeked?,
+        };
 
         // Seeking is a `FormatReader` operation, so the decoder cannot reliably
         // know when a seek took place. Reset it to avoid audio glitches.
@@ -227,7 +254,8 @@ impl AudioDecoder for SymphoniaDecoder {
                     if err.kind() == io::ErrorKind::UnexpectedEof {
                         return Ok(None);
                     } else {
-                        return Err(DecoderError::SymphoniaDecoder(err.to_string()));
+                        // SPOTIFYGOOD: a timed-out read is a stall (DecoderError::Stalled)
+                        return Err(DecoderError::from_io(err));
                     }
                 }
                 Err(err) => {

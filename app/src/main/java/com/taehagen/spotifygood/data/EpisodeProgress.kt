@@ -13,6 +13,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -38,7 +39,8 @@ import kotlin.math.abs
 // Spotify's. The newest wins. A fresh answer counts as news only when Spotify's state differs from
 // the last one seen (nothing here is reported to Spotify, so its state otherwise lags this phone's
 // progress), and an answer requested before the last one seen is ignored. Connect handoffs mark
-// what the next fresh state means. Every play path resumes from the point.
+// what the next fresh state means. Every play decides its start in one place
+// (EpisodeProgressStore.resumeOrLookUp): the point, looked up on Spotify first when it may know better.
 
 /** Spotify's played state of an episode, as a fresh answer reported it. */
 @Serializable
@@ -47,34 +49,59 @@ data class PlayedPoint(val positionMs: Long? = null, val fullyPlayed: Boolean? =
     val inProgress: Boolean get() = fullyPlayed != true && (positionMs ?: 0) > 0
 }
 
-/** Where to resume an episode ([positionMs]; 0 once [fullyPlayed]) and when that was learned ([at]). */
+/**
+ * Where to resume an episode ([positionMs]; 0 once [fullyPlayed]) and when that was learned
+ * ([at]). [byPhone]: saved from this phone's own playback (not Spotify's point, nor a followed
+ * remote device's).
+ */
 @Serializable
-data class ResumePoint(val positionMs: Long, val fullyPlayed: Boolean, val at: Long)
+data class ResumePoint(val positionMs: Long, val fullyPlayed: Boolean, val at: Long, val byPhone: Boolean = false)
 
-/** What the next fresh Spotify state means ([observeSpotify]). */
+/**
+ * What the next fresh Spotify state means ([observeSpotify]). A mark only lasts until the next fresh
+ * answer: that answer's state becomes the reference ([STATE]); [SpotifySeen.state] keeps the last
+ * real state seen under every mark.
+ */
 @Serializable
 enum class SpotifyRef {
     /** [SpotifySeen.state] is the last fresh state seen: a different one is news. */
     STATE,
 
-    /** Playback was handed to this phone, which continues the other device's position: the next fresh state (that device's, older than this phone's progress) only becomes the reference. */
+    /**
+     * Playback was handed to this phone, which continues the other device's position: Spotify's next
+     * state is at best that device's, older than this phone's progress. Only a state beyond the
+     * point (or finished) and different from the last real one seen is news ([furtherThan]); any
+     * other only becomes the reference.
+     */
     ADOPT_NEXT,
 
     /**
-     * Saved from a remote device this phone follows: the next fresh state is news when it is partly
-     * or fully played (that device may have played on after the phone stopped following); a
-     * not-started one is a device that reports nothing (librespot) and changes nothing.
+     * Saved from a remote device this phone follows. The device may report to Spotify (and play on
+     * after the phone stopped following), or report nothing (librespot receivers): the next fresh
+     * state is news when partly or fully played and different from the last real state seen before
+     * ([SpotifySeen.state]; with none, when beyond the point). A not-started state changes nothing.
+     * Once this phone saved its own progress after it ([ResumePoint.byPhone]), Spotify's next state
+     * is at best that device's older one: as after [ADOPT_NEXT]. A play of the episode looks
+     * Spotify's point up first ([EpisodeProgressStore.shouldLookUp]): the device may have played on
+     * after the phone stopped following.
      */
     NEWER_NEXT,
 }
 
-/** The last fresh Spotify state seen for an episode (requested at [at]), or a Connect handoff mark. */
+/** The last fresh Spotify state seen for an episode (requested at [at]), with a Connect handoff mark. */
 @Serializable
 data class SpotifySeen(val state: PlayedPoint? = null, val at: Long, val ref: SpotifyRef = SpotifyRef.STATE)
 
 /** What is kept for one episode: its resume [point] and what [seen] of Spotify's state. */
 @Serializable
 data class EpisodeResume(val point: ResumePoint? = null, val seen: SpotifySeen? = null)
+
+/**
+ * A position a play names together with when it dates from ([at], wall time; 0: unknown, long
+ * ago): a stored session's ([com.taehagen.spotifygood.playback.ResumeState]), which the store
+ * weighs against its own point under the newest-wins rule ([EpisodeProgressStore.resumeOrLookUp]).
+ */
+data class StoredPosition(val positionMs: Long, val at: Long)
 
 /**
  * Spotify's played state carried by this episode (null when it carries none). Only a fresh answer
@@ -94,29 +121,39 @@ fun Show.withoutPlayedState(): Show =
 
 /**
  * What is kept for an episode after a fresh answer, requested at [fetchedAt], reported Spotify's
- * [state] while [current] was kept (null: nothing kept, nor worth keeping).
- * * An answer requested before (or with) the last one seen is ignored: an older page that finishes
- *   later can't undo a newer one.
- * * News (the state differs from the last one seen; or another device played it since; or nothing
- *   was ever known): Spotify's point, learned at [fetchedAt], replaces an older point — unless this
- *   phone saved progress after the request started. A not-started state keeps no point.
- * * No reference yet (this phone played it, nothing fresh seen since): the furthest point wins —
- *   this phone may have played it offline beyond Spotify's point, or started it without knowing
- *   Spotify's (a cached page, a failed lookup).
- * * No news (unchanged; or the first state after this phone took it over from another device):
- *   the point stays and the state becomes the reference.
- * Episodes never played anywhere (not started, or finished, with nothing kept) keep nothing, so
- * browsing doesn't crowd out real points.
+ * [state] while [current] was kept (null: nothing kept, nor worth keeping). The decision table:
+ * 1. An answer requested before (or with) the last one seen is ignored: an older page that
+ *    finishes later can't undo a newer one.
+ * 2. A state equal to the last real one seen is never news, whatever the mark.
+ * 3. A changed state is news with a plain reference ([SpotifyRef.STATE]): it was played elsewhere.
+ * 4. After a followed remote device's save (not followed by this phone's own), a changed played
+ *    state is news (that device reported, or another one played); a not-started one is a device
+ *    that reports nothing (librespot) and isn't.
+ * 5. Otherwise — after a takeover by this phone, after this phone's own save following a remote
+ *    one, or with no real state seen yet (this phone played it offline, or without knowing
+ *    Spotify's) — Spotify's state is at best another device's older one: only a state beyond the
+ *    point is news, the furthest point wins. A finished state is beyond any unfinished point,
+ *    except this phone's own progress while no real state was ever seen: Spotify's finish may
+ *    predate a re-listen here (the reference new entries start with, [EpisodeProgressStore.record],
+ *    makes that rare).
+ * News: Spotify's point, learned at [fetchedAt], replaces the point — unless this phone saved
+ * after the request started (with a reference to tell); a not-started state keeps none. No news:
+ * the point stays. Either way the state becomes the reference (a mark ends here). Episodes never
+ * played anywhere (not started, or finished, with nothing kept) keep nothing, so browsing doesn't
+ * crowd out real points.
  */
 internal fun observeSpotify(current: EpisodeResume?, state: PlayedPoint, fetchedAt: Long): EpisodeResume? {
     val seen = current?.seen
     if (seen != null && fetchedAt <= seen.at) return current
     val point = current?.point
+    val reference = seen?.state
     val news = when {
-        seen == null -> point == null || (state.inProgress && !point.fullyPlayed && (state.positionMs ?: 0) > point.positionMs)
-        seen.ref == SpotifyRef.ADOPT_NEXT -> false
-        seen.ref == SpotifyRef.NEWER_NEXT -> state.inProgress || state.fullyPlayed == true
-        else -> seen.state != state
+        current == null -> true
+        reference == state -> false // 2
+        reference != null && seen?.ref == SpotifyRef.STATE -> true // 3
+        reference != null && seen?.ref == SpotifyRef.NEWER_NEXT && point?.byPhone != true -> state.inProgress || state.fullyPlayed == true // 4
+        reference == null && point?.byPhone == true -> state.inProgress && state.furtherThan(point) // 5, a re-listen here
+        else -> state.furtherThan(point) // 5
     }
     val next = when {
         !news -> point
@@ -129,16 +166,25 @@ internal fun observeSpotify(current: EpisodeResume?, state: PlayedPoint, fetched
     return EpisodeResume(next, SpotifySeen(state, fetchedAt))
 }
 
+/** This state is beyond [point]: finished while the point isn't, or partly played further on. */
+internal fun PlayedPoint.furtherThan(point: ResumePoint?): Boolean = when {
+    point == null -> inProgress || fullyPlayed == true
+    point.fullyPlayed -> false
+    fullyPlayed == true -> true
+    else -> inProgress && (positionMs ?: 0) > point.positionMs
+}
+
 /**
  * Podcast resume points (docs §6.5), per episode ([EpisodeResume]): a small JSON file in the app's
  * files, LRU-bounded, wiped with the account's data (§9.3). Nothing here is reported back to
  * Spotify, so progress made on this phone (offline above all) stays on this phone.
  *
  * Fresh answers are [observe]d once, where they arrive (the catalog and search repositories);
- * everything that shows an episode only [overlay]s the point (no side effects); [resumeMs] is where a
- * play of an episode starts ([com.taehagen.spotifygood.playback.PlayerController.episodeResume]);
- * [recordFrom] records local playback, marks Connect handoffs and resumes an episode playback
- * moved to by itself (auto-advance, next). [version] is bumped on every change. Thread-safe.
+ * everything that shows an episode only [overlay]s the point (no side effects); [resumeOrLookUp] is
+ * where a play of an episode starts ([com.taehagen.spotifygood.playback.PlayerController.episodeResume]);
+ * [markPlayed] is the user's "Mark as played / unplayed"; [recordFrom] records local playback,
+ * marks Connect handoffs and resumes an episode playback moved to by itself (auto-advance, next).
+ * [version] is bumped on every change. Thread-safe.
  */
 class EpisodeProgressStore internal constructor(
     private val file: File?,
@@ -157,13 +203,19 @@ class EpisodeProgressStore internal constructor(
     private val fileMutex = Mutex()
     private val writes = Channel<Unit>(Channel.CONFLATED)
     private val _version = MutableStateFlow(0L)
-    /** When a fresh answer last told Spotify's state of an episode (also not-started ones, which keep nothing). */
-    private val observedAt = object : LinkedHashMap<String, Long>(64, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?) = size > MAX_OBSERVED
+    /**
+     * The last fresh state of every episode an answer told (also finished and not-started ones,
+     * which keep no entry): the reference a new entry starts with ([record]), and how recent the
+     * last answer is ([shouldLookUp]). Memory only; losing it costs a lookup before the next play.
+     */
+    private val lastSeen = object : LinkedHashMap<String, SpotifySeen>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SpotifySeen>?) = size > MAX_OBSERVED
     }
 
     /** Bumped after every change of what [overlay] / [resumeMs] give. */
     val version: StateFlow<Long> = _version.asStateFlow()
+    /** Episodes just marked played / unplayed ([markPlayed]), for the tracker ([recordFrom]). */
+    private val marked = MutableSharedFlow<String>(extraBufferCapacity = 16)
 
     init {
         scope.launch(io) {
@@ -178,7 +230,7 @@ class EpisodeProgressStore internal constructor(
         synchronized(lock) {
             for (episode in episodes) {
                 val state = episode.playedPoint() ?: continue
-                observedAt[episode.uri] = maxOf(observedAt[episode.uri] ?: 0, fetchedAt)
+                if ((lastSeen[episode.uri]?.at ?: Long.MIN_VALUE) < fetchedAt) lastSeen[episode.uri] = SpotifySeen(state, fetchedAt)
                 val current = entries[episode.uri]
                 val next = observeSpotify(current, state, fetchedAt)
                 if (next != current) {
@@ -197,63 +249,116 @@ class EpisodeProgressStore internal constructor(
     }
 
     /**
-     * Records that playback of [uri] got to [positionMs] of [durationMs] now: on this phone, or
-     * [elsewhere] on a remote device this phone follows ([SpotifyRef.NEWER_NEXT]). Within
-     * [COMPLETE_MARGIN_MS] of the end it is fully played (resumes from the start). A position of 0
-     * that is not the end records nothing (a load before its seek to the resume point).
+     * Records that playback of [uri] got to [positionMs] of [durationMs]: on this phone, or
+     * [elsewhere] on a remote device this phone follows ([SpotifyRef.NEWER_NEXT]). [stateAt]: when
+     * that position dates from (a remote device sitting paused since then), null for now; a point
+     * kept from later wins (newest wins), and nothing is recorded. Within [COMPLETE_MARGIN_MS] of
+     * the end it is fully played (resumes from the start). A position of 0 that is not the end
+     * records nothing (a load before its seek to the resume point). A new entry starts with the last
+     * fresh state seen as its reference.
      */
-    fun record(uri: String, positionMs: Long, durationMs: Long, elsewhere: Boolean = false) {
+    fun record(uri: String, positionMs: Long, durationMs: Long, elsewhere: Boolean = false, stateAt: Long? = null) {
         val finished = durationMs > 0 && positionMs >= durationMs - COMPLETE_MARGIN_MS
         if (!finished && positionMs <= 0) return
         synchronized(lock) {
             val current = entries[uri]
+            if (stateAt != null && current?.point != null && current.point.at >= stateAt) return
             val now = clock()
-            val point = ResumePoint(if (finished) 0 else positionMs, finished, now)
-            val seen = if (elsewhere) SpotifySeen(null, now, SpotifyRef.NEWER_NEXT) else current?.seen
+            val point = ResumePoint(if (finished) 0 else positionMs, finished, stateAt ?: now, byPhone = !elsewhere)
+            val reference = current?.seen ?: lastSeen[uri]
+            // A followed remote device's save keeps the last real state as the reference.
+            val seen = if (elsewhere) SpotifySeen(reference?.state, now, SpotifyRef.NEWER_NEXT) else reference
             put(uri, EpisodeResume(point, seen), touch = true)
         }
         changed()
+    }
+
+    /**
+     * The user marked [uri] as [played] (its point: finished) or unplayed (its point: 0, kept as an
+     * entry so that no lookup brings Spotify's old point back): this phone's newest point. Spotify's
+     * last state stays the reference (an unchanged one keeps the mark, a changed one is news) and
+     * the Connect marks end; an answer requested before the mark is ignored. Not reported to
+     * Spotify (no verified endpoint, docs §6.5). Playback of the episode going on meanwhile doesn't
+     * overwrite it (the tracker's [EpisodeProgressTracker.onMarked]).
+     */
+    fun markPlayed(uri: String, played: Boolean) {
+        synchronized(lock) {
+            val now = clock()
+            val reference = entries[uri]?.seen ?: lastSeen[uri]
+            put(uri, EpisodeResume(ResumePoint(0, fullyPlayed = played, at = now, byPhone = true), SpotifySeen(reference?.state, now)), touch = true)
+        }
+        changed()
+        marked.tryEmit(uri)
     }
 
     /** This phone took [uri] over from another device: Spotify's next state is that device's, older than this phone's progress. */
     fun continuedHere(uri: String) {
         synchronized(lock) {
             val current = entries[uri]
-            put(uri, EpisodeResume(current?.point, SpotifySeen(null, clock(), SpotifyRef.ADOPT_NEXT)))
+            val reference = current?.seen ?: lastSeen[uri]
+            put(uri, EpisodeResume(current?.point, SpotifySeen(reference?.state, clock(), SpotifyRef.ADOPT_NEXT)))
         }
         writes.trySend(Unit) // nothing shown changes
     }
 
     /**
-     * Where a play of [uri] resumes, looking Spotify's point up when nothing is known: no point
-     * kept, the session [online], and no fresh answer told its state in the last
-     * [OBSERVED_FRESH_MS]. [lookUp] fetches the episode (a fresh answer, observed where it arrives);
-     * it is given at most [LOOKUP_TIMEOUT_MS], then the play goes ahead without it.
+     * Whether a play of [uri] should look Spotify's point up first (online is the caller's check):
+     * no point kept, or the kept one came from a followed remote device (it may have played on after
+     * the phone stopped following, [SpotifyRef.NEWER_NEXT]); and no fresh answer told its state in
+     * the last [OBSERVED_FRESH_MS].
      */
-    suspend fun resumeOrLookUp(uri: String, online: () -> Boolean, lookUp: suspend (String) -> Unit): Long? {
-        resumeMs(uri)?.let { return it }
-        if (!online()) return null
-        val known = synchronized(lock) { observedAt[uri] }?.let { clock() - it < OBSERVED_FRESH_MS } == true
-        if (known) return null
-        try {
-            withTimeoutOrNull(LOOKUP_TIMEOUT_MS) { lookUp(uri) }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            return null
+    fun shouldLookUp(uri: String): Boolean = synchronized(lock) {
+        val entry = entries[uri]
+        val point = entry?.point
+        val mayKnowBetter = point == null || (entry.seen?.ref == SpotifyRef.NEWER_NEXT && !point.fullyPlayed)
+        val recent = lastSeen[uri]?.let { clock() - it.at < OBSERVED_FRESH_MS } == true
+        mayKnowBetter && !recent
+    }
+
+    /**
+     * Where a play of [uri] resumes — the one place every play decides it
+     * ([com.taehagen.spotifygood.playback.PlayerController.episodeResume], the tracker's arrival):
+     * the kept point, looked up on Spotify first when [shouldLookUp] and the session is [online].
+     * [lookUp] fetches the episode (a fresh answer, observed where it arrives); it is given at most
+     * [LOOKUP_TIMEOUT_MS], then the play goes ahead with the kept point. Null: none (or fully
+     * played), the play starts at the beginning.
+     *
+     * A [stored] position (a stored session's resume) is weighed under the same rule: it wins when
+     * newer than the point (or with none), else the point does — 0 when it is fully played.
+     */
+    suspend fun resumeOrLookUp(
+        uri: String,
+        online: () -> Boolean,
+        stored: StoredPosition? = null,
+        lookUp: suspend (String) -> Unit,
+    ): Long? {
+        if (shouldLookUp(uri) && online()) {
+            try {
+                withTimeoutOrNull(LOOKUP_TIMEOUT_MS) { lookUp(uri) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // The play goes ahead with what is kept.
+            }
         }
-        return resumeMs(uri)
+        val point = synchronized(lock) { entries[uri]?.point }
+        return when {
+            stored == null -> resumeOf(point)
+            point == null || stored.at > point.at -> stored.positionMs
+            else -> resumeOf(point) ?: 0
+        }
     }
 
     /** Where a play of [uri] resumes; null: no point, or fully played. */
-    fun resumeMs(uri: String): Long? = synchronized(lock) { entries[uri]?.point }
-        ?.takeIf { !it.fullyPlayed && it.positionMs > 0 }
-        ?.positionMs
+    fun resumeMs(uri: String): Long? = resumeOf(synchronized(lock) { entries[uri]?.point })
+
+    private fun resumeOf(point: ResumePoint?): Long? = point?.takeIf { !it.fullyPlayed && it.positionMs > 0 }?.positionMs
 
     /** Forgets everything (logout / another account), also on disk. */
     suspend fun clear() {
         synchronized(lock) {
             entries.clear()
+            lastSeen.clear()
             generation++
         }
         _version.update { it + 1 }
@@ -281,15 +386,16 @@ class EpisodeProgressStore internal constructor(
     ): Unit = coroutineScope {
         val lookedUp = Channel<String>(Channel.UNLIMITED)
         val tracker = EpisodeProgressTracker(object : ResumeSink {
-            override fun record(uri: String, positionMs: Long, durationMs: Long, elsewhere: Boolean) =
-                this@EpisodeProgressStore.record(uri, positionMs, durationMs, elsewhere)
+            override fun record(uri: String, positionMs: Long, durationMs: Long, elsewhere: Boolean, stateAt: Long?) =
+                this@EpisodeProgressStore.record(uri, positionMs, durationMs, elsewhere, stateAt)
+            override fun shouldLookUp(uri: String): Boolean = this@EpisodeProgressStore.shouldLookUp(uri)
             override fun continuedHere(uri: String) = this@EpisodeProgressStore.continuedHere(uri)
             override fun resumeMs(uri: String): Long? = this@EpisodeProgressStore.resumeMs(uri)
             override fun pointMs(uri: String): Long? = synchronized(lock) { entries[uri]?.point }?.positionMs
             override fun seek(positionMs: Long) = seek(positionMs)
             override fun lookUp(uri: String) {
                 launch {
-                    resumeOrLookUp(uri, online, lookUp)
+                    resumeOrLookUp(uri, online, lookUp = lookUp)
                     lookedUp.send(uri)
                 }
             }
@@ -303,18 +409,23 @@ class EpisodeProgressStore internal constructor(
                 }
             }
         }
-        merge(ticking.map { TrackerEvent.Snapshot(it) }, lookedUp.receiveAsFlow().map { TrackerEvent.LookedUp(it) })
-            .collect { event ->
-                when (event) {
-                    is TrackerEvent.Snapshot -> tracker.onSnapshot(event.snapshot, now())
-                    is TrackerEvent.LookedUp -> tracker.onLookedUp(event.uri, now())
-                }
+        merge(
+            ticking.map { TrackerEvent.Snapshot(it) },
+            lookedUp.receiveAsFlow().map { TrackerEvent.LookedUp(it) },
+            marked.map { TrackerEvent.Marked(it) },
+        ).collect { event ->
+            when (event) {
+                is TrackerEvent.Snapshot -> tracker.onSnapshot(event.snapshot, now())
+                is TrackerEvent.LookedUp -> tracker.onLookedUp(event.uri, now())
+                is TrackerEvent.Marked -> tracker.onMarked(event.uri)
             }
+        }
     }
 
     private sealed interface TrackerEvent {
         class Snapshot(val snapshot: PlaybackSnapshot) : TrackerEvent
         class LookedUp(val uri: String) : TrackerEvent
+        class Marked(val uri: String) : TrackerEvent
     }
 
     /** Caller holds [lock]. [touch]: moves it to the most recent end (a play), not for marks / observations. */
@@ -400,8 +511,10 @@ class EpisodeProgressStore internal constructor(
 
 /** What [EpisodeProgressTracker] drives ([EpisodeProgressStore.recordFrom]). */
 internal interface ResumeSink {
-    /** [elsewhere]: the position of a remote device this phone follows. */
-    fun record(uri: String, positionMs: Long, durationMs: Long, elsewhere: Boolean)
+    /** [elsewhere]: the position of a remote device this phone follows; [stateAt]: when it dates from (null: now). */
+    fun record(uri: String, positionMs: Long, durationMs: Long, elsewhere: Boolean, stateAt: Long?)
+    /** [EpisodeProgressStore.shouldLookUp]. */
+    fun shouldLookUp(uri: String): Boolean
     fun continuedHere(uri: String)
     /** Where a play resumes (null: none, or fully played). */
     fun resumeMs(uri: String): Long?
@@ -419,14 +532,19 @@ internal interface ResumeSink {
  *   on this phone, and on a remote device this phone follows (it is its remote, or handed it
  *   over: the phone's view of the account's progress). It is saved on every snapshot, and where
  *   the outgoing one got to when it is left (its end when it finished or stopped there). A remote
- *   position near the start doesn't replace a point further on (its device may still seek to it).
+ *   position near the start doesn't replace a point further on (its device may still seek to it);
+ *   a remote device sitting paused saves with the time its position dates from, so an old pause
+ *   (the account's active device for hours) can't replace a newer point.
  * * Local playback arriving at an episode another device was playing (a transfer to this phone:
  *   seen remote just before, or its position is far from the kept point) marks it
  *   [ResumeSink.continuedHere].
  * * Local playback arriving by itself near the start of an episode (auto-advance, next, a context
  *   load: the app's own loads of an episode already start at its point) seeks to its point once;
- *   with no point, it is looked up first ([ResumeSink.lookUp]). Until the seek lands or the lookup
- *   answers (bounded), nothing records the episode below the point.
+ *   when Spotify may know better ([ResumeSink.shouldLookUp]) it is looked up first
+ *   ([ResumeSink.lookUp]). Until the seek lands or the lookup answers (bounded), nothing records
+ *   the episode below the point.
+ * * An episode marked played / unplayed while it plays ([onMarked]) keeps the mark: its playback
+ *   records nothing more until the user seeks in it, it ends, or playback moves to another item.
  */
 internal class EpisodeProgressTracker(private val sink: ResumeSink) {
     private var current: PlaybackSnapshot? = null
@@ -435,7 +553,11 @@ internal class EpisodeProgressTracker(private val sink: ResumeSink) {
     private var arrivedAt = 0L
     /** The episode a remote device was playing, until local playback takes over. */
     private var remoteEpisode: String? = null
+    /** The remote episode this tracker last saw playing: a pause of it without a timestamp is recent. */
+    private var remotePlaying: String? = null
     private var pending: Pending? = null
+    /** The episode playing when the user marked it played / unplayed ([onMarked]). */
+    private var muted: String? = null
 
     /** A resume seek to [target] (or a lookup: [Long.MAX_VALUE]) of [uri] in flight until [until]. */
     private class Pending(val uri: String, val target: Long, val until: Long)
@@ -444,22 +566,36 @@ internal class EpisodeProgressTracker(private val sink: ResumeSink) {
         val source = s.source
         val episodeUri = s.track?.takeIf { it.isEpisode }?.uri
         val previous = current
+        muted?.let { uri ->
+            // A seek in the marked episode: the user plays it again from a point they chose.
+            val same = previous != null && previous.source == source && previous.track?.uri == uri && episodeUri == uri
+            if (same && previous.hasPosition() && s.hasPosition() &&
+                abs(s.positionAt(nowMs) - previous.positionAt(nowMs)) > SEEK_TOLERANCE_MS
+            ) {
+                muted = null
+            }
+        }
         if (previous != null && previous.hasPosition()) {
             val previousUri = previous.track?.uri
             val left = previous.source != source || previousUri != episodeUri
             // Stopped at the end (the last item): where the playing episode got to, i.e. the end.
             val stopped = !left && previous.isPlaying && s.status == PlaybackStatus.STOPPED
             if ((left || stopped) && previousUri != null) {
-                save(previous.source, previousUri, previous.positionAt(nowMs), previous.durationOrTrack(), nowMs)
+                save(previous.source, previousUri, previous.positionAt(nowMs), previous.durationOrTrack(), nowMs, previous.remoteStateAt(previousUri))
             }
         }
+        // Playback moved on to another item (or stopped): the mark's guard ends.
+        if (muted != null && muted != episodeUri) muted = null
         when {
             source == PlaybackSource.REMOTE -> {
                 current = if (episodeUri != null) s else null
                 arrived = null
                 pending = null
                 remoteEpisode = episodeUri
-                if (episodeUri != null && s.hasPosition()) save(source, episodeUri, s.positionAt(nowMs), s.durationOrTrack(), nowMs)
+                if (episodeUri != null && s.isPlaying) remotePlaying = episodeUri
+                if (episodeUri != null && s.hasPosition()) {
+                    save(source, episodeUri, s.positionAt(nowMs), s.durationOrTrack(), nowMs, s.remoteStateAt(episodeUri))
+                }
             }
             source != PlaybackSource.LOCAL || episodeUri == null -> {
                 current = null
@@ -476,9 +612,19 @@ internal class EpisodeProgressTracker(private val sink: ResumeSink) {
                     arrivedAt = nowMs
                     arrive(episodeUri, position, nowMs)
                 }
-                save(source, episodeUri, position, s.durationOrTrack(), nowMs)
+                remotePlaying = null
+                save(source, episodeUri, position, s.durationOrTrack(), nowMs, stateAt = null)
             }
         }
+    }
+
+    /**
+     * The user marked [uri] played / unplayed: if it is the episode playing (here or on a followed
+     * device), its playback from now on doesn't overwrite the mark (a seek, its end or another
+     * item does).
+     */
+    fun onMarked(uri: String) {
+        if (current?.track?.uri == uri) muted = uri
     }
 
     /** The lookup started on arrival answered: seek to the point it brought, unless the user moved on. */
@@ -506,21 +652,37 @@ internal class EpisodeProgressTracker(private val sink: ResumeSink) {
             return
         }
         if (position >= ARRIVAL_START_MS) return
-        val resume = sink.resumeMs(uri)
-        when {
-            resume != null && resume > ARRIVAL_START_MS -> {
-                pending = Pending(uri, resume, nowMs + RESUME_GRACE_MS)
-                sink.seek(resume)
-            }
-            point == null -> {
-                pending = Pending(uri, Long.MAX_VALUE, nowMs + LOOKUP_GRACE_MS)
-                sink.lookUp(uri)
-            }
+        if (sink.shouldLookUp(uri)) {
+            // No point, or one a followed remote device left: the lookup decides (onLookedUp).
+            pending = Pending(uri, Long.MAX_VALUE, nowMs + LOOKUP_GRACE_MS)
+            sink.lookUp(uri)
+            return
+        }
+        val resume = sink.resumeMs(uri) ?: return
+        if (resume > ARRIVAL_START_MS) {
+            pending = Pending(uri, resume, nowMs + RESUME_GRACE_MS)
+            sink.seek(resume)
         }
     }
 
-    /** Saves unless a resume seek / lookup of [uri] is pending and [position] is still below it. */
-    private fun save(source: PlaybackSource, uri: String, position: Long, duration: Long, nowMs: Long) {
+    /**
+     * When a remote snapshot's position dates from: now while it plays (the 15 s saves extrapolate
+     * it); for a paused one, its timestamp — or now when this tracker saw it play, else "long ago"
+     * (0): an old pause must not replace a newer point.
+     */
+    private fun PlaybackSnapshot.remoteStateAt(uri: String): Long? = when {
+        source != PlaybackSource.REMOTE || isPlaying -> null
+        positionTimestampMs > 0 -> positionTimestampMs
+        remotePlaying == uri -> null
+        else -> 0L
+    }
+
+    /**
+     * Saves unless a resume seek / lookup of [uri] is pending and [position] is still below it, or
+     * [uri] was marked while it played and [position] isn't its end.
+     */
+    private fun save(source: PlaybackSource, uri: String, position: Long, duration: Long, nowMs: Long, stateAt: Long?) {
+        if (muted == uri && !(duration > 0 && position >= duration - EpisodeProgressStore.COMPLETE_MARGIN_MS)) return
         val p = pending
         if (p != null && p.uri == uri) {
             if (position < p.target - SEEK_TOLERANCE_MS && nowMs < p.until) return
@@ -528,7 +690,7 @@ internal class EpisodeProgressTracker(private val sink: ResumeSink) {
         }
         val remote = source == PlaybackSource.REMOTE
         if (remote && position < ARRIVAL_START_MS && (sink.resumeMs(uri) ?: 0) > ARRIVAL_START_MS) return
-        sink.record(uri, position, duration, elsewhere = remote)
+        sink.record(uri, position, duration, elsewhere = remote, stateAt = stateAt)
     }
 
     private fun PlaybackSnapshot.hasPosition(): Boolean = status == PlaybackStatus.PLAYING || status == PlaybackStatus.PAUSED

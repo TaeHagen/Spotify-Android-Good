@@ -1,6 +1,5 @@
 package com.taehagen.spotifygood.ui
 
-import android.provider.MediaStore
 import android.util.Log
 import androidx.activity.compose.LocalActivity
 import androidx.compose.animation.AnimatedContent
@@ -25,14 +24,16 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
-import com.taehagen.spotifygood.data.SearchType
 import com.taehagen.spotifygood.engine.EngineState
-import com.taehagen.spotifygood.model.MediaRef
-import com.taehagen.spotifygood.model.MediaType
+import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.model.PlaybackSource
-import com.taehagen.spotifygood.model.SearchResults
-import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.playback.LibraryTree
+import com.taehagen.spotifygood.playback.MediaIds
+import com.taehagen.spotifygood.playback.PlaybackErrorKind
+import com.taehagen.spotifygood.playback.VoiceEntry
+import com.taehagen.spotifygood.playback.VoiceOutcome
+import com.taehagen.spotifygood.playback.VoiceRequest
 import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import com.taehagen.spotifygood.ui.screens.login.LoginScreen
 import com.taehagen.spotifygood.ui.screens.status.PremiumRequiredScreen
@@ -220,8 +221,23 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
         }
     }
 
-    /** MEDIA_PLAY_FROM_SEARCH: search and play the best match (empty query resumes playback). */
+    /** The voice resolver the media session uses too ([LibraryTree.resolveVoice]). */
+    private val voice by lazy { LibraryTree(graph.app, graph) }
+
+    /**
+     * MEDIA_PLAY_FROM_SEARCH ("play X on SpotifyGood" sent to the activity): resolved as the media
+     * session resolves it ([LibraryTree.resolveVoice]: the user's own collections first, the
+     * catalog's search next, offline only the downloads), so both entries play the same thing.
+     * An empty request resumes playback; one that finds nothing says so (not found, or not
+     * available offline).
+     *
+     * The request holds the engine from the start: it arrives in onCreate / onNewIntent, before
+     * onStart takes the UI holder, and an idle-stopped session only starts (and is waited for)
+     * for a holder. Let go once the play went out (it has its own), also when the request is
+     * dropped before it ran.
+     */
     fun playFromSearch(request: MediaSearchRequest) {
+        val holder = graph.engine.acquire(HolderType.UI)
         viewModelScope.launch {
             // A cold start ("Play X on SpotifyGood" with no process) gets here before the engine has
             // read the stored credentials: wait for that instead of answering "log in first".
@@ -234,27 +250,11 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
                 showMessage(graph.app.getString(R.string.shell_msg_login_first))
                 return@launch
             }
-            graph.engine.awaitOnline(ONLINE_TIMEOUT_MS)
-            val type = when (request.focus) {
-                MediaStore.Audio.Artists.ENTRY_CONTENT_TYPE -> SearchType.ARTIST
-                MediaStore.Audio.Albums.ENTRY_CONTENT_TYPE -> SearchType.ALBUM
-                PLAYLIST_ENTRY_CONTENT_TYPE -> SearchType.PLAYLIST
-                MediaStore.Audio.Media.ENTRY_CONTENT_TYPE -> SearchType.TRACK
-                else -> null
-            }
-            val query = when (type) {
-                SearchType.ARTIST -> request.artist ?: request.query
-                SearchType.ALBUM -> request.album ?: request.query
-                SearchType.PLAYLIST -> request.playlist ?: request.query
-                SearchType.TRACK -> listOfNotNull(request.title, request.artist).joinToString(" ").ifBlank { request.query }
-                else -> request.query
-            }?.trim()
-            if (query.isNullOrEmpty()) {
-                graph.player.resume()
-                return@launch
-            }
-            val results = try {
-                graph.search.search(query, if (type != null) setOf(type) else SearchType.entries.toSet(), limit = 10)
+            val voiceRequest = VoiceRequest.of(request.query, request.focus, request.artist, request.album, request.title, request.playlist)
+            val outcome = try {
+                // The catalog's search needs the session (waited for as the media session does);
+                // offline (no network as of now, or offline mode) the downloads answer at once.
+                VoiceEntry.resolve(voiceRequest, voice::isOffline, ::awaitVoiceSession, voice::resolveVoice)
             } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
@@ -262,51 +262,32 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
                 showMessage(graph.app.getString(R.string.shell_msg_voice_search_failed))
                 return@launch
             }
-            if (!playBestMatch(results, type)) {
-                showMessage(graph.app.getString(R.string.shell_msg_no_results, query))
-            }
-        }
-    }
-
-    private fun playBestMatch(results: SearchResults, type: SearchType?): Boolean {
-        val player = graph.player
-        fun playTrack(track: Track) {
-            val album = track.album?.uri
-            if (album != null) player.playContext(album, startUri = track.uri) else player.playTracks(listOf(track.uri))
-        }
-        /** False when the top result is a track/episode the results mark unplayable (e.g. explicit). */
-        fun playRef(ref: MediaRef): Boolean {
-            when (ref.type) {
-                MediaType.TRACK -> {
-                    val track = results.tracks.firstOrNull { it.uri == ref.uri }
-                    when {
-                        track == null -> player.playTracks(listOf(ref.uri))
-                        track.playable -> playTrack(track)
-                        else -> return false
+            when (outcome) {
+                VoiceOutcome.PlaySomething -> graph.player.resume()
+                is VoiceOutcome.NoMatch -> showMessage(
+                    if (outcome.kind == PlaybackErrorKind.NOT_AVAILABLE_OFFLINE) {
+                        graph.player.errorMessages.message(outcome.kind, null)
+                    } else {
+                        graph.app.getString(R.string.shell_msg_no_results, voiceRequest.text)
+                    },
+                )
+                is VoiceOutcome.Play -> {
+                    // Voice answers name contexts and items (never a `dl|` row): no download queue.
+                    val plan = MediaIds.plan(outcome.items.map { it.mediaId }, 0) { emptyList() }
+                    if (plan == null) {
+                        showMessage(graph.app.getString(R.string.shell_msg_no_results, voiceRequest.text))
+                    } else {
+                        graph.player.play(plan.toPlayRequest())
                     }
                 }
-                MediaType.EPISODE -> {
-                    if (results.episodes.firstOrNull { it.uri == ref.uri }?.playable == false) return false
-                    player.playTracks(listOf(ref.uri))
-                }
-                else -> player.playContext(ref.uri)
             }
-            return true
-        }
-        when (type) {
-            SearchType.ARTIST -> results.artists.firstOrNull()?.let { player.playContext(it.uri); return true }
-            SearchType.ALBUM -> results.albums.firstOrNull()?.let { player.playContext(it.uri); return true }
-            SearchType.PLAYLIST -> results.playlists.firstOrNull()?.let { player.playContext(it.uri); return true }
-            SearchType.TRACK -> results.tracks.firstOrNull { it.playable }?.let { playTrack(it); return true }
-            else -> {
-                results.topResult?.let { if (playRef(it)) return true }
-                results.tracks.firstOrNull { it.playable }?.let { playTrack(it); return true }
-                results.artists.firstOrNull()?.let { player.playContext(it.uri); return true }
-                results.albums.firstOrNull()?.let { player.playContext(it.uri); return true }
-                results.playlists.firstOrNull()?.let { player.playContext(it.uri); return true }
-            }
-        }
-        return false
+        }.invokeOnCompletion { holder.release() }
+    }
+
+    /** The media session's bounded wait for a starting session (awaitOnline before it is installed). */
+    private suspend fun awaitVoiceSession() {
+        val environment = graph.player.environment
+        if (environment != null) environment.awaitSessionStart() else graph.engine.awaitOnline(ONLINE_TIMEOUT_MS)
     }
 
     private companion object {
@@ -315,9 +296,6 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
         /** Upper bound for the credential load before voice search gives up (slow keystore). */
         const val LOGIN_WAIT_MS = 10_000L
         const val ONLINE_TIMEOUT_MS = 15_000L
-
-        /** MediaStore.Audio.Playlists.ENTRY_CONTENT_TYPE (deprecated constant, still sent by assistants). */
-        const val PLAYLIST_ENTRY_CONTENT_TYPE = "vnd.android.cursor.item/playlist"
     }
 }
 

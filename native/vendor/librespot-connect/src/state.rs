@@ -144,6 +144,9 @@ pub(super) struct ConnectState {
     request: PutStateRequest,
 
     unavailable_uri: Vec<String>,
+    // SPOTIFYGOOD: see ConnectState::forget_filtered_unavailable
+    /// the ones of `unavailable_uri` refused while the explicit filter was on
+    filtered_uri: Vec<String>,
 
     active_since: Option<SystemTime>,
     queue_count: u64,
@@ -417,10 +420,15 @@ impl ConnectState {
                 | SpircPlayStatus::Stopped
         );
 
-        if player.is_paused {
-            player.playback_speed = 0.;
-        } else {
+        // SPOTIFYGOOD: the speed only while it plays: also 0 while it loads or a stream stalls
+        // (LoadingPlay, PATCHES.md "Stalls" (c) of the vendored player). It was the playing speed
+        // then: every put built meanwhile (and its retries, the stall's own put on a dead network
+        // among them) moved the position on (update_position_in_relation), and the other clients
+        // extrapolated through the stall.
+        if matches!(status, SpircPlayStatus::Playing { .. }) {
             player.playback_speed = speed;
+        } else {
+            player.playback_speed = 0.;
         }
 
         // desktop and mobile require all 'states' set to true, when we are paused,
@@ -506,6 +514,13 @@ impl ConnectState {
             elapsed,
             self.playing_speed(),
         )
+    }
+
+    // SPOTIFYGOOD: for Spirc's PositionCorrection arm
+    /// Whether the position the player reports at `timestamp` is where the playback is at the
+    /// playing speed (within `tolerance_ms`), so that nothing changes
+    pub fn on_playing_line(&self, position_ms: u32, timestamp: i64, tolerance_ms: i64) -> bool {
+        (self.playing_position(timestamp) - i64::from(position_ms)).abs() < tolerance_ms
     }
 
     // SPOTIFYGOOD: see extrapolated_position, playing_position and update_position_in_relation
@@ -627,7 +642,8 @@ impl ConnectState {
     /// playing (on the line of its speed, see update_position_in_relation), and the time
     pub(crate) fn prepare_put(&mut self, status: &SpircPlayStatus, now: i64) {
         self.set_status(status);
-        if self.is_playing() {
+        // SPOTIFYGOOD: only Playing moves on (see set_status); stock re-anchored LoadingPlay too
+        if matches!(status, SpircPlayStatus::Playing { .. }) {
             self.update_position_in_relation(now);
         }
         self.set_now(now as u64);

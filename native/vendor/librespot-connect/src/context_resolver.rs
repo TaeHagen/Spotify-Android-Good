@@ -212,6 +212,18 @@ impl ContextResolver {
         self.unavailable_contexts.remove(resolve);
     }
 
+    // SPOTIFYGOOD: see Spirc's handle_transfer. `add` drops a resolve that failed for good
+    // within RETRY_UNAVAILABLE: a transfer that waited for it never finished (no next tracks,
+    // the transferred queue lost), e.g. a second transfer of the same session within a minute.
+    /// Queues a resolve the user asked for (a transfer), also when it failed a moment ago (like
+    /// a load, see `forget_unavailable`). Returns whether it is queued.
+    pub fn add_requested(&mut self, resolve: ResolveContext) -> bool {
+        self.forget_unavailable(&resolve);
+        let queued = resolve.clone();
+        self.add(resolve);
+        self.queue.contains(&queued)
+    }
+
     // SPOTIFYGOOD
     /// Whether a failed resolve means the context can't be resolved (not found, not allowed,
     /// invalid), as opposed to a transient failure that is worth another try right away
@@ -482,7 +494,11 @@ impl ContextResolver {
             Some(next) if next.update == ContextType::Default => {
                 next.action == ContextAction::Replace
             }
-            // an autoplay resolve: nothing waits for it
+            // SPOTIFYGOOD: the autoplay resolve of a transfer of an autoplay track (see Spirc's
+            // handle_transfer): the transfer is finished with the default context (see
+            // ConnectState::finish_transfer); it was never finished
+            Some(next) if next.update == ContextType::Autoplay && transfer_state.is_some() => false,
+            // an autoplay resolve: nothing else waits for it
             _ => return false,
         };
 

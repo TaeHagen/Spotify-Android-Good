@@ -182,6 +182,17 @@ class SettingsViewModel(private val graph: AppGraph) : ViewModel() {
     /** Moving downloads to a newly chosen location. */
     val relocation: StateFlow<DownloadRelocation> = graph.downloads.relocation
 
+    /** Downloads on an SD card that is no longer used (it died, or another card was chosen). */
+    val onUnusedCard: StateFlow<Int> = graph.downloads.onUnusedCard
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+
+    fun redownloadFromUnusedCard(onDone: (Int?) -> Unit) {
+        graph.appScope.launch {
+            val notice = runCatching { graph.downloads.redownloadFromUnusedCard().notice }.getOrNull()
+            withContext(Dispatchers.Main) { onDone(notice) }
+        }
+    }
+
     fun setDownloadLocation(id: String) {
         graph.appScope.launch { graph.downloads.setDownloadLocation(id) }
     }
@@ -276,6 +287,8 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
     val failedCounts by vm.failedCounts.collectAsStateWithLifecycle()
     val downloadLocations by vm.downloadLocations.collectAsStateWithLifecycle()
     val relocation by vm.relocation.collectAsStateWithLifecycle()
+    val onUnusedCard by vm.onUnusedCard.collectAsStateWithLifecycle()
+    val msgRedownloading = stringResource(R.string.shell_settings_unused_card_started)
     val sleepTimer by vm.sleepTimer.collectAsStateWithLifecycle()
     var dialog by remember { mutableStateOf<SettingsDialog?>(null) }
     // open.spotify.com links need the user's approval on Android 12+; checked again whenever the
@@ -559,11 +572,37 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
                     )
                 }
             }
-            if (relocation.moving || relocation.error != null) {
+            // Downloads left on a card that died or was replaced: downloaded again here on request.
+            if (onUnusedCard > 0) {
+                item(key = "unused_card") {
+                    PrefItem(
+                        title = stringResource(R.string.shell_settings_unused_card),
+                        summary = stringResource(R.string.shell_settings_unused_card_summary, onUnusedCard),
+                        icon = Icons.Rounded.SdCard,
+                        onClick = {
+                            vm.redownloadFromUnusedCard { notice ->
+                                navigator.showMessage(notice?.let { context.getString(it) } ?: msgRedownloading)
+                            }
+                        },
+                    )
+                }
+            }
+            if (relocation.moving || relocation.error != null || relocation.unreadable > 0) {
                 item(key = "download_moving") {
                     PrefItem(
-                        title = stringResource(if (relocation.moving) R.string.shell_settings_download_moving else R.string.shell_settings_download_move_stopped),
-                        summary = relocation.error ?: stringResource(R.string.shell_settings_download_moving_summary, relocation.moved, relocation.total),
+                        title = stringResource(
+                            when {
+                                relocation.moving -> R.string.shell_settings_download_moving
+                                relocation.error != null -> R.string.shell_settings_download_move_stopped
+                                else -> R.string.shell_settings_download_moved
+                            },
+                        ),
+                        summary = relocation.error
+                            ?: if (!relocation.moving && relocation.unreadable > 0) {
+                                stringResource(R.string.shell_settings_download_move_unreadable, relocation.unreadable)
+                            } else {
+                                stringResource(R.string.shell_settings_download_moving_summary, relocation.moved, relocation.total)
+                            },
                         icon = Icons.Rounded.SdCard,
                         onClick = { navigator.navigate(Route.Downloads) },
                     )

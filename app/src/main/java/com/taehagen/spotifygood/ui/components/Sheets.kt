@@ -34,6 +34,7 @@ import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Album
+import androidx.compose.material.icons.rounded.CheckCircleOutline
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.DownloadForOffline
@@ -54,6 +55,7 @@ import androidx.compose.material.icons.rounded.Podcasts
 import androidx.compose.material.icons.rounded.Public
 import androidx.compose.material.icons.rounded.Radio
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
+import androidx.compose.material.icons.rounded.RemoveDone
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -99,7 +101,9 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.data.PlaylistAddChoice
 import com.taehagen.spotifygood.data.Resource
+import com.taehagen.spotifygood.data.SpotifyUris
 import com.taehagen.spotifygood.data.dataOrNull
 import com.taehagen.spotifygood.download.CollectionRef
 import com.taehagen.spotifygood.download.CollectionType
@@ -115,6 +119,7 @@ import com.taehagen.spotifygood.ui.navigation.LocalOptionalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MainNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -294,6 +299,9 @@ private fun EpisodeActions(t: MediaActionTarget.EpisodeTarget, s: ActionScope) {
     val episode = t.episode
     val saved by remember(episode.uri) { s.graph.library.isSaved(episode.uri) }.collectAsStateWithLifecycle(null)
     val download by remember(episode.uri) { s.graph.downloads.state(episode.uri) }.collectAsStateWithLifecycle(null)
+    // As its rows show it: this phone's point, else Spotify's state the episode carries.
+    val progress by s.graph.episodeProgress.version.collectAsStateWithLifecycle()
+    val played = remember(episode, progress) { s.graph.episodeProgress.overlay(episode).fullyPlayed == true }
     SheetHeader(
         imageUrl = episode.images.best(160) ?: episode.show?.images?.best(160),
         title = episode.name,
@@ -304,6 +312,10 @@ private fun EpisodeActions(t: MediaActionTarget.EpisodeTarget, s: ActionScope) {
         s.dismiss()
         s.runner.addToQueue(listOf(episode.uri))
     }
+    SheetAction(Icons.AutoMirrored.Rounded.PlaylistAdd, stringResource(R.string.shell_action_add_to_playlist)) {
+        s.dismissNow()
+        s.navigator?.addToPlaylist(listOf(episode.uri))
+    }
     SavedAction(
         saved = saved,
         icon = { if (it) Icons.Rounded.LibraryAddCheck else Icons.Rounded.LibraryAdd },
@@ -313,6 +325,14 @@ private fun EpisodeActions(t: MediaActionTarget.EpisodeTarget, s: ActionScope) {
         s.runner.setSaved(episode.uri, !shown, R.string.shell_msg_saved_episode, R.string.shell_msg_removed_episode)
     }
     ItemDownloadAction(episode.uri, download, s)
+    SheetAction(
+        if (played) Icons.Rounded.RemoveDone else Icons.Rounded.CheckCircleOutline,
+        stringResource(if (played) R.string.shell_action_mark_unplayed else R.string.shell_action_mark_played),
+    ) {
+        s.dismiss()
+        s.graph.episodeProgress.markPlayed(episode.uri, played = !played)
+        s.runner.message(if (played) R.string.shell_msg_marked_unplayed else R.string.shell_msg_marked_played)
+    }
     episode.show?.takeIf { it.uri.isNotBlank() }?.let { show ->
         SheetAction(Icons.Rounded.Podcasts, stringResource(R.string.shell_action_go_to_show)) { s.go(Route.Show(show.uri)) }
     }
@@ -339,6 +359,13 @@ private fun AlbumActions(t: MediaActionTarget.AlbumTarget, s: ActionScope) {
         s.dismiss()
         s.runner.addCollectionToQueue(album.uri) {
             s.graph.catalog.album(album.uri).awaitData()?.tracks.orEmpty().filter { it.playable }.map { it.uri }
+        }
+    }
+    SheetAction(Icons.AutoMirrored.Rounded.PlaylistAdd, stringResource(R.string.shell_action_add_to_playlist)) {
+        s.dismiss()
+        // All its tracks, as Spotify adds an album (one it can't play here shows dimmed there too).
+        s.runner.pickPlaylistFor {
+            s.graph.catalog.album(album.uri).awaitData()?.tracks.orEmpty().map { it.uri }.filter(SpotifyUris::isPlayableItem)
         }
     }
     SavedAction(
@@ -406,6 +433,10 @@ private fun PlaylistActions(t: MediaActionTarget.PlaylistTarget, s: ActionScope)
     SheetAction(Icons.AutoMirrored.Rounded.QueueMusic, stringResource(R.string.shell_action_add_to_queue)) {
         s.dismiss()
         s.runner.addCollectionToQueue(playlist.uri) { s.graph.catalog.playlistItemUris(playlist.uri) }
+    }
+    SheetAction(Icons.AutoMirrored.Rounded.PlaylistAdd, stringResource(R.string.shell_action_add_to_other_playlist)) {
+        s.dismiss()
+        s.runner.pickPlaylistFor(excludeUri = playlist.uri) { s.graph.catalog.playlistItemUris(playlist.uri) }
     }
     if (t.isOwned) {
         SheetAction(Icons.Rounded.Edit, stringResource(R.string.shell_action_rename)) { s.setPage(SheetPage.Rename) }
@@ -538,7 +569,11 @@ private fun ItemDownloadAction(uri: String, state: DownloadState?, s: ActionScop
         if (active) {
             s.runner.launch(R.string.shell_msg_download_removed) { s.graph.downloads.removeItems(listOf(uri)) }
         } else {
-            s.runner.launch(R.string.shell_msg_download_started) { s.graph.downloads.downloadItems(listOf(uri)) }
+            // Says what really happened: nothing starts for a download on the chosen SD card while it is away.
+            s.runner.launch {
+                val request = s.graph.downloads.downloadItems(listOf(uri))
+                withContext(Dispatchers.Main) { s.runner.message(request.notice ?: R.string.shell_msg_download_started) }
+            }
         }
     }
 }
@@ -555,7 +590,10 @@ private fun CollectionDownloadAction(downloaded: Boolean, s: ActionScope, ref: (
         if (downloaded) {
             s.runner.launch(R.string.shell_msg_download_removed) { s.graph.downloads.removeCollection(collection.uri) }
         } else {
-            s.runner.launch(R.string.shell_msg_download_started) { s.graph.downloads.downloadCollection(collection) }
+            s.runner.launch {
+                val request = s.graph.downloads.downloadCollection(collection)
+                withContext(Dispatchers.Main) { s.runner.message(request.notice ?: R.string.shell_msg_download_started) }
+            }
         }
     }
 }
@@ -750,7 +788,7 @@ private sealed interface PickerEntry {
  * them (not populated yet), playlists owned by the current user (or with an unknown owner) stand
  * in; the server rejects anything else and the error is shown.
  */
-private fun buildPickerEntries(rootlist: Rootlist?, me: String?): List<PickerEntry> {
+private fun buildPickerEntries(rootlist: Rootlist?, me: String?, excludeUri: String? = null): List<PickerEntry> {
     if (rootlist == null) return emptyList()
     val seen = HashSet<String>()
     val canEditKnown = rootlist.flatPlaylists().any { it.canEdit }
@@ -770,7 +808,7 @@ private fun buildPickerEntries(rootlist: Rootlist?, me: String?): List<PickerEnt
                 }
                 RootlistEntryType.PLAYLIST -> {
                     val uri = e.uri
-                    if (uri != null && editable(e) && seen.add(uri)) add(PickerEntry.Playlist(e, uri, depth, "p:$uri"))
+                    if (uri != null && uri != excludeUri && editable(e) && seen.add(uri)) add(PickerEntry.Playlist(e, uri, depth, "p:$uri"))
                 }
             }
         }
@@ -778,9 +816,13 @@ private fun buildPickerEntries(rootlist: Rootlist?, me: String?): List<PickerEnt
     return walk(rootlist.items, 0, "")
 }
 
-/** Pick (or create) a playlist to add [uris] to. Only editable playlists are listed. */
+/**
+ * Pick (or create) a playlist to add [uris] to. Only editable playlists are listed, [excludeUri]
+ * (the playlist they come from) not. Picking one checks it for items already in it ("Already
+ * added", [MediaActionRunner.addToPlaylist]).
+ */
 @Composable
-fun AddToPlaylistSheet(uris: List<String>, onDismiss: () -> Unit) {
+fun AddToPlaylistSheet(uris: List<String>, onDismiss: () -> Unit, excludeUri: String? = null) {
     val graph = rememberAppGraph()
     val navigator = LocalOptionalAppNavigator.current
     val context = LocalContext.current
@@ -790,7 +832,7 @@ fun AddToPlaylistSheet(uris: List<String>, onDismiss: () -> Unit) {
     val animatedDismiss: () -> Unit = { scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() } }
     val rootlist by remember { graph.library.playlists() }.collectAsStateWithLifecycle(Resource.Loading())
     val me by graph.engine.user.collectAsStateWithLifecycle()
-    val entries = remember(rootlist, me) { buildPickerEntries(rootlist.dataOrNull, me?.username) }
+    val entries = remember(rootlist, me, excludeUri) { buildPickerEntries(rootlist.dataOrNull, me?.username, excludeUri) }
     var showCreate by rememberSaveable { mutableStateOf(false) }
 
     ModalBottomSheet(
@@ -876,9 +918,7 @@ fun AddToPlaylistSheet(uris: List<String>, onDismiss: () -> Unit) {
                             .fillMaxWidth()
                             .clickable(role = Role.Button) {
                                 animatedDismiss()
-                                runner.launch(R.string.shell_msg_added_to_playlist, entry.entry.name) {
-                                    graph.playlists.addItems(entry.uri, uris)
-                                }
+                                runner.addToPlaylist(entry.uri, entry.entry.name, uris)
                             }
                             .heightIn(min = 64.dp)
                             .padding(start = 20.dp + (entry.depth * 16).dp, end = 20.dp, top = 8.dp, bottom = 8.dp),
@@ -914,6 +954,47 @@ fun AddToPlaylistSheet(uris: List<String>, onDismiss: () -> Unit) {
             initialUris = uris,
         )
     }
+}
+
+/**
+ * Spotify's "Already added": some of the items of an add are in the playlist already. One item, or
+ * none new: "Add anyway" / "Don't add"; some new: "Add new ones" / "Add anyway" / "Cancel". When
+ * the playlist couldn't be checked: "Add anyway" / "Cancel".
+ */
+@Composable
+fun AlreadyAddedDialog(prompt: PlaylistAddPrompt, onDismiss: () -> Unit) {
+    val graph = rememberAppGraph()
+    val navigator = LocalOptionalAppNavigator.current
+    val context = LocalContext.current
+    val runner = remember(graph, navigator) { MediaActionRunner(graph, navigator, context) }
+    val choose: (PlaylistAddChoice) -> Unit = { choice ->
+        onDismiss()
+        runner.addToPlaylist(prompt, choice)
+    }
+    val message = when {
+        prompt.unchecked -> R.string.shell_add_unchecked_message
+        prompt.offersNewOnes -> R.string.shell_already_added_some
+        prompt.plan.requested.size == 1 -> R.string.shell_already_added_one
+        else -> R.string.shell_already_added_all
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(if (prompt.unchecked) R.string.shell_add_unchecked_title else R.string.shell_already_added_title)) },
+        text = { Text(stringResource(message, prompt.playlistName)) },
+        confirmButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = { choose(PlaylistAddChoice.ALL) }) { Text(stringResource(R.string.shell_action_add_anyway)) }
+                if (prompt.offersNewOnes) {
+                    TextButton(onClick = { choose(PlaylistAddChoice.NEW_ONES) }) { Text(stringResource(R.string.shell_action_add_new_ones)) }
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(if (prompt.offersNewOnes || prompt.unchecked) R.string.shell_cancel else R.string.shell_action_dont_add))
+            }
+        },
+    )
 }
 
 /**

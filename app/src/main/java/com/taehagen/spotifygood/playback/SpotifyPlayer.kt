@@ -359,11 +359,7 @@ internal class SpotifyPlayer(
         onCommand()
         val plan = MediaIds.plan(mediaItems.map { it.mediaId }, startIndex, downloadedQueue)
             ?: return Futures.immediateVoidFuture()
-        val request = PlayRequest(
-            contextUri = plan.contextUri,
-            trackUris = plan.trackUris,
-            startUri = plan.startUri,
-            startIndex = plan.startIndex,
+        val request = plan.toPlayRequest(
             positionMs = if (startPositionMs == C.TIME_UNSET) 0 else startPositionMs.coerceAtLeast(0),
             // Media3 semantics: setMediaItems keeps playWhenReady; controllers call play() next.
             play = playWhenReady,

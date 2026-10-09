@@ -655,6 +655,84 @@ internal object DownloadRules {
     /** Of [paths], those under location root [root]. */
     fun pathsUnder(root: String, paths: Collection<String>): List<String> = paths.filter { rootOf(it) == root }
 
+    // ---- downloads on a card that is gone ----------------------------------------------------------
+
+    /**
+     * Completed downloads on a card that is not mounted: [waiting] for the chosen download location
+     * while it is away (they play again once it is back), or [stranded] on a card that is no longer
+     * the chosen location (it died, or was replaced by one with another UUID): downloaded again to
+     * the chosen location when the user asks.
+     */
+    data class MissingCard(val waiting: Set<String> = emptySet(), val stranded: Set<String> = emptySet()) {
+        val all: Set<String> get() = waiting + stranded
+    }
+
+    /**
+     * Whether the location root [root] is the download location [location] (a volume UUID or a
+     * volume's files directory, [DownloadLocations.INTERNAL] for internal storage at [internalRoot]).
+     */
+    fun isLocation(root: String, location: String, internalRoot: String): Boolean {
+        val normalized = normalizeRoot(root)
+        if (location == DownloadLocations.INTERNAL) return normalized == normalizeRoot(internalRoot)
+        return normalized.startsWith("/storage/$location/") || normalized.startsWith(normalizeRoot(location) + "/")
+    }
+
+    /** [MissingCard] of the completed [rows] for the [chosen] download location. */
+    fun missingCard(rows: List<LocatedRow>, available: (String) -> Boolean, chosen: String, internalRoot: String): MissingCard {
+        val waiting = HashSet<String>()
+        val stranded = HashSet<String>()
+        for (row in rows) {
+            val root = row.path?.let(::rootOf) ?: continue
+            if (available(root)) continue
+            if (isLocation(root, chosen, internalRoot)) waiting += row.uri else stranded += row.uri
+        }
+        return MissingCard(waiting, stranded)
+    }
+
+    /** What downloading single items does ([itemRequest]). */
+    data class ItemRequest(
+        /** No row yet: new single downloads (the only ones marked individual). */
+        val newSingles: List<String>,
+        /** Failed or cancelled: queued again. */
+        val requeue: List<String>,
+        /** Completed on a card that is no longer used: downloaded again to the chosen location. */
+        val redownload: List<String>,
+        /** Completed on the chosen card while it is away: nothing to do, they wait for it. */
+        val waiting: List<String>,
+    )
+
+    /**
+     * What downloading [targets] does, given their rows' [states] (absent: no row) and [missing].
+     * A collection member retried here stays a member (not marked individual): removing the
+     * collection or a sync that drops it still removes it.
+     */
+    fun itemRequest(targets: List<String>, states: Map<String, DownloadState>, missing: MissingCard): ItemRequest {
+        val newSingles = ArrayList<String>()
+        val requeue = ArrayList<String>()
+        val redownload = ArrayList<String>()
+        val waiting = ArrayList<String>()
+        for (uri in targets) {
+            when (states[uri]) {
+                null -> newSingles += uri
+                DownloadState.FAILED, DownloadState.CANCELLED -> requeue += uri
+                DownloadState.COMPLETED -> when (uri) {
+                    in missing.stranded -> redownload += uri
+                    in missing.waiting -> waiting += uri
+                }
+                else -> Unit // already in the queue
+            }
+        }
+        return ItemRequest(newSingles, requeue, redownload, waiting)
+    }
+
+    /** What a download request comes to for the user ([DownloadRequest.outcome]). */
+    fun requestOutcome(queued: Int, waitingForCard: Int, locationAvailable: Boolean): DownloadRequest.Outcome = when {
+        queued > 0 && !locationAvailable -> DownloadRequest.Outcome.LOCATION_MISSING
+        queued > 0 -> DownloadRequest.Outcome.STARTED
+        waitingForCard > 0 -> DownloadRequest.Outcome.WAITING_FOR_CARD
+        else -> DownloadRequest.Outcome.NOTHING
+    }
+
     /** Where a download run stands with its location ([storageCheck]). */
     enum class StorageCheck { OK, LOCATION_MISSING, CARD_FULL, INTERNAL_FULL }
 
@@ -702,6 +780,14 @@ internal object DownloadRules {
             .map { FileMove(it, "$to/${DownloadStorage.IMAGES}/${File(it).name}", image = true) }
         return audio + images
     }
+
+    /**
+     * [plan] (in the stable order of the rows) with the files whose move failed before in this
+     * process ([failedBefore]: unreadable, or a copy that stopped the move) at the end, so one bad
+     * file never holds back the rest.
+     */
+    fun orderPlan(plan: List<FileMove>, failedBefore: Set<String>): List<FileMove> =
+        if (failedBefore.isEmpty()) plan else plan.sortedBy { it.from in failedBefore }
 
     /**
      * Completed downloads ([rows]) whose audio lies on a location that is not [available] (a card

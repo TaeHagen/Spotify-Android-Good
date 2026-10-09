@@ -21,6 +21,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Sort
 import androidx.compose.material.icons.rounded.ArrowCircleDown
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.CheckCircleOutline
 import androidx.compose.material.icons.rounded.DownloadForOffline
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Share
@@ -267,6 +269,7 @@ fun EpisodeScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier
                 contentPadding = contentPadding,
                 navigator = navigator,
                 onPlayPause = viewModel::playPause,
+                onTogglePlayed = viewModel::togglePlayed,
                 onToggleSaved = viewModel::toggleSaved,
                 onDownload = viewModel::download,
                 onRemoveDownload = viewModel::removeDownload,
@@ -284,6 +287,7 @@ private fun EpisodeDetails(
     contentPadding: PaddingValues,
     navigator: AppNavigator,
     onPlayPause: () -> Unit,
+    onTogglePlayed: () -> Unit,
     onToggleSaved: () -> Unit,
     onDownload: () -> Unit,
     onRemoveDownload: () -> Unit,
@@ -328,6 +332,7 @@ private fun EpisodeDetails(
                                     removeDescription = R.string.detail_remove_episode,
                                 )
                                 EpisodeDownloadButton(state.download, onDownload = onDownload, onRemove = onRemoveDownload)
+                                MarkPlayedButton(played = episode.fullyPlayed == true, onClick = onTogglePlayed)
                                 IconButton(onClick = { shareLink(context, uri, shareTitle, onFailure = { navigator.showMessage(shareFailed) }) }) {
                                     Icon(
                                         Icons.Rounded.Share,
@@ -380,6 +385,18 @@ private fun EpisodeMeta(episode: Episode) {
             modifier = Modifier
                 .padding(top = 8.dp)
                 .fillMaxWidth(0.5f),
+        )
+    }
+}
+
+/** The episode page's "Mark as played" / "Mark as unplayed" (filled once played, as Spotify's). */
+@Composable
+private fun MarkPlayedButton(played: Boolean, onClick: () -> Unit) {
+    IconButton(onClick = onClick) {
+        Icon(
+            if (played) Icons.Rounded.CheckCircle else Icons.Rounded.CheckCircleOutline,
+            contentDescription = stringResource(if (played) R.string.shell_action_mark_unplayed else R.string.shell_action_mark_played),
+            tint = if (played) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }

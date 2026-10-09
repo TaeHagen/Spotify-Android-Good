@@ -201,6 +201,14 @@ class PlaybackService : MediaLibraryService() {
             ACTION_START_PRESENCE -> {
                 if (isPresenceWanted()) presence.enable(showNow = !mediaForeground)
                 updatePausedIdle()
+                if (intent?.getBooleanExtra(EXTRA_FOREGROUND_START, false) == true && !presence.isForeground && !mediaForeground) {
+                    // The restore after a reboot or an update (PresenceRestore) is a
+                    // startForegroundService: meet that contract even when presence did not come
+                    // up, as connectedDevice (Android 15 refuses mediaPlayback from boot), and
+                    // tell the user it waits for the app.
+                    satisfyForegroundContract(if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0)
+                    if (isPresenceWanted()) PresenceRestore.postNotice(this)
+                }
                 if (!presence.isEnabled && !mediaForeground && !player.isPlaying) stopSelf(startId)
             }
             ACTION_RESUME -> {
@@ -647,6 +655,13 @@ class PlaybackService : MediaLibraryService() {
             session?.let { onUpdateNotificationAsync(it, false) }
             return
         }
+        if (coordinator.isAppInForeground || presence.isForeground) {
+            // The visible app (or presence's own connectedDevice foreground) keeps the process:
+            // the audio goes on, and Media3 asks for the foreground again on its next update.
+            // Pausing here would stop a play the user just started in the app.
+            Log.w(TAG, "Media foreground refused while the app is visible or presence is up; playing on")
+            return
+        }
         Log.w(TAG, "Foreground service start not allowed; asking the user to resume")
         // Local audio never plays without the media foreground service: pause (Connect sees it).
         coordinator.refuseBackgroundPlayback()
@@ -678,7 +693,9 @@ class PlaybackService : MediaLibraryService() {
      * foreground even when nothing plays; enter and leave it immediately (like Media3's own
      * shutdown path), with a notification of its own so a (paused) media notification stays.
      */
-    private fun satisfyForegroundContract() {
+    private fun satisfyForegroundContract(
+        type: Int = if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0,
+    ) {
         if (mediaForeground || presence.isForeground) return
         try {
             val notifications = NotificationManagerCompat.from(this)
@@ -694,12 +711,7 @@ class PlaybackService : MediaLibraryService() {
                 .setSilent(true)
                 .setVisibility(NotificationCompat.VISIBILITY_SECRET)
                 .build()
-            ServiceCompat.startForeground(
-                this,
-                CONTRACT_NOTIFICATION_ID,
-                notification,
-                if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0,
-            )
+            ServiceCompat.startForeground(this, CONTRACT_NOTIFICATION_ID, notification, type)
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         } catch (e: IllegalStateException) {
             Log.w(TAG, "Foreground not allowed", e)
@@ -917,21 +929,18 @@ class PlaybackService : MediaLibraryService() {
             val first = mediaItems.firstOrNull()
             val query = first?.requestMetadata?.searchQuery
             if (mediaItems.size == 1 && query != null) {
-                // Voice: "play X" (empty query = "play something": resume the last context).
-                if (query.isBlank()) {
-                    val last = resumeStore.read() ?: noVoiceMatch(PlaybackErrorKind.NOT_ACTIVE_DEVICE)
-                    MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
-                } else {
-                    // "Play X" right after a cold start: search needs the session (NOT_CONNECTED otherwise).
-                    coordinator.environment.awaitSessionStart()
-                    val items = runCatching { tree.resolveVoiceQuery(query, first.requestMetadata.extras) }
-                        .onFailure { if (it is CancellationException) throw it }
-                        .getOrNull()
-                        .orEmpty()
-                    if (items.isEmpty()) {
-                        noVoiceMatch(if (tree.isOffline()) PlaybackErrorKind.NOT_AVAILABLE_OFFLINE else PlaybackErrorKind.NOT_FOUND)
+                // Voice: "play X" (empty query = "play something": resume the last context). The
+                // same resolver as the activity's MEDIA_PLAY_FROM_SEARCH (LibraryTree.resolveVoice).
+                val voice = VoiceRequest.of(query, first.requestMetadata.extras)
+                // "Play X" right after a cold start: search needs the session (NOT_CONNECTED
+                // otherwise); ensurePlaybackHolder above lets an idle-stopped one start.
+                when (val outcome = VoiceEntry.resolve(voice, tree::isOffline, coordinator.environment::awaitSessionStart, tree::resolveVoice)) {
+                    VoiceOutcome.PlaySomething -> {
+                        val last = resumeStore.read() ?: noVoiceMatch(PlaybackErrorKind.NOT_ACTIVE_DEVICE)
+                        MediaItemsWithStartPosition(listOf(tree.resumeItem(last, downloadedImages[last.trackUri])), 0, last.positionMs)
                     }
-                    MediaItemsWithStartPosition(items, 0, C.TIME_UNSET)
+                    is VoiceOutcome.NoMatch -> noVoiceMatch(outcome.kind)
+                    is VoiceOutcome.Play -> MediaItemsWithStartPosition(outcome.items, 0, C.TIME_UNSET)
                 }
             } else {
                 MediaItemsWithStartPosition(mediaItems, startIndex, startPositionMs)
@@ -995,6 +1004,12 @@ class PlaybackService : MediaLibraryService() {
 
         /** Start (while the app is visible) to bring up the opt-in Connect presence. */
         const val ACTION_START_PRESENCE = "com.taehagen.spotifygood.playback.START_PRESENCE"
+        /**
+         * Boolean extra of an [ACTION_START_PRESENCE] sent with `startForegroundService` (the
+         * restore after a reboot or an update, [PresenceRestore]): the service reaches the
+         * foreground even when presence cannot come up.
+         */
+        const val EXTRA_FOREGROUND_START = "com.taehagen.spotifygood.playback.extra.FOREGROUND_START"
         /** "Tap to resume" after a refused background start (forwarded by [PlaybackActionReceiver]). */
         const val ACTION_RESUME = "com.taehagen.spotifygood.playback.RESUME"
         /**

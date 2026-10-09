@@ -104,7 +104,17 @@ internal data class LoadPlan(
     val trackUris: List<String>? = null,
     val startUri: String? = null,
     val startIndex: Int? = null,
-)
+) {
+    /** The `player.load` request of this plan, from [positionMs], playing when [play]. */
+    fun toPlayRequest(positionMs: Long = 0, play: Boolean = true): PlayRequest = PlayRequest(
+        contextUri = contextUri,
+        trackUris = trackUris,
+        startUri = startUri,
+        startIndex = startIndex,
+        positionMs = positionMs,
+        play = play,
+    )
+}
 
 /**
  * Media ids used by the browse tree, playback resumption and the session player:
