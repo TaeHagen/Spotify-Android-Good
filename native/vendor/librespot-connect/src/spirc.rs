@@ -447,6 +447,16 @@ impl SpircCommand {
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
 
+// SPOTIFYGOOD: moved out of load_context_from_tracks (see handle_transfer)
+/// The context uri of a plain track list (it can't be resolved)
+const WEB_API_URI: &str = "spotify:web-api";
+
+// SPOTIFYGOOD: see handle_transfer
+/// Whether a transferred context uri can be resolved (a plain track list can't)
+fn resolvable_transfer_context(uri: &str) -> bool {
+    uri != WEB_API_URI
+}
+
 // SPOTIFYGOOD: a position correction this close to the state's extrapolation (at the playback
 // speed) changes nothing, see handle_player_event
 const SPEED_CORRECTION_TOLERANCE_MS: i64 = 500;
@@ -2149,9 +2159,12 @@ impl SpircTask {
             Some(ref uri) => Some(uri.clone()),
         };
 
+        // SPOTIFYGOOD: a plain track list starts over too (see resolvable_transfer_context): one
+        // played here before has the same uri and other tracks
         self.connect_state.reset_context(
             ctx_uri
                 .as_deref()
+                .filter(|uri| resolvable_transfer_context(uri))
                 .map(ResetContext::WhenDifferent)
                 .unwrap_or(ResetContext::Completely),
         );
@@ -2168,24 +2181,34 @@ impl SpircTask {
         if autoplay {
             ctx_uri = ctx_uri.map(|c| c.replace("station:", ""));
         }
+        let fallback = self.connect_state.current_track(|t| &t.uri).clone();
+        // SPOTIFYGOOD: a plain track list (this app's or a librespot device's, see
+        // load_context_from_tracks) is made of the tracks the transfer brought, like a session
+        // without a context uri; its resolve could only fail (a request, then
+        // ContextResolver::finish_after_failure), and within a minute of that it wasn't queued at
+        // all (see below)
+        let load_from_context_uri = ctx_uri.as_deref().is_some_and(resolvable_transfer_context);
         // SPOTIFYGOOD: an autoplay track (see ConnectState::current_track_from_transfer) goes on
         // in autoplay while autoplay is on (Spirc::set_autoplay), else after the default context
-        // (ConnectState::finish_transfer)
-        let resolves_autoplay = autoplay && self.autoplay();
-
-        let fallback = self.connect_state.current_track(|t| &t.uri).clone();
-        let load_from_context_uri = ctx_uri.is_some();
+        // (ConnectState::finish_transfer); a transfer that isn't resolved finishes at once (below)
+        let resolves_autoplay = autoplay && self.autoplay() && load_from_context_uri;
+        // SPOTIFYGOOD: whether the resolve the transfer waits for is queued (add_requested)
+        let mut default_queued = false;
 
         match ctx_uri {
-            Some(ref uri) => {
-                self.context_resolver.add(ResolveContext::from_uri(
-                    uri.clone(),
-                    &fallback,
-                    ContextType::Default,
-                    ContextAction::Replace,
-                ));
+            // SPOTIFYGOOD: a transfer asks again for a context that failed a moment ago (like a
+            // load): ContextResolver::add dropped it, and the transfer never finished
+            Some(ref uri) if load_from_context_uri => {
+                default_queued = self
+                    .context_resolver
+                    .add_requested(ResolveContext::from_uri(
+                        uri.clone(),
+                        &fallback,
+                        ContextType::Default,
+                        ContextAction::Replace,
+                    ));
             }
-            None => {
+            _ => {
                 let all_tracks = transfer
                     .current_session
                     .context
@@ -2197,7 +2220,7 @@ impl SpircTask {
 
                 if !all_tracks.is_empty() {
                     self.load_context_from_tracks(all_tracks)?;
-                } else {
+                } else if ctx_uri.is_none() {
                     warn!(
                         "tried to transfer with an invalid state, using fallback as ctx_uri ({fallback})"
                     );
@@ -2243,38 +2266,70 @@ impl SpircTask {
         let is_playing = !start_paused && !transfer.playback.is_paused();
 
         // SPOTIFYGOOD: resolves_autoplay
+        let mut autoplay_queued = false;
         if resolves_autoplay {
             if let Some(ctx_uri) = ctx_uri {
                 debug!("currently in autoplay context, async resolving autoplay for {ctx_uri}");
-                self.context_resolver.add(ResolveContext::from_uri(
-                    ctx_uri,
-                    fallback,
-                    ContextType::Autoplay,
-                    ContextAction::Replace,
-                ))
+                // SPOTIFYGOOD: see the default resolve above
+                autoplay_queued = self
+                    .context_resolver
+                    .add_requested(ResolveContext::from_uri(
+                        ctx_uri,
+                        fallback,
+                        ContextType::Autoplay,
+                        ContextAction::Replace,
+                    ))
             } else {
                 warn!("couldn't resolve autoplay context without a context uri");
             }
         }
+        // SPOTIFYGOOD: the resolve whose end finishes the transfer is queued (see
+        // ContextResolver::try_finish and finish_after_failure); one that isn't (refused, or
+        // never added) finishes it at once with what it brought, it waited for good
+        let awaited = if resolves_autoplay {
+            autoplay_queued
+        } else {
+            default_queued
+        };
 
         if load_from_context_uri {
             self.transfer_state = Some(transfer);
+            if !awaited {
+                self.finish_transfer_without_resolve();
+            }
         } else {
             match self.connect_state.get_context(ContextType::Default) {
                 Err(why) => {
                     warn!("continuing transfer in an unknown state. {why}");
                     self.transfer_state = Some(transfer);
+                    // SPOTIFYGOOD: see awaited
+                    if !awaited {
+                        self.finish_transfer_without_resolve();
+                    }
                 }
-                Ok(ctx) => {
-                    let idx = ConnectState::find_index_in_context(ctx, |pt| {
-                        self.connect_state.current_track(|t| pt.uri == t.uri)
-                    })?;
-                    self.connect_state.reset_playback_to_position(Some(idx))?;
-                }
+                // SPOTIFYGOOD: finished like a resolved one (ConnectState::finish_transfer): the
+                // transferred queue was dropped, and a current track the tracks don't contain
+                // failed the transfer
+                Ok(_) => self.connect_state.finish_transfer(transfer)?,
             }
         }
 
         self.load_track(is_playing, position.try_into()?)
+    }
+
+    // SPOTIFYGOOD: see handle_transfer
+    /// Finishes the pending transfer with what it brought (see
+    /// ConnectState::finish_transfer_without_context), as when its resolve failed for good
+    fn finish_transfer_without_resolve(&mut self) {
+        let Some(transfer) = self.transfer_state.take() else {
+            return;
+        };
+        if let Err(why) = self.connect_state.finish_transfer_without_context(transfer) {
+            error!("setup of the transfer failed: {why}")
+        }
+        self.connect_state.update_restrictions();
+        self.connect_state.update_queue_revision();
+        self.add_autoplay_resolving_when_required();
     }
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
@@ -2697,7 +2752,6 @@ impl SpircTask {
     }
 
     fn load_context_from_tracks(&mut self, tracks: impl Into<ContextPage>) -> Result<(), Error> {
-        const WEB_API_URI: &str = "spotify:web-api";
         let ctx = Context {
             // by providing values for uri/url the player in the official client's isn't frozen
             uri: Some(WEB_API_URI.into()),
@@ -3639,7 +3693,18 @@ mod tests {
     use super::{
         PlayAction, SpircPlayStatus, StatePut, StatePutResult, StatePuts, SuggestionFetch,
         continues_playing, loading_status, pauses_on_drop, play_action,
+        resolvable_transfer_context,
     };
+
+    // SPOTIFYGOOD: see handle_transfer
+    #[test]
+    fn a_transferred_track_list_isnt_resolved() {
+        assert!(!resolvable_transfer_context("spotify:web-api"));
+        assert!(resolvable_transfer_context(
+            "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"
+        ));
+        assert!(resolvable_transfer_context("spotify:album:0"));
+    }
 
     // SPOTIFYGOOD: see loading_status (the vendored player's reopen)
     #[test]
