@@ -34,6 +34,9 @@ use std::time::{Duration, Instant};
 
 const DECORATE: &str = "decorate=revision,length,attributes,timestamp,owner,capabilities";
 const MAX_PAGE: u32 = 500;
+/// Largest window of `catalog.playlistUris` (Spotify's playlist item limit: one request for any
+/// playlist the server answers whole).
+const MAX_URIS_PAGE: u32 = 10_000;
 const ROOTLIST_PAGE: usize = 500;
 const ROOTLIST_MAX_PAGES: usize = 20;
 /// Header requests per `library.playlists` call for rootlist entries without decorations
@@ -317,7 +320,7 @@ pub(crate) fn build_items(
             let uri = item.uri();
             let attrs = &item.attributes;
             let mut out = PlaylistItem {
-                uid: attrs.item_id.as_deref().and_then(|b| (!b.is_empty()).then(|| hex::encode(b))),
+                uid: item_uid(item),
                 added_at: attrs.timestamp.and_then(millis),
                 added_by: attrs.added_by.clone().filter(|a| !a.is_empty()),
                 track: None,
@@ -358,11 +361,7 @@ pub(crate) async fn playlist(args: Value) -> AppResult<Value> {
         page = window(&list.contents.items, list.contents.pos() as u32, a.offset, limit);
     }
     let page = page.unwrap_or_default();
-    let total = list
-        .length
-        .filter(|l| *l >= 0)
-        .map(|l| l as u32)
-        .unwrap_or(list.contents.pos() as u32 + list.contents.items.len() as u32);
+    let total = list_total(&list);
 
     let track_uris: Vec<String> = page.iter().filter_map(|i| parse_kind(i.uri(), UriKind::Track)).map(|p| p.uri()).collect();
     let episode_uris: Vec<String> =
@@ -407,6 +406,74 @@ pub(crate) async fn playlist(args: Value) -> AppResult<Value> {
         is_public,
         partial,
     })
+}
+
+/// The playlist's item count: its `length`, else what the returned window reaches.
+fn list_total(list: &p4::SelectedListContent) -> u32 {
+    list.length
+        .filter(|l| *l >= 0)
+        .map(|l| l as u32)
+        .unwrap_or(list.contents.pos() as u32 + list.contents.items.len() as u32)
+}
+
+// ---------------------------------------------------------------------------------------------
+// catalog.playlistUris
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PlaylistUrisArgs {
+    uri: String,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default = "default_uris_limit")]
+    limit: u32,
+}
+
+fn default_uris_limit() -> u32 {
+    MAX_URIS_PAGE
+}
+
+/// `catalog.playlistUris`: a window of the playlist's items as they are stored — their URIs (keyed
+/// as `catalog.playlist` items are, [`item_uri`]) and uids — with its total and revision, without
+/// any item metadata (an add's "Already added" check, a whole playlist added to another).
+pub(crate) async fn playlist_uris(args: Value) -> AppResult<Value> {
+    let a: PlaylistUrisArgs = parse_args(args)?;
+    let p = parse_kind(&a.uri, UriKind::Playlist).ok_or_else(|| AppError::invalid("not a playlist uri"))?;
+    let limit = a.limit.clamp(1, MAX_URIS_PAGE);
+    let session = engine::session()?;
+    let mut list = fetch_list(&session, &p.id, Some((a.offset, limit))).await?;
+    let mut page = window(&list.contents.items, list.contents.pos() as u32, a.offset, limit);
+    if page.is_none() {
+        // The server answered with a window starting after `offset`: fetch everything.
+        list = fetch_list(&session, &p.id, None).await?;
+        page = window(&list.contents.items, list.contents.pos() as u32, a.offset, limit);
+    }
+    Ok(uris_page(&page.unwrap_or_default(), list_total(&list), revision_hex(list.revision()), a.offset))
+}
+
+/// The `catalog.playlistUris` answer for the window `items` at `offset`.
+fn uris_page(items: &[p4::Item], total: u32, revision: Option<String>, offset: u32) -> Value {
+    let uris: Vec<String> = items.iter().map(item_uri).collect();
+    let uids: Vec<Option<String>> = items.iter().map(item_uid).collect();
+    json!({ "total": total, "revision": revision, "offset": offset, "uris": uris, "uids": uids })
+}
+
+/// An item's URI as [`build_items`] keys it (so it matches the URIs an add sends): tracks and
+/// episodes normalised, local files and anything else as stored.
+pub(crate) fn item_uri(item: &p4::Item) -> String {
+    let uri = item.uri();
+    if uri.starts_with("spotify:local:") {
+        return uri.to_string();
+    }
+    parse_kind(uri, UriKind::Track)
+        .or_else(|| parse_kind(uri, UriKind::Episode))
+        .map(|p| p.uri())
+        .unwrap_or_else(|| uri.to_string())
+}
+
+/// An item's uid (hex), as [`build_items`] gives it.
+fn item_uid(item: &p4::Item) -> Option<String> {
+    item.attributes.item_id.as_deref().and_then(|b| (!b.is_empty()).then(|| hex::encode(b)))
 }
 
 /// Whether a page whose item metadata came from `tracks`/`episodes` is partial (some requests
@@ -1445,6 +1512,45 @@ mod tests {
         assert!(!out[3].track.as_ref().unwrap().playable, "unresolved track placeholder");
         assert!(out[4].track.is_none() && out[4].episode.is_none());
         let _ = gid("4uLU6hMCjMI75M1A2tKUQC");
+    }
+
+    #[test]
+    fn lists_item_uris_without_metadata() {
+        let mut items = Vec::new();
+        for (uri, id) in [
+            ("spotify:track:4uLU6hMCjMI75M1A2tKUQC", Some(vec![0xde, 0xad])),
+            ("spotify:local:Artist+Name:Album:My+Song:215", None),
+            ("spotify:episode:512ojhOuo1ktJprKbVcKyQ", Some(vec![0x01])),
+            ("spotify:unknown-thing:abc", None),
+        ] {
+            let mut item = p4::Item::new();
+            item.set_uri(uri.into());
+            if let Some(id) = id {
+                let mut a = p4::ItemAttributes::new();
+                a.set_item_id(id);
+                item.attributes = MessageField::some(a);
+            }
+            items.push(item);
+        }
+        // A pure mapping of the stored items: no metadata lookups at all.
+        let v = uris_page(&items, 7, Some("ab".into()), 3);
+        assert_eq!(v["total"], 7);
+        assert_eq!(v["offset"], 3);
+        assert_eq!(v["revision"], "ab");
+        let uris: Vec<String> = serde_json::from_value(v["uris"].clone()).unwrap();
+        // Keyed as the metadata pages key their items, so an add's URIs match them.
+        let built = build_items(&items, &HashMap::new(), &HashMap::new());
+        for (uri, item) in uris.iter().zip(&built).take(3) {
+            let key = item
+                .track
+                .as_ref()
+                .map(|t| t.uri.clone())
+                .or_else(|| item.episode.as_ref().map(|e| e.uri.clone()))
+                .unwrap();
+            assert_eq!(uri, &key);
+        }
+        assert_eq!(uris[3], "spotify:unknown-thing:abc");
+        assert_eq!(v["uids"], json!(["dead", null, "01", null]));
     }
 
     #[test]

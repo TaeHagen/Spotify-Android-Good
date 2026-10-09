@@ -11,7 +11,10 @@ import com.taehagen.spotifygood.data.PlaylistAddPlan
 @Immutable
 data class PlaylistAddPrompt(val playlistUri: String, val playlistName: String, val plan: PlaylistAddPlan) {
     /** Some of the items are new: "Add new ones" is offered too. */
-    val offersNewOnes: Boolean get() = plan.fresh.isNotEmpty() && plan.fresh.size < plan.requested.size
+    val offersNewOnes: Boolean get() = plan.checked && plan.fresh.isNotEmpty() && plan.fresh.size < plan.requested.size
+
+    /** The playlist couldn't be checked for them: "Add anyway?" */
+    val unchecked: Boolean get() = !plan.checked
 }
 
 /** What an add sends and says ([playlistAddOutcome]). */
