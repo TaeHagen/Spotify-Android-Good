@@ -535,17 +535,23 @@ fn seek_without_waiting(
 // `download_timeout` each, as long as data comes. Without data it fails after one wait
 // (`Stalled`, a network failure); each probe used to wait `download_timeout` for it. Data that
 // came is progress: a miss at the byte it waited for last (its data came) is none, and fails.
-// There is no count: an MP3 seek reads every frame header from the start of the file (about 5 s
-// of audio per wait), and a cap of 64 waits failed a resume or a transfer a few minutes in.
+// There is no count: an MP3 seek read every frame header from the start of the file (about 5 s
+// of audio per wait; it seeks coarsely now, see SymphoniaDecoder), and a cap of 64 waits failed
+// a resume or a transfer a few minutes in. A load the player no longer wants (`superseded`)
+// stops at once, also in the middle of a wait.
 fn seek_waiting(
     decoder: &mut (impl AudioDecoder + ?Sized),
     source: &impl DataSource,
     position_ms: u32,
     bytes_per_second: usize,
     deadline: Duration,
+    superseded: impl Fn() -> bool,
 ) -> Result<u32, DecoderError> {
     let mut waited_at = None;
     loop {
+        if superseded() {
+            return Err(DecoderError::Stalled("the load was superseded".into()));
+        }
         let at = match seek_without_waiting(decoder, source, position_ms) {
             SeekOutcome::Done(position_ms) => return Ok(position_ms),
             SeekOutcome::Failed(e) => return Err(e),
@@ -563,8 +569,9 @@ fn seek_waiting(
             STALL_WAIT_BYTES,
             deadline,
             &mut requested,
-            || false,
+            &superseded,
         ) {
+            // SPOTIFYGOOD: Interrupted: superseded (the loop's next pass returns)
             Waited::Came | Waited::Interrupted => (),
             Waited::TimedOut => return Err(DecoderError::Stalled("no data in time".into())),
             Waited::Gone => return Err(DecoderError::LoaderGone("the loader is gone".into())),
@@ -1627,9 +1634,19 @@ struct PlayerTrackLoader {
     session: Session,
     config: PlayerConfig,
     local_file_lookup: Arc<LocalFileLookup>,
+    // SPOTIFYGOOD: alive while the player still wants the load (the future PlayerInternal::
+    // load_track returned holds it), see superseded
+    wanted: std::sync::Weak<()>,
 }
 
 impl PlayerTrackLoader {
+    // SPOTIFYGOOD: the player dropped the load (another load or a stop superseded it): its seek
+    // stops waiting for data (see seek_waiting), and the file it drops stops its download. It
+    // went on to the end on its own thread, downloading what the seek needed.
+    fn superseded(&self) -> bool {
+        self.wanted.strong_count() == 0
+    }
+
     async fn find_available_alternative(&self, audio_item: AudioItem) -> Option<AudioItem> {
         if let Err(e) = audio_item.availability {
             error!("Track is unavailable: {e}");
@@ -2039,24 +2056,16 @@ impl PlayerTrackLoader {
             // the cursor may have been moved by parsing normalisation data. This may not
             // matter for playback (but won't hurt either), but may be useful for the
             // passthrough decoder.
-            // SPOTIFYGOOD: a seek that reads the file from its start (MP3: symphonia parses every
-            // frame header up to the target) gets the bytes up to the target requested in one go
-            // (a no-op for a file that is there), so its waits find them on their way: each wait
-            // was one round trip for about 5 s of audio. Ogg bisects, it would fetch what it
-            // never reads.
-            if !is_ogg_vorbis && position_ms > 0 {
-                let target = (u64::from(position_ms) * bytes_per_second as u64 / 1000) as usize;
-                stream_loader_controller
-                    .fetch_range(0, target.saturating_add(read_ahead_bytes(bytes_per_second)));
-            }
             // SPOTIFYGOOD: one bounded wait for each piece of data the seek misses (see
-            // seek_waiting); without data it is the network's failure (see reopen_waits)
+            // seek_waiting), while the load is wanted; without data it is the network's failure
+            // (see reopen_waits)
             let stream_position_ms = match seek_waiting(
                 &mut *decoder,
                 &stream_loader_controller,
                 position_ms,
                 bytes_per_second,
                 AudioFetchParams::get().download_timeout,
+                || self.superseded(),
             ) {
                 Ok(new_position_ms) => new_position_ms,
                 Err(e) => {
@@ -3966,10 +3975,13 @@ impl PlayerInternal {
         // easily. Instead we spawn a thread to do the work and return a one-shot channel as the
         // future to work with.
 
+        // SPOTIFYGOOD: see PlayerTrackLoader::superseded (the future below holds it)
+        let wanted = Arc::new(());
         let loader = PlayerTrackLoader {
             session: self.session.clone(),
             config: self.config.clone(),
             local_file_lookup: self.local_file_lookup.clone(),
+            wanted: Arc::downgrade(&wanted),
         };
 
         let (result_tx, result_rx) = oneshot::channel();
@@ -4006,7 +4018,11 @@ impl PlayerInternal {
 
         // SPOTIFYGOOD: a dropped sender (the loader thread panicked or could not be spawned) is
         // reported as `Other`.
-        result_rx.map(|result| result.unwrap_or(Err(UnavailableReason::Other)))
+        // SPOTIFYGOOD: `wanted` lives as long as the future (see PlayerTrackLoader::superseded)
+        result_rx.map(move |result| {
+            drop(wanted);
+            result.unwrap_or(Err(UnavailableReason::Other))
+        })
     }
 
     // SPOTIFYGOOD: `preload_data_before_playback` (the wait for the data after a seek, on the
@@ -4262,6 +4278,7 @@ where
 mod spotifygood_tests {
     use super::*;
     use crate::decoder::DecoderResult;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn key_retries_cool_down_after_exhaustion() {
@@ -4768,7 +4785,7 @@ mod spotifygood_tests {
             bytes_per_ms: 40,
         };
         assert_eq!(
-            seek_waiting(&mut decoder, &coming, 20_000, 40_000, ms(2_000)).expect("seek"),
+            seek_waiting(&mut decoder, &coming, 20_000, 40_000, ms(2_000), || false).expect("seek"),
             20_000
         );
         assert_eq!(coming.requests.get(), 1);
@@ -4781,7 +4798,7 @@ mod spotifygood_tests {
             bytes_per_ms: 40,
         };
         let started = Instant::now();
-        let e = seek_waiting(&mut decoder, &never, 20_000, 40_000, ms(300)).unwrap_err();
+        let e = seek_waiting(&mut decoder, &never, 20_000, 40_000, ms(300), || false).unwrap_err();
         assert!(e.is_stall(), "{e}");
         assert!(started.elapsed() < ms(1_000));
         assert_eq!(never.requests.get(), 1);
@@ -4794,7 +4811,7 @@ mod spotifygood_tests {
             len: 1_000_000,
             bytes_per_ms: 40,
         };
-        let e = seek_waiting(&mut decoder, &gone, 20_000, 40_000, ms(5_000)).unwrap_err();
+        let e = seek_waiting(&mut decoder, &gone, 20_000, 40_000, ms(5_000), || false).unwrap_err();
         assert!(e.is_loader_gone(), "{e}");
     }
 
@@ -4831,7 +4848,7 @@ mod spotifygood_tests {
             bytes_per_ms: 20,
         };
         assert_eq!(
-            seek_waiting(&mut decoder, &far, 2_400_000, 20_000, ms(300)).expect("seek"),
+            seek_waiting(&mut decoder, &far, 2_400_000, 20_000, ms(300), || false).expect("seek"),
             2_400_000
         );
         assert!(far.requests.get() > 700, "{} waits", far.requests.get());
@@ -4843,10 +4860,10 @@ mod spotifygood_tests {
             file: &stops,
             bytes_per_ms: 20,
         };
-        assert!(seek_waiting(&mut decoder, &stops, 30_000, 20_000, ms(300)).is_ok());
+        assert!(seek_waiting(&mut decoder, &stops, 30_000, 20_000, ms(300), || false).is_ok());
         stops.chunk.set(0);
         let started = Instant::now();
-        let e = seek_waiting(&mut decoder, &stops, 60_000, 20_000, ms(300)).unwrap_err();
+        let e = seek_waiting(&mut decoder, &stops, 60_000, 20_000, ms(300), || false).unwrap_err();
         assert!(e.is_stall(), "{e}");
         assert!(started.elapsed() < ms(1_000));
 
@@ -4864,9 +4881,268 @@ mod spotifygood_tests {
         }
         let comes = FakeSource::new(0, Some(0));
         let started = Instant::now();
-        let e = seek_waiting(&mut Stuck(&comes), &comes, 20_000, 40_000, ms(5_000)).unwrap_err();
+        let e = seek_waiting(
+            &mut Stuck(&comes),
+            &comes,
+            20_000,
+            40_000,
+            ms(5_000),
+            || false,
+        )
+        .unwrap_err();
         assert!(e.is_stall(), "{e}");
         assert!(started.elapsed() < ms(500));
+    }
+
+    // SPOTIFYGOOD: see PlayerTrackLoader::superseded
+    #[test]
+    fn a_load_the_player_dropped_stops_its_seek() {
+        // its data doesn't come; another load supersedes it after 200 ms
+        let never = FakeSource::new(100_000, None);
+        let mut decoder = BisectingDecoder {
+            file: &never,
+            len: 1_000_000,
+            bytes_per_ms: 40,
+        };
+        let superseded = Arc::new(AtomicBool::new(false));
+        let later = superseded.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(ms(200));
+            later.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let e = seek_waiting(&mut decoder, &never, 20_000, 40_000, ms(5_000), || {
+            superseded.load(Ordering::SeqCst)
+        })
+        .unwrap_err();
+        assert!(e.is_stall(), "{e}");
+        let took = started.elapsed();
+        assert!(took >= ms(200) && took < ms(600), "{took:?}");
+        assert_eq!(never.requests.get(), 1);
+    }
+
+    /// A streamed MP3 for a real decoder: its bytes come in chunks of an odd size (the end of
+    /// what is there falls inside a frame), the next one at the byte a request or a look of a
+    /// wait asks for; a fail-fast read of a byte that isn't there misses (as librespot-audio's),
+    /// a read that waits gets it
+    #[derive(Clone)]
+    struct ChunkedFile(Arc<ChunkedShared>);
+
+    struct ChunkedShared {
+        data: Vec<u8>,
+        there: Mutex<Vec<bool>>,
+        chunk: usize,
+        fail_fast: AtomicBool,
+        missed: Mutex<Option<usize>>,
+    }
+
+    impl ChunkedFile {
+        fn new(data: Vec<u8>, there: usize, chunk: usize) -> Self {
+            let mut map = vec![false; data.len()];
+            map[..there.min(data.len())].fill(true);
+            Self(Arc::new(ChunkedShared {
+                data,
+                there: Mutex::new(map),
+                chunk,
+                fail_fast: AtomicBool::new(false),
+                missed: Mutex::new(None),
+            }))
+        }
+
+        /// The next chunk at `at`: from the first byte there isn't at or after it
+        fn bring(&self, at: usize) {
+            let mut there = self.0.there.lock().unwrap();
+            let len = there.len();
+            let Some(start) = (at..len).find(|&i| !there[i]) else {
+                return;
+            };
+            there[start..(start + self.0.chunk).min(len)].fill(true);
+        }
+
+        fn all_there(&self, start: usize, length: usize) -> bool {
+            let there = self.0.there.lock().unwrap();
+            let end = start.saturating_add(length).min(there.len());
+            there[start.min(end)..end].iter().all(|b| *b)
+        }
+
+        fn decoder(&self) -> SymphoniaDecoder {
+            let mut hint = Hint::new();
+            hint.mime_type("audio/mpeg");
+            let reader = ChunkedReader {
+                file: self.clone(),
+                pos: 0,
+            };
+            SymphoniaDecoder::new(reader, hint).expect("an MP3")
+        }
+    }
+
+    struct ChunkedReader {
+        file: ChunkedFile,
+        pos: usize,
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let shared = &self.file.0;
+            if self.pos >= shared.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            if !self.file.all_there(self.pos, 1) {
+                if shared.fail_fast.load(Ordering::SeqCst) {
+                    shared.missed.lock().unwrap().get_or_insert(self.pos);
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "not there"));
+                }
+                self.file.bring(self.pos);
+            }
+            let there = shared.there.lock().unwrap();
+            let n = there[self.pos..]
+                .iter()
+                .take(buf.len())
+                .take_while(|b| **b)
+                .count();
+            buf[..n].copy_from_slice(&shared.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    impl Seek for ChunkedReader {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            let len = self.file.0.data.len() as i64;
+            let pos = match pos {
+                SeekFrom::Start(pos) => pos as i64,
+                SeekFrom::End(delta) => len + delta,
+                SeekFrom::Current(delta) => self.pos as i64 + delta,
+            };
+            self.pos = pos.clamp(0, len) as usize;
+            Ok(self.pos as u64)
+        }
+    }
+
+    impl MediaSource for ChunkedReader {
+        fn is_seekable(&self) -> bool {
+            true
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            Some(self.file.0.data.len() as u64)
+        }
+    }
+
+    impl DataSource for ChunkedFile {
+        fn read_position(&self) -> Option<usize> {
+            Some(0)
+        }
+
+        fn request(&self, start: usize, _length: usize) {
+            self.bring(start);
+        }
+
+        fn available(&self, start: usize, length: usize) -> bool {
+            if !self.all_there(start, length) {
+                self.bring(start);
+            }
+            self.all_there(start, length)
+        }
+
+        fn gone(&self) -> bool {
+            false
+        }
+
+        fn fail_fast(&self, on: bool) {
+            if on {
+                *self.0.missed.lock().unwrap() = None;
+            }
+            self.0.fail_fast.store(on, Ordering::SeqCst);
+        }
+
+        fn missed(&self) -> Option<usize> {
+            *self.0.missed.lock().unwrap()
+        }
+    }
+
+    /// An MP3 of `frames` frames (MPEG-1 Layer III, 128 kbps, 44.1 kHz, stereo, 417 bytes:
+    /// 1152 samples, about 26 ms each) that play silence, with pseudo-random bytes after their
+    /// side information (which the decoder skips, but in which a resync can find false frame
+    /// headers); the first frame is all zero (no Xing tag)
+    fn noisy_mp3(frames: usize) -> Vec<u8> {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut file = Vec::with_capacity(frames * 417);
+        for index in 0..frames {
+            let mut frame = vec![0; 417];
+            frame[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+            if index > 0 {
+                for byte in &mut frame[36..] {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    *byte = (seed >> 32) as u8;
+                }
+            }
+            file.extend_from_slice(&frame);
+        }
+        file
+    }
+
+    /// The position of the frame the decoder is at, as it says (its first packet) and as it is
+    /// (counted back from the end of the file, `frames` frames long)
+    fn said_and_true(decoder: &mut SymphoniaDecoder, frames: usize) -> (u32, u32) {
+        let mut said = None;
+        let mut left = 0;
+        while let Some((position, _)) = decoder.next_packet().expect("a packet") {
+            said.get_or_insert(position.position_ms);
+            left += 1;
+        }
+        let at = (frames - left) as u64;
+        (said.expect("packets"), (at * 1152 * 1000 / 44_100) as u32)
+    }
+
+    // SPOTIFYGOOD: see SymphoniaDecoder's seek (an MP3 seeks coarsely)
+    #[test]
+    fn a_far_mp3_seek_lands_on_its_frame_while_the_data_comes() {
+        const FRAMES: usize = 3_000; // 78 s
+        const FRAME_MS: u32 = 27;
+        let file = noisy_mp3(FRAMES);
+        let lands = |seeked: u32, (said, truth): (u32, u32), target: u32| {
+            assert!(said.abs_diff(truth) <= FRAME_MS, "said {said}, at {truth}");
+            assert!(
+                seeked.abs_diff(truth) <= FRAME_MS,
+                "seeked {seeked}, at {truth}"
+            );
+            assert!(
+                truth <= target && target - truth <= FRAME_MS,
+                "at {truth} for {target}"
+            );
+        };
+
+        // the loader's seek (a resume, a transfer, a reopen): the open brought the first 64 kB,
+        // the rest comes in chunks of 7919 bytes. It missed at the end of each chunk, in the
+        // middle of a frame, lost that frame (seconds over a far seek), and could sync on a
+        // frame body (DecodeError).
+        for target in [61_000, 1_500, 45_123] {
+            let source = ChunkedFile::new(file.clone(), 65_536, 7_919);
+            let mut decoder = source.decoder();
+            let seeked = seek_waiting(&mut decoder, &source, target, 16_000, ms(2_000), || false)
+                .expect("no failure but a stall");
+            lands(seeked, said_and_true(&mut decoder, FRAMES), target);
+        }
+
+        // the player's: a track that plays at 10 s skips to 70 s, past the download (a seek,
+        // then the stall's waits and seeks again)
+        let source = ChunkedFile::new(file.clone(), 65_536, 7_919);
+        let mut decoder = source.decoder();
+        seek_waiting(&mut decoder, &source, 10_000, 16_000, ms(2_000), || false).expect("seek");
+        for _ in 0..20 {
+            decoder.next_packet().expect("a packet");
+        }
+        let seeked = seek_waiting(&mut decoder, &source, 70_000, 16_000, ms(2_000), || false)
+            .expect("no failure but a stall");
+        lands(seeked, said_and_true(&mut decoder, FRAMES), 70_000);
+        // and back to the start (exact, the first frame)
+        let seeked =
+            seek_waiting(&mut decoder, &source, 0, 16_000, ms(2_000), || false).expect("seek");
+        assert_eq!(seeked, 0);
+        assert_eq!(said_and_true(&mut decoder, FRAMES), (0, 0));
     }
 
     // SPOTIFYGOOD: see stall_action
