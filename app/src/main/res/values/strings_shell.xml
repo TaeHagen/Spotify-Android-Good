@@ -68,6 +68,8 @@
     <string name="shell_action_go_to_show">Go to podcast</string>
     <string name="shell_action_view_artist">View artist</string>
     <string name="shell_action_view_episode">View episode</string>
+    <string name="shell_action_mark_played">Mark as played</string>
+    <string name="shell_action_mark_unplayed">Mark as unplayed</string>
     <string name="shell_action_start_radio">Go to radio</string>
     <string name="shell_action_share">Share</string>
     <string name="shell_action_save_to_library">Add to Your Library</string>
@@ -114,6 +116,8 @@
     <string name="shell_msg_removed_from_library">Removed from Your Library</string>
     <string name="shell_msg_saved_episode">Saved to Your Episodes</string>
     <string name="shell_msg_removed_episode">Removed from Your Episodes</string>
+    <string name="shell_msg_marked_played">Marked as played</string>
+    <string name="shell_msg_marked_unplayed">Marked as unplayed</string>
     <string name="shell_msg_following">Following</string>
     <string name="shell_msg_unfollowed">Unfollowed</string>
     <string name="shell_msg_starting_radio">Starting radio…</string>

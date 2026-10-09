@@ -93,7 +93,9 @@ class AppGraph(val app: Application) {
     val resumeStore: ResumeStore by lazy { ResumeStore(app) }
     val player: PlayerController by lazy {
         PlayerController(appScope, rpc, playback, resumeStore, devices).also {
-            it.episodeResume = { uri -> episodeProgress.resumeOrLookUp(uri, { engine.isOnline.value }) { catalog.episodes(listOf(uri)) } }
+            it.episodeResume = { uri, stored ->
+                episodeProgress.resumeOrLookUp(uri, { engine.isOnline.value }, stored) { catalog.episodes(listOf(uri)) }
+            }
         }
     }
     /** Podcast progress made on this phone (docs §6.5); records local episode playback. */
