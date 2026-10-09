@@ -784,8 +784,9 @@ pub(crate) fn clear_restore() {
     restore::clear();
 }
 
-/// The session of the Spirc `generation` goes away without a network, or offline mode was turned
-/// on, while this device plays a downloaded track: the OfflineController takes the playback over
+/// The session of the Spirc `generation` goes away to come back (without a network, or a reconnect
+/// with one: `connector::keep_playing_offline`), or offline mode was turned on, while this device
+/// plays a downloaded (or fully buffered) track: the OfflineController takes the playback over
 /// without a gap instead of a restore point being frozen. Called before the teardown pauses
 /// anything; returns whether it did (docs/ARCHITECTURE.md §4.6).
 pub(crate) fn hand_off_to_offline(generation: u64) -> bool {
