@@ -488,14 +488,7 @@ impl OfflineQueue {
         }
         let from = if self.order.is_empty() { None } else { Some(self.pos) };
         let next = self.next_context_pos(from);
-        // The end of a handed-over window (it would stop, or wrap with repeat-all, as it is now):
-        // online, Spirc goes on with the context after the window, or at its start for a new pass.
-        let wraps = next.is_some_and(|p| from.is_some_and(|f| p <= f));
-        let goes_on = if next.is_none() || wraps {
-            self.continuation.as_ref().or(self.restart.as_ref().filter(|_| wraps)).cloned()
-        } else {
-            None
-        };
+        let goes_on = self.goes_on_after().cloned();
         if let Some(c) = goes_on.as_ref().filter(|_| self.hand_back) {
             return self.back_to_spirc(c, play);
         }
@@ -509,6 +502,30 @@ impl OfflineQueue {
                 self.stop_at_end()
             }
         }
+    }
+
+    /// Where Spirc goes on (online, see [`OfflineQueue::set_hand_back`]) if the queue advances now:
+    /// no user queue comes first, the handed-over window ends here (it would stop, or wrap with
+    /// repeat-all, as it is now), and the context goes on after the window, or at its start for a
+    /// new pass.
+    fn goes_on_after(&self) -> Option<&Continuation> {
+        if !self.queue.is_empty() {
+            return None;
+        }
+        let from = if self.order.is_empty() { None } else { Some(self.pos) };
+        let next = self.next_context_pos(from);
+        let wraps = next.is_some_and(|p| from.is_some_and(|f| p <= f));
+        if next.is_none() || wraps {
+            self.continuation.as_ref().or(self.restart.as_ref().filter(|_| wraps))
+        } else {
+            None
+        }
+    }
+
+    /// The queue itself can go on at its window's end: a user queue, or the window again with
+    /// repeat-all.
+    fn goes_on_here(&self) -> bool {
+        !self.queue.is_empty() || (self.repeat_context && self.next_context_pos(Some(self.pos)).is_some())
     }
 
     /// Spirc goes on with the context at `c` (see [`HandBack`]).
@@ -539,8 +556,13 @@ impl OfflineQueue {
         if !self.active || !self.hand_back || self.status != PlaybackStatus::Stopped {
             return None;
         }
-        let c = self.continuation.clone()?;
         let play = played && now_ms.saturating_sub(ended) < RESUME_PLAYING_MAX_GAP_MS;
+        if self.goes_on_here() {
+            // The user queue first (online it streams), Spirc goes on at its end.
+            self.window_ended = None;
+            return Some(self.advance(false, play, now_ms));
+        }
+        let c = self.continuation.clone()?;
         Some(self.back_to_spirc(&c, play))
     }
 
@@ -567,6 +589,11 @@ impl OfflineQueue {
                 Some(Action::Play)
             }
             PlaybackStatus::Stopped if self.window_ended.is_some() => {
+                if self.goes_on_here() {
+                    // A user queue (added since), or the window again with repeat-all.
+                    self.window_ended = None;
+                    return Some(self.advance(false, true, now_ms));
+                }
                 // At the window's end the context goes on in Spirc, nothing replays the window.
                 match self.continuation.clone().filter(|_| self.hand_back) {
                     Some(c) => Some(self.back_to_spirc(&c, true)),
@@ -1090,7 +1117,8 @@ impl OfflineQueue {
             prev_tracks: self.prev_tracks(),
             restrictions: PlaybackRestrictions {
                 can_skip_prev: has_track,
-                can_skip_next: !next.is_empty(),
+                // (also where a next hands back to Spirc)
+                can_skip_next: !next.is_empty() || (self.hand_back && self.goes_on_after().is_some()),
                 can_seek: has_track,
                 can_toggle_shuffle: true,
                 can_toggle_repeat: true,
@@ -1683,6 +1711,71 @@ mod tests {
         q.adopt(adoption(1, 0), 0);
         q.on_event(Event::EndOfTrack(7), 0);
         assert_eq!(load_uri(&q.play(0)).as_deref(), Some("spotify:track:0"));
+    }
+
+    fn goes_on() -> Continuation {
+        Continuation {
+            context_uri: "spotify:playlist:p".into(),
+            start_uri: Some("spotify:track:next".into()),
+            smart_shuffle: false,
+            order: None,
+            tracks: None,
+        }
+    }
+
+    #[test]
+    fn next_is_offered_where_it_hands_back() {
+        // a streamed song handed over alone: offline nothing comes after it
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.adopt(Adoption { continuation: Some(goes_on()), ..adoption(1, 0) }, 0);
+        assert!(!q.snapshot(dev(), 0).restrictions.can_skip_next);
+        // the session is back: Next hands back to Spirc, so it is offered
+        q.set_hand_back(true);
+        assert!(q.snapshot(dev(), 0).restrictions.can_skip_next);
+        assert!(matches!(q.next(0), Some(Action::HandBack(_))));
+        // repeat-all: offered either way (the window wraps, or a new pass goes on in Spirc)
+        let restart = Continuation { start_uri: None, ..goes_on() };
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.adopt(Adoption { restart: Some(restart), repeat_context: true, ..adoption(2, 1) }, 0);
+        assert!(q.snapshot(dev(), 0).restrictions.can_skip_next);
+        q.set_hand_back(true);
+        assert!(q.snapshot(dev(), 0).restrictions.can_skip_next);
+        // nothing goes on after the window: not offered, also online
+        let mut q = OfflineQueue::default();
+        q.on_event(Event::RequestId(7), 0);
+        q.adopt(adoption(1, 0), 0);
+        q.set_hand_back(true);
+        assert!(!q.snapshot(dev(), 0).restrictions.can_skip_next);
+    }
+
+    #[test]
+    fn at_a_window_that_ended_offline_the_queue_itself_goes_on_first() {
+        let ended = || {
+            let mut q = OfflineQueue::default();
+            q.on_event(Event::RequestId(7), 0);
+            q.adopt(Adoption { continuation: Some(goes_on()), ..adoption(2, 1) }, 0);
+            q.on_event(Event::Playing { id: 7, position_ms: 0 }, 0);
+            assert_eq!(q.on_event(Event::EndOfTrack(7), 1_000).action, Some(Action::Stop));
+            q
+        };
+        // a queued download added since: Play plays it, no notice
+        let mut q = ended();
+        q.add_to_queue("spotify:track:q".into());
+        assert_eq!(load_uri(&q.play(2_000)).as_deref(), Some("spotify:track:q"));
+        assert_eq!(q.snapshot(dev(), 0).last_error, None);
+        // repeat-all turned on since: Play wraps the window
+        let mut q = ended();
+        q.set_repeat(RepeatMode::Context);
+        assert_eq!(load_uri(&q.play(2_000)).as_deref(), Some("spotify:track:0"));
+        // the session back with a user queue: it plays first (online it streams), Spirc after it
+        let mut q = ended();
+        q.add_to_queue("spotify:track:q".into());
+        q.set_hand_back(true);
+        assert_eq!(load_uri(&q.resume_window_end(2_000)).as_deref(), Some("spotify:track:q"));
+        q.on_event(Event::RequestId(8), 2_000);
+        assert!(matches!(q.on_event(Event::EndOfTrack(8), 3_000).action, Some(Action::HandBack(_))));
     }
 
     #[test]

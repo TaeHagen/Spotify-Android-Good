@@ -802,6 +802,8 @@ pub(crate) fn on_player_lost() {
 /// `engine::set_network_available`.
 pub(crate) fn on_network_changed() {
     hub::changed();
+    // (and whether a handed-over window can go back to Spirc)
+    offline::resume_window_end();
 }
 
 /// The engine's session state changed (online / offline …): recompute what is shown.
@@ -810,10 +812,6 @@ pub(crate) fn on_engine_state_changed() {
         metadata::on_online();
         // The first cluster can arrive before the session is declared online.
         offline::yield_to_active_device();
-        if hub::cluster().is_some() {
-            // (not before the first cluster: another device may have taken over)
-            offline::resume_window_end();
-        }
         if hub::spirc().is_none() {
             // Online but hidden from Spotify Connect: nothing to restore into (the engine only
             // restores into a visible Spirc), so the frozen state goes.
@@ -823,6 +821,9 @@ pub(crate) fn on_engine_state_changed() {
         // Offline / stopped: a cluster kept while hidden is stale now.
         hub::drop_stale_cluster();
     }
+    // A handed-over window goes back to Spirc once the session and its first cluster are there
+    // (another device may have taken over meanwhile); offline its Next isn't offered as such.
+    offline::resume_window_end();
     hub::changed();
     hub::publish();
     hub::publish_devices();

@@ -342,7 +342,10 @@ this phone inactive (nothing plays, the app's own resume is the fallback). A win
 before the session is back (no network, no visible session) stops there and keeps where the
 context goes on: once the session and its first cluster are back it hands back by itself
 (playing if it ended playing less than 120 s ago, else paused), and a play hands back too; a
-play while still offline says "Nothing more to play offline" instead of replaying the window.
+play while still offline plays what the queue itself still has (a user queue added since, the
+window again with repeat-all), else says "Nothing more to play offline" instead of replaying the
+window. A user queue at that end plays before the hand-back (also when the session returns).
+While the session is back, Next on the window's last track is offered: it hands back.
 A plain track list (`spotify:web-api`, whose context can't be loaded again) goes on the same way
 as the rest of it Spirc listed after the window (in play order, kept as its shuffled order),
 loaded as a list; a push to another device sends it after the window too.

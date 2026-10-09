@@ -278,14 +278,14 @@ fn hand_back(back: HandBack) -> AppResult<()> {
     }
 }
 
-/// A visible online session is up, and no other device is active (that one's session isn't
-/// taken away): the end of a handed-over window hands back to Spirc.
+/// A visible online session is up with its cluster, and no other device is active (that one's
+/// session isn't taken away): the end of a handed-over window hands back to Spirc.
 fn hand_back_allowed() -> bool {
     let me = hub::me();
     engine::is_online()
         && engine::network_available()
         && hub::spirc().is_some()
-        && hub::active_device_id().is_none_or(|id| id == me)
+        && hub::cluster().is_some_and(|c| c.active_device_id.is_empty() || c.active_device_id == me)
 }
 
 /// The session of the Spirc `generation` goes away without a network (or offline mode was turned
@@ -650,19 +650,20 @@ pub(crate) fn on_player_event(event: &PlayerEvent) {
 
 /// The session is back (a cluster, the engine online): a queue stopped at the end of its window
 /// offline hands back to Spirc after it (see `OfflineQueue::resume_window_end`).
+/// Also keeps the queue's hand-back flag (its Next shown as possible) as the session is now.
 pub(crate) fn resume_window_end() {
-    if !hand_back_allowed() {
-        return;
-    }
-    let action = {
+    let allowed = hand_back_allowed();
+    let (action, active) = {
         let mut q = QUEUE.lock();
-        q.set_hand_back(true);
-        q.resume_window_end(now_ms())
+        q.set_hand_back(allowed);
+        (q.resume_window_end(now_ms()), q.active)
     };
     if let Some(action) = action {
         if let Err(e) = apply(action) {
             log::warn!("offline playback: {e}");
         }
+    }
+    if active {
         hub::publish();
     }
 }
