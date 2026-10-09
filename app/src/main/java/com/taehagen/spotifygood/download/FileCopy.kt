@@ -63,15 +63,15 @@ internal fun copyVerified(
 
 /**
  * Copies [batch] with [copy], one item at a time, and always hands the items copied so far to
- * [switch]: also when a copy stops the batch (no space, an error about the target) or the pass is
- * cancelled, so a verified copy is never thrown away and redone at the next pass. An item whose
- * original is gone ([FileNotFoundException]) is skipped. An item whose original cannot be read
- * ([SourceUnreadableException]: a damaged file) is skipped and handed to [skip] (downloaded again),
- * and the batch goes on, unless [maxConsecutiveSkips] originals in a row cannot be read: that
- * points at the whole card failing, so the batch stops there and those items are tried again
- * later. [onFailed] sees every item that was skipped as unreadable or stopped the batch (not a
- * cancellation). [onDone] runs after each item. What stopped the batch is rethrown after the switch;
- * a failing switch does not hide it.
+ * [switch]: also when a copy stops the batch (no space, an error about the target, the card gone)
+ * or the pass is cancelled, so a verified copy is never thrown away and redone at the next pass.
+ * An item whose original is gone ([FileNotFoundException]) is skipped. An item whose original
+ * cannot be read ([SourceUnreadableException]: a damaged file) is always skipped and handed to
+ * [skip] (downloaded again), and the batch goes on, however many damaged files lie next to each
+ * other (an album in one bad region of the card); it stops only when [cardFailing] says the card
+ * itself is failing ([SourceHealth]), with a [CardFailingException]. [onFailed] sees every item
+ * that was skipped as unreadable or stopped the batch (not a cancellation). [onDone] runs after
+ * each item. What stopped the batch is rethrown after the switch; a failing switch does not hide it.
  */
 internal suspend fun <T> copyThenSwitch(
     batch: List<T>,
@@ -80,12 +80,10 @@ internal suspend fun <T> copyThenSwitch(
     switch: suspend (List<T>) -> Unit,
     skip: suspend (List<T>) -> Unit = {},
     onFailed: (T) -> Unit = {},
-    maxConsecutiveSkips: Int = MAX_CONSECUTIVE_UNREADABLE,
+    cardFailing: () -> Boolean = { false },
 ) {
     val copied = ArrayList<T>(batch.size)
     val skipped = ArrayList<T>()
-    // Unreadable since the last good copy: a damaged file, or the start of a failing card.
-    val run = ArrayList<T>()
     var stop: Throwable? = null
     try {
         for (item in batch) {
@@ -93,18 +91,15 @@ internal suspend fun <T> copyThenSwitch(
             try {
                 copy(item)
                 copied += item
-                skipped += run
-                run.clear()
             } catch (e: FileNotFoundException) {
                 // Removed meanwhile: nothing to move.
             } catch (e: SourceUnreadableException) {
                 onFailed(item)
-                run += item
-                if (run.size >= maxConsecutiveSkips) {
-                    run.clear()
-                    throw e
-                }
+                skipped += item
+                if (cardFailing()) throw CardFailingException(e)
             } catch (e: CancellationException) {
+                throw e
+            } catch (e: CardFailingException) {
                 throw e
             } catch (e: Throwable) {
                 onFailed(item)
@@ -112,7 +107,6 @@ internal suspend fun <T> copyThenSwitch(
             }
             onDone()
         }
-        skipped += run
     } catch (e: Throwable) {
         stop = e
     }
@@ -127,6 +121,40 @@ internal suspend fun <T> copyThenSwitch(
     }
     stop?.let { throw it }
 }
+
+/**
+ * Whether the card the originals are on is failing as a whole, judged from what a move met (the
+ * card being gone or its folder unreadable is checked directly): at least [sample] originals tried
+ * and at least [ratio] of them unreadable. A cluster of damaged files among readable ones (an album
+ * in a bad region) never counts as that. Used by one move pass at a time.
+ */
+internal class SourceHealth(private val sample: Int = CARD_FAILING_SAMPLE, private val ratio: Double = CARD_FAILING_RATIO) {
+    private var tried = 0
+    private var unreadable = 0
+
+    fun copied() {
+        tried++
+    }
+
+    fun unreadable() {
+        tried++
+        unreadable++
+    }
+
+    val failing: Boolean get() = tried >= sample && unreadable >= tried * ratio
+}
+
+/** The card itself is failing ([SourceHealth]): the move stops and resumes later. */
+internal class CardFailingException(cause: IOException) : IOException("The card is failing", cause)
+
+/** The originals' card went (unmounted, removed) or its folder cannot be read: the move waits for it. */
+internal class CardGoneException(message: String, cause: IOException? = null) : IOException(message, cause)
+
+/** Originals a move must try before it may judge the card as failing ([SourceHealth]). */
+internal const val CARD_FAILING_SAMPLE = 20
+
+/** Share of unreadable originals from which a move judges the card as failing ([SourceHealth]). */
+internal const val CARD_FAILING_RATIO = 0.8
 
 /** The original of a move cannot be read (a bad sector, a short read): a damaged download. */
 internal class SourceUnreadableException(val src: File, cause: IOException) : IOException("Could not read ${src.path}", cause)
@@ -143,8 +171,7 @@ private inline fun <T> readingSource(src: File, block: () -> T): T =
         throw SourceUnreadableException(src, e)
     }
 
-/** Unreadable originals in a row after which a move stops (the card itself is failing). */
-internal const val MAX_CONSECUTIVE_UNREADABLE = 3
+
 
 /** Not enough space at [dir] for a copy. */
 internal class NoSpaceException(val dir: File) : IOException("Not enough space in ${dir.path}")

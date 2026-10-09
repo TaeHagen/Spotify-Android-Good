@@ -1415,10 +1415,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   all the same. An original that cannot be read while its card is still there (a bad sector, a
   short read: a damaged download) does not stop the move: it is skipped, its downloads go back into
   the queue and are downloaded fresh to the chosen location (out of the offline index; an
-  unreadable cover is dropped for the CDN image), and Settings says how many. Three unreadable
-  originals in a row stop the move instead (the card itself is failing), as does a card that went.
-  The plan follows a stable order (`addedAt`, uri) with the files that failed before in this
-  process last, so one bad file never holds back the rest. The cover maps and the session
+  unreadable cover is dropped for the CDN image), and Settings says how many, however many damaged
+  files lie next to each other (an album in one bad region). The move stops only on evidence
+  about the card itself: it is no longer mounted or its folder cannot be read (resumes when it is
+  back), or at least 80% of at least 20 originals tried in the pass were unreadable (the card is
+  failing; the unreadable ones are still downloaded again). The plan follows a stable order
+  (`addedAt`, uri); a file whose copy stopped a pass (an error about the target) goes last. A pass
+  that stopped after getting somewhere is tried again after 5 min; a stopped move restarts from its
+  row in Settings > Storage, also for the same location. The cover maps and the session
   artwork follow the moved covers at once.
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
