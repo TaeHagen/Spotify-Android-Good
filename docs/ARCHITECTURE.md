@@ -395,7 +395,9 @@ rule for every load (track lists too, e.g. a stored session resumed or a sorted 
 network, offline mode off and the session not Online (connecting, or a reconnect backoff), it
 plays offline only when its requested start itself is downloaded (or none was asked for);
 otherwise it waits for the session (at most 10 s, also during a backoff) and then fails with
-`UNAVAILABLE` "Not available offline". Smart shuffle is not offered for
+`UNAVAILABLE` "Not available offline". The hand-off to the OfflineController while a reconnect
+is needed with the network up (above) is no load: it keeps the track already playing; a load
+during it follows this rule too. Smart shuffle is not offered for
 `offline:true` snapshots.
 
 ## 5. Events (Rust → Kotlin `onEvent(type, json)`)

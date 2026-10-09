@@ -838,7 +838,8 @@ pub(crate) fn clear_restore() {
 /// with one: `connector::keep_playing_offline`), or offline mode was turned on, while this device
 /// plays a downloaded (or fully buffered) track: the OfflineController takes the playback over
 /// without a gap instead of a restore point being frozen. Called before the teardown pauses
-/// anything; returns whether it did (docs/ARCHITECTURE.md §4.6).
+/// anything; returns whether it did (docs/ARCHITECTURE.md §4.6). It keeps the track already
+/// playing; a new load meanwhile never swaps in another download (see [`Downloads::play_offline`]).
 pub(crate) fn hand_off_to_offline(generation: u64) -> bool {
     offline::take_over(generation)
 }
