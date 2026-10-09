@@ -113,7 +113,8 @@
     <string name="shell_msg_added_n_to_queue">Added %1$d items to queue</string>
     <string name="shell_msg_added_some_to_queue">Added %1$d of %2$d items to queue</string>
     <string name="shell_msg_queue_full">The queue is full</string>
-    <string name="shell_msg_queue_full_added">The queue is full. Added %1$d of %2$d items.</string>
+    <string name="shell_msg_queue_full_added">The queue is full. Added the first %1$d of %2$d items.</string>
+    <string name="shell_msg_list_timed_out">It took too long to load. Try again.</string>
     <string name="shell_msg_liked">Added to Liked Songs</string>
     <string name="shell_msg_unliked">Removed from Liked Songs</string>
     <string name="shell_msg_added_to_playlist">Added to %1$s</string>

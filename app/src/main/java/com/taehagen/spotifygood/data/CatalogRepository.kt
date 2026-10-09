@@ -5,7 +5,6 @@ import com.taehagen.spotifygood.model.Artist
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.MediaRef
 import com.taehagen.spotifygood.model.Playlist
-import com.taehagen.spotifygood.model.PlaylistItem
 import com.taehagen.spotifygood.model.Show
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.model.User
@@ -52,10 +51,6 @@ class CatalogRepository(
     suspend fun playlistPage(uri: String, offset: Int, limit: Int = 100): Playlist =
         rpc.callOffMain("catalog.playlist", rpcArgs { put("uri", uri); put("offset", offset); put("limit", limit) })
 
-    /** All item URIs of a playlist (paged internally), for play-all/shuffle/download. */
-    suspend fun playlistItemUris(uri: String): List<String> =
-        playlistItems(uri, ::playlistPage).mapNotNull { it.uri }.filter(SpotifyUris::isPlayableItem)
-
     /**
      * A window of a playlist's item URIs (and uids) without their metadata
      * (`catalog.playlistUris`): what an add needs, a small fraction of a [playlistPage].
@@ -64,11 +59,12 @@ class CatalogRepository(
         rpc.callOffMain("catalog.playlistUris", rpcArgs { put("uri", uri); put("offset", offset); put("limit", limit) })
 
     /**
-     * A playlist's items to add to another playlist: at most [PLAYLIST_MAX_ITEMS] (no playlist
-     * holds more), URIs only, in a bounded number of requests ([pagePlaylist]).
+     * A playlist's tracks and episodes in order (local files and other entries left out, as the
+     * queue and other playlists can't take them), for a whole-playlist action: "Add to queue",
+     * "Add to other playlist". At most [PLAYLIST_MAX_ITEMS] (no playlist holds more), URIs only
+     * (no item metadata), in a bounded number of small requests ([pagePlaylist]): usually one.
      */
-    suspend fun playlistItemUrisToAdd(uri: String): List<String> =
-        pagePlaylist(uri, ::playlistUrisPage).items.filter(SpotifyUris::isPlayableItem)
+    suspend fun playlistItemUris(uri: String): List<String> = playableItemUris(uri, ::playlistUrisPage)
 
     /**
      * The show's first page. Spotify's played state (resume points) only comes with a fresh answer:
@@ -113,24 +109,6 @@ class CatalogRepository(
     internal companion object {
         /** `catalog.tracks` accepts at most 200 URIs per call (docs §6.3). */
         const val METADATA_BATCH = 200
-
-        /** Pages a playlist with [fetchPage] until `total` (bounded). */
-        suspend fun playlistItems(
-            uri: String,
-            fetchPage: suspend (uri: String, offset: Int, limit: Int) -> Playlist,
-            pageSize: Int = 100,
-        ): List<PlaylistItem> {
-            val items = ArrayList<PlaylistItem>()
-            var offset = 0
-            while (items.size < MAX_PAGED_ITEMS) {
-                val page = fetchPage(uri, offset, pageSize)
-                if (page.items.isEmpty()) break
-                items += page.items
-                offset += page.items.size
-                if (offset >= page.total) break
-            }
-            return items
-        }
     }
 }
 
