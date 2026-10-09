@@ -262,4 +262,77 @@ class SleepTimerTest {
         runCurrent()
         assertEquals(listOf("player.pause"), h.calls)
     }
+
+    private val localPlaying = PlaybackSnapshot(
+        source = PlaybackSource.LOCAL,
+        status = PlaybackStatus.PLAYING,
+        track = PlaybackTrack(uri = "spotify:track:1", uid = "c7"),
+        durationMs = 300_000,
+        positionMs = 100_000,
+    )
+
+    @Test
+    fun anOfflineHandOffOfTheSameTrackKeepsWaiting() = runTest {
+        val h = Harness(this)
+        h.snapshot(localPlaying)
+        runCurrent()
+        h.timer.endOfTrack()
+        runCurrent()
+        // The engine hands the track to the offline queue: a new uid, the same track playing on.
+        h.snapshot(localPlaying.copy(track = localPlaying.track!!.copy(uid = "o0"), positionMs = 100_500))
+        runCurrent()
+        assertTrue(h.calls.isEmpty())
+        assertEquals(SleepTimerState.EndOfTrack, h.timer.state.value)
+        assertEquals(h.now + 300_000 - 100_500 - SleepTimer.END_MARGIN_MS, h.wakeups.scheduled.last())
+    }
+
+    @Test
+    fun aRestoreThatReMakesTheUidKeepsWaiting() = runTest {
+        val h = Harness(this)
+        h.snapshot(localPlaying.copy(track = localPlaying.track!!.copy(uid = "q3")))
+        runCurrent()
+        h.timer.endOfTrack()
+        runCurrent()
+        // A Spirc restore after a reconnect re-creates the queue uids (position a moment back).
+        h.snapshot(localPlaying.copy(track = localPlaying.track!!.copy(uid = "q1"), positionMs = 98_000))
+        runCurrent()
+        assertTrue(h.calls.isEmpty())
+        assertEquals(SleepTimerState.EndOfTrack, h.timer.state.value)
+    }
+
+    @Test
+    fun theSameTrackAgainEndsTheWait() = runTest {
+        val h = Harness(this)
+        h.snapshot(localPlaying)
+        runCurrent()
+        h.timer.endOfTrack()
+        runCurrent()
+        // The track ended and the same uri comes next (queued twice, repeat-one): from the start.
+        h.snapshot(localPlaying.copy(track = localPlaying.track!!.copy(uid = "q1"), positionMs = 0))
+        runCurrent()
+        assertEquals(listOf("player.pause"), h.calls)
+    }
+
+    @Test
+    fun aUidReMadeWhilePausedKeepsTheTimer() = runTest {
+        val h = Harness(this)
+        h.snapshot(localPlaying)
+        runCurrent()
+        h.timer.endOfTrack()
+        runCurrent()
+        // Paused, and meanwhile handed to the offline queue.
+        h.snapshot(localPlaying.copy(status = PlaybackStatus.PAUSED, track = localPlaying.track!!.copy(uid = "o0"), positionMs = 120_000))
+        runCurrent()
+        assertTrue(h.calls.isEmpty())
+        assertEquals(SleepTimerState.EndOfTrack, h.timer.state.value)
+        // Playing on: armed for its end again.
+        h.snapshot(localPlaying.copy(track = localPlaying.track!!.copy(uid = "o0"), positionMs = 120_000))
+        runCurrent()
+        assertTrue(h.calls.isEmpty())
+        assertEquals(h.now + 300_000 - 120_000 - SleepTimer.END_MARGIN_MS, h.wakeups.scheduled.last())
+        // Another track: the end came.
+        h.snapshot(localPlaying.copy(track = PlaybackTrack(uri = "spotify:track:2", uid = "o1"), positionMs = 0))
+        runCurrent()
+        assertEquals(listOf("player.pause"), h.calls)
+    }
 }
