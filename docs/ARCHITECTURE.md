@@ -1402,8 +1402,15 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   renamed, then the rows and the offline index (`offline.add`, numbered) switched to the copy, then
   the original deleted. Every step is resumable: an interrupted move leaves the original in use or
   both copies with the rows on one of them, and the next pass (start, mount, change) carries on;
-  the files copied before a stop (no space, an I/O error) are switched all the same. The cover
-  maps and the session artwork follow the moved covers at once.
+  the files copied before a stop (no space, an error about the target, a cancellation) are switched
+  all the same. An original that cannot be read while its card is still there (a bad sector, a
+  short read: a damaged download) does not stop the move: it is skipped, its downloads go back into
+  the queue and are downloaded fresh to the chosen location (out of the offline index; an
+  unreadable cover is dropped for the CDN image), and Settings says how many. Three unreadable
+  originals in a row stop the move instead (the card itself is failing), as does a card that went.
+  The plan follows a stable order (`addedAt`, uri) with the files that failed before in this
+  process last, so one bad file never holds back the rest. The cover maps and the session
+  artwork follow the moved covers at once.
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
 * A card that is removed or unmounted (the system's media broadcasts): its downloads stay COMPLETED

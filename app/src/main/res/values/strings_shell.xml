@@ -272,6 +272,8 @@
     <string name="shell_settings_download_moving">Moving downloads</string>
     <string name="shell_settings_download_moving_summary">%1$d of %2$d files moved</string>
     <string name="shell_settings_download_move_stopped">Moving downloads stopped</string>
+    <string name="shell_settings_download_moved">Downloads moved</string>
+    <string name="shell_settings_download_move_unreadable">%1$d downloads couldn\'t be read from the old location and are downloaded again</string>
     <string name="shell_settings_unused_card">Downloads on an SD card no longer used</string>
     <string name="shell_settings_unused_card_summary">%1$d items. Tap to download them again to the current location.</string>
     <string name="shell_settings_unused_card_started">Downloading them again</string>

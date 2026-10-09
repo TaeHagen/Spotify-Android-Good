@@ -140,6 +140,108 @@ class SdCardFollowUpsTest {
         assertTrue(stop!!.suppressed.single() is IllegalStateException)
     }
 
+    // ---- a damaged file on the old card ------------------------------------------------------------------
+
+    private fun unreadable(name: String) = SourceUnreadableException(File(name), IOException("EIO"))
+
+    @Test
+    fun aDamagedOriginalIsSkippedAndTheMoveGoesOn() = runTest {
+        val switched = ArrayList<String>()
+        val skipped = ArrayList<String>()
+        val failed = ArrayList<String>()
+        copyThenSwitch(
+            listOf("a", "bad", "c", "d"),
+            copy = { item -> if (item == "bad") throw unreadable(item) },
+            onDone = {},
+            switch = { switched += it },
+            skip = { skipped += it },
+            onFailed = { failed += it },
+        )
+        assertEquals("the files after it are still moved", listOf("a", "c", "d"), switched)
+        assertEquals("downloaded again", listOf("bad"), skipped)
+        assertEquals(listOf("bad"), failed)
+    }
+
+    @Test
+    fun anErrorAboutTheTargetStillStopsTheBatch() = runTest {
+        val switched = ArrayList<String>()
+        val skipped = ArrayList<String>()
+        val failed = ArrayList<String>()
+        val stop = runCatching {
+            copyThenSwitch(
+                listOf("a", "b", "c"),
+                copy = { item -> if (item == "b") throw IOException("target write failed") },
+                onDone = {},
+                switch = { switched += it },
+                skip = { skipped += it },
+                onFailed = { failed += it },
+            )
+        }.exceptionOrNull()
+        assertEquals("target write failed", stop?.message)
+        assertEquals(listOf("a"), switched)
+        assertEquals(emptyList<String>(), skipped)
+        assertEquals("moved last at the next pass", listOf("b"), failed)
+    }
+
+    @Test
+    fun aRunOfUnreadableOriginalsStopsTheMove() = runTest {
+        val switched = ArrayList<String>()
+        val skipped = ArrayList<String>()
+        val stop = runCatching {
+            copyThenSwitch(
+                listOf("a", "x1", "b", "y1", "y2", "y3", "c"),
+                copy = { item -> if (item.startsWith("x") || item.startsWith("y")) throw unreadable(item) },
+                onDone = {},
+                switch = { switched += it },
+                skip = { skipped += it },
+                maxConsecutiveSkips = 3,
+            )
+        }.exceptionOrNull()
+        // The card itself is failing: stopped, and the run is tried again later (not re-downloaded).
+        assertTrue(stop is SourceUnreadableException)
+        assertEquals(listOf("a", "b"), switched)
+        assertEquals("a lone damaged file before a good one is still skipped", listOf("x1"), skipped)
+    }
+
+    @Test
+    fun readErrorsOfTheOriginalAreToldApartFromTargetErrors() {
+        val src = File(base, "card/audio/${"cd".repeat(20)}").apply {
+            parentFile!!.mkdirs()
+            writeBytes(ByteArray(100_000) { it.toByte() })
+        }
+        val dst = File(base, "internal/audio/${src.name}")
+        val failing: (File) -> java.io.InputStream = { file ->
+            object : java.io.FilterInputStream(java.io.FileInputStream(file)) {
+                private var reads = 0
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    if (++reads > 1) throw IOException("EIO")
+                    return super.read(b, off, minOf(len, 1_000))
+                }
+            }
+        }
+        val bad = runCatching { copyVerified(src, dst, { Long.MAX_VALUE }, 0, failing) }.exceptionOrNull()
+        assertTrue(bad is SourceUnreadableException)
+        assertFalse(dst.exists())
+        assertFalse(File(dst.path + TMP_SUFFIX).exists())
+
+        // A short read (the original ends early) is the original's fault too.
+        val short: (File) -> java.io.InputStream = { file -> java.io.ByteArrayInputStream(file.readBytes().copyOf(10)) }
+        assertTrue(runCatching { copyVerified(src, dst, { Long.MAX_VALUE }, 0, short) }.exceptionOrNull() is SourceUnreadableException)
+
+        // The target: its folder cannot be made.
+        File(base, "blocked").writeText("a file, not a folder")
+        val targetError = runCatching { copyVerified(src, File(base, "blocked/audio/${src.name}"), { Long.MAX_VALUE }, 0) }.exceptionOrNull()
+        assertTrue(targetError is IOException && targetError !is SourceUnreadableException)
+    }
+
+    @Test
+    fun filesThatFailedBeforeAreMovedLast() {
+        val plan = listOf("a", "b", "c", "d").map { DownloadRules.FileMove("/card/audio/$it", "/internal/audio/$it", image = false) }
+        val ordered = DownloadRules.orderPlan(plan, setOf("/card/audio/b"))
+        assertEquals(listOf("a", "c", "d", "b"), ordered.map { File(it.from).name })
+        assertEquals(plan, DownloadRules.orderPlan(plan, emptySet()))
+    }
+
     // ---- runs with a missing or full card ---------------------------------------------------------------
 
     @Test
