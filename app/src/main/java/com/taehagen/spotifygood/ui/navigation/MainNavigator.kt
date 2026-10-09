@@ -33,6 +33,7 @@ import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.MediaRef
 import com.taehagen.spotifygood.model.MediaType
+import com.taehagen.spotifygood.ui.components.PlaylistAddPrompt
 import com.taehagen.spotifygood.ui.screens.library.launchTrackStart
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -67,6 +68,7 @@ class MainNavigator internal constructor(
     sleepTimerState: MutableState<Boolean>,
     actionTargetState: MutableState<MediaActionTarget?>,
     addToPlaylistState: MutableState<List<String>?>,
+    addToPlaylistExcludeState: MutableState<String?>,
 ) : AppNavigator {
     var isNowPlayingOpen: Boolean by nowPlayingState
         private set
@@ -84,6 +86,12 @@ class MainNavigator internal constructor(
     var actionTarget: MediaActionTarget? by actionTargetState
         private set
     var addToPlaylistUris: List<String>? by addToPlaylistState
+        private set
+    /** A playlist the picker doesn't offer (the one the items come from). */
+    var addToPlaylistExclude: String? by addToPlaylistExcludeState
+        private set
+    /** "Already added", waiting for the user (not saved: a recreated activity drops the question). */
+    var playlistAddPrompt: PlaylistAddPrompt? by mutableStateOf(null)
         private set
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 16)
@@ -170,11 +178,14 @@ class MainNavigator internal constructor(
 
     override fun showActions(target: MediaActionTarget) = onMain { actionTarget = target }
 
-    override fun addToPlaylist(uris: List<String>) = onMain {
+    override fun addToPlaylist(uris: List<String>, excludeUri: String?) = onMain {
         if (uris.isEmpty()) return@onMain
         actionTarget = null
+        addToPlaylistExclude = excludeUri
         addToPlaylistUris = uris
     }
+
+    override fun confirmPlaylistAdd(prompt: PlaylistAddPrompt) = onMain { playlistAddPrompt = prompt }
 
     override fun showMessage(message: String) {
         _messages.tryEmit(message)
@@ -187,7 +198,11 @@ class MainNavigator internal constructor(
     fun dismissDevices() = onMain { isDevicesOpen = false }
     fun dismissSleepTimer() = onMain { isSleepTimerOpen = false }
     fun dismissActions() = onMain { actionTarget = null }
-    fun dismissAddToPlaylist() = onMain { addToPlaylistUris = null }
+    fun dismissAddToPlaylist() = onMain {
+        addToPlaylistUris = null
+        addToPlaylistExclude = null
+    }
+    fun dismissPlaylistAddPrompt() = onMain { playlistAddPrompt = null }
     fun closeQueue() = onMain { isQueueOpen = false }
     fun closeLyrics() = onMain { isLyricsOpen = false }
 
@@ -273,8 +288,9 @@ fun rememberMainNavigator(navController: NavHostController): MainNavigator {
     val sleepTimer = rememberSaveable { mutableStateOf(false) }
     val actionTarget = rememberSaveable(stateSaver = ActionTargetSaver) { mutableStateOf<MediaActionTarget?>(null) }
     val addToPlaylist = rememberSaveable(stateSaver = UriListSaver) { mutableStateOf<List<String>?>(null) }
+    val addToPlaylistExclude = rememberSaveable { mutableStateOf<String?>(null) }
     return remember(navController) {
-        MainNavigator(navController, graph, nowPlaying, queue, lyrics, devices, sleepTimer, actionTarget, addToPlaylist)
+        MainNavigator(navController, graph, nowPlaying, queue, lyrics, devices, sleepTimer, actionTarget, addToPlaylist, addToPlaylistExclude)
     }
 }
 
@@ -313,7 +329,8 @@ internal val ActionTargetSaver: Saver<MediaActionTarget?, String> = Saver(
 
 /** URI lists as a bundle-safe ArrayList (the list's own runtime type may not be). */
 internal val UriListSaver: Saver<List<String>?, ArrayList<String>> = Saver(
-    save = { uris -> uris?.let { ArrayList(it) } },
+    // A whole playlist's items can be too large for the saved state: then the picker closes.
+    save = { uris -> uris?.takeIf { list -> list.sumOf { it.length } <= MAX_SAVED_TARGET_CHARS }?.let { ArrayList(it) } },
     restore = { it },
 )
 

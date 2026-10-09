@@ -1477,7 +1477,13 @@ refetched twice while on screen (after 15 s and 30 s). The home feed is treated 
 when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
-app scope, so they complete even if their screen closes. Saved/liked state is cached in
+app scope, so they complete even if their screen closes. "Add to playlist" (a song, an episode,
+an album's tracks, another playlist's items — "Add to other playlist") lists the playlist picked
+first (`catalog.playlist` pages of 500, at most 41 requests; a source playlist the same way, at
+most 10,000 items): items already in it get Spotify's "Already added" question (one item, or
+none new: Add anyway / Don't add; some new: Add new ones / Add anyway / Cancel), and an add
+stops at a playlist's 10,000-item limit, the snackbar saying how many went in. When the listing
+fails, everything is added as asked. Saved/liked state is cached in
 memory (LRU) and looked up via `library.contains` (batched). It is unknown until looked up: a
 failed lookup (offline, the session still connecting, a network error) stays unknown, never
 "not saved", and is looked up again when the session comes online (with backoff if it fails
