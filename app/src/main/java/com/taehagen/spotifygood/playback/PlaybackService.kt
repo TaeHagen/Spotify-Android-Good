@@ -655,6 +655,13 @@ class PlaybackService : MediaLibraryService() {
             session?.let { onUpdateNotificationAsync(it, false) }
             return
         }
+        if (coordinator.isAppInForeground || presence.isForeground) {
+            // The visible app (or presence's own connectedDevice foreground) keeps the process:
+            // the audio goes on, and Media3 asks for the foreground again on its next update.
+            // Pausing here would stop a play the user just started in the app.
+            Log.w(TAG, "Media foreground refused while the app is visible or presence is up; playing on")
+            return
+        }
         Log.w(TAG, "Foreground service start not allowed; asking the user to resume")
         // Local audio never plays without the media foreground service: pause (Connect sees it).
         coordinator.refuseBackgroundPlayback()

@@ -1224,18 +1224,27 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   notification (Stop action), so remote "play on this phone" works. Uses
   `onUpdateNotificationAsync` override as described in research; off by default because of
   the battery cost (~2 radio wake-ups per minute). Started while the app is visible (FGS start
-  rules), and restored after a reboot (`BOOT_COMPLETED`, after the first unlock: the
-  credentials and settings are in credential-encrypted storage, so `LOCKED_BOOT_COMPLETED` is
-  not used) and an app update (`MY_PACKAGE_REPLACED`) by the non-exported
+  rules), and restored after an app update (`MY_PACKAGE_REPLACED`) and, up to Android 14, a
+  reboot (`BOOT_COMPLETED`, after the first unlock: the credentials and settings are in
+  credential-encrypted storage, so `LOCKED_BOOT_COMPLETED` is not used) by the non-exported
   `PresenceRestoreReceiver` (`PresenceRestore`): both broadcasts exempt the app from the
-  background FGS-start ban, and `connectedDevice` is allowed from boot also on Android 15 (which
-  refuses `mediaPlayback` and `dataSync` there). It reads the setting and the stored login
+  background FGS-start ban. Not from boot on Android 15+: a service started from
+  `BOOT_COMPLETED` keeps that start reason on its record for as long as it stays in the
+  foreground (only leaving the foreground resets it), and every later `startForeground` of it is
+  checked against the boot allowlist of types (`connectedDevice` passes, `mediaPlayback` does
+  not); presence keeps the service in the foreground, so Media3's media foreground would be
+  refused for good. There the "open the app" notification below is posted instead, and opening
+  the app starts presence with the app's own start reason (`MY_PACKAGE_REPLACED` records a reason
+  of its own, which that check does not restrict). It reads the setting and the stored login
   (bounded, inside the broadcast; nothing held awake) and starts the service with
   `startForegroundService` (`EXTRA_FOREGROUND_START`: the service meets that contract as
   `connectedDevice` even when presence cannot come up). A refused start (a restricted app, OEM
   limits), or a login not read in time, posts one "Open SpotifyGood to stay available for
   Spotify Connect" notification (tap: the app), gone once presence is up again; presence then
-  waits for the app to be visible, as before.
+  waits for the app to be visible, as before. A media foreground the system refuses
+  (`onForegroundStartNotAllowed`) pauses local playback with "Tap to resume" only when neither
+  the app is visible nor presence keeps the service in the foreground: then the process stays,
+  the audio plays on and Media3 asks again on its next update.
 * Audio focus (`AudioFocusController`, AudioManagerCompat): requested when local playback
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
@@ -1584,7 +1593,7 @@ error while ONLINE: after the next reconnect).
 | Paused ≥ 10 min, app background | hidden and stopped when the service lets go (other releases: hidden after 20 s, stopped after 60 s, both wall time) | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
-| Presence opt-in, idle (also restored after a reboot or an app update) | Online | yes | connectedDevice (low-importance) | none |
+| Presence opt-in, idle (also restored after an app update, and after a reboot up to Android 14; from Android 15 a notification asks to open the app) | Online | yes | connectedDevice (low-importance) | none |
 | Nothing | stopped | no | none | none |
 
 ## 11. Feature checklist
