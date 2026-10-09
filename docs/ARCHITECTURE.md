@@ -1211,7 +1211,19 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   foreground as `connectedDevice` with a low-importance "Available on Spotify Connect"
   notification (Stop action), so remote "play on this phone" works. Uses
   `onUpdateNotificationAsync` override as described in research; off by default because of
-  the battery cost (~2 radio wake-ups per minute).
+  the battery cost (~2 radio wake-ups per minute). Started while the app is visible (FGS start
+  rules), and restored after a reboot (`BOOT_COMPLETED`, after the first unlock: the
+  credentials and settings are in credential-encrypted storage, so `LOCKED_BOOT_COMPLETED` is
+  not used) and an app update (`MY_PACKAGE_REPLACED`) by the non-exported
+  `PresenceRestoreReceiver` (`PresenceRestore`): both broadcasts exempt the app from the
+  background FGS-start ban, and `connectedDevice` is allowed from boot also on Android 15 (which
+  refuses `mediaPlayback` and `dataSync` there). It reads the setting and the stored login
+  (bounded, inside the broadcast; nothing held awake) and starts the service with
+  `startForegroundService` (`EXTRA_FOREGROUND_START`: the service meets that contract as
+  `connectedDevice` even when presence cannot come up). A refused start (a restricted app, OEM
+  limits), or a login not read in time, posts one "Open SpotifyGood to stay available for
+  Spotify Connect" notification (tap: the app), gone once presence is up again; presence then
+  waits for the app to be visible, as before.
 * Audio focus (`AudioFocusController`, AudioManagerCompat): requested when local playback
   starts (status playing, source local), abandoned on stop/pause timeout. LOSS → pause;
   LOSS_TRANSIENT → pause + resume on GAIN (if within 10 min); CAN_DUCK → AudioTrack volume
@@ -1556,7 +1568,7 @@ error while ONLINE: after the next reconnect).
 | Paused ≥ 10 min, app background | hidden and stopped when the service lets go (other releases: hidden after 20 s, stopped after 60 s, both wall time) | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
-| Presence opt-in, idle | Online | yes | connectedDevice (low-importance) | none |
+| Presence opt-in, idle (also restored after a reboot or an app update) | Online | yes | connectedDevice (low-importance) | none |
 | Nothing | stopped | no | none | none |
 
 ## 11. Feature checklist
