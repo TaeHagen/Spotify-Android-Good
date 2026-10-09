@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.connect
 
 import android.os.SystemClock
+import com.taehagen.spotifygood.data.StoredPosition
 import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
@@ -41,6 +42,7 @@ class DevicesRepository(
     clock: () -> Long = SystemClock::elapsedRealtime,
 ) {
     private val _devices = MutableStateFlow(events.devices.value)
+    private val playback: StateFlow<PlaybackSnapshot> = events.playback
 
     /** Latest device list: the latest `devices` event. */
     val devices: StateFlow<DeviceList> = _devices.asStateFlow()
@@ -61,6 +63,14 @@ class DevicesRepository(
      * app is visible. Installed by the playback coordinator.
      */
     @Volatile var onTransferToThisDevice: (() -> Unit)? = null
+
+    /**
+     * Where a play of an episode starts ([com.taehagen.spotifygood.playback.PlayerController.episodeResume]):
+     * a transfer that starts the [lastSession] on a device starts its episode at the same point as
+     * a play of it here (the stored position only when newer, after a bounded lookup when Spotify
+     * may know better; docs §6.5). Installed by the app graph.
+     */
+    @Volatile var episodeResume: (suspend (episodeUri: String, stored: StoredPosition?) -> Long?)? = null
 
     init {
         scope.launch {
@@ -118,7 +128,12 @@ class DevicesRepository(
             onTransferToThisDevice?.invoke()
         }
         // Sent whether or not the (possibly stale) list shows an active device: the engine decides.
-        val args = transferArgs(deviceId, play, lastSession())
+        val session = lastSession()?.let { last ->
+            // The engine starts it only when nothing is loaded: an ordinary transfer waits for no lookup.
+            val resolve = episodeResume
+            if (resolve != null && resumeMayStart(playback.value)) withEpisodeStart(last, resolve) else last
+        }
+        val args = transferArgs(deviceId, play, session)
         try {
             rpc.callUnit("connect.transfer", args)
         } catch (e: NativeException) {
@@ -143,6 +158,25 @@ class DevicesRepository(
     internal companion object {
         /** The longest wait of the expiry timer between two looks at the clock. */
         const val EXPIRY_CHECK_MS = 15_000L
+
+        /**
+         * Whether a transfer may start the stored session (the engine's rule, §6.2: nothing is
+         * active, or this phone is with nothing loaded): nothing plays or is paused anywhere.
+         */
+        fun resumeMayStart(snapshot: PlaybackSnapshot): Boolean = !snapshot.isActive
+
+        /**
+         * [state] with its episode starting where a play of it does ([resumeOf]: the store's
+         * decision, which weighs the stored position by [ResumeState.positionAt]; 0: of unknown
+         * age); music, and a session the decision leaves alone, as stored.
+         */
+        suspend fun withEpisodeStart(state: ResumeState, resumeOf: suspend (String, StoredPosition?) -> Long?): ResumeState {
+            if (!state.trackUri.startsWith("spotify:episode:")) return state
+            // A stored 0 names no position (as a play naming none).
+            val stored = state.positionMs.takeIf { it > 0 }?.let { StoredPosition(it, state.positionAt ?: 0) }
+            val position = resumeOf(state.trackUri, stored) ?: return state
+            return state.copy(positionMs = position.coerceAtLeast(0))
+        }
 
         /**
          * [id] is a listed Connect device other than this phone, with a name: the same rule as the

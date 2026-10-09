@@ -63,7 +63,7 @@ internal object ResumeSaver {
             a.loggedOut == b.loggedOut && a.handedOver == b.handedOver && sameSession(a.session, b.session)
         }
         .transformLatest { input ->
-            fun stateOf(s: PlaybackSnapshot) = ResumeState.from(s, s.positionAt(now()))
+            fun stateOf(s: PlaybackSnapshot) = now().let { t -> ResumeState.from(s, s.positionAt(t), t) }
             val session = input.session
             when {
                 input.loggedOut -> emit(Action.Clear)

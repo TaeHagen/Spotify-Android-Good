@@ -10,6 +10,7 @@ import com.taehagen.spotifygood.model.PlaylistRef
 import com.taehagen.spotifygood.model.SearchResults
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import com.taehagen.spotifygood.ui.screens.library.NowPlaying
 import com.taehagen.spotifygood.ui.screens.library.debouncedInput
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.toList
@@ -164,5 +165,30 @@ class SearchLogicTest {
         assertNull(cache["b"])
         assertEquals(1, cache["a"])
         assertEquals(3, cache["c"])
+    }
+
+    @Test
+    fun theTopResultsPlayButtonTogglesWhatPlaysOrIsPaused() {
+        val album = MediaRef(MediaType.ALBUM, "spotify:album:ok", "OK Computer")
+        val playingAlbum = NowPlaying(trackUri = "spotify:track:4", contextUri = album.uri, isPlaying = true)
+        assertEquals(TopPlay.Toggle, topPlay(album, null, playingAlbum))
+        assertEquals("paused: Play resumes it", TopPlay.Toggle, topPlay(album, null, playingAlbum.copy(isPlaying = false)))
+        assertEquals(TopPlay.ContextByUri(album.uri), topPlay(album, null, NowPlaying()))
+        assertEquals(TopPlay.ContextByUri(album.uri), topPlay(album, null, playingAlbum.copy(contextUri = "spotify:album:other")))
+        // A playlist playing under its user form is the same context.
+        val playlist = MediaRef(MediaType.PLAYLIST, "spotify:playlist:p", "P")
+        assertEquals(TopPlay.Toggle, topPlay(playlist, null, NowPlaying("spotify:track:1", "spotify:user:u:playlist:p", true)))
+        // A song: the track playing, in whatever context; else it starts in its album.
+        val song = SearchItem.Song(track)
+        val songRef = MediaRef(MediaType.TRACK, track.uri, track.name)
+        assertEquals(TopPlay.Toggle, topPlay(songRef, song, NowPlaying(track.uri, "spotify:playlist:x", true)))
+        assertEquals(TopPlay.SongInAlbum(track), topPlay(songRef, song, NowPlaying("spotify:track:other", track.uri, true)))
+        assertEquals(TopPlay.SongByUri(track.uri), topPlay(songRef, null, NowPlaying()))
+        // An episode.
+        val episode = MediaRef(MediaType.EPISODE, "spotify:episode:e", "E")
+        assertEquals(TopPlay.Toggle, topPlay(episode, null, NowPlaying("spotify:episode:e", "spotify:show:s", false)))
+        assertEquals(TopPlay.EpisodeByUri(episode.uri), topPlay(episode, null, NowPlaying()))
+        // Unplayable: nothing at all.
+        assertNull(topPlay(songRef, SearchItem.Song(track.copy(playable = false)), NowPlaying(track.uri, null, true)))
     }
 }

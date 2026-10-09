@@ -314,8 +314,8 @@ private fun TopResults(
                                         { onPlayTop(ref, sections) }
                                     },
                                     unavailable = !playable,
-                                    isPlaying = state.nowPlaying.isPlaying &&
-                                        (state.nowPlaying.contextUri == ref.uri || state.nowPlaying.trackUri == ref.uri),
+                                    // The same test as its toggle (SearchViewModel.playTop).
+                                    isPlaying = state.nowPlaying.isPlaying && state.nowPlaying.isTop(ref),
                                     modifier = Modifier.padding(top = 8.dp),
                                 )
                             }

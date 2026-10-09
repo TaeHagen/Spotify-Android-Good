@@ -467,6 +467,14 @@ internal class EpisodeViewModel(graph: AppGraph, private val uri: String) : Deta
         graph.player.play(request)
     }
 
+    /** "Mark as played" / "Mark as unplayed": this phone's newest point (docs §6.5). */
+    fun togglePlayed() {
+        // Overlaid: this phone's point, else Spotify's state of the page.
+        val played = state.value.load.dataOrNull()?.episode?.fullyPlayed == true
+        graph.episodeProgress.markPlayed(uri, played = !played)
+        message(if (played) R.string.shell_msg_marked_unplayed else R.string.shell_msg_marked_played)
+    }
+
     fun toggleSaved() {
         toggleSaved(
             saved = state.value.saved,

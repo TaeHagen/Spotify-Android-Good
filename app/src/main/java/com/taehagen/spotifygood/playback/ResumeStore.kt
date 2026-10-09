@@ -49,6 +49,13 @@ data class ResumeState(
      * stored by older versions, which did not record it).
      */
     val trackUris: List<String>? = null,
+    /**
+     * When [positionMs] dates from (wall time): the save's time while the session played, the
+     * snapshot's position timestamp when it was paused (a remote device sitting paused for hours
+     * keeps its old one); null when unknown (states stored by older versions). An episode's resume
+     * point newer than it wins over it ([PlayRequest.positionAt]).
+     */
+    val positionAt: Long? = null,
 ) {
     /** [trackUris] when usable (it starts with [trackUri]). */
     private val trackList: List<String>?
@@ -84,6 +91,7 @@ data class ResumeState(
             startIndex = if (list != null) 0 else null,
             positionMs = positionMs,
             play = true,
+            positionAt = positionAt ?: 0,
         )
         return resumeLoad.applyModes(request)
     }
@@ -98,6 +106,7 @@ data class ResumeState(
                 shuffle = !ordered && (shuffle || smartShuffle),
                 smartShuffle = !ordered && smartShuffle,
                 repeat = if (isEpisode) RepeatMode.OFF else repeat,
+                positionAt = positionAt ?: 0,
             )
         }
 
@@ -105,8 +114,12 @@ data class ResumeState(
         /** Longest stored track list (like the engine's hand-over window). */
         const val RESUME_TRACKS = 50
 
-        /** Resume state of a local snapshot at [positionMs]; null if nothing is loaded. */
-        fun from(snapshot: PlaybackSnapshot, positionMs: Long = snapshot.positionAt()): ResumeState? {
+        /** Resume state of a local snapshot at [positionMs] at [nowMs]; null if nothing is loaded. */
+        fun from(
+            snapshot: PlaybackSnapshot,
+            positionMs: Long = snapshot.positionAt(),
+            nowMs: Long = System.currentTimeMillis(),
+        ): ResumeState? {
             val track = snapshot.track ?: return null
             val context = snapshot.context?.uri?.takeIf { it.isNotBlank() }
             val inContext = track.provider == TrackProvider.CONTEXT && context != null &&
@@ -125,6 +138,7 @@ data class ResumeState(
                 smartShuffle = snapshot.smartShuffle,
                 repeat = snapshot.repeat,
                 trackUris = if (inContext) null else trackList(track, snapshot),
+                positionAt = if (snapshot.isPlaying) nowMs else snapshot.positionTimestampMs.takeIf { it > 0 },
             )
         }
 
@@ -176,14 +190,16 @@ data class ResumeState(
 }
 
 /**
- * The load form of a resume item ([ResumeState.resumeLoad]): the modes, and the track list of the
- * track-list form (null: the item's own media id says what to load).
+ * The load form of a resume item ([ResumeState.resumeLoad]): the modes, the track list of the
+ * track-list form (null: the item's own media id says what to load), and when the stored position
+ * dates from ([ResumeState.positionAt]; null: not a stored position).
  */
 internal data class ResumeLoad(
     val trackUris: List<String>?,
     val shuffle: Boolean,
     val smartShuffle: Boolean,
     val repeat: RepeatMode,
+    val positionAt: Long? = null,
 ) {
     fun applyModes(request: PlayRequest): PlayRequest =
         request.copy(shuffle = shuffle || smartShuffle, smartShuffle = smartShuffle, repeat = repeat)
@@ -193,7 +209,8 @@ internal data class ResumeLoad(
      * load: its modes, and its track list when the request starts at the list's first track.
      */
     fun applyTo(request: PlayRequest): PlayRequest {
-        val withModes = applyModes(request)
+        // Its start position is the stored session's: an episode's newer point wins over it.
+        val withModes = applyModes(request).copy(positionAt = positionAt ?: request.positionAt)
         val list = trackUris?.takeIf { it.isNotEmpty() } ?: return withModes
         val start = request.trackUris?.getOrNull(request.startIndex ?: 0) ?: request.startUri
         if (request.contextUri != null || start != list.first()) return withModes
@@ -212,6 +229,7 @@ internal object ResumeModes {
     private const val SMART_SHUFFLE = "com.taehagen.spotifygood.resume.SMART_SHUFFLE"
     private const val REPEAT = "com.taehagen.spotifygood.resume.REPEAT"
     private const val TRACK_URIS = "com.taehagen.spotifygood.resume.TRACK_URIS"
+    private const val POSITION_AT = "com.taehagen.spotifygood.resume.POSITION_AT"
 
     fun extras(state: ResumeState): Bundle = Bundle().apply {
         val load = state.resumeLoad
@@ -219,6 +237,7 @@ internal object ResumeModes {
         putBoolean(SMART_SHUFFLE, load.smartShuffle)
         putString(REPEAT, PlaybackModes.wire(load.repeat))
         load.trackUris?.let { putStringArrayList(TRACK_URIS, ArrayList(it)) }
+        putLong(POSITION_AT, load.positionAt ?: 0)
     }
 
     /** The resume load in [extras]; null when they carry none (any other item). */
@@ -229,6 +248,8 @@ internal object ResumeModes {
             shuffle = extras.getBoolean(SHUFFLE),
             smartShuffle = extras.getBoolean(SMART_SHUFFLE),
             repeat = PlaybackModes.parseRepeat(repeat),
+            // A resume item's start position is always the stored session's (0: of unknown age).
+            positionAt = extras.getLong(POSITION_AT, 0),
         )
     }
 
@@ -261,6 +282,7 @@ class ResumeStore internal constructor(private val store: DataStore<Preferences>
                 smartShuffle = p[SMART_SHUFFLE] ?: false,
                 repeat = PlaybackModes.parseRepeat(p[REPEAT]),
                 trackUris = p[TRACK_URIS]?.split(LIST_SEPARATOR)?.filter { it.isNotBlank() }?.takeIf { it.isNotEmpty() },
+                positionAt = p[POSITION_AT],
             )
         }
     } catch (e: IOException) {
@@ -284,6 +306,7 @@ class ResumeStore internal constructor(private val store: DataStore<Preferences>
                 p[SMART_SHUFFLE] = state.smartShuffle
                 p[REPEAT] = PlaybackModes.wire(state.repeat)
                 p.setOrRemove(TRACK_URIS, state.trackUris?.takeIf { it.isNotEmpty() }?.joinToString(LIST_SEPARATOR))
+                if (state.positionAt != null) p[POSITION_AT] = state.positionAt else p.remove(POSITION_AT)
             }
         } catch (e: IOException) {
             Log.w(TAG, "Cannot save resume state", e)
@@ -322,6 +345,8 @@ class ResumeStore internal constructor(private val store: DataStore<Preferences>
         val REPEAT = stringPreferencesKey("repeat")
         /** The track-list form, newline-separated (uris never contain one). */
         val TRACK_URIS = stringPreferencesKey("track_uris")
+        /** When the position dates from ([ResumeState.positionAt]). */
+        val POSITION_AT = longPreferencesKey("position_at")
         const val LIST_SEPARATOR = "\n"
     }
 }
