@@ -634,6 +634,25 @@ pub(crate) fn on_player_event(event: &PlayerEvent) {
     }
 }
 
+/// The session is back (a cluster, the engine online): a queue stopped at the end of its window
+/// offline hands back to Spirc after it (see `OfflineQueue::resume_window_end`).
+pub(crate) fn resume_window_end() {
+    if !hand_back_allowed() {
+        return;
+    }
+    let action = {
+        let mut q = QUEUE.lock();
+        q.set_hand_back(true);
+        q.resume_window_end(now_ms())
+    };
+    if let Some(action) = action {
+        if let Err(e) = apply(action) {
+            log::warn!("offline playback: {e}");
+        }
+        hub::publish();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
