@@ -9,6 +9,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.data.LibraryEdit
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.download.CollectionRef
 import com.taehagen.spotifygood.download.CollectionType
@@ -22,6 +23,7 @@ import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.engineReach
 import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
 import com.taehagen.spotifygood.ui.screens.album.isNetworkClassError
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.channels.Channel
@@ -32,7 +34,6 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
@@ -45,6 +46,7 @@ import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.transformLatest
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
@@ -78,8 +80,10 @@ data class LikedSongsUiState(
     val loadedCount: Int = 0,
     /** Every page is being fetched (a sort or a filter needs them all). */
     val loadingAll: Boolean = false,
-    /** What plays is a sorted list this page started (playing or paused). */
+    /** What plays is this sorted list (playing or paused), also when started before the page reopened. */
     val sortedListIsCurrent: Boolean = false,
+    /** The session is ONLINE: songs that aren't downloaded can start ([canStartNow]). */
+    val online: Boolean = true,
 )
 
 /**
@@ -112,8 +116,37 @@ private data class LikedMeta(
     val partial: Boolean,
     val offline: Boolean,
     val sort: TrackSort,
-    val sortedSent: Set<String>,
+    val lastSorted: SortedPlays.Entry?,
+    val online: Boolean,
 )
+
+/** Likes and unlikes made in the app, applied to a fully loaded Liked Songs instead of paging it again. */
+internal data class LikedPatch(val removed: Set<String> = emptySet(), val added: List<Track> = emptyList()) {
+    fun unliked(uris: Collection<String>): LikedPatch {
+        val gone = uris.toHashSet()
+        return copy(removed = removed + gone, added = added.filterNot { it.uri in gone })
+    }
+
+    /** [tracks] were just liked: newest first, ahead of the earlier ones. */
+    fun liked(tracks: List<Track>): LikedPatch {
+        val uris = tracks.mapTo(HashSet()) { it.uri }
+        return copy(removed = removed - uris, added = tracks + added.filterNot { it.uri in uris })
+    }
+}
+
+/**
+ * The loaded Liked Songs (newest first) with [patch] applied: new likes first (a song liked again
+ * moves to the top), unliked songs gone, [total] adjusted to match.
+ */
+internal fun applyLikedPatch(loaded: List<Track>, total: Int?, patch: LikedPatch): Pair<List<Track>, Int?> {
+    if (patch.removed.isEmpty() && patch.added.isEmpty()) return loaded to total
+    val loadedUris = loaded.mapTo(HashSet()) { it.uri }
+    val addedUris = patch.added.mapTo(HashSet()) { it.uri }
+    val kept = loaded.filter { it.uri !in patch.removed && it.uri !in addedUris }
+    val newCount = patch.added.count { it.uri !in loadedUris }
+    val removedCount = loaded.count { it.uri in patch.removed }
+    return (patch.added + kept) to total?.let { (it + newCount - removedCount).coerceAtLeast(0) }
+}
 
 /** What Liked Songs lists. */
 internal enum class LikedView {
@@ -187,8 +220,8 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     private val refreshing = MutableStateFlow(false)
     private val sortStore = ListSortStore(graph.app)
     private val sort = MutableStateFlow(TrackSort.RECENTLY_ADDED)
-    /** Track URIs of the last sorted list this page started ([isSortedPlayback]). */
-    private val sortedSent = MutableStateFlow<Set<String>>(emptySet())
+    /** Likes and unlikes since the list was fully loaded ([applyLikedPatch]). */
+    private val likedPatch = MutableStateFlow(LikedPatch())
     /** The loaded songs in the shown order (before the filter): what a sorted play plays. */
     @Volatile private var sortedTracks: List<Track> = emptyList()
     private val messages = Channel<LibraryMessage>(Channel.BUFFERED)
@@ -260,8 +293,9 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             LikedView.WAITING -> flowOf(
                 LikedSource(emptyList(), null, isLoading = true, canLoadMore = false, error = null, fromDownload = false),
             )
-            LikedView.SERVER -> pager.state.map { page ->
-                LikedSource(page.items.map { it.track }, page.total, page.isLoading, page.canLoadMore, page.error, fromDownload = false)
+            LikedView.SERVER -> combine(pager.state, likedPatch) { page, patch ->
+                val (tracks, total) = applyLikedPatch(page.items.map { it.track }, page.total, patch)
+                LikedSource(tracks, total, page.isLoading, page.canLoadMore, page.error, fromDownload = false)
             }
         }
     }
@@ -290,12 +324,18 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         sortedSource,
         filterQuery,
         contextUri,
-        combine(download, refreshing, partialPages.partial, reach, combine(sort, sortedSent, ::Pair)) { download, refreshing, partial, reach, (sort, sent) ->
-            LikedMeta(download, refreshing, partial, offline = reach == EngineReach.OFFLINE, sort = sort, sortedSent = sent)
+        combine(download, refreshing, partialPages.partial, reach, combine(sort, SortedPlays.last, ::Pair)) { download, refreshing, partial, reach, (sort, last) ->
+            LikedMeta(
+                download, refreshing, partial,
+                offline = reach == EngineReach.OFFLINE,
+                sort = sort,
+                lastSorted = last,
+                online = reach == EngineReach.ONLINE,
+            )
         },
         graph.nowPlayingFlow(),
     ) { source, filter, contextUri, meta, nowPlaying ->
-        val (download, refreshing, partial, offline, sort, sent) = meta
+        val (download, refreshing, partial, offline, sort, lastSorted, online) = meta
         val visible = if (filter.isEmpty()) source.tracks else source.tracks.filter { it.matches(filter) }
         val needsAll = filter.isNotEmpty() || sort != TrackSort.RECENTLY_ADDED
         LikedSongsUiState(
@@ -318,7 +358,12 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             sort = sort,
             loadedCount = source.tracks.size,
             loadingAll = needsAll && !source.fromDownload && source.tracks.isNotEmpty() && (source.canLoadMore || source.isLoading),
-            sortedListIsCurrent = isSortedPlayback(nowPlaying.trackUri, nowPlaying.contextUri, sent),
+            sortedListIsCurrent = sort != TrackSort.RECENTLY_ADDED && isSortedPlayback(
+                nowPlaying.trackUri,
+                nowPlaying.contextUri,
+                sortedListUris(ListSortStore.LIKED_SONGS, lastSorted) { source.tracks.map { it.uri } },
+            ),
+            online = online,
         )
     }.flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LikedSongsUiState())
@@ -332,7 +377,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             .launchIn(viewModelScope)
         // Loaded pages carry the playable flags of the old explicit filter.
         graph.explicitFilterChanges()
-            .onEach { if (graph.engineReach() == EngineReach.ONLINE) pager.reload() }
+            .onEach { if (graph.engineReach() == EngineReach.ONLINE) reloadPager() }
             .catch { }
             .launchIn(viewModelScope)
         // While filtering or sorted, fetch the remaining pages (one at a time, the pager's size) so
@@ -346,9 +391,18 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         viewModelScope.launch {
             sortStore.get(ListSortStore.LIKED_SONGS)?.takeIf { it in TrackSort.LIKED_SONGS }?.let { sort.value = it }
         }
-        // Liked Songs pages are not cached: start over after library edits (likes/unlikes).
-        graph.library.changes.debounce(CHANGE_DEBOUNCE_MS)
-            .onEach { if (graph.engineReach() == EngineReach.ONLINE) pager.reload() }
+        // Likes and unlikes made in the app: applied to the loaded list (a sorted or filtered list
+        // has every page; paging them all again, with metadata, after each like would cost the
+        // whole library). Other library edits (albums, follows, playlists) don't touch it;
+        // pull-to-refresh (changes elsewhere) starts over.
+        graph.library.edits
+            .onEach { edit ->
+                when (edit) {
+                    is LibraryEdit.LikedTracks -> onLikedEdit(edit)
+                    LibraryEdit.Refreshed -> if (graph.engineReach() == EngineReach.ONLINE) reloadPager()
+                    is LibraryEdit.PlaylistEdited -> Unit
+                }
+            }
             .catch { }
             .launchIn(viewModelScope)
         // Refresh indicator ends with the reload.
@@ -381,10 +435,51 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
      */
     private fun playSorted(startUri: String?): Boolean {
         val uris = sortedTracks.filter { it.playable && !it.isPlaceholder }.map { it.uri }
-        val request = sortedPlayRequest(uris, startUri?.let { uris.indexOf(it).coerceAtLeast(0) } ?: 0) ?: return false
-        sortedSent.value = request.trackUris.orEmpty().toSet()
-        graph.player.play(request)
-        return true
+        // Not ONLINE, a track list goes to the offline queue: planned like any plain list.
+        return when (val plan = planSortedPlay(uris, startUri, graph.engineReach(), graph.downloads.downloadedUris.value)) {
+            is SortedStart.Load -> {
+                SortedPlays.record(ListSortStore.LIKED_SONGS, plan.request)
+                graph.player.play(plan.request)
+                true
+            }
+            SortedStart.NotDownloaded -> {
+                messenger.post(R.string.playback_error_not_available_offline)
+                true
+            }
+            SortedStart.Nothing -> false
+        }
+    }
+
+    /** Starts the list over (pull-to-refresh, the explicit filter): the patch goes with the old pages. */
+    private fun reloadPager() {
+        likedPatch.value = LikedPatch()
+        pager.reload()
+    }
+
+    /**
+     * Songs liked or unliked in the app. A fully loaded list (every page: a sort, a filter, or a
+     * short library) is patched: unliked songs are dropped, liked ones looked up (just those) and put
+     * first. Otherwise only the first pages are loaded and a reload costs one page.
+     */
+    private suspend fun onLikedEdit(edit: LibraryEdit.LikedTracks) {
+        if (graph.engineReach() != EngineReach.ONLINE) return
+        val page = pager.state.value
+        if (!page.endReached || page.items.isEmpty() || page.error != null) {
+            reloadPager()
+            return
+        }
+        if (!edit.saved) {
+            likedPatch.update { it.unliked(edit.uris) }
+            return
+        }
+        val tracks = try {
+            graph.catalog.tracks(edit.uris)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+        if (tracks.isNullOrEmpty()) reloadPager() else likedPatch.update { it.liked(tracks) }
     }
 
     fun loadMore() = pager.loadMore()
@@ -479,7 +574,6 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     private companion object {
         const val PAGE_SIZE = 100
         const val FILTER_DEBOUNCE_MS = 200L
-        const val CHANGE_DEBOUNCE_MS = 500L
     }
 }
 

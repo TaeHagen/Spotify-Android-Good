@@ -43,6 +43,10 @@ import com.taehagen.spotifygood.ui.screens.album.searchText
 import com.taehagen.spotifygood.ui.screens.album.searchTokens
 import com.taehagen.spotifygood.ui.screens.album.statesFor
 import com.taehagen.spotifygood.ui.screens.library.explicitFilterChanges
+import com.taehagen.spotifygood.ui.screens.library.sortedListUris
+import com.taehagen.spotifygood.ui.screens.library.planSortedPlay
+import com.taehagen.spotifygood.ui.screens.library.SortedStart
+import com.taehagen.spotifygood.ui.screens.library.SortedPlays
 import com.taehagen.spotifygood.ui.screens.library.sortedPlayRequest
 import com.taehagen.spotifygood.ui.screens.library.sortOrder
 import com.taehagen.spotifygood.ui.screens.library.sortKey
@@ -148,7 +152,7 @@ internal data class PlaylistUiState(
     val filterExplicit: Boolean = false,
     /** The chosen order (not applied in edit mode, which shows the playlist's own). */
     val sort: TrackSort = TrackSort.CUSTOM,
-    /** What plays is a sorted list this page started (playing or paused). */
+    /** What plays is this sorted list (playing or paused), also when started before the page reopened. */
     val sortedListIsCurrent: Boolean = false,
 )
 
@@ -184,8 +188,6 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     private val filter = MutableStateFlow("")
     private val sortStore = ListSortStore(graph.app)
     private val sort = MutableStateFlow(TrackSort.CUSTOM)
-    /** Track URIs of the last sorted list this page started ([isSortedPlayback]). */
-    private val sortedSent = MutableStateFlow<Set<String>>(emptySet())
     private val editMode = MutableStateFlow(false)
     private val addQuery = MutableStateFlow("")
     private val addedFromSheet = MutableStateFlow<Set<String>>(emptySet())
@@ -221,8 +223,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         .map { load -> load.dataOrNull()?.rows?.mapNotNullTo(HashSet()) { it.item.uri } ?: emptySet() }
         .distinctUntilChanged()
 
-    private val core: Flow<CoreState> = combine(data, listUi, paging, editMode, combine(sort, sortedSent, ::Pair)) { load, list, paging, editing, (sort, sent) ->
-        CoreState(load, list, paging, editing, sort, sent)
+    private val core: Flow<CoreState> = combine(data, listUi, paging, editMode, combine(sort, SortedPlays.last, ::Pair)) { load, list, paging, editing, (sort, last) ->
+        CoreState(load, list, paging, editing, sort, last)
     }
 
     val state: StateFlow<PlaylistUiState> = combine(
@@ -236,7 +238,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             core.load, core.list, core.paging, core.editMode, playback, following, download, rows,
             connectivity.offline, connectivity.online, connectivity.filterExplicit,
             sort = core.sort,
-            sortedListIsCurrent = isSortedPlayback(playback.trackUri, playback.contextUri, core.sortedSent),
+            sortedListIsCurrent = core.sort != TrackSort.CUSTOM && !core.editMode && isSortedPlayback(
+                playback.trackUri,
+                playback.contextUri,
+                sortedListUris(ListSortStore.playlist(uri), core.lastSorted) { core.list.rows.mapNotNull { it.row.item.uri } },
+            ),
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlaylistUiState())
 
@@ -536,9 +542,16 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
                     item.uri?.takeIf { playable && !it.startsWith("spotify:local:") }
                 }
             }
-            val request = sortedPlayRequest(uris, startUri?.let { uris.indexOf(it).coerceAtLeast(0) } ?: 0) ?: return@launch
-            sortedSent.value = request.trackUris.orEmpty().toSet()
-            graph.player.play(request)
+            // Not ONLINE, a track list goes to the offline queue: planned like any plain list (the
+            // reach as of now, after the sort).
+            when (val plan = planSortedPlay(uris, startUri, graph.engineReach(), graph.downloads.downloadedUris.value)) {
+                is SortedStart.Load -> {
+                    SortedPlays.record(ListSortStore.playlist(uri), plan.request)
+                    graph.player.play(plan.request)
+                }
+                SortedStart.NotDownloaded -> message(R.string.playback_error_not_available_offline)
+                SortedStart.Nothing -> Unit
+            }
         }
     }
 
@@ -548,8 +561,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             super.playContext()
             return
         }
-        val playback = currentPlayback()
-        if (isSortedPlayback(playback.trackUri, playback.contextUri, sortedSent.value)) {
+        // Also after the page was reopened (the last sorted play is kept outside it).
+        if (state.value.sortedListIsCurrent) {
             graph.player.togglePlayPause()
         } else {
             playSorted(startUri = null)
@@ -709,7 +722,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val paging: PagingUi,
         val editMode: Boolean,
         val sort: TrackSort,
-        val sortedSent: Set<String>,
+        val lastSorted: SortedPlays.Entry?,
     )
 
     private data class ListInput(val playlist: PlaylistData?, val query: String, val sort: TrackSort)

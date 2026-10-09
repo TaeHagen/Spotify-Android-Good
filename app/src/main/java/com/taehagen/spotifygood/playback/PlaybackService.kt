@@ -152,7 +152,7 @@ class PlaybackService : MediaLibraryService() {
         coordinator = PlaybackCoordinator.install(this)
         resumeStore = graph.resumeStore
         tree = LibraryTree(this, graph)
-        presence = PresenceController(this, graph)
+        presence = PresenceController(this, graph) { coordinator.isAppInForeground }
         player = SpotifyPlayer(
             context = this,
             playback = graph.playback,
@@ -209,7 +209,9 @@ class PlaybackService : MediaLibraryService() {
                     satisfyForegroundContract(if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0)
                     if (isPresenceWanted()) PresenceRestore.postNotice(this)
                 }
-                if (!presence.isEnabled && !mediaForeground && !player.isPlaying) stopSelf(startId)
+                // Presence not up (not wanted, or refused: also silently, for a restricted app) and
+                // nothing else to do: this start is over; the app starts presence again when visible.
+                if (!presence.isForeground && !mediaForeground && !player.isPlaying) stopSelf(startId)
             }
             ACTION_RESUME -> {
                 ensurePlaybackHolder()

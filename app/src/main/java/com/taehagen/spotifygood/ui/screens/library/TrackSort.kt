@@ -3,9 +3,14 @@ package com.taehagen.spotifygood.ui.screens.library
 import android.content.Context
 import com.taehagen.spotifygood.model.PlaylistItem
 import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.playback.PlayRequest
+import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.text.CollationKey
 import java.text.Collator
@@ -131,6 +136,75 @@ fun sortedPlayRequest(uris: List<String>, startIndex: Int = 0): PlayRequest? {
     val from = if (uris.size <= MAX_SORTED_PLAY) 0 else (start - SORTED_PLAY_BEFORE).coerceIn(0, uris.size - MAX_SORTED_PLAY)
     val window = uris.subList(from, minOf(uris.size, from + MAX_SORTED_PLAY)).toList()
     return PlayRequest(trackUris = window, startIndex = start - from, shuffle = false, smartShuffle = false)
+}
+
+/** How a sorted list starts ([planSortedPlay]). */
+sealed interface SortedStart {
+    data class Load(val request: PlayRequest) : SortedStart
+
+    /** The tapped song isn't downloaded and the engine is offline (or Play with nothing downloaded). */
+    data object NotDownloaded : SortedStart
+
+    /** Nothing to play. */
+    data object Nothing : SortedStart
+}
+
+/**
+ * Starts the sorted list [uris] (its playable songs, in the shown order) at [startUri] (a tapped
+ * row) or from the top (Play: null), by the engine's [reach] like any plain list ([planListPlay]):
+ * ONLINE the window around the start ([sortedPlayRequest]). Otherwise a downloaded start plays the
+ * list's downloads ([downloaded]) from exactly there; a tapped song that isn't downloaded is sent
+ * alone while CONNECTING (it plays once the session is back, else "not available offline") and
+ * doesn't start OFFLINE: a track list loaded then goes to the offline queue, which would start the
+ * next download instead. Play while not ONLINE plays the list's downloads from the first; with none
+ * the whole window while CONNECTING (it waits for the session), nothing OFFLINE.
+ */
+fun planSortedPlay(uris: List<String>, startUri: String?, reach: EngineReach, downloaded: Set<String>): SortedStart {
+    if (startUri == null) {
+        if (uris.isEmpty()) return SortedStart.Nothing
+        if (reach == EngineReach.ONLINE) return sortedPlayRequest(uris, 0)?.let(SortedStart::Load) ?: SortedStart.Nothing
+        val own = uris.filter { it in downloaded }
+        return when {
+            own.isNotEmpty() -> sortedPlayRequest(own, 0)?.let(SortedStart::Load) ?: SortedStart.Nothing
+            reach == EngineReach.CONNECTING -> sortedPlayRequest(uris, 0)?.let(SortedStart::Load) ?: SortedStart.Nothing
+            else -> SortedStart.NotDownloaded
+        }
+    }
+    val list = if (startUri in uris) uris else listOf(startUri)
+    return when (val plan = planListPlay(list, list.indexOf(startUri), reach, downloaded)) {
+        is ListPlay.Tracks -> sortedPlayRequest(plan.uris, plan.index)?.let(SortedStart::Load) ?: SortedStart.Nothing
+        ListPlay.NotDownloaded -> SortedStart.NotDownloaded
+    }
+}
+
+/**
+ * The last sorted list played in this session: its list key ([ListSortStore.LIKED_SONGS],
+ * [ListSortStore.playlist]) and the URIs sent. Kept outside the pages, so a page opened again
+ * still knows its list is playing (its Play button resumes it instead of starting it over).
+ */
+internal object SortedPlays {
+    internal data class Entry(val list: String, val uris: Set<String>, val generation: Int)
+
+    private val entry = MutableStateFlow<Entry?>(null)
+
+    /** The last sorted play of this session (a logout ends it), or null. */
+    val last: Flow<Entry?> = entry.map { it?.takeIf { e -> e.generation == BackgroundMessages.currentGeneration() } }
+
+    fun record(list: String, request: PlayRequest) {
+        entry.value = Entry(list, request.trackUris.orEmpty().toSet(), BackgroundMessages.currentGeneration())
+    }
+}
+
+/**
+ * The URIs of list [list] whose playback counts as this sorted list playing: what was sent for it
+ * when the last sorted play ([last]) was this list's; nothing when it was another list's. With no
+ * sorted play recorded (a new process, e.g. a resumed session), the list as [shown]: a context-less
+ * play of one of its songs is taken for it.
+ */
+internal fun sortedListUris(list: String, last: SortedPlays.Entry?, shown: () -> List<String>): Set<String> = when {
+    last == null -> shown().toHashSet()
+    last.list == list -> last.uris
+    else -> emptySet()
 }
 
 /**

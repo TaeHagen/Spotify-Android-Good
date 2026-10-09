@@ -1254,7 +1254,15 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `connectedDevice` even when presence cannot come up). A refused start (a restricted app, OEM
   limits), or a login not read in time, posts one "Open SpotifyGood to stay available for
   Spotify Connect" notification (tap: the app), gone once presence is up again; presence then
-  waits for the app to be visible, as before. A media foreground the system refuses
+  waits for the app to be visible, as before. A refusal is not always an exception: for an app
+  whose battery use is "Restricted" the system drops the start or ignores the service's
+  `startForeground` silently. The receiver therefore asks `isBackgroundRestricted` (Restricted:
+  the notification, no start), and `PresenceController.showForeground` checks that the
+  foreground took effect (`PresenceRestore.foregroundTookEffect`: from API 29 the service's
+  recorded type, which an ignored start leaves at none; on API 28 the restriction unless the app
+  is visible). An ignored one counts as refused: the presence flags stay off (so the app starts
+  presence again when it is visible), no engine is held for it, the start stops, and the
+  notification updates do not ask again until presence is started anew. A media foreground the system refuses
   (`onForegroundStartNotAllowed`) pauses local playback with "Tap to resume" only when neither
   the app is visible nor presence keeps the service in the foreground: then the process stays,
   the audio plays on and Media3 asks again on its next update.
@@ -1415,10 +1423,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   all the same. An original that cannot be read while its card is still there (a bad sector, a
   short read: a damaged download) does not stop the move: it is skipped, its downloads go back into
   the queue and are downloaded fresh to the chosen location (out of the offline index; an
-  unreadable cover is dropped for the CDN image), and Settings says how many. Three unreadable
-  originals in a row stop the move instead (the card itself is failing), as does a card that went.
-  The plan follows a stable order (`addedAt`, uri) with the files that failed before in this
-  process last, so one bad file never holds back the rest. The cover maps and the session
+  unreadable cover is dropped for the CDN image), and Settings says how many, however many damaged
+  files lie next to each other (an album in one bad region). The move stops only on evidence
+  about the card itself: it is no longer mounted or its folder cannot be read (resumes when it is
+  back), or at least 80% of at least 20 originals tried in the pass were unreadable (the card is
+  failing; the unreadable ones are still downloaded again). The plan follows a stable order
+  (`addedAt`, uri); a file whose copy stopped a pass (an error about the target) goes last. A pass
+  that stopped after getting somewhere is tried again after 5 min; a stopped move restarts from its
+  row in Settings > Storage, also for the same location. The cover maps and the session
   artwork follow the moved covers at once.
   Garbage collection waits while a move runs; it covers every mounted location (by location and
   name), never a card that is not mounted.
@@ -1584,10 +1596,20 @@ accents ignored; rows that can't play last; ties keep the list order), then appl
 plays the server's order (Spirc resolves the context itself), so a non-default order plays as a
 `trackUris` list in the shown order, shuffle off, at most 500 tracks around the start item (50
 before it). That list has no context: Connect and the notification show no playlist, and it is
-a snapshot of what was loaded (later edits and likes don't reach it); the Play button toggles it
-while one of its tracks plays with no catalog context. The default order keeps the context load
-(Connect shows the playlist), and Shuffle always loads the context, its order doesn't matter.
-Offline, the downloaded rows sort the same way and already play as a track list.
+a snapshot of what was loaded (later edits and likes don't reach it). Its start follows the
+plain-list rule of §4.6 (`planListPlay`), since a track list loaded while the session isn't ONLINE
+goes to the offline queue: a tapped song that is downloaded plays the list's downloads from
+exactly there, one that isn't is sent alone while connecting ("not available offline" offline,
+never the next download); Play plays the list's downloads from the first. Liked Songs rows that
+can't start then are dimmed, as on playlists. The last sorted play (its list and URIs) is kept for
+the session outside the page, so a reopened page's Play button still toggles (resumes) it while
+one of its tracks plays with no catalog context; in a new process, a context-less play of one of
+the shown songs counts. The default order keeps the context load (Connect shows the playlist),
+and Shuffle always loads the context, its order doesn't matter. Offline, the downloaded rows sort
+the same way and already play as a track list. Likes and unlikes made in the app
+(`LibraryEdit.LikedTracks`) patch a fully loaded Liked Songs (unliked songs dropped, liked ones
+looked up and put first, then sorted again) instead of paging it all again; other library edits
+don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet reloads.
 
 ### 9.9 UI
 

@@ -1,9 +1,11 @@
 package com.taehagen.spotifygood.playback
 
+import android.app.ActivityManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationChannelCompat
@@ -37,8 +39,11 @@ import kotlinx.coroutines.withTimeoutOrNull
  * storage, readable only after the first unlock, which `BOOT_COMPLETED` follows. Nothing is held
  * awake: the receiver reads the setting and the stored login (bounded, inside its broadcast) and
  * starts the service; presence itself then holds the engine, as when started from the app. When
- * the start is refused (a restricted app, an OEM's own limits) the same notification asks the
- * user to open the app once; it goes away when presence is up again.
+ * the start is refused the same notification asks the user to open the app once; it goes away
+ * when presence is up again. A refusal is not always an exception: for an app whose battery use is
+ * "Restricted" the system drops the start or ignores the service's `startForeground` silently, so
+ * the restore checks that state itself ([decide]: `isBackgroundRestricted`), and the service checks
+ * that its presence foreground took effect ([foregroundTookEffect]).
  */
 internal object PresenceRestore {
     /** The broadcasts presence is restored after. */
@@ -66,17 +71,47 @@ internal object PresenceRestore {
 
     /**
      * What to do after [action] on API level [sdk]: [connectPresence] the setting, [loggedIn] the
-     * stored login (null: not read in time), [presenceUp] presence already in the foreground.
+     * stored login (null: not read in time), [presenceUp] presence already in the foreground,
+     * [backgroundRestricted] the app's battery use is "Restricted" (`isBackgroundRestricted`: the
+     * system drops or ignores its background foreground starts without a word).
      */
-    fun decide(action: String?, connectPresence: Boolean?, loggedIn: Boolean?, presenceUp: Boolean, sdk: Int): Decision = when {
+    fun decide(
+        action: String?,
+        connectPresence: Boolean?,
+        loggedIn: Boolean?,
+        presenceUp: Boolean,
+        sdk: Int,
+        backgroundRestricted: Boolean = false,
+    ): Decision = when {
         action !in RESTORE_POINTS || presenceUp -> Decision.SKIP
         connectPresence != true -> Decision.SKIP
         loggedIn == false -> Decision.SKIP
         loggedIn == null -> Decision.NOTIFY
         // A boot-started presence would refuse every later media foreground (see above).
         action == Intent.ACTION_BOOT_COMPLETED && sdk >= BOOT_TYPES_CHECKED_SDK -> Decision.NOTIFY
+        // Restricted: the start would be dropped, or the service would run without its foreground
+        // (advertised on Connect for a minute, then stopped).
+        backgroundRestricted -> Decision.NOTIFY
         else -> Decision.RESTORE
     }
+
+    /**
+     * Whether a presence `startForeground` took effect. For a background-restricted app the system
+     * ignores it without an exception: from API 29 the service's recorded foreground type tells
+     * ([recordedType]: none after an ignored start, the system records it only for one that took
+     * effect); on API 28 the restriction ([backgroundRestricted]) and whether the app is visible
+     * ([appVisible]: a visible app may start one anyway) are all there is to go by; before, no
+     * such restriction exists.
+     */
+    fun foregroundTookEffect(sdk: Int, recordedType: Int, backgroundRestricted: Boolean, appVisible: Boolean): Boolean = when {
+        sdk >= 29 -> recordedType and ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE != 0
+        sdk >= 28 -> !backgroundRestricted || appVisible
+        else -> true
+    }
+
+    /** The app's battery use is "Restricted" (API 28+). */
+    fun isBackgroundRestricted(context: Context): Boolean =
+        Build.VERSION.SDK_INT >= 28 && context.getSystemService(ActivityManager::class.java)?.isBackgroundRestricted == true
 
     /** "Open SpotifyGood to stay available for Spotify Connect", opening the app on a tap. */
     fun postNotice(context: Context) {
@@ -142,7 +177,8 @@ class PresenceRestoreReceiver : BroadcastReceiver() {
                 } else {
                     null
                 }
-                when (PresenceRestore.decide(action, presence, loggedIn, PlaybackService.isPresenceForeground, Build.VERSION.SDK_INT)) {
+                val restricted = PresenceRestore.isBackgroundRestricted(app)
+                when (PresenceRestore.decide(action, presence, loggedIn, PlaybackService.isPresenceForeground, Build.VERSION.SDK_INT, restricted)) {
                     PresenceRestore.Decision.RESTORE -> start(app)
                     PresenceRestore.Decision.NOTIFY -> PresenceRestore.postNotice(app)
                     PresenceRestore.Decision.SKIP -> Unit
