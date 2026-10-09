@@ -1303,7 +1303,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   allow-while-idle quota). A timer ending within 10 min while a remote device plays also holds the
   wake lock from the start (honoured outside Doze). "End of track" arms the snapshot's track end (the media time left
   divided by the snapshot's speed: an episode at a podcast speed ends sooner or later in wall
-  time) and re-arms on every snapshot (a speed change publishes one). Disarmed on cancel, replace, finish and manual pause (end of track).
+  time) and re-arms on every snapshot (a speed change publishes one). The item it waits for is
+  its uri (`SleepSchedule.sameItem`): the engine re-makes the uid of the same item while it plays
+  on (a hand-off to the offline queue, `o<i>`; a Spirc restore's queue and suggestion uids), so
+  a new uid ends the wait only when the position also starts over (back by more than 5 s:
+  repeat-one, the same track reached again), and never while paused. Disarmed on cancel, replace, finish and manual pause (end of track).
 
 ### 9.5 Audio output routing (Bluetooth / external)
 
