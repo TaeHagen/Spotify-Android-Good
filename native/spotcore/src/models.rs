@@ -547,6 +547,11 @@ pub struct PlaybackSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_device: Option<ActiveDeviceRef>,
     pub status: PlaybackStatus,
+    /// The current item is still loading: status `Loading`, or a paused load (which reads
+    /// `Paused`). Its position and duration aren't settled yet (Spirc still has the previous
+    /// item's duration, a seek may not land).
+    #[serde(default)]
+    pub loading: bool,
     pub position_ms: u64,
     /// Wall-clock epoch ms at which `position_ms` was valid.
     pub position_timestamp_ms: i64,

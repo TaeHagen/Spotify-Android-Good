@@ -137,6 +137,8 @@ pub(crate) fn map_local(s: &ConnectSnapshot, device: ActiveDeviceRef) -> Playbac
         offline: false,
         active_device: Some(device),
         status,
+        // (a paused load reads paused: the app tells it from a settled pause by this)
+        loading: matches!(s.status, SnapshotPlayStatus::LoadingPlay | SnapshotPlayStatus::LoadingPause),
         position_ms: clamp_u64(s.position_ms),
         position_timestamp_ms: s.position_timestamp_ms,
         playback_speed: if status == PlaybackStatus::Playing { s.playback_speed } else { 0.0 },
@@ -216,6 +218,7 @@ pub(crate) fn map_remote(cluster: &Cluster, me: &str, time_delta_s: i64) -> Opti
         offline: false,
         active_device: Some(ActiveDeviceRef { id: active.to_string(), name, kind }),
         status,
+        loading: status == PlaybackStatus::Loading,
         position_ms: clamp_u64(ps.position_as_of_timestamp),
         position_timestamp_ms: if ps.timestamp > 0 { ps.timestamp - time_delta_s * 1000 } else { 0 },
         playback_speed: speed,
@@ -363,6 +366,16 @@ mod tests {
         let mut snap = base_snapshot();
         snap.status = SnapshotPlayStatus::Paused;
         assert_eq!(map_local(&snap, device()).playback_speed, 0.0);
+        assert!(!map_local(&snap, device()).loading, "a settled pause");
+        // a paused load reads paused, and tells itself apart by `loading`
+        snap.status = SnapshotPlayStatus::LoadingPause;
+        let s = map_local(&snap, device());
+        assert_eq!((s.status, s.loading), (PlaybackStatus::Paused, true));
+        snap.status = SnapshotPlayStatus::LoadingPlay;
+        let s = map_local(&snap, device());
+        assert_eq!((s.status, s.loading), (PlaybackStatus::Loading, true));
+        snap.status = SnapshotPlayStatus::Playing;
+        assert!(!map_local(&snap, device()).loading);
         assert_eq!(status_from(SnapshotPlayStatus::LoadingPause), PlaybackStatus::Paused);
         assert_eq!(status_from(SnapshotPlayStatus::LoadingPlay), PlaybackStatus::Loading);
         assert_eq!(status_from(SnapshotPlayStatus::Stopped), PlaybackStatus::Stopped);

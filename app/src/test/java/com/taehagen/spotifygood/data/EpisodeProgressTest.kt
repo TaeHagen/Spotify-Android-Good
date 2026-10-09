@@ -551,6 +551,28 @@ class EpisodeProgressStoreTest {
     }
 
     @Test
+    fun nextWhilePausedSeeksOnlyOnceTheLoadSettled() = runTest {
+        val (store, scope) = store()
+        val e2 = "spotify:episode:e2"
+        store.record(e2, 35 * MIN, 2 * HOUR)
+        val seeks = mutableListOf<Long>()
+        val tracker = store.tracker(seeks)
+        // Paused on a 20 min E1, then Next: Spirc loads E2 paused, still with E1's duration (a
+        // seek to 35:00 now would be dropped against it).
+        tracker.onSnapshot(snapshot(source = PlaybackSource.LOCAL, status = PlaybackStatus.PAUSED, positionMs = 5 * MIN, at = 1_000), 1_000)
+        val loading = snapshot(uri = e2, source = PlaybackSource.LOCAL, status = PlaybackStatus.PAUSED, positionMs = 0, at = 2_000)
+            .copy(loading = true, durationMs = 20 * MIN)
+        tracker.onSnapshot(loading, 2_000)
+        assertTrue("no seek during the load", seeks.isEmpty())
+        assertEquals("nothing recorded with the previous item's duration", 35 * MIN, store.resumeMs(e2))
+        // settled paused at 0:00 with its own duration: the resume seek goes out now
+        tracker.onSnapshot(snapshot(uri = e2, source = PlaybackSource.LOCAL, status = PlaybackStatus.PAUSED, positionMs = 0, at = 3_000), 3_000)
+        assertEquals(listOf(35 * MIN), seeks)
+        assertEquals(35 * MIN, store.resumeMs(e2))
+        scope.cancel()
+    }
+
+    @Test
     fun aResumeSeekThatNeverLandsStopsGuardingAfterAWhile() = runTest {
         val (store, scope) = store()
         store.record(EP, 30 * MIN, 2 * HOUR)

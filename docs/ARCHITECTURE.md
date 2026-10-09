@@ -390,7 +390,14 @@ available offline" without a native call. While the session is still connecting 
 online), a requested start item that is not downloaded is sent alone as `trackUris` (any context,
 artists too): Spirc plays it in its context if the session comes online, otherwise the engine
 answers "not available offline" — another download is never swapped in. Only offline does a
-start that is not downloaded move on to the next download. Smart shuffle is not offered for
+start that is not downloaded move on to the next download. `connect::load` holds to the same
+rule for every load (track lists too, e.g. a stored session resumed or a sorted list): with a
+network, offline mode off and the session not Online (connecting, or a reconnect backoff), it
+plays offline only when its requested start itself is downloaded (or none was asked for);
+otherwise it waits for the session (at most 10 s, also during a backoff) and then fails with
+`UNAVAILABLE` "Not available offline". The hand-off to the OfflineController while a reconnect
+is needed with the network up (above) is no load: it keeps the track already playing; a load
+during it follows this rule too. Smart shuffle is not offered for
 `offline:true` snapshots.
 
 ## 5. Events (Rust → Kotlin `onEvent(type, json)`)
@@ -420,6 +427,10 @@ start that is not downloaded move on to the next download. Smart shuffle is not 
   "activeDevice": {"id","name","type"},  // omitted when none
   "status": "stopped|loading|playing|paused",  // loading: to play (also a stall while playing,
                                          // at the position heard); a paused load is "paused"
+  "loading": false,                      // the item is still loading: status "loading", or a
+                                         // paused load ("paused"); position and duration aren't
+                                         // settled yet (Spirc keeps the previous item's duration
+                                         // and drops a seek past it): seek once it is false
   "positionMs": 0, "positionTimestampMs": 0,   // wall-clock epoch ms when positionMs was valid
   "playbackSpeed": 1.0, "durationMs": 0,
   "context": {"uri":"spotify:playlist:…","name":"…","type":"playlist|album|artist|collection|search|show|station|tracks|unknown"},

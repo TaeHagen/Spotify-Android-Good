@@ -413,6 +413,11 @@ data class PlaybackSnapshot(
     val offline: Boolean = false,
     val activeDevice: ActiveDeviceRef? = null,
     val status: PlaybackStatus = PlaybackStatus.STOPPED,
+    /**
+     * The item is still loading: [status] LOADING, or a paused load (PAUSED). Its position and
+     * duration aren't settled yet (a seek may not land).
+     */
+    val loading: Boolean = false,
     val positionMs: Long = 0,
     val positionTimestampMs: Long = 0,
     val playbackSpeed: Double = 1.0,
