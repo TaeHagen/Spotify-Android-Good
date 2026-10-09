@@ -486,7 +486,7 @@ internal class EpisodeViewModel(graph: AppGraph, private val uri: String) : Deta
 
     fun download() {
         launchWrite(successRes = null, failureRes = R.string.detail_download_failed) {
-            graph.downloads.downloadItems(listOf(uri))
+            graph.downloads.downloadItems(listOf(uri)).notice?.let { message(it) }
         }
     }
 

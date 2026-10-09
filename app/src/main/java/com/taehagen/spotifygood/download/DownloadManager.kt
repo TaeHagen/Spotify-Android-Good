@@ -8,6 +8,7 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.util.Log
 import androidx.annotation.RequiresApi
+import androidx.annotation.StringRes
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -117,6 +118,28 @@ data class DownloadItem(
     val imagePath: String?,
     val error: String?,
 )
+
+/**
+ * What a download request did ([DownloadManager.downloadItems], [DownloadManager.downloadCollection]):
+ * [queued] items are now in the queue, [waitingForCard] are downloaded on the chosen SD card while
+ * it is away (nothing to do: they play again once it is back), and whether the download location
+ * is available ([locationAvailable]; else the queue waits for the card).
+ */
+data class DownloadRequest(val queued: Int = 0, val waitingForCard: Int = 0, val locationAvailable: Boolean = true) {
+    enum class Outcome { STARTED, LOCATION_MISSING, WAITING_FOR_CARD, NOTHING }
+
+    val outcome: Outcome get() = DownloadRules.requestOutcome(queued, waitingForCard, locationAvailable)
+
+    /** What to tell the user when the request did not simply start; null when it did. */
+    @get:StringRes
+    val notice: Int?
+        get() = when (outcome) {
+            Outcome.STARTED -> null
+            Outcome.LOCATION_MISSING -> R.string.data_dl_request_location_missing
+            Outcome.WAITING_FOR_CARD -> R.string.data_dl_error_volume
+            Outcome.NOTHING -> R.string.data_dl_request_nothing
+        }
+}
 
 /** A place downloads can be stored (Settings > Storage): internal storage or a mounted SD card. */
 data class DownloadLocation(val id: String, val label: String, val freeBytes: Long, val removable: Boolean)
@@ -252,11 +275,26 @@ class DownloadManager(
      * they stay COMPLETED (nothing is failed or deleted) and come back with the card, but are shown
      * as not available and are left out of the offline index meanwhile.
      */
-    private val unavailable: StateFlow<Set<String>> = combine(completedLocated, volumes) { rows, _ -> rows }
-        .map { rows -> DownloadRules.unavailableUris(rows, storage.availability()) }
+    private val missingCard: StateFlow<DownloadRules.MissingCard> = combine(
+        completedLocated,
+        volumes,
+        settings.persisted.map { it.downloadLocation }.distinctUntilChanged(),
+    ) { rows, _, chosen -> rows to chosen }
+        .map { (rows, chosen) -> DownloadRules.missingCard(rows, storage.availability(), chosen, storage.locations.internalRoot.path) }
         .distinctUntilChanged()
         .flowOn(Dispatchers.IO)
+        .stateIn(scope, SharingStarted.Eagerly, DownloadRules.MissingCard())
+
+    private val unavailable: StateFlow<Set<String>> = missingCard
+        .map { it.all }
+        .distinctUntilChanged()
         .stateIn(scope, SharingStarted.Eagerly, emptySet())
+
+    /**
+     * How many downloads are on an SD card that is no longer used (it died, or another card was
+     * chosen): Settings > Storage offers to download them again ([redownloadFromUnusedCard]).
+     */
+    val onUnusedCard: Flow<Int> = missingCard.map { it.stranded.size }.distinctUntilChanged()
 
     /**
      * URIs of completed downloads that can play (hot), iterating newest download first (Android Auto
@@ -286,10 +324,12 @@ class DownloadManager(
         dao.observeListRows().map { rows ->
             rows.map { DownloadItem(it.uri, it.state, it.bytesDone, it.sizeBytes, it.metadataJson, it.imagePath, it.error) }
         },
-        unavailable,
+        missingCard,
         runner.activity.map { Triple(it.currentUri, it.bytes, it.totalBytes) }.distinctUntilChanged(),
-    ) { items, gone, (uri, bytes, total) ->
-        val shown = DownloadRules.withUnavailable(items, gone, appContext.getString(R.string.data_dl_error_volume))
+    ) { items, missing, (uri, bytes, total) ->
+        // On a card that is away: plays again once it is back. On one no longer used: "Retry" downloads it again.
+        val waiting = DownloadRules.withUnavailable(items, missing.waiting, appContext.getString(R.string.data_dl_error_volume))
+        val shown = DownloadRules.withUnavailable(waiting, missing.stranded, appContext.getString(R.string.data_dl_error_card_unused))
         DownloadRules.withLiveProgress(shown, uri, bytes, total)
     }
         .flowOn(Dispatchers.Default)
@@ -312,12 +352,13 @@ class DownloadManager(
     val failedCounts: Flow<FailedCounts> = combine(
         items,
         collectionDao.observeAll().map { list -> list.flatMapTo(HashSet()) { decodeItems(it.unavailableUrisJson) } },
-        unavailable,
-    ) { rows, unavailable, onMissingCard ->
+        missingCard,
+    ) { rows, unavailable, missing ->
         DownloadRules.failedCounts(
             rows.map { RetryRow(it.uri, it.state, it.error) },
-            // Downloads on a card that is not mounted are not retried: they come back with it.
-            unavailable + onMissingCard,
+            // Downloads on the chosen card while it is away are not retried: they come back with it.
+            // The ones on a card no longer used are: "Retry" downloads them again.
+            unavailable + missing.waiting,
             appContext.getString(R.string.data_dl_error_unplayable),
         )
     }.distinctUntilChanged().flowOn(Dispatchers.Default)
@@ -429,9 +470,9 @@ class DownloadManager(
      * [com.taehagen.spotifygood.nativebridge.NativeException] when that fails. Calling it again
      * re-queues failed and individually removed items.
      */
-    suspend fun downloadCollection(ref: CollectionRef): Unit = scope.detached { downloadCollectionNow(ref) }
+    suspend fun downloadCollection(ref: CollectionRef): DownloadRequest = scope.detached { downloadCollectionNow(ref) }
 
-    private suspend fun downloadCollectionNow(ref: CollectionRef) {
+    private suspend fun downloadCollectionNow(ref: CollectionRef): DownloadRequest {
         val countryKnown = awaitCountry()
         val listed = requireNotNull(resolver.resolve(ref.type, ref.uri))
         // Without the country the catalog's `playable` is not trustworthy: queue everything and let
@@ -443,7 +484,7 @@ class DownloadManager(
             throw NativeException(NativeErrorInfo(NativeErrorCode.NETWORK, "Could not load the items of ${ref.name.ifBlank { ref.uri }}"))
         }
         val resolved = withCatalogInfo(found, known = emptySet())
-        val removed = mutex.withLock {
+        val result = mutex.withLock {
             val existing = collectionDao.get(ref.uri)
             val now = System.currentTimeMillis()
             val entity = DownloadCollectionEntity(
@@ -460,11 +501,12 @@ class DownloadManager(
                 unavailableUrisJson = existing?.unavailableUrisJson ?: EMPTY_ITEMS,
                 unavailableCheckedAt = existing?.unavailableCheckedAt,
             )
-            applyMembershipLocked(entity, resolved, userInitiated = true).removal
+            applyMembershipLocked(entity, resolved, userInitiated = true)
         }
-        afterRemoval(listOf(removed))
+        afterRemoval(listOf(result.removal))
         updateSyncSchedule(true)
         scheduleExecution(kick = true)
+        return DownloadRequest(result.queued, result.waitingForCard, locationAvailable = storage.target.value !is DownloadStorage.Target.Missing)
     }
 
     /** Stops keeping [uri] offline; deletes its items unless another download still needs them. */
@@ -489,15 +531,22 @@ class DownloadManager(
         if (collectionDao.count() == 0) updateSyncSchedule(false)
     }
 
-    /** Downloads single tracks / episodes (kept until removed, independent of collections). */
-    suspend fun downloadItems(uris: List<String>): Unit = scope.detached { downloadItemsNow(uris) }
+    /**
+     * Downloads single tracks / episodes (kept until removed, independent of collections), or
+     * again: failed ones, and ones on an SD card that is no longer used ([DownloadRules.itemRequest]).
+     * Says what it did: nothing starts for downloads on the chosen card while it is away.
+     */
+    suspend fun downloadItems(uris: List<String>): DownloadRequest = scope.detached { downloadItemsNow(uris) }
 
-    private suspend fun downloadItemsNow(uris: List<String>) {
+    private suspend fun downloadItemsNow(uris: List<String>): DownloadRequest {
         val targets = uris.filter(SpotifyUris::isPlayableItem).distinct()
-        if (targets.isEmpty()) return
-        // Names for the Downloads screen while queued; best effort (the record brings them anyway).
-        val metadata = try {
-            withTimeout(METADATA_TIMEOUT_MS) { resolver.metadata(targets) }
+        if (targets.isEmpty()) return DownloadRequest()
+        // Names for the Downloads screen while queued, for new rows (existing ones have theirs);
+        // best effort (the record brings them anyway).
+        val known = targets.chunked(SQL_CHUNK).flatMap { dao.statesOf(it) }.mapTo(HashSet()) { it.uri }
+        val lacking = targets.filter { it !in known }
+        val metadata = if (lacking.isEmpty()) emptyMap() else try {
+            withTimeout(METADATA_TIMEOUT_MS) { resolver.metadata(lacking) }
         } catch (e: TimeoutCancellationException) {
             emptyMap()
         } catch (e: CancellationException) {
@@ -505,19 +554,41 @@ class DownloadManager(
         } catch (e: Exception) {
             emptyMap()
         }
-        mutex.withLock {
+        val (plan, queued, seq) = mutex.withLock {
             val now = System.currentTimeMillis()
             val quality = settings.awaitLoaded().downloadQuality.kbps
+            val states = targets.chunked(SQL_CHUNK).flatMap { dao.statesOf(it) }.associate { it.uri to it.state }
+            val plan = DownloadRules.itemRequest(targets, states, missingCardOf(targets))
             database.withTransaction {
-                insertRows(targets.map { CollectionResolver.Item(it, metadata[it]) }, quality, individual = true, now = now)
-                targets.chunked(SQL_CHUNK).forEach {
-                    dao.setIndividual(it, true)
-                    dao.requeueFailed(it)
-                }
+                insertRows(plan.newSingles.map { CollectionResolver.Item(it, metadata[it]) }, quality, individual = true, now = now)
+                plan.requeue.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+                plan.redownload.chunked(SQL_CHUNK).forEach { dao.requeueFromUnusedCard(it) }
                 metadata.forEach { (uri, meta) -> dao.fillMetadata(uri, meta) }
             }
+            keys.remove(plan.redownload)
+            val queued = targets.chunked(SQL_CHUNK).flatMap { dao.statesOf(it) }.count { DownloadRules.isPending(it.state) }
+            Triple(plan, queued, if (plan.redownload.isNotEmpty()) index.next() else null)
         }
+        // Out of the index already (their card is not mounted); numbered, so the new download wins.
+        seq?.let { index.remove(plan.redownload, it) }
         scheduleExecution(kick = true)
+        return DownloadRequest(queued, plan.waiting.size, locationAvailable = storage.target.value !is DownloadStorage.Target.Missing)
+    }
+
+    /**
+     * Downloads again every download on an SD card that is no longer used (Settings > Storage),
+     * to the chosen location.
+     */
+    suspend fun redownloadFromUnusedCard(): DownloadRequest = scope.detached { downloadItemsNow(missingCard.value.stranded.toList()) }
+
+    /** Must hold [mutex] (or accept a stale answer). [DownloadRules.MissingCard] of [uris] now. */
+    private suspend fun missingCardOf(uris: List<String>): DownloadRules.MissingCard {
+        val rows = uris.chunked(SQL_CHUNK).flatMap { dao.completedLocatedOf(it) }
+        if (rows.isEmpty()) return DownloadRules.MissingCard()
+        val chosen = settings.awaitLoaded().downloadLocation
+        return withContext(Dispatchers.IO) {
+            DownloadRules.missingCard(rows, storage.availability(), chosen, storage.locations.internalRoot.path)
+        }
     }
 
     /** Deletes the given downloads (files, rows, offline index), whatever collection they belong to. */
@@ -573,6 +644,8 @@ class DownloadManager(
             val uris = DownloadRules.retryable(dao.retryRows(), unavailable, appContext.getString(R.string.data_dl_error_unplayable))
             uris.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
         }
+        // Downloads on an SD card that is no longer used count as failed: downloaded again.
+        if (missingCard.value.stranded.isNotEmpty()) downloadItemsNow(missingCard.value.stranded.toList())
         scheduleExecution(kick = true)
     }
 
@@ -1277,7 +1350,11 @@ class DownloadManager(
 
     // ---- membership ----------------------------------------------------------------------------------
 
-    private class MembershipResult(val added: Int, val removal: Removal)
+    /**
+     * [added] items queued; for a user-initiated download also how many members are now [queued]
+     * and how many wait for the chosen card that is away ([waitingForCard]).
+     */
+    private class MembershipResult(val added: Int, val removal: Removal, val queued: Int = 0, val waitingForCard: Int = 0)
 
     /** Downloads deleted by one change of the offline index ([OfflineIndexSync.next]). */
     private class Removal(val uris: List<String>, val seq: Long)
@@ -1319,6 +1396,9 @@ class DownloadManager(
             val wanted = diff.added.toHashSet() + availability.revived
             resolved.items.filter { it.uri in wanted && !it.unavailable }
         }
+        // Downloaded again when the user asks: members on an SD card that is no longer used.
+        val missing = if (userInitiated) missingCardOf(newItems) else DownloadRules.MissingCard()
+        val redownload = missing.stranded.filter { it !in availability.unavailable }
         val now = System.currentTimeMillis()
         val quality = settings.awaitLoaded().downloadQuality.kbps
         database.withTransaction {
@@ -1336,14 +1416,18 @@ class DownloadManager(
             insertRows(toQueue, quality, individual = false, now = now)
             if (userInitiated) {
                 newItems.filter { it !in availability.unavailable }.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+                redownload.chunked(SQL_CHUNK).forEach { dao.requeueFromUnusedCard(it) }
             } else {
                 DownloadRules.requeueOnSync(toQueue.map { it.uri }, availability.revived).chunked(SQL_CHUNK).forEach { dao.requeueFailedOnly(it) }
             }
             deleteRows(toDelete)
         }
         deleteFiles(files)
+        keys.remove(redownload)
         if (toDelete.isNotEmpty()) cancelWorkIfIdleLocked()
-        return MembershipResult(toQueue.size, Removal(toDelete, index.next()))
+        val queued = if (userInitiated) newItems.chunked(SQL_CHUNK).flatMap { dao.statesOf(it) }.count { DownloadRules.isPending(it.state) } else 0
+        // Downloads going again leave the index with the deleted ones (numbered: the new one wins).
+        return MembershipResult(toQueue.size, Removal(toDelete + redownload, index.next()), queued, missing.waiting.size)
     }
 
     /**
