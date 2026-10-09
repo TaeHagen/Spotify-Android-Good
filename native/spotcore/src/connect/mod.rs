@@ -810,6 +810,10 @@ pub(crate) fn on_engine_state_changed() {
         metadata::on_online();
         // The first cluster can arrive before the session is declared online.
         offline::yield_to_active_device();
+        if hub::cluster().is_some() {
+            // (not before the first cluster: another device may have taken over)
+            offline::resume_window_end();
+        }
         if hub::spirc().is_none() {
             // Online but hidden from Spotify Connect: nothing to restore into (the engine only
             // restores into a visible Spirc), so the frozen state goes.

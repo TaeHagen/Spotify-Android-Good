@@ -338,7 +338,11 @@ Spirc: the queue's track stops, and the context loads at its first track after t
 on after the handoff), at the context's start for a new pass; with its options as now, unless the
 user changed the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
 stays shown (loading), so the notification and the media session stay; a failed load makes
-this phone inactive (nothing plays, the app's own resume is the fallback).
+this phone inactive (nothing plays, the app's own resume is the fallback). A window that ends
+before the session is back (no network, no visible session) stops there and keeps where the
+context goes on: once the session and its first cluster are back it hands back by itself
+(playing if it ended playing less than 120 s ago, else paused), and a play hands back too; a
+play while still offline says "Nothing more to play offline" instead of replaying the window.
 A streamed current track is frozen for the reconnect as before (§8), unless its data is all in
 the Player (the vendored `Player::fully_buffered`): it plays on to its end, then the downloaded
 tracks after it, and it isn't loaded again offline (the window around it is the downloads only).
