@@ -198,8 +198,9 @@ pub fn reusable_credentials() -> Option<StoredCredentials> {
     config::from_session(session.username(), session.auth_data())
 }
 
-/// Mints a fresh login5 access token (keymaster client, `streaming` scope) for the logged-in
-/// user, bounded by [`TOKEN_TIMEOUT`]. Used for the ZeroConf `accesstoken` login path.
+/// Mints a fresh login5 access token (this session's own keymaster client) for the logged-in
+/// user, bounded by [`TOKEN_TIMEOUT`]. The last token source of a ZeroConf `accesstoken` login,
+/// after the ones issued for the device's own client (`device_token`).
 pub async fn access_token() -> AppResult<String> {
     let session = session()?;
     let token = tokio::time::timeout(TOKEN_TIMEOUT, session.login5().auth_token()).await??;
