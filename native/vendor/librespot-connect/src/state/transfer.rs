@@ -245,9 +245,21 @@ impl ConnectState {
             self.shuffling_context()
         );
 
-        // SPOTIFYGOOD: see above (a shuffle would play the context again)
-        if after_the_end {
+        // SPOTIFYGOOD: see above (a shuffle would play the context again). A transfer that goes
+        // on in the autoplay context doesn't shuffle either: the shuffle (shuffle_new or
+        // shuffle_restore of the transferred option, which a device that shuffled the context
+        // before autoplay keeps on) made the default context the active one again and played the
+        // finished one anew, reshuffled, before autoplay came back; with an autoplay context
+        // that doesn't allow shuffling it failed the transfer. The default context is at its end
+        // (as update_context leaves it while autoplay plays), the shuffle option stays.
+        let continues_autoplay = matches!(context_ty, ContextType::Autoplay);
+        if after_the_end || continues_autoplay {
             self.transfer_shuffle = None;
+            if continues_autoplay {
+                if let Ok(ctx) = self.get_context_mut(ContextType::Default) {
+                    ctx.index.track = ctx.tracks.len() as u32;
+                }
+            }
             self.reset_playback_to_position(current_index)?;
         } else if self.shuffling_context() {
             // SPOTIFYGOOD: a queued track, or one the context doesn't contain, stays the current
