@@ -21,8 +21,11 @@ over JNI). Requires a Spotify Premium account.
     Chromecast built-in): the app starts Spotify on them and signs them in itself, without the
     Cast SDK or Google Play services;
   - receive: the phone shows up as a Connect device and can be switched to. Receiving while
-    the app is closed needs the "Stay available for Spotify Connect" setting. The phone is
-    only listed as a Connect target while it can actually play.
+    the app is closed needs the "Stay available for Spotify Connect" setting. It comes back by
+    itself after an app update, and after a reboot up to Android 14; from Android 15 a
+    notification after a reboot asks to open the app once (Android does not let a service
+    started at boot play media later). The phone is only listed as a Connect target while it
+    can actually play.
 - **Play modes:** shuffle, smart shuffle (suggestions mixed into the context), repeat all,
   repeat one, autoplay, radio, podcast playback speed (0.5× to 3.5×, one speed for all
   episodes, on this phone).

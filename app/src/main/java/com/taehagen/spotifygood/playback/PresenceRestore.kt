@@ -4,6 +4,7 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
@@ -18,16 +19,26 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Brings the opt-in Connect presence back after the process was gone with no way of its own to
- * return (docs/ARCHITECTURE.md §9.4): a reboot (`BOOT_COMPLETED`, after the first unlock) and an
- * app update (`MY_PACKAGE_REPLACED`). Both broadcasts exempt the app from the background
- * foreground-service start ban, and presence is a `connectedDevice` foreground service, which
- * Android 15 still allows from boot (it refuses `mediaPlayback` and `dataSync` there).
+ * return (docs/ARCHITECTURE.md §9.4): an app update (`MY_PACKAGE_REPLACED`) and, up to Android 14,
+ * a reboot (`BOOT_COMPLETED`, after the first unlock). Both broadcasts exempt the app from the
+ * background foreground-service start ban.
+ *
+ * Not from boot on Android 15+ ([BOOT_TYPES_CHECKED_SDK]): a service started from
+ * `BOOT_COMPLETED` keeps that start reason on its record for as long as it stays in the
+ * foreground (it is reset only when the service leaves it), and every later `startForeground` of
+ * that instance is checked against the boot allowlist of types (`ActiveServices`
+ * `shouldAllowBootCompletedStart`, for apps targeting 35+). Presence keeps the service in the
+ * foreground, so Media3's later `mediaPlayback` foreground would be refused for good and every
+ * local play paused. There a notification asks the user to open the app instead, which starts
+ * presence with the app's own (visible) start reason. `MY_PACKAGE_REPLACED` records a reason of
+ * its own, which that check does not restrict.
+ *
  * `LOCKED_BOOT_COMPLETED` is not used: the credentials and settings live in credential-encrypted
  * storage, readable only after the first unlock, which `BOOT_COMPLETED` follows. Nothing is held
  * awake: the receiver reads the setting and the stored login (bounded, inside its broadcast) and
  * starts the service; presence itself then holds the engine, as when started from the app. When
- * the start is refused (a restricted app, an OEM's own limits) a notification asks the user to
- * open the app once; it goes away when presence is up again.
+ * the start is refused (a restricted app, an OEM's own limits) the same notification asks the
+ * user to open the app once; it goes away when presence is up again.
  */
 internal object PresenceRestore {
     /** The broadcasts presence is restored after. */
@@ -40,20 +51,31 @@ internal object PresenceRestore {
         /** Nothing to restore (not one of [RESTORE_POINTS], presence off, logged out, already up). */
         SKIP,
 
-        /** Presence is on but the stored login could not be read in time: ask the user to open the app. */
+        /**
+         * Presence is on but cannot come back by itself (from boot on Android 15+, or the stored
+         * login was not read in time): ask the user to open the app.
+         */
         NOTIFY,
     }
 
     /**
-     * What to do after [action]: [connectPresence] the setting, [loggedIn] the stored login (null:
-     * not read in time), [presenceUp] presence already in the foreground.
+     * From this API level a service started from `BOOT_COMPLETED` is held to the boot allowlist of
+     * foreground types on every later `startForeground` while it stays in the foreground.
      */
-    fun decide(action: String?, connectPresence: Boolean?, loggedIn: Boolean?, presenceUp: Boolean): Decision = when {
+    const val BOOT_TYPES_CHECKED_SDK = 35
+
+    /**
+     * What to do after [action] on API level [sdk]: [connectPresence] the setting, [loggedIn] the
+     * stored login (null: not read in time), [presenceUp] presence already in the foreground.
+     */
+    fun decide(action: String?, connectPresence: Boolean?, loggedIn: Boolean?, presenceUp: Boolean, sdk: Int): Decision = when {
         action !in RESTORE_POINTS || presenceUp -> Decision.SKIP
         connectPresence != true -> Decision.SKIP
+        loggedIn == false -> Decision.SKIP
         loggedIn == null -> Decision.NOTIFY
-        loggedIn -> Decision.RESTORE
-        else -> Decision.SKIP
+        // A boot-started presence would refuse every later media foreground (see above).
+        action == Intent.ACTION_BOOT_COMPLETED && sdk >= BOOT_TYPES_CHECKED_SDK -> Decision.NOTIFY
+        else -> Decision.RESTORE
     }
 
     /** "Open SpotifyGood to stay available for Spotify Connect", opening the app on a tap. */
@@ -120,7 +142,7 @@ class PresenceRestoreReceiver : BroadcastReceiver() {
                 } else {
                     null
                 }
-                when (PresenceRestore.decide(action, presence, loggedIn, PlaybackService.isPresenceForeground)) {
+                when (PresenceRestore.decide(action, presence, loggedIn, PlaybackService.isPresenceForeground, Build.VERSION.SDK_INT)) {
                     PresenceRestore.Decision.RESTORE -> start(app)
                     PresenceRestore.Decision.NOTIFY -> PresenceRestore.postNotice(app)
                     PresenceRestore.Decision.SKIP -> Unit

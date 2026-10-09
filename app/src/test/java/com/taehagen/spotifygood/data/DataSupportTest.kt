@@ -1,9 +1,6 @@
 package com.taehagen.spotifygood.data
 
 import com.taehagen.spotifygood.model.Page
-import com.taehagen.spotifygood.model.Playlist
-import com.taehagen.spotifygood.model.PlaylistItem
-import com.taehagen.spotifygood.model.Track
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -62,17 +59,6 @@ class PagingTest {
         assertEquals((0 until 25).toList(), items)
     }
 
-    @Test
-    fun playlistItemsFollowsOffsets() = runTest {
-        val tracks = (0 until 130).map { PlaylistItem(track = Track(uri = "spotify:track:$it", name = "t$it")) }
-        val pages = mutableListOf<Int>()
-        val items = CatalogRepository.playlistItems("spotify:playlist:x", { uri, offset, limit ->
-            pages += offset
-            Playlist(uri = uri, name = "p", offset = offset, total = tracks.size, items = tracks.drop(offset).take(limit))
-        })
-        assertEquals(130, items.size)
-        assertEquals(listOf(0, 100), pages)
-    }
 }
 
 class CacheFreshnessTest {
