@@ -587,11 +587,22 @@ fun SettingsScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier)
                     )
                 }
             }
-            if (relocation.moving || relocation.error != null) {
+            if (relocation.moving || relocation.error != null || relocation.unreadable > 0) {
                 item(key = "download_moving") {
                     PrefItem(
-                        title = stringResource(if (relocation.moving) R.string.shell_settings_download_moving else R.string.shell_settings_download_move_stopped),
-                        summary = relocation.error ?: stringResource(R.string.shell_settings_download_moving_summary, relocation.moved, relocation.total),
+                        title = stringResource(
+                            when {
+                                relocation.moving -> R.string.shell_settings_download_moving
+                                relocation.error != null -> R.string.shell_settings_download_move_stopped
+                                else -> R.string.shell_settings_download_moved
+                            },
+                        ),
+                        summary = relocation.error
+                            ?: if (!relocation.moving && relocation.unreadable > 0) {
+                                stringResource(R.string.shell_settings_download_move_unreadable, relocation.unreadable)
+                            } else {
+                                stringResource(R.string.shell_settings_download_moving_summary, relocation.moved, relocation.total)
+                            },
                         icon = Icons.Rounded.SdCard,
                         onClick = { navigator.navigate(Route.Downloads) },
                     )
