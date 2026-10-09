@@ -339,8 +339,11 @@ on after the handoff), at the context's start for a new pass; with its options a
 user changed the window meanwhile (a load, a shuffle toggle). Until Spirc has its track the queue's view
 stays shown (loading), so the notification and the media session stay; a failed load makes
 this phone inactive (nothing plays, the app's own resume is the fallback).
-A streamed current track is frozen for the reconnect as before (§8), and so is any playback
-when the session dies while the network is up (the reconnect follows within seconds).
+A streamed current track is frozen for the reconnect as before (§8), unless its data is all in
+the Player (the vendored `Player::fully_buffered`): it plays on to its end, then the downloaded
+tracks after it, and it isn't loaded again offline (the window around it is the downloads only).
+Any playback is frozen when the session dies while the network is up (the reconnect follows
+within seconds).
 The OfflineController notices a Player whose thread died: the queue stops where it was (so its
 snapshot no longer shows playing), and the next control starts a new Player (a play loads the
 track there again at that position). A paused or finished
@@ -640,7 +643,10 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                device and every 15 s while playing; within 30 s of the end it is played. That is
                this phone's playback and a remote device's this phone follows (it is its remote, or
                handed it over): the phone's view of the account's progress. A remote position near
-               the start doesn't replace a point further on.
+               the start doesn't replace a point further on. A remote device sitting paused saves
+               with the time its position dates from (its snapshot's timestamp; "long ago" without
+               one, unless this phone saw it play), so an old pause — a paused device stays the
+               account's active one for hours (§4.6) — can't replace a newer point.
              * Only a fresh answer carries Spotify's state: cached show pages (fresh hits, copies
                shown while revalidating or offline) and download metadata are stripped (when
                emitted / stored / decoded). Fresh answers are observed once, where they arrive
@@ -648,34 +654,58 @@ resume       `resumePositionMs` / `fullyPlayed` are Spotify's resume point (the 
                `LibraryRepository.episodes`); an answer
                requested before the last one seen is ignored, so an older page can't undo a newer
                one. Everything that shows an episode only overlays the point (no side effects).
-             * A fresh state is news only when it differs from the last one seen (nothing is
-               reported to Spotify, so otherwise its state lags this phone's progress); then it
-               replaces an older point (a not-started one keeps none). With no reference yet (the
-               phone played it, nothing fresh seen since) the furthest point wins. A partly played
-               state is kept when nothing is.
+             * The reference is the last real (fresh) state seen. Every fresh state is remembered
+               in memory (also finished and not-started ones, which keep no entry), and a new entry
+               starts with it, so a re-listen here of an episode Spotify has as finished has one.
+               Decision table (`observeSpotify`): a state equal to the reference is never news,
+               whatever the mark; with a plain reference a changed state is news (nothing is
+               reported to Spotify, so otherwise its state lags this phone's progress); news
+               replaces an older point (a not-started state keeps none). A partly played state is
+               kept when nothing is.
              * Connect marks (each lasts until the next fresh answer, whose state then becomes the
-               reference; the last real state seen is kept under them): after a followed remote
-               device's save, Spotify's next state is news when partly or fully played and
-               different from the last real state seen (with none: when beyond the point); a
-               not-started one (a device that reports nothing, e.g. a librespot receiver) changes
-               nothing. Once this phone saved its own progress after that, and after it took an
-               episode over (seen remote just before, or arriving far from the kept point),
-               Spotify's next state is at best the other device's older one: only a state beyond
-               the point, or finished, is news. A play of an episode whose point came from a
-               followed remote device looks Spotify's point up first (that device may have played
-               on after the phone stopped following).
-             * Every play path resumes from the point: the app's pages (rows and the show's Play),
+               reference; the reference is kept under them): after a followed remote device's
+               save, a changed state is news when partly or fully played; a not-started one (a
+               device that reports nothing, e.g. a librespot receiver) changes nothing. Once this
+               phone saved its own progress after that, after it took an episode over (seen remote
+               just before, or arriving far from the kept point), and with no reference at all,
+               Spotify's state is at best another device's older one: only a state beyond the point
+               is news (the furthest point wins). A finished state is beyond any unfinished point,
+               except this phone's own progress while no real state was ever seen (Spotify's
+               finish may predate a re-listen here).
+             * Every play decides its start in one place, just before the load is sent:
+               `PlayerController.episodeResume` (`EpisodeProgressStore.resumeOrLookUp`) for a play
+               that names no position — the app's pages (rows, the show's and episode's Play),
                Your Episodes, Downloads, search, Android Auto / Assistant / media browsers (their
-               rows also carry the completion status) via `PlayerController.episodeResume` for a
-               play with no position. With no point known and the session online (and no fresh
-               answer about it in the last 10 min), the load first looks Spotify's up
-               (`episodeResumeLookup`: `catalog.episodes`, at most 3.5 s). Auto-advance, next and
-               context loads (Spirc, the offline queue) seek once when local playback arrives near
-               the start of a partly played episode, after the same lookup when nothing is known
-               (nothing is saved below the point until the seek lands or the lookup answers).
-               Tapping the episode that is playing (here or on a Connect device) toggles it.
+               rows also carry the completion status); the pages pass none. It is the kept point,
+               looked up on Spotify first (`catalog.episodes`, at most 3.5 s, then the kept point)
+               when Spotify may know better and the session is online: no point is kept, or it came
+               from a followed remote device (that device may have played on after the phone
+               stopped following); and no fresh answer told its state in the last 10 min.
+               Auto-advance, next and context loads (Spirc, the offline queue) seek once when local
+               playback arrives near the start of a partly played episode, after the same lookup
+               when Spotify may know better (nothing is saved below the point until the seek lands
+               or the lookup answers). Tapping the episode that is playing (here or on a Connect
+               device) toggles it. Offline, the episode page's Play of an episode that isn't
+               downloaded says so (a show load would start another, downloaded one).
+             * The stored session's resumes (Media3 / Bluetooth / Auto resumption, Tap to resume,
+               "play something", the in-app Play fallback, and a transfer that starts it on a device
+               while nothing is loaded, `DevicesRepository.episodeResume`) take the same decision: their position
+               carries when it dates from (`ResumeState.positionAt`: the save's time while it
+               played, the snapshot's timestamp when paused — a remote device sitting paused keeps
+               its old one; `PlayRequest.positionAt`), and it plays only when newer than the
+               episode's point (else the point, or the start of a finished episode), after the same
+               lookup when Spotify may know better. Other positions a request names (a seek-to
+               load) are kept.
+             * "Mark as played" / "Mark as unplayed" (the episode sheet, so every row's More and
+               long press, and the episode page's check button): this phone's newest point,
+               finished or 0 (kept as an entry, so no lookup brings an old point back). Spotify's
+               last state stays the reference (an unchanged one keeps the mark, a changed one is
+               news), the Connect marks end, and an answer requested before the mark is ignored.
+               The episode playing while marked keeps the mark until the user seeks in it, it ends,
+               or playback moves on. Not sent to Spotify: no write endpoint for the played state
+               is verified (Pathfinder's operations here are read-only, `catalog/played.rs`).
              Nothing is reported back to Spotify: progress made on this phone, offline above all,
-             is not synced to other devices.
+             and its marks are not synced to other devices.
 SearchResults {"tracks","artists","albums","playlists","shows","episodes" (arrays),"topResult"?:MediaRef,
               "totals"?:{"tracks"?:n,"artists"?:n,"albums"?:n,"playlists"?:n,"shows"?:n,"episodes"?:n},"partial"?:true}
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
@@ -1515,7 +1545,7 @@ normalisation, streaming quality, playlists (view, create, edit, reorder, delete
 follow), Liked Songs, saved albums/artists/podcasts, follow artists, search (all types,
 recent searches), home feed, album/artist/playlist/show/episode pages, podcast resume
 points (this phone's progress, kept on the phone and not synced to other devices; Spotify's
-when its web API provides them, §6.5), lyrics (synced),
+when its web API provides them; mark as played / unplayed, §6.5), lyrics (synced),
 podcast playback speed (0.5×–3.5×, on this phone), radio, share links, deep links, downloads (track/album/playlist/liked/podcast, Wi-Fi only
 option, storage management, auto-sync), offline mode, sleep timer, explicit-content
 filter, system equalizer, settings, adaptive layouts, accessibility (content

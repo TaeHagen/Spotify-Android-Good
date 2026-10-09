@@ -205,6 +205,9 @@ enum StatePut {
     State,
     Volume,
     AudioOutput,
+    // SPOTIFYGOOD: see handle_connection_id_update
+    /// the announce under a new connection id of the dealer (after a reconnect of it)
+    NewDevice,
 }
 
 impl StatePut {
@@ -213,6 +216,7 @@ impl StatePut {
             StatePut::State => None,
             StatePut::Volume => Some(PutStateReason::VOLUME_CHANGED),
             StatePut::AudioOutput => Some(PutStateReason::AUDIO_DRIVER_INFO_CHANGED),
+            StatePut::NewDevice => Some(PutStateReason::NEW_DEVICE),
         }
     }
 }
@@ -1610,6 +1614,20 @@ impl SpircTask {
                     trace!("==> Loading");
                 }
             },
+            // SPOTIFYGOOD: the stream stalled (see the vendored player's stall_action): buffering
+            // at the position played until its data comes (the PositionCorrection of its first
+            // packet then goes on as Playing), so nothing extrapolates past what was heard. It
+            // stayed Playing: the seek bar, a -15 s from there, the progress saved and the other
+            // clients ran ahead by speed x stall.
+            PlayerEvent::Stalled { position_ms, .. } => {
+                trace!("==> Stalled");
+                if !matches!(self.play_status, SpircPlayStatus::Playing { .. }) {
+                    return Ok(());
+                }
+                self.connect_state
+                    .update_position(position_ms, self.now_ms());
+                self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
+            }
             PlayerEvent::Seeked { position_ms, .. } => {
                 trace!("==> Seeked");
                 self.connect_state
@@ -1747,6 +1765,17 @@ impl SpircTask {
         // SPOTIFYGOOD: the announce below carries the whole state, a put of before (in flight or
         // waiting, see StatePuts) must not land after it
         self.state_puts.cancel();
+
+        // SPOTIFYGOOD: a later connection id (the dealer reconnected while the task runs): the
+        // announce is a put like the others (StatePuts: bounded by STATE_PUT_TIMEOUT, sent again
+        // after a failure, the puts requested meanwhile wait behind it), and the loop goes on.
+        // It was awaited for up to NEW_DEVICE_PUT_TIMEOUT with no command, player event or
+        // cluster handled (a pause from unplugged headphones, the end of a track), and a failure
+        // ended the task: the playback paused and the session was built again.
+        if self.connect_established {
+            self.put_state(StatePut::NewDevice);
+            return Ok(());
+        }
         // SPOTIFYGOOD: the announce is the put of the dropped one: the status, the position and
         // the time of now. It went out as the state was at the last put built (playing, with
         // the position going on, after a pause), and nothing put it again.
@@ -1754,7 +1783,8 @@ impl SpircTask {
             .prepare_put(&self.play_status, self.now_ms());
 
         // SPOTIFYGOOD: bounded, see NEW_DEVICE_PUT_TIMEOUT (unbounded, a live task never
-        // delivered its first cluster: the app never knew which device was active)
+        // delivered its first cluster: the app never knew which device was active). Only for the
+        // first connection: the commands wait in `pending_commands` until it is established.
         let announced = timeout(
             NEW_DEVICE_PUT_TIMEOUT,
             self.connect_state.notify_new_device_appeared(&self.session),
@@ -3599,6 +3629,41 @@ mod tests {
         puts.cancel();
         assert!(puts.in_flight.is_none() && puts.waiting.is_empty());
         assert!(puts.request(StatePut::State));
+    }
+
+    // SPOTIFYGOOD: see handle_connection_id_update
+    #[test]
+    fn the_announce_after_a_dealer_reconnect_is_a_put() {
+        use crate::protocol::connect::PutStateReason;
+
+        let now = tokio::time::Instant::now();
+        let mut puts = StatePuts::default();
+        assert!(puts.request(StatePut::Volume));
+        puts.start(StatePut::Volume, 0, std::future::pending().boxed());
+        assert!(!puts.request(StatePut::State));
+
+        // the reconnect drops the puts of before, the announce goes out at once
+        puts.cancel();
+        assert!(puts.request(StatePut::NewDevice));
+        puts.start(StatePut::NewDevice, 0, std::future::pending().boxed());
+        assert_eq!(
+            StatePut::NewDevice.reason(),
+            Some(PutStateReason::NEW_DEVICE)
+        );
+        // the ones requested meanwhile wait behind it (none lands before it)
+        assert!(!puts.request(StatePut::State));
+        assert_eq!(puts.waiting, [(StatePut::State, 0)]);
+
+        // a failed announce is sent again later, like the other puts
+        assert_eq!(
+            puts.failed(StatePut::NewDevice, 0, now),
+            Some(super::STATE_PUT_RETRY_DELAYS[0])
+        );
+        assert_eq!(puts.done(), Some((StatePut::State, 0)));
+        assert_eq!(
+            puts.take_due(now + super::STATE_PUT_RETRY_DELAYS[0]),
+            [(StatePut::NewDevice, 1)]
+        );
     }
 
     #[test]

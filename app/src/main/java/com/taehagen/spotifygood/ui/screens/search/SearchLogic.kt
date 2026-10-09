@@ -12,7 +12,9 @@ import com.taehagen.spotifygood.model.SearchResults
 import com.taehagen.spotifygood.model.ShowRef
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import com.taehagen.spotifygood.ui.screens.album.isSameContext
 import com.taehagen.spotifygood.ui.screens.library.BrowseError
+import com.taehagen.spotifygood.ui.screens.library.NowPlaying
 import com.taehagen.spotifygood.ui.screens.library.toMediaRef
 
 // Pure search shaping (JVM-testable).
@@ -111,6 +113,37 @@ val SearchItem?.isPlayable: Boolean
         is SearchItem.EpisodeItem -> episode.playable
         else -> true
     }
+
+/**
+ * Whether the top result [ref] is what plays (or is paused): its track / episode, or its context
+ * (playlist URI forms compared canonically). The card's Pause icon and its toggle both read it.
+ */
+fun NowPlaying.isTop(ref: MediaRef): Boolean = when (ref.type) {
+    MediaType.TRACK, MediaType.EPISODE -> trackUri == ref.uri
+    else -> isSameContext(contextUri, ref.uri)
+}
+
+/** What the top result card's Play / Pause does ([SearchViewModel.playTop]). */
+sealed interface TopPlay {
+    /** It is what plays (or is paused): pause / resume it. */
+    data object Toggle : TopPlay
+
+    /** Start it (the result is remembered as a recent search). */
+    sealed interface Start : TopPlay
+    data class SongInAlbum(val track: Track) : Start
+    data class SongByUri(val uri: String) : Start
+    data class EpisodeByUri(val uri: String) : Start
+    data class ContextByUri(val uri: String) : Start
+}
+
+/** [TopPlay] for [ref] (its result [item]) while [nowPlaying] plays; null: it can't start (unplayable). */
+fun topPlay(ref: MediaRef, item: SearchItem?, nowPlaying: NowPlaying): TopPlay? = when {
+    !item.isPlayable -> null
+    nowPlaying.isTop(ref) -> TopPlay.Toggle
+    ref.type == MediaType.TRACK -> (item as? SearchItem.Song)?.let { TopPlay.SongInAlbum(it.track) } ?: TopPlay.SongByUri(ref.uri)
+    ref.type == MediaType.EPISODE -> TopPlay.EpisodeByUri(ref.uri)
+    else -> TopPlay.ContextByUri(ref.uri)
+}
 
 /** De-duplicates every list of a results page by URI (the server sometimes repeats items). */
 fun SearchResults.distinct(): SearchResults = copy(

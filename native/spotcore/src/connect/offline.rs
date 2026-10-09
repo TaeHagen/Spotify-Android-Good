@@ -104,7 +104,22 @@ pub(crate) fn handover(max_next: usize) -> Option<Handover> {
 /// and whether it plays, and
 /// where the context goes on after the window (see [`continuation`]). `None` unless this device
 /// is active with a downloaded current track that isn't stopped.
+#[cfg(test)]
 pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, now_ms: i64) -> Option<Adoption> {
+    handoff_with(s, downloaded, None, now_ms)
+}
+
+/// [`handoff`], also of a streamed current track whose data is all in the Player (`buffered`, see
+/// the vendored `Player::fully_buffered`): it plays to its end, then the downloads after it. The
+/// window around it is still the downloaded tracks only, and it isn't loaded again offline
+/// ([`Adoption::streamed`]). A train losing the signal cut such a song off at the network-loss
+/// cap (60 s) and froze it as a restore point, and the downloads after it never played.
+pub(crate) fn handoff_with(
+    s: &ConnectSnapshot,
+    downloaded: impl Fn(&str) -> bool,
+    buffered: Option<&str>,
+    now_ms: i64,
+) -> Option<Adoption> {
     if !s.is_active {
         return None;
     }
@@ -115,7 +130,9 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
         SnapshotPlayStatus::LoadingPause => (false, true),
         SnapshotPlayStatus::Stopped => return None,
     };
-    let current = s.track.as_ref().filter(|t| !t.hidden && downloaded(&t.uri))?;
+    let playable = |uri: &str| downloaded(uri) || buffered == Some(uri);
+    let current = s.track.as_ref().filter(|t| !t.hidden && playable(&t.uri))?;
+    let streamed = !downloaded(&current.uri);
     // A suggestion that isn't downloaded can't play offline and isn't the context's: skipped, it
     // doesn't end the window (a hand-back gets new ones from Spirc).
     let keep = |t: &SnapshotTrack| t.provider != TrackProvider::Suggestion || downloaded(&t.uri);
@@ -158,7 +175,8 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
         start: pass.start,
         outside,
         user_queued,
-        position_ms: super::restore::position_now(s, now_ms).max(0) as u64,
+        // As far as it was heard (a stalled stream goes on in the snapshot).
+        position_ms: super::restore::position_heard(s, now_ms, super::restore::player_decoded().as_ref()).max(0) as u64,
         duration_ms: s.duration_ms.max(0) as u64,
         playing,
         loading,
@@ -172,6 +190,7 @@ pub(crate) fn handoff(s: &ConnectSnapshot, downloaded: impl Fn(&str) -> bool, no
             smart_shuffle: s.smart_shuffle,
             order: None,
         }),
+        streamed,
     })
 }
 
@@ -262,7 +281,9 @@ fn hand_back_allowed() -> bool {
 pub(crate) fn take_over(generation: u64) -> bool {
     let Some((spirc, snap)) = hub::link_snapshot(generation) else { return false };
     let now = now_ms();
-    let Some(adoption) = handoff(&snap, downloads::is_downloaded, now) else { return false };
+    // A streamed current track whose data is all in the Player plays on too.
+    let buffered = engine::player_host::player().and_then(|p| p.fully_buffered()).and_then(|u| u.to_uri().ok());
+    let Some(adoption) = handoff_with(&snap, downloads::is_downloaded, buffered.as_deref(), now) else { return false };
     if engine::player_host::player().is_none() {
         return false;
     }
@@ -711,6 +732,26 @@ mod tests {
         assert!(handoff(&playing(&[], "t:3x", &["t:4"]), downloaded, 0).is_none());
         assert!(handoff(&ConnectSnapshot { status: SnapshotPlayStatus::Stopped, ..s.clone() }, downloaded, 0).is_none());
         assert!(handoff(&ConnectSnapshot { is_active: false, ..s }, downloaded, 0).is_none());
+    }
+
+    #[test]
+    fn a_fully_buffered_streamed_track_is_handed_over_with_the_downloads_after_it() {
+        let downloaded = |u: &str| !u.ends_with('x');
+        let mut s = playing(&["t:1", "t:2x"], "t:3x", &["t:4", "t:5", "t:6x", "t:7"]);
+        s.repeat_context = false;
+        // its data is all in the Player: it plays on, then the downloads after it
+        let a = handoff_with(&s, downloaded, Some("t:3x"), 1_005_000).expect("handed over");
+        assert_eq!(a.uris, ["t:3x", "t:4", "t:5"], "the window around it is the downloads only");
+        assert_eq!(a.start, 0);
+        assert!(a.streamed && a.playing);
+        assert_eq!(a.position_ms, 15_000);
+        assert_eq!(a.continuation.as_ref().and_then(|c| c.start_uri.as_deref()), Some("t:6x"));
+        // not all there (or another track is): frozen as before
+        assert!(handoff_with(&s, downloaded, None, 1_005_000).is_none());
+        assert!(handoff_with(&s, downloaded, Some("t:4"), 1_005_000).is_none());
+        // a downloaded current track isn't streamed
+        let d = playing(&[], "t:3", &["t:4"]);
+        assert!(handoff_with(&d, downloaded, Some("t:3"), 0).is_some_and(|a| !a.streamed));
     }
 
     #[test]

@@ -197,6 +197,10 @@ pub(crate) struct Adoption {
     /// turned on after the handoff) hands back there instead of the queue wrapping a part of the
     /// context, unless the context goes on after the window ([`Adoption::continuation`]).
     pub restart: Option<Continuation>,
+    /// `uris[start]` isn't downloaded: a streamed track whose data is all in the Player. It plays
+    /// on (seeks within it too), but it is never loaded again offline: the queue doesn't go back
+    /// to it (it counts as unavailable).
+    pub streamed: bool,
 }
 
 impl Default for OfflineQueue {
@@ -747,6 +751,12 @@ impl OfflineQueue {
         // The user queue is in the handed over tracks (taken out of them below).
         self.queue.clear();
         let load = self.load(spec, now_ms)?;
+        // See Adoption::streamed (after the load, which starts the queue afresh).
+        if a.streamed {
+            if let Some(item) = self.items.get(a.start) {
+                self.unavailable.insert(item.uri.clone());
+            }
+        }
         // Spirc's queued tracks after the current one are the user queue here too, in order.
         for i in a.user_queued.into_iter().filter(|&i| i > a.start && i < self.items.len()) {
             let uid = format!("q{}", self.next_queue_id);
@@ -1691,7 +1701,23 @@ mod tests {
             shuffle: false,
             continuation: None,
             restart: None,
+            streamed: false,
         }
+    }
+
+    #[test]
+    fn an_adopted_streamed_track_plays_on_but_isnt_loaded_again() {
+        let mut q = OfflineQueue::default();
+        // Spirc's load of the current track (a streamed one, its data all in the Player)
+        q.on_event(Event::RequestId(7), 0);
+        assert_eq!(q.adopt(Adoption { streamed: true, ..adoption(3, 1) }, 1_000), Some(Action::Play));
+        assert_eq!(q.current_uri(), Some("spotify:track:1"));
+        // it plays to its end, then the downloads after it
+        let next = q.on_event(Event::EndOfTrack(7), 200_000).action;
+        assert!(matches!(next, Some(Action::Load { ref uri, .. }) if uri == "spotify:track:2"));
+        // the queue never goes back to it (offline it can't be loaded again)
+        assert!(!q.playable(1));
+        assert!(q.playable(0) && q.playable(2));
     }
 
     #[test]

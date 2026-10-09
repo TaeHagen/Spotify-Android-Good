@@ -13,6 +13,7 @@ import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.Show
 import com.taehagen.spotifygood.model.best
+import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadUi
@@ -27,6 +28,7 @@ import com.taehagen.spotifygood.ui.screens.album.PlaybackInfo
 import com.taehagen.spotifygood.ui.screens.album.RichText
 import com.taehagen.spotifygood.ui.screens.album.collectionUi
 import com.taehagen.spotifygood.ui.screens.album.dataOrNull
+import com.taehagen.spotifygood.ui.screens.album.engineReach
 import com.taehagen.spotifygood.ui.screens.album.failureReason
 import com.taehagen.spotifygood.ui.screens.album.oldestFirstPage
 import com.taehagen.spotifygood.ui.screens.album.parseHtml
@@ -54,7 +56,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** Where to resume an episode (0 when fully played or never started). */
+/**
+ * Where an episode resumes, as its row shows it (0 when fully played or never started). Plays
+ * name no position: the player decides it ([com.taehagen.spotifygood.playback.PlayerController.episodeResume]).
+ */
 internal fun Episode.resumePosition(): Long {
     if (fullyPlayed == true) return 0
     val position = (resumePositionMs ?: 0).coerceAtLeast(0)
@@ -322,7 +327,7 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
     /**
      * A row tap: the episode playing (here or on a Connect device) toggles, as the episode page's
      * button does (reloading it at the row's point would restart a remote device's progress); any
-     * other starts at its resume point.
+     * other starts at its resume point (the player's, looked up first when Spotify may know better).
      */
     fun playEpisode(episode: Episode) {
         if (episode.isPlaceholder || !episode.playable) return
@@ -330,12 +335,12 @@ internal class ShowViewModel(graph: AppGraph, private val uri: String) : DetailV
             graph.player.togglePlayPause()
             return
         }
-        graph.player.play(PlayRequest(contextUri = uri, startUri = episode.uri, positionMs = episode.resumePosition()))
+        graph.player.play(PlayRequest(contextUri = uri, startUri = episode.uri))
     }
 
     /** Toggles playback of this show, or starts its newest episode at its resume point. */
     override fun playContext() {
-        val newest = firstPage.firstOrNull { it.playable && !it.isPlaceholder }?.let(graph.episodeProgress::overlay)
+        val newest = firstPage.firstOrNull { it.playable && !it.isPlaceholder }
         when {
             currentPlayback().isContext(uri) -> graph.player.togglePlayPause()
             newest != null -> playEpisode(newest)
@@ -454,13 +459,20 @@ internal class EpisodeViewModel(graph: AppGraph, private val uri: String) : Deta
             graph.player.togglePlayPause()
             return
         }
-        val showUri = episode.show?.uri
-        val request = if (showUri != null) {
-            PlayRequest(contextUri = showUri, startUri = uri, positionMs = episode.resumePosition())
-        } else {
-            PlayRequest(trackUris = listOf(uri), positionMs = episode.resumePosition())
+        val request = episodePlayRequest(uri, episode.show?.uri, graph.engineReach(), state.value.download)
+        if (request == null) {
+            message(R.string.playback_error_not_available_offline)
+            return
         }
         graph.player.play(request)
+    }
+
+    /** "Mark as played" / "Mark as unplayed": this phone's newest point (docs §6.5). */
+    fun togglePlayed() {
+        // Overlaid: this phone's point, else Spotify's state of the page.
+        val played = state.value.load.dataOrNull()?.episode?.fullyPlayed == true
+        graph.episodeProgress.markPlayed(uri, played = !played)
+        message(if (played) R.string.shell_msg_marked_unplayed else R.string.shell_msg_marked_played)
     }
 
     fun toggleSaved() {
@@ -483,4 +495,17 @@ internal class EpisodeViewModel(graph: AppGraph, private val uri: String) : Deta
             graph.downloads.removeItems(listOf(uri))
         }
     }
+}
+
+/**
+ * The episode page's Play of [uri], in its show's context ([showUri]) when known; null when it can't
+ * start here: while OFFLINE a show load is rewritten to its downloads ([com.taehagen.spotifygood.playback.OfflineLoads]),
+ * so an episode that isn't downloaded would start a different, downloaded one (the rows are disabled
+ * for the same reason, [com.taehagen.spotifygood.ui.screens.album.canStartNow]). It names no
+ * position: the player resumes it ([com.taehagen.spotifygood.playback.PlayerController.episodeResume]).
+ */
+internal fun episodePlayRequest(uri: String, showUri: String?, reach: EngineReach, download: DownloadState?): PlayRequest? = when {
+    reach == EngineReach.OFFLINE && download != DownloadState.COMPLETED -> null
+    showUri != null -> PlayRequest(contextUri = showUri, startUri = uri)
+    else -> PlayRequest(trackUris = listOf(uri))
 }

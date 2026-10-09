@@ -33,6 +33,7 @@ import com.taehagen.spotifygood.ui.screens.library.playTrackInAlbum
 import com.taehagen.spotifygood.ui.screens.library.launchTrackStart
 import com.taehagen.spotifygood.ui.screens.library.toBrowseError
 import com.taehagen.spotifygood.ui.screens.library.toMediaRef
+import com.taehagen.spotifygood.ui.screens.library.toNowPlaying
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -315,15 +316,23 @@ class SearchViewModel(private val graph: AppGraph) : ViewModel() {
         graph.playTrackInAlbum(track)
     }
 
-    /** Plays a top-result reference (play button on the top result card). */
+    /**
+     * The top result card's Play / Pause: toggles the result when it is what plays (or is paused),
+     * as every other Play button does; otherwise plays it.
+     */
     fun playTop(ref: MediaRef, sections: TopSections) {
-        if (!sections.byUri[ref.uri].isPlayable) return
-        onOpened(ref)
-        when (ref.type) {
-            MediaType.TRACK -> (sections.byUri[ref.uri] as? SearchItem.Song)?.let { graph.playTrackInAlbum(it.track) }
-                ?: graph.launchTrackStart(ref.uri, track = null)
-            MediaType.EPISODE -> graph.player.playTracks(listOf(ref.uri))
-            else -> graph.player.playContext(ref.uri)
+        when (val play = topPlay(ref, sections.byUri[ref.uri], graph.playback.snapshot.value.toNowPlaying())) {
+            null -> Unit
+            TopPlay.Toggle -> graph.player.togglePlayPause()
+            is TopPlay.Start -> {
+                onOpened(ref)
+                when (play) {
+                    is TopPlay.SongInAlbum -> graph.playTrackInAlbum(play.track)
+                    is TopPlay.SongByUri -> graph.launchTrackStart(play.uri, track = null)
+                    is TopPlay.EpisodeByUri -> graph.player.playTracks(listOf(play.uri))
+                    is TopPlay.ContextByUri -> graph.player.playContext(play.uri)
+                }
+            }
         }
     }
 
