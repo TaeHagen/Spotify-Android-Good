@@ -17,7 +17,12 @@ use librespot_core::{Error, http_client::HttpClient, session::Session};
 use crate::range_set::{Range, RangeSet};
 
 use super::{
-    AudioFetchParams, AudioFileError, AudioFileResult, AudioFileShared, StreamLoaderCommand,
+    AudioFetchParams,
+    AudioFileError,
+    AudioFileResult,
+    AudioFileShared,
+    StreamLoaderCommand,
+    StreamOutput, // SPOTIFYGOOD: see temp_buffer
     StreamingRequest,
 };
 
@@ -241,7 +246,8 @@ async fn receive_data(
 struct AudioFileFetch {
     session: Session,
     shared: Arc<AudioFileShared>,
-    output: Option<NamedTempFile>,
+    // SPOTIFYGOOD: StreamOutput (was NamedTempFile), see temp_buffer
+    output: Option<StreamOutput>,
 
     file_data_tx: mpsc::UnboundedSender<ReceivedData>,
     complete_tx: Option<oneshot::Sender<NamedTempFile>>,
@@ -599,7 +605,8 @@ impl AudioFileFetch {
 
         let complete_tx = self.complete_tx.take();
 
-        if let Some(mut output) = output {
+        // SPOTIFYGOOD: a stream kept in memory isn't saved to the cache (see temp_buffer)
+        if let Some(StreamOutput::File(mut output)) = output {
             output.rewind()?;
             if let Some(complete_tx) = complete_tx {
                 complete_tx
@@ -616,7 +623,7 @@ pub(super) async fn audio_file_fetch(
     session: Session,
     shared: Arc<AudioFileShared>,
     initial_request: StreamingRequest,
-    output: NamedTempFile,
+    output: StreamOutput, // SPOTIFYGOOD: see temp_buffer
     mut stream_loader_command_rx: mpsc::UnboundedReceiver<StreamLoaderCommand>,
     complete_tx: oneshot::Sender<NamedTempFile>,
     // SPOTIFYGOOD: see AudioFileFetch::url
