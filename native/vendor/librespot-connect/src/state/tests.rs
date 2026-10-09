@@ -551,6 +551,51 @@ fn a_stall_stays_where_it_was_heard_across_puts() {
     assert_eq!(state.player().playback_speed, 2.);
 }
 
+// SPOTIFYGOOD: see ConnectState::forget_filtered_unavailable
+#[test]
+fn tracks_the_explicit_filter_refused_play_again_once_it_is_off() {
+    let (_rt, mut state) = state(6);
+    let uri = |n| SpotifyUri::from_uri(&track_uri(n, 0)).unwrap();
+    let next_uris = |s: &ConnectState| -> Vec<String> {
+        s.next_tracks().iter().map(|t| t.uri.clone()).collect()
+    };
+    // while the filter is on: the track after the current one is refused (explicit), another one
+    // for another reason
+    state.mark_unavailable(&uri(1)).unwrap();
+    state.note_filtered_unavailable(&uri(1)).unwrap();
+    state.mark_unavailable(&uri(3)).unwrap();
+    assert!(!next_uris(&state).contains(&track_uri(1, 0)));
+    // a playlist update meanwhile marks it in the context too
+    update_same_context(&mut state, context(6, 0));
+    assert!(
+        state
+            .get_context(ContextType::Default)
+            .unwrap()
+            .tracks
+            .iter()
+            .any(|t| t.uri == track_uri(1, 0) && t.is_unavailable())
+    );
+    assert!(!next_uris(&state).contains(&track_uri(1, 0)));
+
+    // the filter is off: it is the next track again; the other refusal stays
+    assert!(state.forget_filtered_unavailable().unwrap());
+    let next = next_uris(&state);
+    assert_eq!(next.first(), Some(&track_uri(1, 0)), "{next:?}");
+    assert!(!next.contains(&track_uri(3, 0)));
+    assert!(!state.forget_filtered_unavailable().unwrap(), "only once");
+    // it plays, and a fill up after it keeps it (the context has its provider back)
+    assert_eq!(play_through(&mut state, 1), uids(1..2));
+    update_same_context(&mut state, context(6, 0));
+    assert!(
+        state
+            .get_context(ContextType::Default)
+            .unwrap()
+            .tracks
+            .iter()
+            .all(|t| t.uri != track_uri(1, 0) || !t.is_unavailable())
+    );
+}
+
 // SPOTIFYGOOD: see Spirc's loading_status
 #[test]
 fn a_reopen_while_playing_loads_at_its_position() {
