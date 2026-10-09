@@ -146,9 +146,16 @@ data class DownloadLocation(val id: String, val label: String, val freeBytes: Lo
 
 /**
  * Moving downloads to the chosen location: [moved] of [total] files while [moving]; [error] when a
- * pass stopped early (it resumes at the next start, mount or change of the location).
+ * pass stopped early (it resumes at the next start, mount or change of the location); [unreadable]
+ * downloads whose file could not be read were left where they were and are downloaded again.
  */
-data class DownloadRelocation(val moving: Boolean = false, val moved: Int = 0, val total: Int = 0, val error: String? = null)
+data class DownloadRelocation(
+    val moving: Boolean = false,
+    val moved: Int = 0,
+    val total: Int = 0,
+    val error: String? = null,
+    val unreadable: Int = 0,
+)
 
 /** What the downloader is doing right now (Downloads screen header, banners). */
 data class DownloadActivity(
@@ -942,7 +949,8 @@ class DownloadManager(
         val target = storage.target.value as? DownloadStorage.Target.Ready ?: return
         val available = storage.availability()
         moveParts(target.root)
-        val plan = DownloadRules.relocationPlan(dao.locatedRows(), target.root.path, available)
+        // Files that failed before go last: one bad file never holds back the rest.
+        val plan = DownloadRules.orderPlan(DownloadRules.relocationPlan(dao.locatedRows(), target.root.path, available), relocationFailures)
         if (plan.isEmpty()) return
         Log.i(TAG, "Moving ${plan.size} download files to ${target.root}")
         // Under the commit lock, which garbage collection holds while it runs: it never sees a copy
@@ -950,31 +958,88 @@ class DownloadManager(
         mutex.withLock { storage.relocating = true }
         _relocation.value = DownloadRelocation(moving = true, moved = 0, total = plan.size)
         var moved = 0
+        var unreadable = 0
         try {
             for (batch in plan.chunked(RELOCATE_BATCH)) {
                 if (storage.target.value != target) return // changed again: the next pass moves there
-                // The copies made before a stop (no space, an I/O error) are switched all the same.
+                // The copies made before a stop (no space, an error about the target) are switched all
+                // the same; a damaged original is skipped and downloaded again.
                 copyThenSwitch(
                     batch,
-                    copy = { move -> withContext(Dispatchers.IO) { copyVerified(File(move.from), File(move.to), storage::freeBytes, DownloadRules.MIN_FREE_BYTES) } },
+                    copy = { move -> withContext(Dispatchers.IO) { copyMove(move) } },
                     onDone = {
                         moved++
-                        _relocation.value = DownloadRelocation(moving = true, moved = moved, total = plan.size)
+                        _relocation.value = DownloadRelocation(moving = true, moved = moved, total = plan.size, unreadable = unreadable)
                     },
                     switch = { copies -> switchCopies(copies) },
+                    skip = { damaged ->
+                        dropUnreadable(damaged)
+                        unreadable += damaged.count { !it.image }
+                    },
+                    onFailed = { move -> relocationFailures += move.from },
                 )
             }
-            _relocation.value = DownloadRelocation(moved = moved, total = plan.size)
-            Log.i(TAG, "Moved $moved download files to ${target.root}")
+            _relocation.value = DownloadRelocation(moved = moved, total = plan.size, unreadable = unreadable)
+            Log.i(TAG, "Moved $moved download files to ${target.root} ($unreadable unreadable, downloaded again)")
         } catch (e: CancellationException) {
             throw e
         } catch (e: NoSpaceException) {
             Log.w(TAG, "Moving downloads stopped: not enough space at ${e.dir}")
-            _relocation.value = DownloadRelocation(moved = moved, total = plan.size, error = appContext.getString(R.string.data_dl_move_no_space))
+            _relocation.value = DownloadRelocation(moved = moved, total = plan.size, error = appContext.getString(R.string.data_dl_move_no_space), unreadable = unreadable)
         } catch (e: IOException) {
             Log.w(TAG, "Moving downloads stopped; retried later", e)
-            _relocation.value = DownloadRelocation(moved = moved, total = plan.size, error = appContext.getString(R.string.data_dl_move_failed))
+            _relocation.value = DownloadRelocation(moved = moved, total = plan.size, error = appContext.getString(R.string.data_dl_move_failed), unreadable = unreadable)
+        } finally {
+            // The damaged ones are queued: download them now.
+            if (unreadable > 0) withContext(NonCancellable) { if (dao.pendingCount() > 0) scheduleExecution(kick = true) }
         }
+    }
+
+    /** Sources whose move failed in this process (unreadable, or a copy that stopped a pass): moved last. */
+    private val relocationFailures: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+
+    /**
+     * Blocking. Copies one file of a move ([copyVerified]). An original that cannot be read while its
+     * location is still there is a damaged file ([SourceUnreadableException]: skipped); when the
+     * card itself went (removed meanwhile) the move stops instead, and resumes when it is back.
+     */
+    private fun copyMove(move: DownloadRules.FileMove) {
+        try {
+            copyVerified(File(move.from), File(move.to), storage::freeBytes, DownloadRules.MIN_FREE_BYTES)
+        } catch (e: SourceUnreadableException) {
+            val root = DownloadRules.rootOf(move.from)
+            val there = root != null && storage.locations.isAvailable(root) && File(move.from).parentFile?.isDirectory == true
+            if (!there) throw IOException("The location of ${move.from} went", e)
+            Log.w(TAG, "Could not read ${move.from}; it is downloaded again", e)
+            throw e
+        }
+    }
+
+    /**
+     * Damaged originals met while moving: downloads whose audio cannot be read go back into the
+     * queue (downloaded fresh to the chosen location, out of the offline index with a numbered
+     * change); an unreadable cover is dropped (the CDN image shows). Their old files are collected
+     * with the rest.
+     */
+    private suspend fun dropUnreadable(moves: List<DownloadRules.FileMove>) {
+        if (moves.isEmpty()) return
+        val (uris, seq) = mutex.withLock {
+            val uris = LinkedHashSet<String>()
+            database.withTransaction {
+                moves.forEach { move ->
+                    if (move.image) {
+                        dao.dropImage(move.from)
+                    } else {
+                        uris += dao.completedUrisWithPath(move.from)
+                        dao.requeueUnreadable(move.from)
+                        dao.forgetUnreadable(move.from)
+                    }
+                }
+            }
+            keys.remove(uris)
+            uris.toList() to (if (uris.isNotEmpty()) index.next() else null)
+        }
+        seq?.let { index.remove(uris, it) }
     }
 
     /**

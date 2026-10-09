@@ -782,6 +782,14 @@ internal object DownloadRules {
     }
 
     /**
+     * [plan] (in the stable order of the rows) with the files whose move failed before in this
+     * process ([failedBefore]: unreadable, or a copy that stopped the move) at the end, so one bad
+     * file never holds back the rest.
+     */
+    fun orderPlan(plan: List<FileMove>, failedBefore: Set<String>): List<FileMove> =
+        if (failedBefore.isEmpty()) plan else plan.sortedBy { it.from in failedBefore }
+
+    /**
      * Completed downloads ([rows]) whose audio lies on a location that is not [available] (a card
      * removed or unmounted): they stay downloaded (nothing is deleted or failed) but cannot play
      * until it is back.
