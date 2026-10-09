@@ -138,6 +138,9 @@ struct SpircTask {
 
     /// is set when transferring, and used after resolving the contexts to finish the transfer
     pub transfer_state: Option<TransferState>,
+    // SPOTIFYGOOD: see skip_refused_after_transfer
+    /// the current track the player refused while a transfer waited for its context
+    skip_after_transfer: Option<String>,
 
     /// when set to true, it will update the volume after [VOLUME_UPDATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
@@ -457,6 +460,19 @@ fn resolvable_transfer_context(uri: &str) -> bool {
     uri != WEB_API_URI
 }
 
+// SPOTIFYGOOD: while a track loads its duration isn't known (0, see ConnectState::start_loading):
+// a seek then reaches the player (its decoder bounds it). It was checked against the previous
+// item's duration: a seek during a load (a SeekTo of another client, a scrub right after Next)
+// was dropped when it was past that one's end.
+/// Whether a seek to `position_ms` goes past the end of the track (it is dropped)
+fn seeks_past_the_end(position_ms: u32, duration: i64, play_status: &SpircPlayStatus) -> bool {
+    let loading = matches!(
+        play_status,
+        SpircPlayStatus::LoadingPlay { .. } | SpircPlayStatus::LoadingPause { .. }
+    );
+    !loading && duration > 0 && i64::from(position_ms) > duration
+}
+
 // SPOTIFYGOOD: moved out of SpircTask::add_autoplay_resolving_when_required (unchanged), so that
 // a test can check it against a state
 /// The autoplay resolve the state needs (few next tracks are left), while `autoplay` is on
@@ -661,6 +677,8 @@ impl Spirc {
             session,
 
             transfer_state: None,
+            // SPOTIFYGOOD: see skip_refused_after_transfer
+            skip_after_transfer: None,
             update_volume: false,
             update_state: false,
 
@@ -1325,7 +1343,19 @@ impl SpircTask {
 
     // SPOTIFYGOOD: `background`: a resolve of the loop, not the one a load waits for (a failed
     // load reports its error, the user loads again)
+    // SPOTIFYGOOD: see skip_refused_after_transfer (the resolve is apply_next_context_result)
     fn handle_next_context(
+        &mut self,
+        next_context: Result<Context, Error>,
+        background: bool,
+    ) -> bool {
+        let handled = self.apply_next_context_result(next_context, background);
+        let skipped = self.skip_refused_after_transfer();
+        handled || skipped
+    }
+
+    // SPOTIFYGOOD: was handle_next_context
+    fn apply_next_context_result(
         &mut self,
         next_context: Result<Context, Error>,
         background: bool,
@@ -1804,7 +1834,14 @@ impl SpircTask {
                         self.connect_state.note_filtered_unavailable(&track_id)?;
                     }
                 }
-                if is_current {
+                // SPOTIFYGOOD: while a transfer waits for its context there is nothing to skip
+                // to (no next tracks yet): the skip waits until the transfer is finished (see
+                // skip_refused_after_transfer). It ran against the empty state, or (before
+                // ConnectState::mark_unavailable went on without a context) not at all: Spirc
+                // stayed LoadingPlay on the refused track (a local file, a hidden explicit song).
+                if is_current && self.transfer_state.is_some() {
+                    self.skip_after_transfer = Some(track_id.to_uri()?);
+                } else if is_current {
                     self.handle_preload_next_track();
                     self.handle_next(None)?
                 } else if !transient && reason != UnavailableReason::KeyDenied {
@@ -2188,6 +2225,8 @@ impl SpircTask {
         mut transfer: TransferState,
         start_paused: bool,
     ) -> Result<(), Error> {
+        // SPOTIFYGOOD: see skip_refused_after_transfer (a refusal of the transfer before)
+        self.skip_after_transfer = None;
         let mut ctx_uri = match transfer.current_session.context.uri {
             None => Err(SpircError::NoUri("transfer context"))?,
             // can apparently happen when a state is transferred and was started with "uris" via the api
@@ -2350,6 +2389,27 @@ impl SpircTask {
         self.load_track(is_playing, position.try_into()?)
     }
 
+    // SPOTIFYGOOD: a track the player refused (Unavailable) while a transfer waited for its
+    // context is skipped once the transfer is finished (with its context, its queue), if it is
+    // still the current track; see the Unavailable arm of handle_player_event
+    /// Skips the refused track of a finished transfer; returns whether it did
+    fn skip_refused_after_transfer(&mut self) -> bool {
+        if self.transfer_state.is_some() {
+            return false;
+        }
+        let Some(refused) = self.skip_after_transfer.take() else {
+            return false;
+        };
+        if !self.connect_state.current_track(|t| t.uri == refused) {
+            return false;
+        }
+        self.handle_preload_next_track();
+        if let Err(why) = self.handle_next(None) {
+            error!("skipping the refused track of the transfer failed: {why}");
+        }
+        true
+    }
+
     // SPOTIFYGOOD: see handle_transfer
     /// Finishes the pending transfer with what it brought (see
     /// ConnectState::finish_transfer_without_context), as when its resolve failed for good
@@ -2367,6 +2427,8 @@ impl SpircTask {
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
         self.context_resolver.clear();
+        // SPOTIFYGOOD: see skip_refused_after_transfer
+        self.skip_after_transfer = None;
         // SPOTIFYGOOD: a put still in flight (or waiting) would announce the active state again
         // after the inactive one below
         self.state_puts.cancel();
@@ -2479,6 +2541,8 @@ impl SpircTask {
         if reset_completely {
             self.context_resolver.clear();
             self.transfer_state = None;
+            // SPOTIFYGOOD: see skip_refused_after_transfer
+            self.skip_after_transfer = None;
         }
 
         self.connect_state.reset_options();
@@ -2735,6 +2799,8 @@ impl SpircTask {
             self.context_resolver.clear();
             // SPOTIFYGOOD: a pending transfer was finished against the loaded context
             self.transfer_state = None;
+            // SPOTIFYGOOD: see skip_refused_after_transfer
+            self.skip_after_transfer = None;
             // SPOTIFYGOOD: an explicit load always asks again, a failure of the same context a
             // moment ago (e.g. a network hiccup) refused it without any request for a minute
             self.context_resolver.forget_unavailable(&resolve);
@@ -2880,7 +2946,8 @@ impl SpircTask {
 
     fn handle_seek(&mut self, position_ms: u32) {
         let duration = self.connect_state.player().duration;
-        if i64::from(position_ms) > duration {
+        // SPOTIFYGOOD: see seeks_past_the_end
+        if seeks_past_the_end(position_ms, duration, &self.play_status) {
             warn!("tried to seek to {position_ms}ms of {duration}ms");
             return;
         }
@@ -3485,8 +3552,8 @@ impl SpircTask {
             self.player.load(id, start_playing, position_ms);
         }
 
-        self.connect_state
-            .update_position(position_ms, self.now_ms());
+        // SPOTIFYGOOD: see ConnectState::start_loading (was update_position)
+        self.connect_state.start_loading(position_ms, self.now_ms());
         if start_playing {
             self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
         } else {
@@ -3699,8 +3766,34 @@ mod tests {
     use super::{
         PlayAction, SpircPlayStatus, StatePut, StatePutResult, StatePuts, SuggestionFetch,
         continues_playing, loading_status, pauses_on_drop, play_action,
-        resolvable_transfer_context,
+        resolvable_transfer_context, seeks_past_the_end,
     };
+
+    // SPOTIFYGOOD: see seeks_past_the_end
+    #[test]
+    fn a_seek_during_a_load_reaches_the_player() {
+        let playing = SpircPlayStatus::Playing {
+            nominal_start_time: 0,
+            preloading_of_next_track_triggered: false,
+        };
+        // a 3:30 song: a seek past its end is dropped, one within it isn't
+        assert!(seeks_past_the_end(300_000, 210_000, &playing));
+        assert!(!seeks_past_the_end(200_000, 210_000, &playing));
+        // an episode loading at 35:00 (its duration isn't known yet, or still the song's)
+        for loading in [
+            SpircPlayStatus::LoadingPlay {
+                position_ms: 2_100_000,
+            },
+            SpircPlayStatus::LoadingPause {
+                position_ms: 2_100_000,
+            },
+        ] {
+            assert!(!seeks_past_the_end(2_400_000, 0, &loading));
+            assert!(!seeks_past_the_end(2_400_000, 210_000, &loading));
+        }
+        // no duration known: the player bounds it
+        assert!(!seeks_past_the_end(2_400_000, 0, &playing));
+    }
 
     // SPOTIFYGOOD: see handle_transfer
     #[test]

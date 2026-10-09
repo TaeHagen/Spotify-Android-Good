@@ -199,6 +199,14 @@ impl ConnectState {
             .or_else(|| ctx.tracks.iter().position(|t| t.uri == track.uri))
     }
 
+    // SPOTIFYGOOD: see position_in_context
+    /// The position of the current track in the context of the given type, by uid, else by uri
+    pub fn current_track_position(&self, ty: ContextType) -> Option<usize> {
+        let ctx = self.get_context(ty).ok()?;
+        let track = self.player().track.as_ref()?;
+        Self::position_in_context(ctx, track)
+    }
+
     pub fn get_context(&self, ty: ContextType) -> Result<&StateContext, StateError> {
         match ty {
             ContextType::Default => self.context.as_ref(),
@@ -1042,11 +1050,9 @@ impl ConnectState {
         if !self.place_current_track {
             return Ok(());
         }
-        let uri = self.current_track(|t| t.uri.clone());
-        let position = self
-            .get_context(ContextType::Default)
-            .ok()
-            .and_then(|ctx| ctx.tracks.iter().position(|t| t.uri == uri));
+        // SPOTIFYGOOD: by uid first (see position_in_context), it went by the uri: the first
+        // copy of a song that is twice in the context
+        let position = self.current_track_position(ContextType::Default);
         let Some(position) = position else {
             return Ok(());
         };

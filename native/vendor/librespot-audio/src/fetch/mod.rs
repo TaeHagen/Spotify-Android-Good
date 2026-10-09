@@ -390,6 +390,22 @@ impl StreamLoaderController {
     }
 
     // SPOTIFYGOOD: see stalled_for_tests
+    /// The rest of the file comes (all of it is there)
+    #[doc(hidden)]
+    pub fn complete_for_tests(&self) {
+        if let Some(shared) = self.stream_shared.as_ref() {
+            let mut status = shared
+                .download_status
+                .lock()
+                .expect(DOWNLOAD_STATUS_POISON_MSG);
+            status
+                .downloaded
+                .add_range(&Range::new(0, shared.file_size));
+            shared.cond.notify_all();
+        }
+    }
+
+    // SPOTIFYGOOD: see stalled_for_tests
     /// A streamed file whose `downloaded` bytes are there, read at `read_position`
     #[doc(hidden)]
     pub fn partial_for_tests(

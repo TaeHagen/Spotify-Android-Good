@@ -538,6 +538,16 @@ impl ConnectState {
         self.player_mut().duration = duration.into()
     }
 
+    // SPOTIFYGOOD: Spirc's load_track. The duration is unknown (0) until the player opened the
+    // track (its TrackChanged): the state, the snapshots and the other clients had the previous
+    // item's while it loaded, and the engine capped a restore point or an offline hand-off taken
+    // meanwhile at it (an episode loaded at 35:00 after a 3:30 song came back at 3:30).
+    /// The playback of a track that loads at `position_ms`
+    pub fn start_loading(&mut self, position_ms: u32, timestamp: i64) {
+        self.update_duration(0);
+        self.update_position(position_ms, timestamp);
+    }
+
     pub fn update_queue_revision(&mut self) {
         let mut state = DefaultHasher::new();
         self.next_tracks()

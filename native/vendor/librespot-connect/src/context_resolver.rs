@@ -517,13 +517,8 @@ impl ContextResolver {
         {
             // like try_finish: e.g. a load whose start track was on a further page (it plays
             // outside the context until then), placed if it is there, before the context if not
-            let ctx = state
-                .get_context(state.active_context)
-                .expect("checked by precondition");
-            let idx = ConnectState::find_index_in_context(ctx, |t| {
-                state.current_track(|c| t.uri == c.uri)
-            })
-            .ok();
+            // SPOTIFYGOOD: by uid first (see ConnectState::current_track_position)
+            let idx = state.current_track_position(state.active_context);
             state.reset_playback_to_position(idx)
         } else {
             state.fill_up_next_tracks()
@@ -620,11 +615,8 @@ impl ContextResolver {
         } else if matches!(active_ctx, Ok(ctx) if ctx.index.track == 0) {
             // has context, and context is not touched
             // when the index is not zero, the next index was already evaluated elsewhere
-            let ctx = active_ctx.expect("checked by precondition");
-            let idx = ConnectState::find_index_in_context(ctx, |t| {
-                state.current_track(|c| t.uri == c.uri)
-            })
-            .ok();
+            // SPOTIFYGOOD: by uid first (see ConnectState::current_track_position)
+            let idx = state.current_track_position(state.active_context);
 
             state.reset_playback_to_position(idx)
         } else {

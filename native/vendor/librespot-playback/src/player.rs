@@ -189,11 +189,23 @@ pub struct Player {
     buffered: SharedBuffered,
 }
 
-// SPOTIFYGOOD: see Player::fully_buffered
-type SharedBuffered = Arc<Mutex<Option<SpotifyUri>>>;
+// SPOTIFYGOOD: see Player::fully_buffered: the playing (or paused) track and its file's loader
+// controller (was the track once the poll loop saw its file all there)
+type SharedBuffered = Arc<Mutex<Option<(SpotifyUri, StreamLoaderController)>>>;
 
-fn lock_buffered(buffered: &SharedBuffered) -> MutexGuard<'_, Option<SpotifyUri>> {
+fn lock_buffered(
+    buffered: &SharedBuffered,
+) -> MutexGuard<'_, Option<(SpotifyUri, StreamLoaderController)>> {
     buffered.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// SPOTIFYGOOD: see Player::fully_buffered
+/// The track of `buffered` if its file is all there from where it is read to its end
+fn fully_buffered_track(buffered: &SharedBuffered) -> Option<SpotifyUri> {
+    lock_buffered(buffered)
+        .as_ref()
+        .filter(|(_, controller)| controller.range_to_end_available())
+        .map(|(track_id, _)| track_id.clone())
 }
 
 // SPOTIFYGOOD: see Player::last_decoded
@@ -1204,8 +1216,12 @@ impl Player {
     // goes away: a downloaded one, or a streamed one whose data is all there
     /// The playing (or paused) track if its file is all there (downloaded, or streamed to its
     /// end); read without a command
+    // SPOTIFYGOOD: looked at when it is read: the poll loop marked it when a pass saw the file
+    // all there, and a paused track's download that ended during the pause woke no pass (a
+    // paused player sleeps until a command), so it stayed unmarked and the engine's offline
+    // hand-off skipped it
     pub fn fully_buffered(&self) -> Option<SpotifyUri> {
-        lock_buffered(&self.buffered).clone()
+        fully_buffered_track(&self.buffered)
     }
 
     // SPOTIFYGOOD: Connect's position of a playing track is extrapolated from its last anchor;
@@ -2627,8 +2643,6 @@ impl Future for PlayerInternal {
                 };
             }
 
-            // SPOTIFYGOOD: see Player::fully_buffered
-            let buffered = self.buffered.clone();
             if let PlayerState::Playing {
                 ref track_id,
                 play_request_id,
@@ -2649,11 +2663,7 @@ impl Future for PlayerInternal {
             } = self.state
             {
                 let track_id = track_id.clone();
-                // SPOTIFYGOOD: see Player::fully_buffered (its data stays once it is all there)
-                let marked = lock_buffered(&buffered).as_ref() == Some(&track_id);
-                if !marked && stream_loader_controller.range_to_end_available() {
-                    *lock_buffered(&buffered) = Some(track_id.clone());
-                }
+                // SPOTIFYGOOD: Player::fully_buffered is no longer marked here (see there)
 
                 if (!*suggested_to_preload_next_track)
                     && ((duration_ms as i64 - stream_position_ms as i64)
@@ -3329,6 +3339,11 @@ impl PlayerInternal {
         let position_ms = loaded_track.stream_position_ms;
         // SPOTIFYGOOD: see Player::last_decoded
         set_decoded(&self.decoded, &track_id, position_ms);
+        // SPOTIFYGOOD: see Player::fully_buffered (a load, a preload, a reopen)
+        *lock_buffered(&self.buffered) = Some((
+            track_id.clone(),
+            loaded_track.stream_loader_controller.clone(),
+        ));
         // SPOTIFYGOOD: (d) it is open again, see PlayerInternal::reopen
         if self.reopen.as_ref() == Some(&track_id) {
             self.reopen = None;
@@ -5177,6 +5192,36 @@ mod spotifygood_tests {
             seek_waiting(&mut decoder, &source, 0, 16_000, ms(2_000), || false).expect("seek");
         assert_eq!(seeked, 0);
         assert_eq!(said_and_true(&mut decoder, FRAMES), (0, 0));
+    }
+
+    // SPOTIFYGOOD: see Player::fully_buffered
+    #[test]
+    fn a_paused_track_whose_download_ends_is_fully_buffered_without_a_command() {
+        let runtime = test_runtime();
+        let _runtime = runtime.enter();
+        let mut h = Harness::new();
+        let t = track(1);
+        // paused 30 s in, its file 60% there
+        let controller = StreamLoaderController::partial_for_tests(1_000_000, 0..600_000, 60_000);
+        let (data, _) = loaded_with(&t, 30_000, false, controller.clone(), u32::MAX);
+        h.start(&t, data, false);
+        assert_eq!(fully_buffered_track(&h.internal.buffered), None);
+        // the rest comes during the pause: no command, no pass of the loop (it stayed None)
+        controller.complete_for_tests();
+        assert_eq!(fully_buffered_track(&h.internal.buffered), Some(t.clone()));
+        // a load of another track forgets it
+        h.internal
+            .handle_command_load(track(2), None, false, 0)
+            .expect("load");
+        assert_eq!(fully_buffered_track(&h.internal.buffered), None);
+
+        // a playing one, the same
+        let controller = StreamLoaderController::partial_for_tests(1_000_000, 0..600_000, 60_000);
+        let (data, _) = loaded_with(&t, 30_000, false, controller.clone(), u32::MAX);
+        h.start(&t, data, true);
+        assert_eq!(fully_buffered_track(&h.internal.buffered), None);
+        controller.complete_for_tests();
+        assert_eq!(fully_buffered_track(&h.internal.buffered), Some(t));
     }
 
     // SPOTIFYGOOD: see cached_file_is_cut

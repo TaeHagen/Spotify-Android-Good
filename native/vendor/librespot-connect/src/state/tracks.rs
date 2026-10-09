@@ -503,7 +503,12 @@ impl<'ct> ConnectState {
         }
 
         self.unavailable_uri.push(uri);
-        self.fill_up_next_tracks()?;
+        // SPOTIFYGOOD: only when there is a context to fill up from: while a transfer waits for
+        // its context there is none, and the error (NoContext) made Spirc's Unavailable arm
+        // return before it skipped the refused track (it stayed LoadingPlay, for good)
+        if self.get_context(self.fill_up_context).is_ok() {
+            self.fill_up_next_tracks()?;
+        }
         self.update_queue_revision();
 
         Ok(())
