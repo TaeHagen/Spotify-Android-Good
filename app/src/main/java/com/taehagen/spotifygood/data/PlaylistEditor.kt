@@ -53,6 +53,13 @@ class PlaylistEditor(
         return uri
     }
 
+    /**
+     * What [playlistUri] holds before an add (its item count and items, for "Already added" and
+     * the item limit; [pagePlaylist]: a bounded number of requests).
+     */
+    suspend fun contents(playlistUri: String): PlaylistContents =
+        pagePlaylist(playlistUri, catalog::playlistPage).let { PlaylistContents(it.total, it.items.toHashSet()) }
+
     /** Appends [uris]; returns the new revision (null if the engine reported none). */
     suspend fun addItems(playlistUri: String, uris: List<String>): String? {
         if (uris.isEmpty()) return null

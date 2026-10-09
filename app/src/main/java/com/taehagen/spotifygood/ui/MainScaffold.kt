@@ -88,6 +88,7 @@ import com.taehagen.spotifygood.ui.navigation.MainNavigator
 import com.taehagen.spotifygood.ui.navigation.MainTab
 import com.taehagen.spotifygood.ui.navigation.rememberMainNavigator
 import com.taehagen.spotifygood.ui.components.AddToPlaylistSheet
+import com.taehagen.spotifygood.ui.components.AlreadyAddedDialog
 import com.taehagen.spotifygood.ui.components.MediaActionsSheet
 import com.taehagen.spotifygood.ui.screens.player.DevicePicks
 import com.taehagen.spotifygood.ui.screens.player.DevicesSheet
@@ -281,7 +282,12 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
             key(target) { MediaActionsSheet(target = target, onDismiss = navigator::dismissActions) }
         }
         navigator.addToPlaylistUris?.let { uris ->
-            key(uris) { AddToPlaylistSheet(uris = uris, onDismiss = navigator::dismissAddToPlaylist) }
+            key(uris) {
+                AddToPlaylistSheet(uris = uris, onDismiss = navigator::dismissAddToPlaylist, excludeUri = navigator.addToPlaylistExclude)
+            }
+        }
+        navigator.playlistAddPrompt?.let { prompt ->
+            key(prompt) { AlreadyAddedDialog(prompt, onDismiss = navigator::dismissPlaylistAddPrompt) }
         }
         if (navigator.isDevicesOpen) DevicesSheet(onDismiss = navigator::dismissDevices)
         if (navigator.isSleepTimerOpen) SleepTimerSheet(onDismiss = navigator::dismissSleepTimer)
