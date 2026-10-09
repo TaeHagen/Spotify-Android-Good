@@ -457,6 +457,42 @@ fn resolvable_transfer_context(uri: &str) -> bool {
     uri != WEB_API_URI
 }
 
+// SPOTIFYGOOD: moved out of SpircTask::add_autoplay_resolving_when_required (unchanged), so that
+// a test can check it against a state
+/// The autoplay resolve the state needs (few next tracks are left), while `autoplay` is on
+pub(crate) fn autoplay_resolve_when_required(
+    state: &ConnectState,
+    autoplay: bool,
+) -> Option<ResolveContext> {
+    let require_load_new = !state.has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
+        // SPOTIFYGOOD: Spirc::set_autoplay
+        && autoplay
+        && !state.context_uri().is_empty();
+
+    if !require_load_new {
+        return None;
+    }
+
+    let current_context = state.context_uri();
+    let fallback = state.current_track(|t| &t.uri);
+
+    let has_tracks = state
+        .get_context(ContextType::Autoplay)
+        .map(|c| !c.tracks.is_empty())
+        .unwrap_or_default();
+
+    Some(ResolveContext::from_uri(
+        current_context,
+        fallback,
+        ContextType::Autoplay,
+        if has_tracks {
+            ContextAction::Append
+        } else {
+            ContextAction::Replace
+        },
+    ))
+}
+
 // SPOTIFYGOOD: a position correction this close to the state's extrapolation (at the playback
 // speed) changes nothing, see handle_player_event
 const SPEED_CORRECTION_TOLERANCE_MS: i64 = 500;
@@ -2298,20 +2334,17 @@ impl SpircTask {
                 self.finish_transfer_without_resolve();
             }
         } else {
-            match self.connect_state.get_context(ContextType::Default) {
-                Err(why) => {
-                    warn!("continuing transfer in an unknown state. {why}");
-                    self.transfer_state = Some(transfer);
-                    // SPOTIFYGOOD: see awaited
-                    if !awaited {
-                        self.finish_transfer_without_resolve();
-                    }
-                }
-                // SPOTIFYGOOD: finished like a resolved one (ConnectState::finish_transfer): the
-                // transferred queue was dropped, and a current track the tracks don't contain
-                // failed the transfer
-                Ok(_) => self.connect_state.finish_transfer(transfer)?,
+            // SPOTIFYGOOD: it waits for no resolve: finished at once, like a resolved one, with
+            // the context of the tracks it brought (or of its current track), see
+            // finish_transfer_without_resolve. The transferred queue was dropped, and a current
+            // track the tracks don't contain failed the transfer; then (round 20, the tracks'
+            // context) autoplay was never asked for, so the playback stopped after the last song
+            // or the autoplay track.
+            if let Err(why) = self.connect_state.get_context(ContextType::Default) {
+                warn!("continuing transfer in an unknown state. {why}");
             }
+            self.transfer_state = Some(transfer);
+            self.finish_transfer_without_resolve();
         }
 
         self.load_track(is_playing, position.try_into()?)
@@ -3244,38 +3277,11 @@ impl SpircTask {
     // PlayerEvent::Unavailable handling, which now depends on the reason
 
     fn add_autoplay_resolving_when_required(&mut self) {
-        let require_load_new = !self
-            .connect_state
-            .has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
-            // SPOTIFYGOOD: Spirc::set_autoplay
-            && self.autoplay()
-            && !self.connect_state.context_uri().is_empty();
-
-        if !require_load_new {
-            return;
+        // SPOTIFYGOOD: see autoplay_resolve_when_required
+        if let Some(resolve) = autoplay_resolve_when_required(&self.connect_state, self.autoplay())
+        {
+            self.context_resolver.add(resolve);
         }
-
-        let current_context = self.connect_state.context_uri();
-        let fallback = self.connect_state.current_track(|t| &t.uri);
-
-        let has_tracks = self
-            .connect_state
-            .get_context(ContextType::Autoplay)
-            .map(|c| !c.tracks.is_empty())
-            .unwrap_or_default();
-
-        let resolve = ResolveContext::from_uri(
-            current_context,
-            fallback,
-            ContextType::Autoplay,
-            if has_tracks {
-                ContextAction::Append
-            } else {
-                ContextAction::Replace
-            },
-        );
-
-        self.context_resolver.add(resolve);
     }
 
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {

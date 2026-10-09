@@ -3098,3 +3098,69 @@ fn a_transfer_asks_again_for_a_context_that_failed_a_moment_ago() {
     // asked twice, queued once
     assert!(resolver.add_requested(resolve()));
 }
+
+// SPOTIFYGOOD: see Spirc's handle_transfer (finish_transfer_without_resolve) and
+// autoplay_resolve_when_required
+#[test]
+fn a_transferred_track_list_goes_on_in_autoplay_after_its_end() {
+    use crate::protocol::{
+        playback::Playback, queue::Queue, session::Session as PlayingSession,
+        transfer_state::TransferState,
+    };
+    const LIST: &str = "spotify:web-api";
+
+    // a list (Liked Songs, a sorted playlist: spotify:web-api) on its last song, or after its
+    // end on an autoplay track; nothing queued
+    for autoplay_track in [false, true] {
+        let (rt, mut state) = state(3);
+        state.reset_context(ResetContext::Completely);
+        let mut current = if autoplay_track {
+            ContextTrack {
+                uri: Some(track_uri(0, 6)),
+                uid: Some("r1".to_string()),
+                ..Default::default()
+            }
+        } else {
+            ContextTrack {
+                uri: Some(track_uri(9, 0)),
+                uid: Some("uid9".to_string()),
+                ..Default::default()
+            }
+        };
+        if autoplay_track {
+            current.set_from_autoplay(true);
+        }
+        let mut list = context(10, 0);
+        list.uri = Some(LIST.to_string());
+        let mut transfer = TransferState {
+            playback: MessageField::some(Playback {
+                current_track: MessageField::some(current),
+                ..Default::default()
+            }),
+            current_session: MessageField::some(PlayingSession {
+                context: MessageField::some(list.clone()),
+                ..Default::default()
+            }),
+            queue: MessageField::some(Queue::default()),
+            ..Default::default()
+        };
+        // what handle_transfer does: the list of the tracks it brought, no resolve, then
+        // finish_transfer_without_resolve
+        let track = state.current_track_from_transfer(&transfer).unwrap();
+        state.set_track(track);
+        state.update_context(list, ContextType::Default).unwrap();
+        state.handle_initial_transfer(&mut transfer, Some(LIST.to_string()));
+        state.active_context = ContextType::Default;
+        state.finish_transfer_without_context(transfer).unwrap();
+        assert!(state.next_tracks().is_empty(), "autoplay: {autoplay_track}");
+
+        // autoplay is asked for (with the list's uri), so the playback goes on after it
+        let resolve = crate::spirc::autoplay_resolve_when_required(&state, true)
+            .expect("an autoplay resolve");
+        let mut resolver = resolver(&rt);
+        resolver.add(resolve);
+        assert_eq!(resolver.next_update(), Some(ContextType::Autoplay));
+        // not while autoplay is off
+        assert!(crate::spirc::autoplay_resolve_when_required(&state, false).is_none());
+    }
+}
