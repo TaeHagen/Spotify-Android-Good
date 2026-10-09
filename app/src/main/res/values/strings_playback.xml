@@ -29,6 +29,9 @@
     <string name="playback_presence_title">Available on Spotify Connect</string>
     <string name="playback_presence_text">Other devices can play music on this phone</string>
     <string name="playback_presence_stop">Stop</string>
+    <!-- After a reboot or an update the phone could not become available again by itself -->
+    <string name="playback_presence_restore_title">Not available on Spotify Connect</string>
+    <string name="playback_presence_restore_text">Open SpotifyGood to stay available for Spotify Connect.</string>
 
     <!-- Podcast playback speed (Now Playing; spoken with the value, e.g. "Playback speed, 1.5×") -->
     <string name="playback_speed">Playback speed</string>
