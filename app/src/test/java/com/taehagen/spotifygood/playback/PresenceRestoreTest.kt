@@ -2,6 +2,8 @@ package com.taehagen.spotifygood.playback
 
 import com.taehagen.spotifygood.playback.PresenceRestore.Decision
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PresenceRestoreTest {
@@ -49,5 +51,46 @@ class PresenceRestoreTest {
         for (sdk in 26..34) {
             assertEquals(Decision.RESTORE, PresenceRestore.decide(boot, connectPresence = true, loggedIn = true, presenceUp = false, sdk = sdk))
         }
+    }
+
+    @Test
+    fun aRestrictedAppIsAskedToOpenTheAppInsteadOfFailingSilently() {
+        // Battery use "Restricted": the system would drop the start or ignore its foreground.
+        for (sdk in listOf(28, 31, 34, 35)) {
+            assertEquals(
+                Decision.NOTIFY,
+                PresenceRestore.decide(update, connectPresence = true, loggedIn = true, presenceUp = false, sdk = sdk, backgroundRestricted = true),
+            )
+        }
+        assertEquals(
+            Decision.NOTIFY,
+            PresenceRestore.decide(boot, connectPresence = true, loggedIn = true, presenceUp = false, sdk = 31, backgroundRestricted = true),
+        )
+        // Nothing to ask for when presence is off or the account is gone, restricted or not.
+        assertEquals(
+            Decision.SKIP,
+            PresenceRestore.decide(boot, connectPresence = false, loggedIn = true, presenceUp = false, sdk = 31, backgroundRestricted = true),
+        )
+        assertEquals(
+            Decision.SKIP,
+            PresenceRestore.decide(update, connectPresence = true, loggedIn = false, presenceUp = false, sdk = 31, backgroundRestricted = true),
+        )
+    }
+
+    @Test
+    fun anIgnoredPresenceForegroundIsNotTakenForOne() {
+        val connected = 0x10 // FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        val media = 0x2 // FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        // API 29+: the type the system recorded (none after an ignored start).
+        assertTrue(PresenceRestore.foregroundTookEffect(34, connected, backgroundRestricted = false, appVisible = false))
+        assertTrue(PresenceRestore.foregroundTookEffect(31, connected or media, backgroundRestricted = true, appVisible = true))
+        assertFalse(PresenceRestore.foregroundTookEffect(34, 0, backgroundRestricted = true, appVisible = false))
+        assertFalse(PresenceRestore.foregroundTookEffect(29, media, backgroundRestricted = false, appVisible = false))
+        // API 28: the restriction, unless the app is visible.
+        assertFalse(PresenceRestore.foregroundTookEffect(28, 0, backgroundRestricted = true, appVisible = false))
+        assertTrue(PresenceRestore.foregroundTookEffect(28, 0, backgroundRestricted = true, appVisible = true))
+        assertTrue(PresenceRestore.foregroundTookEffect(28, 0, backgroundRestricted = false, appVisible = false))
+        // Before: no such restriction.
+        assertTrue(PresenceRestore.foregroundTookEffect(26, 0, backgroundRestricted = false, appVisible = false))
     }
 }

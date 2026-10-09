@@ -1246,7 +1246,15 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `connectedDevice` even when presence cannot come up). A refused start (a restricted app, OEM
   limits), or a login not read in time, posts one "Open SpotifyGood to stay available for
   Spotify Connect" notification (tap: the app), gone once presence is up again; presence then
-  waits for the app to be visible, as before. A media foreground the system refuses
+  waits for the app to be visible, as before. A refusal is not always an exception: for an app
+  whose battery use is "Restricted" the system drops the start or ignores the service's
+  `startForeground` silently. The receiver therefore asks `isBackgroundRestricted` (Restricted:
+  the notification, no start), and `PresenceController.showForeground` checks that the
+  foreground took effect (`PresenceRestore.foregroundTookEffect`: from API 29 the service's
+  recorded type, which an ignored start leaves at none; on API 28 the restriction unless the app
+  is visible). An ignored one counts as refused: the presence flags stay off (so the app starts
+  presence again when it is visible), no engine is held for it, the start stops, and the
+  notification updates do not ask again until presence is started anew. A media foreground the system refuses
   (`onForegroundStartNotAllowed`) pauses local playback with "Tap to resume" only when neither
   the app is visible nor presence keeps the service in the foreground: then the process stays,
   the audio plays on and Media3 asks again on its next update.
