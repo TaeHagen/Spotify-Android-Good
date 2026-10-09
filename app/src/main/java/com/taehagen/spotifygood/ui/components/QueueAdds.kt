@@ -37,6 +37,38 @@ internal fun queueAddOutcome(requested: Int, added: Int, error: NativeErrorInfo?
     else -> QueueAddOutcome.Stopped(added, requested, error)
 }
 
+/** What "Add to queue" of a collection does ([collectionQueuePlan]). */
+internal sealed interface CollectionQueuePlan {
+    /** Queue [uris] (the queue add says how many went in). */
+    data class Queue(val uris: List<String>) : CollectionQueuePlan
+
+    /** The collection has nothing the queue can take (empty, or local files only). */
+    data object NothingToQueue : CollectionQueuePlan
+
+    /** Not online, and none of it is downloaded. */
+    data object NothingDownloaded : CollectionQueuePlan
+
+    /** Online, but its list couldn't be fetched ([error]; null: not in time), and none of it is downloaded. */
+    data class Failed(val error: Throwable?) : CollectionQueuePlan
+}
+
+/**
+ * "Add to queue" of a collection: the server's list [fromServer] (null: not fetched — not online,
+ * or it failed with [failure], or took too long, [timedOut]), else its [downloaded] members; a
+ * failure while online is said as such, not as "nothing downloaded".
+ */
+internal fun collectionQueuePlan(
+    fromServer: List<String>?,
+    downloaded: List<String>,
+    failure: Throwable? = null,
+    timedOut: Boolean = false,
+): CollectionQueuePlan = when {
+    fromServer != null -> if (fromServer.isEmpty()) CollectionQueuePlan.NothingToQueue else CollectionQueuePlan.Queue(fromServer)
+    downloaded.isNotEmpty() -> CollectionQueuePlan.Queue(downloaded)
+    failure != null || timedOut -> CollectionQueuePlan.Failed(failure)
+    else -> CollectionQueuePlan.NothingDownloaded
+}
+
 /**
  * What "Add to queue" of a collection adds while the session can't stream: its downloaded
  * [members] in collection order, without [skipped] ones (explicit while filtered). An item that

@@ -14,7 +14,8 @@ use std::{
 };
 
 use futures_util::{StreamExt, TryFutureExt, future::IntoStream};
-use hyper::{Response, StatusCode, body::Incoming, header::CONTENT_RANGE};
+// SPOTIFYGOOD: + HeaderMap
+use hyper::{HeaderMap, Response, StatusCode, body::Incoming, header::CONTENT_RANGE};
 use hyper_util::client::legacy::ResponseFuture;
 
 use tempfile::NamedTempFile;
@@ -141,6 +142,8 @@ pub struct StreamingRequest {
     initial_response: Option<Response<Incoming>>,
     offset: usize,
     length: usize,
+    // SPOTIFYGOOD: the index of the CDN URL it asks (see AudioFileShared::cdn_urls)
+    url: usize,
 }
 
 #[derive(Debug)]
@@ -382,19 +385,31 @@ impl StreamLoaderController {
     /// (the loader isn't gone, the rest never comes)
     #[doc(hidden)]
     pub fn stalled_for_tests(file_size: usize, downloaded: usize) -> Self {
+        Self::partial_for_tests(file_size, 0..downloaded, 0)
+    }
+
+    // SPOTIFYGOOD: see stalled_for_tests
+    /// A streamed file whose `downloaded` bytes are there, read at `read_position`
+    #[doc(hidden)]
+    pub fn partial_for_tests(
+        file_size: usize,
+        downloaded: std::ops::Range<usize>,
+        read_position: usize,
+    ) -> Self {
         let mut status = AudioFileDownloadStatus {
             requested: RangeSet::new(),
             downloaded: RangeSet::new(),
         };
-        if downloaded > 0 {
+        let end = downloaded.end.min(file_size);
+        if end > downloaded.start {
             status
                 .downloaded
-                .add_range(&Range::new(0, downloaded.min(file_size)));
+                .add_range(&Range::new(downloaded.start, end - downloaded.start));
         }
         Self {
             channel_tx: None,
             stream_shared: Some(Arc::new(AudioFileShared {
-                cdn_url: String::new(),
+                cdn_urls: Vec::new(),
                 file_size,
                 bytes_per_second: 40_000,
                 cond: Condvar::new(),
@@ -402,7 +417,7 @@ impl StreamLoaderController {
                 download_streaming: AtomicBool::new(true),
                 download_slots: Semaphore::new(1),
                 ping_time_ms: AtomicUsize::new(0),
-                read_position: AtomicUsize::new(0),
+                read_position: AtomicUsize::new(read_position),
                 throughput: AtomicUsize::new(0),
                 fail_fast: AtomicBool::new(false),
                 missed: AtomicUsize::new(usize::MAX),
@@ -425,7 +440,9 @@ struct AudioFileDownloadStatus {
 }
 
 struct AudioFileShared {
-    cdn_url: String,
+    // SPOTIFYGOOD: all of storage-resolve's URLs (was the one that opened): the loader goes on
+    // to another one when its URL fails (see AudioFileFetch::url)
+    cdn_urls: Vec<String>,
     file_size: usize,
     bytes_per_second: usize,
     cond: Condvar,
@@ -562,16 +579,33 @@ impl AudioFileStreaming {
     ) -> Result<AudioFileStreaming, Error> {
         let minimum_download_size = AudioFetchParams::get().minimum_download_size;
 
-        let mut response_streamer_url = None;
-        for url in urls {
+        // SPOTIFYGOOD: every URL is tried until one answers with the file's first bytes: an error
+        // status (a CDN that fails, or that refuses the region) or a bad Content-Range goes on to
+        // the next one, like a transport error. Stock failed the open at the first URL that
+        // answered at all, so the other CDNs storage-resolve listed were never tried (every load
+        // failed while the first one did). The URLs that answered that they can't deliver (see
+        // receive::url_is_dead) aren't asked again by the loader. A URL is logged by its index
+        // (it carries a token).
+        let mut opened = None;
+        let mut dead_urls = vec![false; urls.len()];
+        let mut last_err = None;
+        for (index, url) in urls.iter().enumerate() {
             // When the audio file is really small, this `download_size` may turn out to be
             // larger than the audio file we're going to stream later on. This is OK; requesting
             // `Content-Range` > `Content-Length` will return the complete file with status code
             // 206 Partial Content.
             let mut streamer =
-                session
+                match session
                     .spclient()
-                    .stream_from_cdn(*url, 0, minimum_download_size)?;
+                    .stream_from_cdn(*url, 0, minimum_download_size)
+                {
+                    Ok(streamer) => streamer,
+                    Err(e) => {
+                        warn!("CDN URL {index} can't be asked ({e}), trying the next one");
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
 
             // Get the first chunk with the headers to get the file size.
             // The remainder of that chunk with possibly also a response body is then
@@ -582,49 +616,54 @@ impl AudioFileStreaming {
                 .and_then(|x| x.ok_or_else(|| AudioFileError::NoData.into()))
                 .and_then(|x| x.map_err(Error::from));
 
-            match streamer_result {
-                Ok(r) => {
-                    response_streamer_url = Some((r, streamer, url));
+            let response = match streamer_result {
+                Ok(response) => response,
+                Err(e) => {
+                    warn!("Fetching CDN URL {index} failed with error {e:?}, trying the next one");
+                    continue;
+                }
+            };
+
+            let code = response.status();
+            if code != StatusCode::PARTIAL_CONTENT {
+                warn!(
+                    "CDN URL {index} answered {code} instead of partial content, trying the next one"
+                );
+                dead_urls[index] = receive::url_is_dead(code);
+                last_err = Some(AudioFileError::StatusCode(code).into());
+                continue;
+            }
+
+            match content_range(response.headers()) {
+                Ok((upper_bound, file_size)) => {
+                    opened = Some((index, response, streamer, upper_bound, file_size));
                     break;
                 }
-                Err(e) => warn!("Fetching {url} failed with error {e:?}, trying next"),
+                Err(e) => {
+                    warn!("CDN URL {index} sent no valid Content-Range ({e}), trying the next one");
+                    last_err = Some(e);
+                }
             }
         }
 
-        let Some((response, streamer, url)) = response_streamer_url else {
-            return Err(Error::unavailable(format!(
-                "{} URLs failed, none left to try",
-                urls.len()
-            )));
+        let Some((url, response, streamer, upper_bound, file_size)) = opened else {
+            return Err(last_err.unwrap_or_else(|| {
+                Error::unavailable(format!("{} URLs failed, none left to try", urls.len()))
+            }));
         };
 
-        trace!("Streaming from {url}");
-
-        let code = response.status();
-        if code != StatusCode::PARTIAL_CONTENT {
-            debug!("Opening audio file expected partial content but got: {code}");
-            return Err(AudioFileError::StatusCode(code).into());
-        }
-
-        let header_value = response
-            .headers()
-            .get(CONTENT_RANGE)
-            .ok_or(AudioFileError::Header)?;
-        let str_value = header_value.to_str()?;
-        let hyphen_index = str_value.find('-').unwrap_or_default();
-        let slash_index = str_value.find('/').unwrap_or_default();
-        let upper_bound: usize = str_value[hyphen_index + 1..slash_index].parse()?;
-        let file_size = str_value[slash_index + 1..].parse()?;
+        trace!("Streaming from CDN URL {url}");
 
         let initial_request = StreamingRequest {
             streamer,
             initial_response: Some(response),
             offset: 0,
             length: upper_bound + 1,
+            url,
         };
 
         let shared = Arc::new(AudioFileShared {
-            cdn_url: url.to_string(),
+            cdn_urls: urls.iter().map(|url| url.to_string()).collect(),
             file_size,
             bytes_per_second,
             cond: Condvar::new(),
@@ -657,6 +696,7 @@ impl AudioFileStreaming {
             write_file,
             stream_loader_command_rx,
             complete_tx,
+            dead_urls,
         ));
 
         Ok(AudioFileStreaming {
@@ -666,6 +706,24 @@ impl AudioFileStreaming {
             shared,
         })
     }
+}
+
+// SPOTIFYGOOD: see AudioFileStreaming::open_urls (checked: stock sliced the header at indexes that
+// a malformed one made panic)
+/// The last byte and the size of the file from a `Content-Range: bytes first-last/size`
+fn content_range(headers: &HeaderMap) -> Result<(usize, usize), Error> {
+    let value = headers
+        .get(CONTENT_RANGE)
+        .ok_or(AudioFileError::Header)?
+        .to_str()?;
+    let (range, size) = value.rsplit_once('/').ok_or(AudioFileError::Header)?;
+    let (_, last) = range.split_once('-').ok_or(AudioFileError::Header)?;
+    let last: usize = last.trim().parse()?;
+    let size: usize = size.trim().parse()?;
+    if last >= size {
+        return Err(AudioFileError::Header.into());
+    }
+    Ok((last, size))
 }
 
 impl Read for AudioFileStreaming {
@@ -872,16 +930,22 @@ mod spotifygood_tests {
     /// A status of the CDN below: no answer at all
     const HANG: u16 = 0;
 
-    /// A CDN on localhost: a range from the start of the file is served, every other one gets
-    /// `status` (206: served too, HANG: nothing). Counts the requests.
+    /// A CDN on localhost: a range from the start of the file gets `open_status`, every other
+    /// one `status` (206: served, HANG: nothing). Counts the requests.
     struct Cdn {
         url: String,
         requests: Arc<AtomicUsize>,
+        status: Arc<AtomicU16>,
     }
 
     impl Cdn {
         fn requests(&self) -> usize {
             self.requests.load(Ordering::SeqCst)
+        }
+
+        /// From now on the ranges after the start get `status`
+        fn answers(&self, status: u16) {
+            self.status.store(status, Ordering::SeqCst);
         }
     }
 
@@ -895,14 +959,19 @@ mod spotifygood_tests {
     }
 
     async fn cdn(status: u16) -> Cdn {
+        cdn_opening(206, status).await
+    }
+
+    async fn cdn_opening(open_status: u16, status: u16) -> Cdn {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let url = format!("http://{}/audio", listener.local_addr().expect("addr"));
         let requests = Arc::new(AtomicUsize::new(0));
         let status = Arc::new(AtomicU16::new(status));
         let counted = requests.clone();
+        let answers = status.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let (counted, status) = (counted.clone(), status.clone());
+                let (counted, status) = (counted.clone(), answers.clone());
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut chunk = [0u8; 1024];
@@ -916,7 +985,7 @@ mod spotifygood_tests {
                     let (start, end) = range_of(&String::from_utf8_lossy(&request).to_lowercase());
                     let end = end.min(FILE_SIZE - 1);
                     let status = if start == 0 {
-                        206
+                        open_status
                     } else {
                         status.load(Ordering::SeqCst)
                     };
@@ -941,7 +1010,11 @@ mod spotifygood_tests {
                 });
             }
         });
-        Cdn { url, requests }
+        Cdn {
+            url,
+            requests,
+            status,
+        }
     }
 
     /// The file streamed from `cdn` (its first 64 KiB are there) and its controller; in stream
@@ -951,15 +1024,19 @@ mod spotifygood_tests {
         cdn: &Cdn,
         stream: bool,
     ) -> (AudioFile, StreamLoaderController) {
+        open_from(session, &[cdn.url.as_str()], stream).await
+    }
+
+    /// The file streamed from the first of `urls` that opens it, see open
+    async fn open_from(
+        session: &Session,
+        urls: &[&str],
+        stream: bool,
+    ) -> (AudioFile, StreamLoaderController) {
         let (complete_tx, _) = oneshot::channel();
-        let file = AudioFileStreaming::open_urls(
-            session.clone(),
-            &[cdn.url.as_str()],
-            complete_tx,
-            40_000,
-        )
-        .await
-        .expect("open");
+        let file = AudioFileStreaming::open_urls(session.clone(), urls, complete_tx, 40_000)
+            .await
+            .expect("open");
         let file = AudioFile::Streaming(file);
         let controller = file.get_stream_loader_controller().expect("controller");
         if stream {
@@ -1132,6 +1209,161 @@ mod spotifygood_tests {
             let (_, result, _) = read_at(file, 300_000, 4_096).await;
             assert_eq!(result.expect("read"), 4_096);
             assert!(cdn.requests() > before);
+        });
+    }
+
+    /// A URL whose connection is refused (nothing listens there)
+    fn refused_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/audio", listener.local_addr().expect("addr"));
+        drop(listener);
+        url
+    }
+
+    /// Whether 64 kB at `at` are there within `within`
+    async fn arrives(controller: &StreamLoaderController, at: usize, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if controller.range_available_at(at, 65_536) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        controller.range_available_at(at, 65_536)
+    }
+
+    #[test]
+    fn an_open_goes_on_to_the_next_cdn_when_one_fails() {
+        params();
+        runtime().block_on(async {
+            let session = Session::new(SessionConfig::default(), None);
+            // the first one fails, refuses the region, doesn't know the file, isn't there
+            for failing in [503, 403, 404, 0] {
+                let status = if failing == 0 { 503 } else { failing };
+                let first = cdn_opening(status, status).await;
+                let first_url = if failing == 0 {
+                    refused_url()
+                } else {
+                    first.url.clone()
+                };
+                let second = cdn(206).await;
+                let (_file, controller) =
+                    open_from(&session, &[first_url.as_str(), second.url.as_str()], false).await;
+                // the loader asks the one that opened it
+                let before = first.requests();
+                controller.fetch_range(300_000, 65_536);
+                assert!(
+                    arrives(&controller, 300_000, Duration::from_secs(2)).await,
+                    "{failing}"
+                );
+                assert_eq!(first.requests(), before, "{failing}");
+                assert!(second.requests() >= 2, "{failing}");
+            }
+        });
+    }
+
+    #[test]
+    fn an_open_fails_when_every_cdn_fails() {
+        params();
+        runtime().block_on(async {
+            let session = Session::new(SessionConfig::default(), None);
+            let (first, second) = (cdn_opening(503, 503).await, cdn_opening(404, 404).await);
+            let (complete_tx, _) = oneshot::channel();
+            let urls = [first.url.as_str(), second.url.as_str()];
+            let e = AudioFileStreaming::open_urls(session.clone(), &urls, complete_tx, 40_000)
+                .await
+                .err()
+                .expect("no CDN opens it");
+            assert!(
+                matches!(
+                    e.error.downcast_ref::<AudioFileError>(),
+                    Some(AudioFileError::StatusCode(StatusCode::NOT_FOUND))
+                ),
+                "{e:?}"
+            );
+            assert_eq!((first.requests(), second.requests()), (1, 1));
+
+            // none of them is there
+            let (refused, also_refused) = (refused_url(), refused_url());
+            let (complete_tx, _) = oneshot::channel();
+            let urls = [refused.as_str(), also_refused.as_str()];
+            assert!(
+                AudioFileStreaming::open_urls(session.clone(), &urls, complete_tx, 40_000)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn a_loader_goes_on_with_the_next_cdn_and_ends_when_none_is_left() {
+        params();
+        runtime().block_on(async {
+            let session = Session::new(SessionConfig::default(), None);
+            let (first, second) = (cdn(206).await, cdn(206).await);
+            let (_file, controller) =
+                open_from(&session, &[first.url.as_str(), second.url.as_str()], false).await;
+            assert_eq!(second.requests(), 0);
+
+            // its URL expires: the range comes from the other one, at once
+            first.answers(403);
+            controller.fetch_range(200_000, 65_536);
+            assert!(arrives(&controller, 200_000, Duration::from_secs(2)).await);
+            assert!(!controller.is_loader_gone());
+            assert_eq!(second.requests(), 1);
+            let asked_first = first.requests();
+
+            // the other one fails for a while (5xx): its ranges wait out the backoff, it is
+            // left after URL_FAILURES_MAX of them in a row, but not for the dead one
+            second.answers(503);
+            let asked_second = second.requests();
+            controller.fetch_range(400_000, 65_536);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(second.requests() - asked_second, 1);
+            assert!(!controller.is_loader_gone());
+
+            // it expires too: none is left, the loader ends (the player opens the file again)
+            second.answers(403);
+            for _ in 0..5 {
+                controller.fetch_range(400_000, 65_536);
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                if controller.is_loader_gone() {
+                    break;
+                }
+            }
+            assert!(controller.is_loader_gone());
+            assert_eq!(
+                first.requests(),
+                asked_first,
+                "a dead URL isn't asked again"
+            );
+        });
+    }
+
+    #[test]
+    fn a_loader_leaves_a_cdn_that_fails_again_and_again() {
+        params();
+        runtime().block_on(async {
+            let session = Session::new(SessionConfig::default(), None);
+            let (first, second) = (cdn(206).await, cdn(206).await);
+            let (_file, controller) =
+                open_from(&session, &[first.url.as_str(), second.url.as_str()], false).await;
+            first.answers(503);
+            let asked = first.requests();
+            // the player waits for the range again and again: three failures (with their
+            // backoff), then the other URL, which delivers
+            let mut came = false;
+            for _ in 0..40 {
+                controller.fetch_range(200_000, 65_536);
+                if arrives(&controller, 200_000, Duration::from_millis(200)).await {
+                    came = true;
+                    break;
+                }
+            }
+            assert!(came);
+            assert_eq!(first.requests() - asked, receive::URL_FAILURES_MAX as usize);
+            assert_eq!(second.requests(), 1);
+            assert!(!controller.is_loader_gone());
         });
     }
 }

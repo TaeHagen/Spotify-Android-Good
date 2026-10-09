@@ -30,9 +30,14 @@ enum ReceivedData {
     Throughput(usize),
     ResponseTime(Duration),
     Data(PartialFileData),
-    // SPOTIFYGOOD: a request failed: its error status, `None` for a transport error (see
-    // AudioFileFetch::retry_at)
-    Failed(Option<StatusCode>),
+    // SPOTIFYGOOD: a request failed: its error status (`None` for a transport error, see
+    // AudioFileFetch::retry_at), the index of the CDN URL it asked (see AudioFileFetch::url) and
+    // the part of its range that didn't come
+    Failed {
+        status: Option<StatusCode>,
+        url: usize,
+        missing: Option<Range>,
+    },
 }
 
 const ONE_SECOND: Duration = Duration::from_secs(1);
@@ -74,15 +79,21 @@ fn request_idle_timeout() -> Duration {
 }
 
 // SPOTIFYGOOD: a CDN URL that is expired (403) or invalid (401, 404, 410) never delivers again:
-// the loader ends, so that a read gets `BrokenPipe` and the vendored player opens the file again
-// (with a new URL) instead of asking the dead one for a minute
+// the loader goes on with another URL of the file (see AudioFileFetch::url); once none is left it
+// ends, so that a read gets `BrokenPipe` and the vendored player opens the file again (with new
+// URLs) instead of asking the dead one for a minute
 /// Whether a response's status means that its URL can't deliver any more
-fn url_is_dead(code: StatusCode) -> bool {
+pub(super) fn url_is_dead(code: StatusCode) -> bool {
     matches!(
         code,
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE
     )
 }
+
+// SPOTIFYGOOD: see AudioFileFetch::url
+/// Failed requests in a row after which the loader goes on with the file's next CDN URL (an error
+/// status that isn't the URL's end, or a transport error)
+pub(super) const URL_FAILURES_MAX: u32 = 3;
 
 async fn receive_data(
     shared: Arc<AudioFileShared>,
@@ -194,6 +205,8 @@ async fn receive_data(
     }
 
     let bytes_remaining = request.length - actual_length;
+    // SPOTIFYGOOD: see ReceivedData::Failed
+    let missing = (bytes_remaining > 0).then(|| Range::new(offset, bytes_remaining));
     if bytes_remaining > 0 {
         {
             let missing_range = Range::new(offset, bytes_remaining);
@@ -214,7 +227,11 @@ async fn receive_data(
             request.offset, request.length, e
         );
         // SPOTIFYGOOD: see ReceivedData::Failed (a loader that is gone doesn't need it)
-        let _ = file_data_tx.send(ReceivedData::Failed(status));
+        let _ = file_data_tx.send(ReceivedData::Failed {
+            status,
+            url: request.url,
+            missing,
+        });
         return Err(e);
     }
 
@@ -241,6 +258,16 @@ struct AudioFileFetch {
     deferred: RangeSet,
     /// no prefetch after a failure, until data comes again
     prefetch_paused: bool,
+
+    // SPOTIFYGOOD: the CDN URL it asks (an index of AudioFileShared::cdn_urls). When it can't
+    // deliver any more (url_is_dead), or after URL_FAILURES_MAX failures in a row, the loader
+    // goes on with the next URL that isn't dead (in turn), and asks it at once for what failed
+    // and for what waited for the backoff. Stock asked the URL that opened the file for the
+    // whole file: a CDN that failed kept the track stalled until it paused, and a reopen started
+    // again with the same first URL.
+    url: usize,
+    /// the URLs that can't deliver any more
+    dead_urls: Vec<bool>,
 }
 
 // Might be replaced by enum from std once stable
@@ -297,12 +324,15 @@ impl AudioFileFetch {
 
         // TODO : refresh cdn_url when the token expired
 
+        // SPOTIFYGOOD: see AudioFileFetch::url
+        let Some(cdn_url) = self.shared.cdn_urls.get(self.url) else {
+            return Err(AudioFileError::Channel.into());
+        };
         for range in ranges_to_request.iter() {
-            let streamer = self.session.spclient().stream_from_cdn(
-                &self.shared.cdn_url,
-                range.start,
-                range.length,
-            )?;
+            let streamer =
+                self.session
+                    .spclient()
+                    .stream_from_cdn(cdn_url, range.start, range.length)?;
 
             download_status.requested.add_range(range);
 
@@ -311,6 +341,7 @@ impl AudioFileFetch {
                 initial_response: None,
                 offset: range.start,
                 length: range.length,
+                url: self.url, // SPOTIFYGOOD
             };
 
             self.session.spawn(receive_data(
@@ -321,6 +352,15 @@ impl AudioFileFetch {
         }
 
         Ok(())
+    }
+
+    // SPOTIFYGOOD: see AudioFileFetch::url
+    /// The next URL in turn that isn't dead, other than the one it asks
+    fn next_url(&self) -> Option<usize> {
+        let urls = self.dead_urls.len();
+        (1..urls)
+            .map(|step| (self.url + step) % urls)
+            .find(|&url| !self.dead_urls[url])
     }
 
     // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST
@@ -489,15 +529,49 @@ impl AudioFileFetch {
                     return Ok(ControlFlow::Break);
                 }
             }
-            // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST and url_is_dead
-            ReceivedData::Failed(status) => {
-                if status.is_some_and(url_is_dead) {
-                    warn!(
-                        "The file's CDN URL can't deliver any more ({status:?}), its loader ends"
-                    );
-                    return Ok(ControlFlow::Break);
+            // SPOTIFYGOOD: see RETRY_BACKOFF_FIRST, url_is_dead and AudioFileFetch::url
+            ReceivedData::Failed {
+                status,
+                url,
+                missing,
+            } => {
+                let dead = status.is_some_and(url_is_dead);
+                if let Some(dead_url) = self.dead_urls.get_mut(url).filter(|_| dead) {
+                    *dead_url = true;
                 }
-                self.failures = self.failures.saturating_add(1);
+                // a request to a URL the loader has left: what didn't come is asked of the
+                // current one
+                if url != self.url {
+                    if let Some(missing) = missing {
+                        self.download_range(missing.start, missing.length)?;
+                    }
+                    return Ok(ControlFlow::Continue);
+                }
+                if !dead {
+                    self.failures = self.failures.saturating_add(1);
+                }
+                if dead || self.failures >= URL_FAILURES_MAX {
+                    if let Some(next) = self.next_url() {
+                        warn!(
+                            "The file's CDN URL {url} fails ({status:?}), going on with URL {next}"
+                        );
+                        self.url = next;
+                        self.failures = 0;
+                        self.retry_at = None;
+                        self.prefetch_paused = true;
+                        if let Some(missing) = missing {
+                            self.download_range(missing.start, missing.length)?;
+                        }
+                        self.request_deferred()?;
+                        return Ok(ControlFlow::Continue);
+                    }
+                    if dead {
+                        warn!(
+                            "None of the file's CDN URLs can deliver any more ({status:?}), its loader ends"
+                        );
+                        return Ok(ControlFlow::Break);
+                    }
+                }
                 self.retry_at = Some(tokio::time::Instant::now() + retry_backoff(self.failures));
                 self.prefetch_paused = true;
             }
@@ -545,6 +619,8 @@ pub(super) async fn audio_file_fetch(
     output: NamedTempFile,
     mut stream_loader_command_rx: mpsc::UnboundedReceiver<StreamLoaderCommand>,
     complete_tx: oneshot::Sender<NamedTempFile>,
+    // SPOTIFYGOOD: see AudioFileFetch::url
+    dead_urls: Vec<bool>,
 ) -> AudioFileResult {
     let (file_data_tx, mut file_data_rx) = mpsc::unbounded_channel();
 
@@ -561,6 +637,8 @@ pub(super) async fn audio_file_fetch(
         download_status.requested.add_range(&requested_range);
     }
 
+    // SPOTIFYGOOD: see AudioFileFetch::url
+    let url = initial_request.url;
     session.spawn(receive_data(
         shared.clone(),
         file_data_tx.clone(),
@@ -585,6 +663,9 @@ pub(super) async fn audio_file_fetch(
         retry_at: None,
         deferred: RangeSet::new(),
         prefetch_paused: false,
+        // SPOTIFYGOOD: see AudioFileFetch::url
+        url,
+        dead_urls,
     };
 
     loop {

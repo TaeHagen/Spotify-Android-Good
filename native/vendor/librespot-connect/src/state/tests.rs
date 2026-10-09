@@ -2890,3 +2890,131 @@ fn a_restored_shuffle_of_a_context_without_uids_keeps_its_order() {
     let next = next_uids(&state);
     assert_eq!(next_uids(&restored)[..next.len()], next[..]);
 }
+
+/// What handle_transfer sets up for a transfer from a device that plays autoplay after the
+/// context (CONTEXT_URI, an album) ended: its track `r1` has the autoplay metadata, two tracks
+/// are queued after it; `resolves_autoplay`: Spirc's autoplay is on
+fn transferred_from_autoplay(
+    state: &mut ConnectState,
+    resolves_autoplay: bool,
+) -> crate::protocol::transfer_state::TransferState {
+    use crate::protocol::{
+        playback::Playback, queue::Queue, session::Session as PlayingSession,
+        transfer_state::TransferState,
+    };
+
+    state.reset_context(ResetContext::Completely);
+    let mut current = ContextTrack {
+        uri: Some(track_uri(0, 6)),
+        uid: Some("r1".to_string()),
+        ..Default::default()
+    };
+    current.set_from_autoplay(true);
+    let mut transfer = TransferState {
+        playback: MessageField::some(Playback {
+            current_track: MessageField::some(current),
+            ..Default::default()
+        }),
+        current_session: MessageField::some(PlayingSession {
+            context: MessageField::some(Context {
+                uri: Some(CONTEXT_URI.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        queue: MessageField::some(Queue {
+            tracks: (0..2)
+                .map(|i| ContextTrack {
+                    uri: Some(track_uri(i, 9)),
+                    ..Default::default()
+                })
+                .collect(),
+            is_playing_queue: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let track = state.current_track_from_transfer(&transfer).unwrap();
+    // handle_transfer goes by the provider: it resolves the autoplay context for it
+    assert!(track.is_autoplay(), "{}", track.provider);
+    state.set_track(track);
+    state.handle_initial_transfer(&mut transfer, Some(CONTEXT_URI.to_string()));
+    state.active_context = if resolves_autoplay {
+        ContextType::Autoplay
+    } else {
+        ContextType::Default
+    };
+    transfer
+}
+
+/// How many of the next tracks are queued, and the uids of the others
+fn queued_and_not(state: &ConnectState) -> (usize, Vec<String>) {
+    let queued = state.queued_count();
+    let rest = state.next_tracks()[queued..]
+        .iter()
+        .map(|t| t.uid.clone())
+        .collect();
+    (queued, rest)
+}
+
+// SPOTIFYGOOD: see ConnectState::finish_transfer and current_track_from_transfer
+#[test]
+fn a_transfer_of_an_autoplay_track_keeps_its_queue_and_goes_on_after_the_context() {
+    use crate::context_resolver::{ContextAction, ResolveContext};
+
+    // the album resolves, then the autoplay context: the queue, then autoplay
+    let (rt, mut state) = state(3);
+    let transfer = transferred_from_autoplay(&mut state, true);
+    state
+        .update_context(context(10, 0), ContextType::Default)
+        .unwrap();
+    state
+        .update_context(autoplay_context(5), ContextType::Autoplay)
+        .unwrap();
+    state.finish_transfer(transfer).expect("finished");
+    assert_eq!(state.current_track(|t| t.uid.clone()), "r1");
+    let autoplay = (0..5).map(|i| format!("a{i}")).collect::<Vec<_>>();
+    assert_eq!(queued_and_not(&state), (2, autoplay));
+    assert_eq!(state.active_context, ContextType::Autoplay);
+
+    // the autoplay resolve fails for good: the transfer is finished all the same, after the
+    // end of the album (it isn't played again)
+    let (_rt, mut state) = self::state(3);
+    let transfer = transferred_from_autoplay(&mut state, true);
+    state
+        .update_context(context(10, 0), ContextType::Default)
+        .unwrap();
+    let mut resolver = resolver(&rt);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Autoplay,
+        ContextAction::Replace,
+    ));
+    let mut transfer_state = Some(transfer);
+    assert!(resolver.finish_after_failure(&mut state, &mut transfer_state));
+    assert!(transfer_state.is_none());
+    assert_eq!(state.current_track(|t| t.uid.clone()), "r1");
+    assert_eq!(queued_and_not(&state), (2, vec![]));
+    assert_eq!(state.active_context, ContextType::Default);
+    assert_eq!(prev_uids(&state).last().map(String::as_str), Some("uid9"));
+
+    // autoplay is off: the album's resolve finishes it, the same way
+    let (_rt, mut state) = self::state(3);
+    let transfer = transferred_from_autoplay(&mut state, false);
+    let mut resolver = self::resolver(&rt);
+    resolver.add(ResolveContext::from_uri(
+        CONTEXT_URI,
+        "",
+        ContextType::Default,
+        ContextAction::Replace,
+    ));
+    state
+        .update_context(context(10, 0), ContextType::Default)
+        .unwrap();
+    let mut transfer_state = Some(transfer);
+    assert!(resolver.finish_transfer_early(&mut state, &mut transfer_state));
+    assert_eq!(state.current_track(|t| t.uid.clone()), "r1");
+    assert_eq!(queued_and_not(&state), (2, vec![]));
+    assert_eq!(prev_uids(&state).last().map(String::as_str), Some("uid9"));
+}

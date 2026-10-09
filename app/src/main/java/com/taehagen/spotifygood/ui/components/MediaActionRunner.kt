@@ -69,33 +69,36 @@ internal class MediaActionRunner(
 
     /**
      * "Add to queue" of the collection [uri] (playlist or album). While the session is ONLINE (by
-     * the engine's reach) the server's list ([online]); otherwise, or when fetching it fails for
-     * lack of connection, the collection's downloaded members in order (offline nothing else can be
-     * queued), without explicit ones while Hide explicit content is on.
+     * the engine's reach) the server's list ([online]: URIs only, bounded to [LOAD_TIMEOUT_MS]);
+     * otherwise, or when fetching it fails for lack of connection or in time, the collection's
+     * downloaded members in order (offline nothing else can be queued), without explicit ones
+     * while Hide explicit content is on ([collectionQueuePlan]). The queue add says how many went
+     * in ([addToQueue]).
      */
     fun addCollectionToQueue(uri: String, online: suspend () -> List<String>) {
         launch {
+            var failure: Throwable? = null
+            var timedOut = false
             val fromServer = if (graph.engineReach() == EngineReach.ONLINE) {
                 try {
-                    online()
+                    withTimeoutOrNull(LOAD_TIMEOUT_MS) { online() }.also { timedOut = it == null }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
                     if (!isNetworkClassError(e)) throw e
+                    failure = e
                     null
                 }
             } else {
                 null
             }
-            if (fromServer != null) {
-                addToQueue(fromServer)
-                return@launch
-            }
-            val downloaded = graph.downloadedQueueUris(uri)
-            if (downloaded.isEmpty()) {
-                withContext(Dispatchers.Main) { message(R.string.shell_msg_queue_nothing_downloaded) }
-            } else {
-                addToQueue(downloaded)
+            val downloaded = if (fromServer == null) graph.downloadedQueueUris(uri) else emptyList()
+            when (val plan = collectionQueuePlan(fromServer, downloaded, failure, timedOut)) {
+                is CollectionQueuePlan.Queue -> addToQueue(plan.uris)
+                CollectionQueuePlan.NothingToQueue -> message(R.string.shell_msg_nothing_to_add)
+                CollectionQueuePlan.NothingDownloaded -> withContext(Dispatchers.Main) { message(R.string.shell_msg_queue_nothing_downloaded) }
+                is CollectionQueuePlan.Failed ->
+                    plan.error?.let { navigator?.showMessage(friendlyErrorMessage(appContext, it)) } ?: message(R.string.shell_msg_list_timed_out)
             }
         }
     }

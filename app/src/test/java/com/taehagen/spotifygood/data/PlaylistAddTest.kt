@@ -162,4 +162,23 @@ class PlaylistAddTest {
         assertEquals(listOf("spotify:track:a", "spotify:local:x:y:z:1"), page.uris)
         assertEquals(listOf("dead", null), page.uids)
     }
+
+    @Test
+    fun aWholePlaylistActionReadsUrisOnlyAndSkipsLocalFiles() = runTest {
+        // "Add to queue" / "Add to other playlist" of a 3,000-song playlist: one small request.
+        var requests = 0
+        val stored = (0 until 3_000).map { "spotify:track:$it" }.toMutableList().apply {
+            add(1, "spotify:local:Artist:Album:Song:215")
+            add(5, "spotify:episode:e")
+            add(7, "spotify:unknown:x")
+        }
+        val uris = playableItemUris("spotify:playlist:p") { _, offset, limit ->
+            requests++
+            PlaylistUris(total = stored.size, offset = offset, uris = stored.drop(offset).take(limit))
+        }
+        assertEquals(1, requests)
+        assertEquals(3_001, uris.size)
+        assertEquals(listOf(t(0), t(1), t(2), t(3), "spotify:episode:e", t(4)), uris.take(6))
+        assertTrue(uris.none { it.startsWith("spotify:local:") || it.startsWith("spotify:unknown:") })
+    }
 }

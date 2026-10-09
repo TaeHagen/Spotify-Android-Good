@@ -436,7 +436,7 @@ private fun PlaylistActions(t: MediaActionTarget.PlaylistTarget, s: ActionScope)
     }
     SheetAction(Icons.AutoMirrored.Rounded.PlaylistAdd, stringResource(R.string.shell_action_add_to_other_playlist)) {
         s.dismiss()
-        s.runner.pickPlaylistFor(excludeUri = playlist.uri) { s.graph.catalog.playlistItemUrisToAdd(playlist.uri) }
+        s.runner.pickPlaylistFor(excludeUri = playlist.uri) { s.graph.catalog.playlistItemUris(playlist.uri) }
     }
     if (t.isOwned) {
         SheetAction(Icons.Rounded.Edit, stringResource(R.string.shell_action_rename)) { s.setPage(SheetPage.Rename) }
