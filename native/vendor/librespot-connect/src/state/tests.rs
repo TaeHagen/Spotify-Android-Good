@@ -3315,6 +3315,49 @@ fn a_remote_plays_start_track_is_what_it_names_and_blank_names_nothing() {
         start(&format!(r#"{{"track_uri": "{uri}", "track_uid": "uid8"}}"#)).locate(&tracks),
         Some(3)
     );
+    // position first: an index with the uid of its track is that track
+    let at = start(r#"{"track_uri": "", "track_uid": "uid5", "track_index": 5}"#);
+    assert_eq!(at.locate(&tracks), Some(5));
+    assert!(!at.wants_more_pages(&tracks));
+    // the playlist changed since the other device loaded it (a song was added before the track):
+    // the track at the index isn't the uid's, the uid's track is where it is now
+    let mut changed = tracks.clone();
+    changed.insert(
+        2,
+        ProvidedTrack {
+            uri: track_uri(2, 7),
+            uid: "added".to_string(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(at.locate(&changed), Some(6));
+    assert!(!at.wants_more_pages(&changed));
+    assert_eq!(at.start_at(&changed), Some(crate::model::StartAt::Index(6)));
+    let uri5 = track_uri(5, 0);
+    assert_eq!(
+        start(&format!(
+            r#"{{"track_uri": "{uri5}", "track_uid": "uid5", "track_index": 5}}"#
+        ))
+        .locate(&changed),
+        Some(6)
+    );
+    // without a uid: the uri's copy nearest to the index
+    assert_eq!(
+        start(&format!(r#"{{"track_uri": "{uri5}", "track_index": 5}}"#)).locate(&changed),
+        Some(6)
+    );
+    // an index alone is taken as it is (nothing tells of a change)
+    assert_eq!(start(r#"{"track_index": 5}"#).locate(&changed), Some(5));
+    assert!(!start(r#"{"track_index": 5}"#).wants_more_pages(&changed));
+    // an index past the tracks there are waits for the pages still to come, also when the uri
+    // is there (the copy at the index may be another one, on a later page)
+    let past = start(&format!(r#"{{"track_uri": "{uri5}", "track_index": 40}}"#));
+    assert!(past.wants_more_pages(&tracks));
+    assert!(start(r#"{"track_uri": "", "track_index": 40}"#).wants_more_pages(&tracks));
+    // a uid alone, as before: its track, or the pages still to come
+    assert!(!named.wants_more_pages(&tracks));
+    assert!(start(r#"{"track_uid": "elsewhere"}"#).wants_more_pages(&tracks));
+
     // a song twice in the context: the copy of the uid, or of the index
     let mut twice = tracks.clone();
     twice[8].uri = uri.clone();
@@ -3325,6 +3368,35 @@ fn a_remote_plays_start_track_is_what_it_names_and_blank_names_nothing() {
     assert_eq!(
         start(&format!(r#"{{"track_uri": "{uri}", "track_index": 8}}"#)).locate(&twice),
         Some(8)
+    );
+    assert_eq!(
+        start(&format!(r#"{{"track_uri": "{uri}", "track_index": 3}}"#)).locate(&twice),
+        Some(3)
+    );
+    assert_eq!(
+        start(r#"{"track_uri": "", "track_index": 8}"#).locate(&twice),
+        Some(8)
+    );
+    assert_eq!(
+        start(r#"{"track_uri": "", "track_uid": "uid8", "track_index": 8}"#).locate(&twice),
+        Some(8)
+    );
+    // the index of the other copy: the uid picks the copy
+    assert_eq!(
+        start(&format!(
+            r#"{{"track_uri": "{uri}", "track_uid": "uid3", "track_index": 8}}"#
+        ))
+        .locate(&twice),
+        Some(3)
+    );
+    // the index of another song, no uid: the copy nearest to it
+    assert_eq!(
+        start(&format!(r#"{{"track_uri": "{uri}", "track_index": 7}}"#)).locate(&twice),
+        Some(8)
+    );
+    assert_eq!(
+        start(&format!(r#"{{"track_uri": "{uri}", "track_index": 4}}"#)).locate(&twice),
+        Some(3)
     );
     // the uri of a uid the play's own pages carry
     let mut learned = start(r#"{"track_uri": "", "track_uid": "uid9"}"#);
@@ -3364,8 +3436,23 @@ fn a_remote_play_into_a_long_playlist_starts_at_its_track_once_its_page_is_there
 
     // what handle_load does with the play: the first page of a 960 track playlist is there,
     // the other pages resolve after it (resolve_pages_until), then the track is located and the
-    // playback starts there
-    for shuffle in [false, true] {
+    // playback starts there. The user picked the 701st song on the other device, named by
+    // (no uri and)
+    let picks = [
+        // its uid
+        r#"{"track_uri": "", "track_uid": "uid700"}"#,
+        // its index
+        r#"{"track_uri": "", "track_index": 700}"#,
+        // both
+        r#"{"track_uri": "", "track_uid": "uid700", "track_index": 700}"#,
+        // its uid and the index it had before a song before it was removed: the track at that
+        // index isn't the uid's, the uid's track is on the next page
+        r#"{"track_uri": "", "track_uid": "uid700", "track_index": 699}"#,
+    ];
+    for (pick, shuffle) in picks
+        .iter()
+        .flat_map(|pick| [(*pick, false), (*pick, true)])
+    {
         let (_rt, mut state) = state(3);
         state.reset_context(ResetContext::Completely);
         let mut playlist = Context {
@@ -3385,10 +3472,7 @@ fn a_remote_play_into_a_long_playlist_starts_at_its_track_once_its_page_is_there
         assert_eq!(remaining.len(), 9);
         state.set_active_context(ContextType::Default);
 
-        // the user picked the 701st song on the other device: no uri, its uid (and no index)
-        let start = StartTrack::from_skip_to(Some(&skip_to(
-            r#"{"track_uri": "", "track_uid": "uid700"}"#,
-        )));
+        let start = StartTrack::from_skip_to(Some(&skip_to(pick)));
         let mut page = 1;
         while start.wants_more_pages(&state.get_context(ContextType::Default).unwrap().tracks) {
             let range = page * 100..((page + 1) * 100).min(960);
@@ -3397,11 +3481,14 @@ fn a_remote_play_into_a_long_playlist_starts_at_its_track_once_its_page_is_there
                 .unwrap();
             page += 1;
         }
-        assert_eq!(page, 8, "it waited for the page of its track, not more");
+        assert_eq!(
+            page, 8,
+            "{pick}: it waited for the page of its track, not more"
+        );
         let index = start
             .locate(&state.get_context(ContextType::Default).unwrap().tracks)
             .expect("located");
-        assert_eq!(index, 700);
+        assert_eq!(index, 700, "{pick}");
 
         state.set_current_track(index).unwrap();
         if shuffle {

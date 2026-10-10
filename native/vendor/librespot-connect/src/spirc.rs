@@ -2678,11 +2678,12 @@ impl SpircTask {
 
         debug!("play track <{:?}>", cmd_options.playing_track);
 
-        // SPOTIFYGOOD: the start track is everything the load names of it (see StartTrack). It
-        // may be on a further page (a long playlist, an artist's albums), which is resolved
-        // later: a uid, or an index past the pages there are, can't be played without its
-        // track, so those pages are resolved here until it is there (an index refers to the
-        // context's order, the context isn't shuffled here).
+        // SPOTIFYGOOD: the start track is everything the load names of it (see StartTrack): its
+        // position (if the track there is the one named), else its uid, else its uri. It may be
+        // on a further page (a long playlist, an artist's albums), which is resolved later: an
+        // index past the pages there are, or a uid, can't be played without its track, so those
+        // pages are resolved here until it is there (an index refers to the context's order, the
+        // context isn't shuffled here).
         let start = start.with_playing_track(cmd_options.playing_track.as_ref());
         let wants_more_pages = self
             .connect_state
