@@ -92,6 +92,10 @@ Gradle properties:
 
 Tests: `./gradlew :app:testDebugUnitTest` and
 `cd native && cargo test -p spotcore -p librespot-connect -p librespot-playback -p librespot-audio`.
+Some JVM tests run on Robolectric: the first test run downloads its Android runtime
+(`org.robolectric:android-all-instrumented`, about 200 MB) from Maven Central's Google-hosted
+mirror (`maven-central.storage-download.googleapis.com`) into `~/.m2/repository`, so it needs a
+network; later runs use that copy and run offline.
 Screenshots (Robolectric + Roborazzi, test dependencies only): `./gradlew :app:testDebugUnitTest -Pscreenshots --tests '*ScreenshotTest'` writes PNGs to `app/build/outputs/roborazzi` (build output, not committed); the plain test run skips them.
 
 ## Known limitations
@@ -125,5 +129,6 @@ Screenshots (Robolectric + Roborazzi, test dependencies only): `./gradlew :app:t
   receiver may refuse the token the app obtains for it; the device then shows an error and can
   still be started from the official Spotify app or Google Assistant.
 - The app was developed without a device or a Spotify account: the JVM and Rust test
-  suites run offline (with fakes for the CDN and the ZeroConf server), and nothing has yet
-  been run against Spotify's live services.
+  suites run offline (with fakes for the CDN and the ZeroConf server; the JVM suite's first
+  run downloads the Robolectric runtime, see Tests above), and nothing has yet been run
+  against Spotify's live services.

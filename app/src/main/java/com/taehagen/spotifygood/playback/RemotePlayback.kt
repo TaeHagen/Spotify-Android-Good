@@ -19,11 +19,13 @@ import com.taehagen.spotifygood.model.PlaybackStatus
  * playback as suppressed ([suppressionReason]): Media3 keeps `playWhenReady` (the media
  * foreground, the notification and Media3 controllers stay as they are), and the platform
  * `PlaybackState` reads paused, which Bluetooth passes on as paused. So does Media3's placeholder
- * of a pending command, above all a play of the paused device ([placeholderSuppression]). Without
- * a Bluetooth output no headset or car reads the session, so it reads playing as it should (pause
- * button, moving position). The surfaces that show the paused state (the notification and lock
- * screen, Auto, Wear, a headset's AVRCP play) offer "play" while the device plays: their play is a
- * toggle there and pauses it ([playMeansPause]), except a voice assistant's explicit play. Volume
+ * of a pending command, above all a play of the paused device ([placeholderSuppression]), except
+ * while a media-session load is in flight: that load plays on this phone, so it reads playing.
+ * Without a Bluetooth output no headset or car reads the session, so it reads playing as it should
+ * (pause button, moving position). The surfaces that show the paused state (the notification and
+ * lock screen, Auto, Wear, a headset's AVRCP play) offer "play" while the device plays: their play
+ * is a toggle there and pauses it ([playMeansPause]), except a voice assistant's explicit play and
+ * any play while a media-session load is in flight (the play Media3 sends after that load). Volume
  * keys only reach a session in an active playback state, which the paused one is not:
  * [RemoteVolumeKeys] takes them meanwhile ([volumeKeysSession]).
  */
@@ -61,9 +63,13 @@ internal object RemotePlayback {
      * follows does ([suppressionReason]). A play sent through the session to a paused device stays
      * pending until that device reports playing (the Connect round trip, then the next snapshot);
      * reading playing meanwhile would tell a headset that the phone started playing. Seeks, skips
-     * and queue changes keep the state they start from, so they read paused too. Except while a
-     * media session load is in flight ([localLoadPending]): that one plays on this phone (as does
-     * the play that follows it), so it reads playing as local playback does.
+     * and queue changes keep the state they start from, so they read paused too.
+     *
+     * Except while a media-session load is in flight ([localLoadPending]: Auto, a car's browse
+     * list, a watch, resumption): it plays on this phone (`local`, taking the session over from the
+     * other device), as does the play that follows it, so a placeholder with [playWhenReady] reads
+     * playing as local playback does. That also lifts the suppression it starts from while the
+     * other device plays: the phone is about to play, which is what Bluetooth should hear.
      */
     fun placeholderSuppression(
         s: PlaybackSnapshot,
@@ -71,22 +77,31 @@ internal object RemotePlayback {
         suggested: Int,
         bluetoothOutput: Boolean?,
         localLoadPending: Boolean,
-    ): Int =
-        if (playWhenReady && suggested == Player.PLAYBACK_SUPPRESSION_REASON_NONE &&
-            s.source == PlaybackSource.REMOTE && s.track != null && bluetoothOutput != false && !localLoadPending
-        ) {
+    ): Int = when {
+        !playWhenReady -> suggested
+        localLoadPending -> Player.PLAYBACK_SUPPRESSION_REASON_NONE
+        suggested == Player.PLAYBACK_SUPPRESSION_REASON_NONE &&
+            s.source == PlaybackSource.REMOTE && s.track != null && bluetoothOutput != false ->
             Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS
-        } else {
-            suggested
-        }
+        else -> suggested
+    }
 
     /**
      * Whether a play request from [requesterPackage] pauses instead: another device plays, the
-     * session reads paused ([suppressed]: the state the requester saw, any button), and it is not a
-     * voice assistant asking to play. While the session reads playing a play stays a play.
+     * session reads paused ([suppressed]: the state the requester saw, any button), it is not a
+     * voice assistant asking to play, and no media-session load is in flight ([localLoadPending]).
+     * While the session reads playing a play stays a play. So does every play while such a load is
+     * pending: Media3 runs a controller's pick (a car's browse list, Auto's list or search, a
+     * watch) as setMediaItems, then play, and that play belongs to the load, which plays here; a
+     * play from another controller meanwhile asks for the same.
      */
-    fun playMeansPause(s: PlaybackSnapshot, suppressed: Boolean, requesterPackage: String?): Boolean =
-        suppressed && playsElsewhere(s) && requesterPackage !in VOICE_ASSISTANTS
+    fun playMeansPause(
+        s: PlaybackSnapshot,
+        suppressed: Boolean,
+        requesterPackage: String?,
+        localLoadPending: Boolean,
+    ): Boolean =
+        suppressed && !localLoadPending && playsElsewhere(s) && requesterPackage !in VOICE_ASSISTANTS
 
     /**
      * Whether the volume keys need [RemoteVolumeKeys]: the session reads paused ([suppressed]) while
