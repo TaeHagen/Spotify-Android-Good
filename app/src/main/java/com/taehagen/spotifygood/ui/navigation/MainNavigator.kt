@@ -2,6 +2,7 @@ package com.taehagen.spotifygood.ui.navigation
 
 import android.os.Handler
 import android.os.Looper
+import androidx.activity.compose.BackHandler
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.LibraryMusic
@@ -14,6 +15,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.Stable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -357,3 +359,16 @@ fun TabReselectedEffect(tab: MainTab, onReselect: suspend () -> Unit) {
  * shared components that only optionally navigate.
  */
 val LocalOptionalAppNavigator = staticCompositionLocalOf<AppNavigator?> { null }
+
+/** True while an overlay (Now Playing, Queue, Lyrics, the playback-refused screen) covers the pages. */
+val LocalPageCovered = compositionLocalOf { false }
+
+/**
+ * Back for a page's own state (a search query, a Library folder, edit mode). Off while an overlay
+ * covers the pages ([LocalPageCovered]), so a hidden page never takes Back from what is on screen,
+ * whichever handler was added last.
+ */
+@Composable
+fun PageBackHandler(enabled: Boolean, onBack: () -> Unit) {
+    BackHandler(enabled = enabled && !LocalPageCovered.current, onBack = onBack)
+}

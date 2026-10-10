@@ -11,6 +11,10 @@ import androidx.compose.foundation.gestures.FlingBehavior
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.ScrollScope
 import androidx.compose.foundation.gestures.anchoredDraggable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitVerticalTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Box
@@ -34,6 +38,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -58,7 +63,6 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.changedToDownIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.layout
@@ -83,7 +87,11 @@ import coil3.compose.AsyncImage
 import coil3.compose.AsyncImagePainter
 import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
-import coil3.request.crossfade
+import coil3.request.ImageResult
+import coil3.request.transitionFactory
+import coil3.transition.CrossfadeTransition
+import coil3.transition.Transition
+import coil3.transition.TransitionTarget
 import com.taehagen.spotifygood.ui.components.imageData
 import kotlin.math.roundToInt
 
@@ -466,8 +474,9 @@ private fun MiniPlayerLayer(sheet: PlayerSheetState, content: @Composable () -> 
 /**
  * The art while the player moves (0 < p < 1): laid out once at Now Playing's art size and moved,
  * scaled and rounded by its layer, so no frame relayouts it. At rest the mini player's thumbnail
- * (p = 0) or Now Playing's own art (p = 1) shows instead; all three load the same request, so
- * each starts from the bitmap the others already decoded.
+ * (p = 0) or Now Playing's own art (p = 1) shows instead. It stays composed (and loads each new
+ * cover) while hidden, so it already holds the cover when it appears; one loaded out of sight shows
+ * without a fade ([PlayerArtwork]).
  */
 @Composable
 private fun FlyingArtwork(sheet: PlayerSheetState, artwork: String?) {
@@ -500,7 +509,13 @@ private fun FlyingArtwork(sheet: PlayerSheetState, artwork: String?) {
             .clearAndSetSemantics {},
     ) {
         PlayerSurfaceTheme {
-            PlayerArtwork(url = artwork, contentDescription = null, shape = null, modifier = Modifier.fillMaxSize())
+            PlayerArtwork(
+                url = artwork,
+                contentDescription = null,
+                shape = null,
+                shown = { flying },
+                modifier = Modifier.fillMaxSize(),
+            )
         }
     }
 }
@@ -527,13 +542,19 @@ internal fun Modifier.ignoreTapsWhile(blocked: () -> Boolean): Modifier = pointe
 
 /**
  * Vertical motion that starts on a slider stays with it: Now Playing neither scrolls nor collapses
- * from the seek bar or the volume slider. Consumed after the slider itself has seen the change.
+ * from the seek bar or the volume slider. A drag that crosses the vertical touch slop before the
+ * slider took it sideways is held here until the finger lifts; being deeper than Now Playing's
+ * scroll and the sheet, this sees each move before them, so they never get one past their slop.
+ * Everything else is left to the slider: it takes sideways drags at its own slop (those within 30°
+ * of horizontal; it leaves steeper ones to the vertical draggables above it, so they end up held
+ * here), and a tap that jitters a little still lands (consuming a move earlier would cancel both).
  */
 internal fun Modifier.keepDragsLocal(): Modifier = pointerInput(Unit) {
-    awaitPointerEventScope {
-        while (true) {
-            awaitPointerEvent().changes.forEach { if (it.positionChange() != Offset.Zero) it.consume() }
-        }
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        val vertical = awaitVerticalTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
+            ?: return@awaitEachGesture
+        drag(vertical.id) { it.consume() }
     }
 }
 
@@ -568,13 +589,19 @@ internal fun Modifier.playerDetailsMotion(sheet: PlayerSheetState?, besideArtwor
         }
     }
 
+/** Whether Now Playing's own art is the one on screen: at rest (p = 1), or outside the player. */
+internal fun PlayerSheetState?.showsPlayerArtwork(): Boolean = this == null || progress >= 1f
+
+/** Whether the mini player's thumbnail is the art on screen: at rest (p = 0), or outside the player. */
+internal fun PlayerSheetState?.showsMiniArtwork(): Boolean = this == null || progress <= 0f
+
 /** Now Playing's own art: shown only at rest (p = 1); [FlyingArtwork] takes over while it moves. */
 internal fun Modifier.playerArtworkAtRest(sheet: PlayerSheetState?): Modifier =
-    if (sheet == null) this else graphicsLayer { alpha = if (sheet.progress >= 1f) 1f else 0f }
+    if (sheet == null) this else graphicsLayer { alpha = if (sheet.showsPlayerArtwork()) 1f else 0f }
 
 /** The mini player's thumbnail: shown only at rest (p = 0). */
 internal fun Modifier.miniArtworkAtRest(sheet: PlayerSheetState?): Modifier =
-    if (sheet == null) this else graphicsLayer { alpha = if (sheet.progress <= 0f) 1f else 0f }
+    if (sheet == null) this else graphicsLayer { alpha = if (sheet.showsMiniArtwork()) 1f else 0f }
 
 /** The mini player's title and artist: pushed aside by the growing art while they fade. */
 internal fun Modifier.miniTextMotion(sheet: PlayerSheetState?): Modifier =
@@ -598,8 +625,13 @@ private const val PLAYER_ARTWORK_PX = 640
 
 /**
  * Cover art of the player surfaces. The mini player's thumbnail, the moving art and Now Playing's
- * art make this same request (same data, fixed size), so they share one memory-cached bitmap and
- * the art never reloads or flickers as it passes between them. [shape] null: the caller clips.
+ * art make this same request (same data, fixed size), so a copy composed after another has loaded
+ * the cover gets that bitmap from the memory cache. A new cover reaches the composed copies at
+ * once, and each may decode it before any is cached.
+ *
+ * A cover that loads while this copy is [shown] fades in; one that loads while it is hidden shows
+ * at once, since Coil's fade starts at the painter's first draw: it would otherwise run, from the
+ * grey placeholder, only when the copy appears. [shape] null: the caller clips.
  */
 @Composable
 internal fun PlayerArtwork(
@@ -607,11 +639,17 @@ internal fun PlayerArtwork(
     contentDescription: String?,
     modifier: Modifier = Modifier,
     shape: Shape? = RoundedCornerShape(MiniArtworkCorner),
+    shown: () -> Boolean = { true },
 ) {
     val context = LocalPlatformContext.current
+    val currentShown by rememberUpdatedState(shown)
     val request = remember(url, context) {
         url?.takeIf { it.isNotBlank() }?.let {
-            ImageRequest.Builder(context).data(imageData(it)).size(PLAYER_ARTWORK_PX).crossfade(true).build()
+            ImageRequest.Builder(context)
+                .data(imageData(it))
+                .size(PLAYER_ARTWORK_PX)
+                .transitionFactory(CrossfadeWhileShown { currentShown() })
+                .build()
         }
     }
     var loaded by remember(url) { mutableStateOf(false) }
@@ -650,3 +688,12 @@ internal fun PlayerArtwork(
         }
     }
 }
+
+/** Coil's crossfade for a cover that loads while [shown]; any other shows at once (see [PlayerArtwork]). */
+private class CrossfadeWhileShown(private val shown: () -> Boolean) : Transition.Factory {
+    override fun create(target: TransitionTarget, result: ImageResult): Transition =
+        (if (shown()) PlayerArtworkCrossfade else Transition.Factory.NONE).create(target, result)
+}
+
+/** The fade the app's image loader gives every other image (a memory-cache hit never fades). */
+private val PlayerArtworkCrossfade = CrossfadeTransition.Factory()

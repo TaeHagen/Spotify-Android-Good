@@ -1,6 +1,5 @@
 package com.taehagen.spotifygood.ui.screens.playlist
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -78,6 +77,7 @@ import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MainNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import com.taehagen.spotifygood.ui.navigation.PageBackHandler
 import com.taehagen.spotifygood.ui.navigation.Route
 import com.taehagen.spotifygood.ui.screens.album.AddedButton
 import com.taehagen.spotifygood.ui.screens.album.CollectionDownloadButton
@@ -128,7 +128,7 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
     val exitEditMode = {
         viewModel.setEditMode(false)
     }
-    BackHandler(enabled = state.editMode, onBack = exitEditMode)
+    PageBackHandler(enabled = state.editMode, onBack = exitEditMode)
     val actions = remember(viewModel) {
         PlaylistActions(
             onPlay = viewModel::playContext,

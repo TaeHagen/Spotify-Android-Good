@@ -696,6 +696,7 @@ private fun NowPlayingArtwork(
     val previousLabel = stringResource(R.string.player_previous)
     val collapseLabel = stringResource(R.string.player_collapse)
     val artworkDescription = stringResource(R.string.player_artwork, title)
+    val sheet = LocalPlayerSheet.current
     SwipeToSkipBox(
         canNext = canNext,
         canPrevious = canPrevious,
@@ -714,6 +715,7 @@ private fun NowPlayingArtwork(
                 url = url,
                 contentDescription = artworkDescription,
                 shape = RoundedCornerShape(LargeArtworkCorner),
+                shown = { sheet.showsPlayerArtwork() },
                 modifier = Modifier
                     .fillMaxSize()
                     .shadow(elevation = LargeArtworkElevation, shape = RoundedCornerShape(LargeArtworkCorner)),

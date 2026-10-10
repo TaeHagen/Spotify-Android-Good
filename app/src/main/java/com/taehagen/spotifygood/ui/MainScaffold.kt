@@ -7,7 +7,6 @@ import android.os.Build
 import android.os.SystemClock
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalActivity
-import androidx.activity.compose.PredictiveBackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -68,7 +67,6 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -99,6 +97,7 @@ import com.taehagen.spotifygood.ui.components.rememberAppGraph
 import com.taehagen.spotifygood.ui.navigation.AppNavHost
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalOptionalAppNavigator
+import com.taehagen.spotifygood.ui.navigation.LocalPageCovered
 import com.taehagen.spotifygood.ui.navigation.MainNavigator
 import com.taehagen.spotifygood.ui.navigation.MainTab
 import com.taehagen.spotifygood.ui.navigation.rememberMainNavigator
@@ -110,6 +109,7 @@ import com.taehagen.spotifygood.ui.screens.player.DevicesSheet
 import com.taehagen.spotifygood.ui.screens.player.ExpandingPlayer
 import com.taehagen.spotifygood.ui.screens.player.LyricsScreen
 import com.taehagen.spotifygood.ui.screens.player.PendingDeviceBanner
+import com.taehagen.spotifygood.ui.screens.player.PlayerBackHandler
 import com.taehagen.spotifygood.ui.screens.player.PlayerDock
 import com.taehagen.spotifygood.ui.screens.player.PlayerSheetState
 import com.taehagen.spotifygood.ui.screens.player.pendingTargetNameFlow
@@ -121,7 +121,6 @@ import com.taehagen.spotifygood.ui.screens.player.surfaceCoversStatusBar
 import com.taehagen.spotifygood.ui.screens.status.PlaybackRefusedBanner
 import com.taehagen.spotifygood.ui.screens.status.PlaybackRefusedScreen
 import com.taehagen.spotifygood.ui.theme.LocalSystemBarsController
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -129,7 +128,6 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -230,6 +228,7 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
     CompositionLocalProvider(
         LocalAppNavigator provides navigator,
         LocalOptionalAppNavigator provides navigator,
+        LocalPageCovered provides overlayOpen,
     ) {
         Box(modifier.fillMaxSize()) {
             val suiteType = NavigationSuiteScaffoldDefaults.navigationSuiteType(currentWindowAdaptiveInfoV2())
@@ -289,7 +288,14 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
                 )
             }
 
-            PlayerOverlay(navigator = navigator, sheet = sheet, hasTrack = hasTrack)
+            PlayerOverlay(
+                navigator = navigator,
+                sheet = sheet,
+                hasTrack = hasTrack,
+                // Back is Now Playing's while nothing is drawn over it (the overlays below are).
+                onTop = navigator.isNowPlayingOpen && !navigator.isQueueOpen && !navigator.isLyricsOpen &&
+                    refusal != PlaybackRefusal.SCREEN,
+            )
             FullScreenOverlay(visible = navigator.isQueueOpen, onBack = navigator::closeQueue) {
                 QueueScreen(onDismiss = navigator::closeQueue)
             }
@@ -438,28 +444,18 @@ private fun Modifier.blockTouches(): Modifier = pointerInput(Unit) {
 
 /**
  * The expanding player above the shell, while something is loaded or Now Playing is open (it then
- * shows "nothing playing"). Back collapses it; on Android 14+ the predictive back gesture shrinks
- * it toward the mini player as it goes and springs it back when cancelled. The system-bar icons
- * turn light once the (always dark) player reaches under the status bar.
+ * shows "nothing playing"). While Now Playing is [onTop] Back collapses it ([PlayerBackHandler],
+ * with predictive back). The system-bar icons turn light once the (always dark) player reaches
+ * under the status bar.
  */
 @Composable
-private fun PlayerOverlay(navigator: MainNavigator, sheet: PlayerSheetState, hasTrack: Boolean) {
+private fun PlayerOverlay(navigator: MainNavigator, sheet: PlayerSheetState, hasTrack: Boolean, onTop: Boolean) {
     val wanted = hasTrack || navigator.isNowPlayingOpen
     val shown = animateFloatAsState(if (wanted) 1f else 0f, tween(if (wanted) 260 else 200), label = "player")
     val composed by remember { derivedStateOf { shown.value > 0f } }
     if (!wanted && !composed) return
 
-    val scope = rememberCoroutineScope()
-    PredictiveBackHandler(enabled = navigator.isNowPlayingOpen && !navigator.isQueueOpen && !navigator.isLyricsOpen) { events ->
-        try {
-            events.collect { event -> sheet.previewBack(event.progress) }
-            navigator.closeNowPlaying()
-        } catch (e: CancellationException) {
-            // Cancelled gesture: spring back (unless the player is closing anyway).
-            scope.launch { if (navigator.isNowPlayingOpen) sheet.animateTo(expanded = true) }
-            throw e
-        }
-    }
+    PlayerBackHandler(sheet = sheet, enabled = onTop, onCollapse = navigator::closeNowPlaying)
 
     val barsController = LocalSystemBarsController.current
     val statusBarHeight = rememberUpdatedState(WindowInsets.statusBars.getTop(LocalDensity.current).toFloat())
