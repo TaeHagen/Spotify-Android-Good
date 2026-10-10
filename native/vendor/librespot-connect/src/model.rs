@@ -1,8 +1,9 @@
-// SPOTIFYGOOD: + AudioOutputDeviceType
+// SPOTIFYGOOD: + AudioOutputDeviceType, ContextPage and ProvidedTrack (StartTrack)
 use crate::{
     core::dealer::protocol::SkipTo,
     protocol::{
-        connect::AudioOutputDeviceType, context_player_options::ContextPlayerOptionOverrides,
+        connect::AudioOutputDeviceType, context_page::ContextPage,
+        context_player_options::ContextPlayerOptionOverrides, player::ProvidedTrack,
     },
 };
 
@@ -194,9 +195,12 @@ impl TryFrom<SkipTo> for PlayingTrack {
     fn try_from(value: SkipTo) -> Result<Self, Self::Error> {
         // order of checks is important, as the index can be 0, but still has an uid or uri provided,
         // so we only use the index as last resort
-        if let Some(uri) = value.track_uri {
+        // SPOTIFYGOOD: a blank uri or uid names nothing (see StartTrack): a remote play sent
+        // `track_uri: ""` with the uid of the track, the empty uri was taken, nothing was found
+        // and the load failed ("track uri <None> contains invalid characters")
+        if let Some(uri) = named(value.track_uri) {
             Ok(PlayingTrack::Uri(uri))
-        } else if let Some(uid) = value.track_uid {
+        } else if let Some(uid) = named(value.track_uid) {
             Ok(PlayingTrack::Uid(uid))
         } else if let Some(index) = value.track_index {
             Ok(PlayingTrack::Index(index))
@@ -204,6 +208,161 @@ impl TryFrom<SkipTo> for PlayingTrack {
             Err(())
         }
     }
+}
+
+// SPOTIFYGOOD: see StartTrack
+/// The string, unless it is blank
+fn named(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+// SPOTIFYGOOD: the track a load starts with, as everything the play names of it: a remote play's
+// skip_to (its uri, uid and index; blank strings name nothing), what the play's own context pages
+// tell of the uid, or a local load's PlayingTrack. Stock looked it up by one of them (the uri if
+// any): a remote play from a client that sends `track_uri: ""` with the uid failed, a uid on a
+// page not resolved yet, or an index past it, played another track, and a song that is twice in
+// the context started at its first copy. It is looked up by its position first (the index, if
+// the track there is the one named), then by its uid, then by its uri (see locate).
+/// The start track of a load
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StartTrack {
+    pub uri: Option<String>,
+    pub uid: Option<String>,
+    /// in the context's order (not shuffled)
+    pub index: Option<usize>,
+}
+
+impl StartTrack {
+    /// What a remote play's skip_to names
+    pub(crate) fn from_skip_to(skip_to: Option<&SkipTo>) -> Self {
+        let Some(skip_to) = skip_to else {
+            return Self::default();
+        };
+        Self {
+            uri: named(skip_to.track_uri.clone()),
+            uid: named(skip_to.track_uid.clone()),
+            index: skip_to.track_index.map(|index| index as usize),
+        }
+    }
+
+    /// What a load's PlayingTrack names, with `self` (a remote play's skip_to) for the rest
+    pub(crate) fn with_playing_track(mut self, playing_track: Option<&PlayingTrack>) -> Self {
+        match playing_track {
+            Some(PlayingTrack::Uri(uri)) => self.uri = named(Some(uri.clone())).or(self.uri),
+            Some(PlayingTrack::Uid(uid)) => self.uid = named(Some(uid.clone())).or(self.uid),
+            Some(PlayingTrack::Index(index)) => self.index = self.index.or(Some(*index as usize)),
+            None => (),
+        }
+        self
+    }
+
+    /// Learns the uri of its uid from the play's own context pages (a play sends the tracks it
+    /// names with their uri and uid)
+    pub(crate) fn learn_from_pages(&mut self, pages: &[ContextPage]) {
+        if self.uri.is_some() {
+            return;
+        }
+        let Some(uid) = self.uid.as_deref() else {
+            return;
+        };
+        self.uri = pages
+            .iter()
+            .flat_map(|page| page.tracks.iter())
+            .find(|track| track.uid.as_deref() == Some(uid))
+            .and_then(|track| named(track.uri.clone()));
+    }
+
+    /// Whether the play names a track at all
+    pub(crate) fn is_named(&self) -> bool {
+        self.uri.is_some() || self.uid.is_some() || self.index.is_some()
+    }
+
+    /// The position of the track in `tracks` (the context, in its order):
+    /// 1. the index, if the track there is the one the uid and the uri name (an index alone is
+    ///    taken as it is); a track there that isn't (the context changed since the other device
+    ///    loaded it) is looked for:
+    /// 2. by its uid (the copy of a song that is twice), if that is the uri's song,
+    /// 3. by its uri, the copy nearest to the index (the first without one)
+    pub(crate) fn locate(&self, tracks: &[ProvidedTrack]) -> Option<usize> {
+        self.of_index(tracks)
+            .or_else(|| self.of_uid(tracks))
+            .or_else(|| self.of_uri(tracks))
+    }
+
+    /// The index, if the track there is the one named (step 1 of locate)
+    fn of_index(&self, tracks: &[ProvidedTrack]) -> Option<usize> {
+        self.valid_index(tracks.len())
+            .filter(|&i| self.uid.as_ref().is_none_or(|uid| &tracks[i].uid == uid))
+            .filter(|&i| self.uri.as_ref().is_none_or(|uri| &tracks[i].uri == uri))
+    }
+
+    /// The track of the uid, if it is the uri's song (step 2 of locate)
+    fn of_uid(&self, tracks: &[ProvidedTrack]) -> Option<usize> {
+        let uid = self.uid.as_ref()?;
+        tracks
+            .iter()
+            .position(|t| &t.uid == uid)
+            .filter(|&i| self.uri.as_ref().is_none_or(|uri| &tracks[i].uri == uri))
+    }
+
+    /// The copy of the uri nearest to the index (step 3 of locate)
+    fn of_uri(&self, tracks: &[ProvidedTrack]) -> Option<usize> {
+        let uri = self.uri.as_ref()?;
+        let near = self.index.unwrap_or_default();
+        tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| &t.uri == uri)
+            .min_by_key(|(i, _)| i.abs_diff(near))
+            .map(|(i, _)| i)
+    }
+
+    /// Whether the track may be on a page of the context still to come: neither the track at the
+    /// index nor the uid's track is in `tracks`, and the index is past them (the track there is
+    /// looked at first, see locate) or a uid is given (a uri alone plays at once, outside the
+    /// context)
+    pub(crate) fn wants_more_pages(&self, tracks: &[ProvidedTrack]) -> bool {
+        if self.of_index(tracks).is_some() || self.of_uid(tracks).is_some() {
+            return false;
+        }
+        self.index.is_some_and(|i| i >= tracks.len()) || self.uid.is_some()
+    }
+
+    /// The index, when it is one of `len` tracks
+    pub(crate) fn valid_index(&self, len: usize) -> Option<usize> {
+        self.index.filter(|&i| i < len)
+    }
+
+    /// Where a load of `tracks` (the context, once the pages it waited for are there) starts;
+    /// `None` when the play names no track
+    pub(crate) fn start_at(&self, tracks: &[ProvidedTrack]) -> Option<StartAt> {
+        if !self.is_named() {
+            return None;
+        }
+        Some(match (self.locate(tracks), self.uri.as_ref()) {
+            (Some(index), _) => StartAt::Index(index),
+            (None, Some(uri)) => StartAt::Outside(uri.clone()),
+            (None, None) => match self.valid_index(tracks.len()) {
+                Some(index) => StartAt::Index(index),
+                None => StartAt::First,
+            },
+        })
+    }
+}
+
+// SPOTIFYGOOD: see StartTrack::start_at
+/// Where a load starts
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartAt {
+    /// at this track of the context
+    Index(usize),
+    /// at this track, which the context doesn't contain (yet): the context goes on after it
+    Outside(String),
+    /// the track named isn't there: at the first track (a random one when shuffled), from its
+    /// start
+    First,
 }
 
 #[derive(Debug)]

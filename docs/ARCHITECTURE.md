@@ -1680,6 +1680,37 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
   Add-to-playlist sheet, Create playlist dialog, Settings, Profile.
 * Mini player above the navigation bar (swipe/tap to expand, progress line, play/pause,
   device indicator).
+* Fast scroller (`ui/components/FastScroller.kt`) on long lists: playlists and Liked Songs, the
+  Downloads page, the library list, Your Episodes, a show's episodes and (long) albums. A slim
+  track and a pill thumb on the right edge, between the top bar and the mini player / navigation
+  bar. The thumb's length is the screen's share of the list (at least 48 dp). It shows while the
+  list moves and fades 1.5 s after; lists shorter than three screens have none. Its 48 dp touch
+  strip only takes touches while it shows, and it leaves horizontal moves alone. Dragging the
+  thumb seeks 1:1 over the whole list: the position maps to a row and its offset through the
+  measured header and footer and the average row height, both ways, so the thumb and the rows
+  agree. A drag on the track jumps there first; a tap jumps. A bubble beside the thumb names the
+  row on top while dragging: the first letter of the Title / Artist / Album sort key (accents
+  dropped; digits and symbols "#"), the month it was added in Recently added, otherwise
+  "1,234 / 5,000". A letter change gives a soft haptic tick. The thumb is computed from the
+  `LazyListState` in derived state, read in layout and placement only, so a scroll frame
+  re-lays out the thumb and not the list. TalkBack gets an adjustable control (progress in 5 %
+  steps) with "Scroll to top / bottom". It is off in a playlist's edit mode, whose drag handles
+  sit on that edge. Its screenshots (Robolectric + Roborazzi, test dependencies only) render
+  with `./gradlew :app:testDebugUnitTest -Pscreenshots --tests '*FastScrollerScreenshotTest'`
+  into `app/build/outputs/roborazzi` (not in git); the plain unit test run skips them.
+* Random access in long paged lists. In their own order while ONLINE, a playlist and Liked
+  Songs list every row to the end: the loaded rows, then placeholders sized like a row, so the
+  scroller spans `total`. The rows on screen (`VisibleRowsEffect`) drive the loading. Near the
+  loaded end, the next page continues them. Further down, the pages holding those rows load by
+  offset (`PageWindows`, 100 rows a page). A page loads once the rows on screen have stayed put
+  150 ms (a fast drag loads nothing on the way). A load for a page scrolled away is cancelled.
+  At most 8 pages are kept (the farthest go). A failed page loads again every 3 s while it is
+  on screen, and pages the loaded rows reach are dropped. A window row plays and acts like a
+  loaded one (context with its index and uid; positional removal with the page's revision).
+  Windows belong to one version of the list: a playlist page of another revision reloads the
+  loaded rows, and a new revision or total, the explicit filter, a reload or pull-to-refresh
+  drops them (the rows on screen load again). A sort or a filter loads every row anyway
+  (§9.8), so its scroller just jumps; offline lists show their loaded rows only.
 * Deep links: `https://open.spotify.com/{type}/{id}` and `spotify:{type}:{id}` intents. The
   https links can't be verified for this app: from Android 12 they reach it only after the user
   approves open.spotify.com in its "Open by default" settings. Settings › Links offers that

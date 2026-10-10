@@ -34,6 +34,8 @@ import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
+import com.taehagen.spotifygood.ui.components.FastScroller
+import androidx.compose.foundation.layout.Box
 
 @Composable
 fun AlbumScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier = Modifier) {
@@ -87,67 +89,71 @@ private fun AlbumList(
     onRetry: () -> Unit,
 ) {
     val album = content.album
-    LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
-        item(key = "header", contentType = "header") {
-            AlbumHeader(
-                content = content,
-                state = state,
-                onArtistClick = { navigator.navigate(Route.Artist(it.uri)) },
-                onPlay = onPlay,
-                onShuffle = onShuffle,
-                onToggleSaved = onToggleSaved,
-                onDownload = onDownload,
-                onRemoveDownload = onRemoveDownload,
-                onMore = { navigator.showActions(MediaActionTarget.AlbumTarget(album.toRef())) },
-            )
-        }
-        if (content.downloadedCopy) {
-            item(key = "downloaded", contentType = "notice") {
-                DownloadedCopyNotice(
-                    stringResource(R.string.detail_showing_downloaded_tracks),
-                    onRetry = onRetry.takeUnless { state.offline },
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
+            item(key = "header", contentType = "header") {
+                AlbumHeader(
+                    content = content,
+                    state = state,
+                    onArtistClick = { navigator.navigate(Route.Artist(it.uri)) },
+                    onPlay = onPlay,
+                    onShuffle = onShuffle,
+                    onToggleSaved = onToggleSaved,
+                    onDownload = onDownload,
+                    onRemoveDownload = onRemoveDownload,
+                    onMore = { navigator.showActions(MediaActionTarget.AlbumTarget(album.toRef())) },
                 )
             }
-        }
-        if (album.partial) {
-            // Some tracks are placeholders (their metadata failed right now).
-            item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetry) }
-        }
-        content.discs.forEach { disc ->
-            if (content.multiDisc) {
-                item(key = "disc-${disc.disc}", contentType = "disc") {
-                    SubsectionTitle(stringResource(R.string.detail_disc, disc.disc))
+            if (content.downloadedCopy) {
+                item(key = "downloaded", contentType = "notice") {
+                    DownloadedCopyNotice(
+                        stringResource(R.string.detail_showing_downloaded_tracks),
+                        onRetry = onRetry.takeUnless { state.offline },
+                    )
                 }
             }
-            items(disc.tracks, key = { "t-${it.index}" }, contentType = { "track" }) { indexed ->
-                val track = indexed.track
-                val downloadState = state.rowDownloads[track.uri]
-                val playable = canStartNow(track.playable, state.online, downloadState, track.explicit, state.filterExplicit)
-                val showActions = { navigator.showActions(MediaActionTarget.TrackTarget(track, contextUri = uri)) }
-                TrackRow(
-                    track = track,
-                    onClick = { onPlayTrack(track) },
-                    isCurrent = state.playback.isCurrent(track.uri),
-                    isPlaying = state.playback.isPlayingItem(track.uri),
-                    showArtwork = false,
-                    index = track.trackNumber ?: (indexed.index + 1),
-                    subtitleOverride = indexed.artistLine,
-                    downloadState = downloadState,
-                    onMoreClick = showActions,
-                    onLongClick = showActions,
-                    // Unplayable (or not downloaded while the session isn't online): dimmed, actions still in the overflow.
-                    enabled = playable,
-                )
+            if (album.partial) {
+                // Some tracks are placeholders (their metadata failed right now).
+                item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetry) }
+            }
+            content.discs.forEach { disc ->
+                if (content.multiDisc) {
+                    item(key = "disc-${disc.disc}", contentType = "disc") {
+                        SubsectionTitle(stringResource(R.string.detail_disc, disc.disc))
+                    }
+                }
+                items(disc.tracks, key = { "t-${it.index}" }, contentType = { "track" }) { indexed ->
+                    val track = indexed.track
+                    val downloadState = state.rowDownloads[track.uri]
+                    val playable = canStartNow(track.playable, state.online, downloadState, track.explicit, state.filterExplicit)
+                    val showActions = { navigator.showActions(MediaActionTarget.TrackTarget(track, contextUri = uri)) }
+                    TrackRow(
+                        track = track,
+                        onClick = { onPlayTrack(track) },
+                        isCurrent = state.playback.isCurrent(track.uri),
+                        isPlaying = state.playback.isPlayingItem(track.uri),
+                        showArtwork = false,
+                        index = track.trackNumber ?: (indexed.index + 1),
+                        subtitleOverride = indexed.artistLine,
+                        downloadState = downloadState,
+                        onMoreClick = showActions,
+                        onLongClick = showActions,
+                        // Unplayable (or not downloaded while the session isn't online): dimmed, actions still in the overflow.
+                        enabled = playable,
+                    )
+                }
+            }
+            item(key = "footer", contentType = "footer") {
+                AlbumFooter(content)
+            }
+            if (state.moreBy.isNotEmpty()) {
+                item(key = "more-by", contentType = "carousel") {
+                    MoreByCarousel(content, state.moreBy, navigator)
+                }
             }
         }
-        item(key = "footer", contentType = "footer") {
-            AlbumFooter(content)
-        }
-        if (state.moreBy.isNotEmpty()) {
-            item(key = "more-by", contentType = "carousel") {
-                MoreByCarousel(content, state.moreBy, navigator)
-            }
-        }
+        // Long albums only (a short one is shorter than the scroller's minimum).
+        FastScroller(listState, topPadding = detailTopInset(), bottomPadding = contentPadding.calculateBottomPadding())
     }
 }
 
