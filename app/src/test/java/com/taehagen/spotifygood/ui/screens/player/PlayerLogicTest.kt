@@ -22,6 +22,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.random.Random
 
 class LikeStateTest {
     @Test
@@ -283,27 +284,38 @@ class LyricsIndexTest {
     }
 
     @Test
-    fun previewViewportHasOneRowPerWindowLine() {
-        assertEquals(6, lyricsPreviewRows(lineCount = 40))
-        assertEquals(6, lyricsPreviewRows(lineCount = 6))
-        assertEquals(3, lyricsPreviewRows(lineCount = 3))
-        assertEquals(0, lyricsPreviewRows(lineCount = 0))
-        for (count in 0..12) assertEquals(lyricsPreviewWindow(count, currentIndex = 0).count(), lyricsPreviewRows(count))
+    fun previewViewportTakesTheRowsOfShortLyrics() {
+        // Six lines or more: six rows, whatever they take (nothing is measured).
+        assertEquals(6, lyricsPreviewRows(lineCount = 40, rowsOf = { error("measured line $it") }))
+        assertEquals(6, lyricsPreviewRows(lineCount = 6, rowsOf = { error("measured line $it") }))
+        // Fewer: the rows they take, at most six.
+        assertEquals(3, lyricsPreviewRows(lineCount = 3, rowsOf = { 1 }))
+        assertEquals(3, lyricsPreviewRows(lineCount = 2, rowsOf = { if (it == 0) 2 else 1 }))
+        assertEquals(6, lyricsPreviewRows(lineCount = 3, rowsOf = { 3 }))
+        assertEquals(0, lyricsPreviewRows(lineCount = 0, rowsOf = { 1 }))
+        // Single-line rows: one per window line, as the card had.
+        for (count in 0..12) {
+            assertEquals(lyricsPreviewWindow(count, currentIndex = 0).count(), lyricsPreviewRows(count, rowsOf = { 1 }))
+        }
     }
 
     @Test
     fun previewLinesTakeWholeRows() {
-        // 84 px a row of text (28 sp at 3x).
-        assertEquals(1, lyricsPreviewLineRows(textHeight = 84, rowTextHeight = 84))
-        assertEquals(2, lyricsPreviewLineRows(textHeight = 168, rowTextHeight = 84))
-        assertEquals(3, lyricsPreviewLineRows(textHeight = 252, rowTextHeight = 84))
+        // 102 px a row (28 sp of text and 2 × 3 dp at 3x), the text's rows set that far apart.
+        assertEquals(1, lyricsPreviewLineRows(textHeight = 102, rowHeight = 102))
+        assertEquals(2, lyricsPreviewLineRows(textHeight = 204, rowHeight = 102))
+        assertEquals(3, lyricsPreviewLineRows(textHeight = 306, rowHeight = 102))
         // A pixel of rounding either way stays on the same number of rows.
-        assertEquals(1, lyricsPreviewLineRows(textHeight = 85, rowTextHeight = 84))
-        assertEquals(2, lyricsPreviewLineRows(textHeight = 167, rowTextHeight = 84))
-        assertEquals(2, lyricsPreviewLineRows(textHeight = 169, rowTextHeight = 84))
+        assertEquals(1, lyricsPreviewLineRows(textHeight = 103, rowHeight = 102))
+        assertEquals(2, lyricsPreviewLineRows(textHeight = 203, rowHeight = 102))
+        assertEquals(2, lyricsPreviewLineRows(textHeight = 205, rowHeight = 102))
         // Never less than one; nothing measured yet counts as one.
-        assertEquals(1, lyricsPreviewLineRows(textHeight = 0, rowTextHeight = 84))
-        assertEquals(1, lyricsPreviewLineRows(textHeight = 84, rowTextHeight = 0))
+        assertEquals(1, lyricsPreviewLineRows(textHeight = 0, rowHeight = 102))
+        assertEquals(1, lyricsPreviewLineRows(textHeight = 102, rowHeight = 0))
+        // Heights: exactly whole rows, so a pixel of rounding never moves a line off the grid.
+        assertEquals(102, lyricsPreviewLineHeight(textHeight = 103, rowHeight = 102))
+        assertEquals(204, lyricsPreviewLineHeight(textHeight = 203, rowHeight = 102))
+        assertEquals(306, lyricsPreviewLineHeight(textHeight = 306, rowHeight = 102))
     }
 
     @Test
@@ -316,49 +328,124 @@ class LyricsIndexTest {
         assertEquals(0, lyricsPreviewTopLine(lineCount = 0, currentIndex = 3))
     }
 
+    /** 100 px rows; [lineRows] the rows each line takes. */
+    private class PreviewSong(val lineRows: List<Int>) {
+        val row = 100
+
+        /** Line i's top, from the first line's; the last entry is the last line's bottom. */
+        val tops = lineRows.runningFold(0) { top, rows -> top + rows * row }
+        val viewport = row * lyricsPreviewRows(lineRows.size, rowsOf = { lineRows[it] })
+        val contentBottom = tops.last()
+
+        /** Where the viewport's top rests with [current] playing (the distance from the very top). */
+        fun restingTop(current: Int): Int {
+            val line = current.coerceIn(0, lineRows.size - 1)
+            return lyricsPreviewScrollDistance(
+                previousTop = tops[lyricsPreviewTopLine(lineRows.size, current)],
+                currentTop = tops[line],
+                currentBottom = tops[line + 1],
+                contentBottom = contentBottom,
+                viewportHeight = viewport,
+            )
+        }
+    }
+
     @Test
-    fun previewTopLineKeepsTheCurrentLineInTheWindowsSlot() {
-        // With single-line rows the list stops once the last line reaches the viewport's bottom
-        // (top line lineCount - rows): what is in view is then exactly the window, and the current
-        // line sits in the same row the window gave it.
+    fun previewKeepsTheCurrentLineInTheWindowsSlot() {
+        // Single-line rows: what is in view is exactly the window, the current line in the row the
+        // window gave it (second, first before the second line plays, lower at the end).
         for (count in 1..14) {
-            val rows = lyricsPreviewRows(count)
+            val song = PreviewSong(List(count) { 1 })
             for (current in -1 until count) {
-                val shownTop = lyricsPreviewTopLine(count, current).coerceAtMost(count - rows)
-                val window = lyricsPreviewWindow(count, current)
-                assertEquals("lines $count, current $current", window, shownTop until shownTop + rows)
+                val top = song.restingTop(current) / song.row
+                val rows = song.viewport / song.row
+                assertEquals("lines $count, current $current", lyricsPreviewWindow(count, current), top until top + rows)
+            }
+        }
+    }
+
+    @Test
+    fun previewShowsTheCurrentLineWhole() {
+        val v = 600
+        // Both fit: the previous line at the top.
+        assertEquals(0, lyricsPreviewScrollDistance(previousTop = 0, currentTop = 200, currentBottom = 300, contentBottom = null, viewportHeight = v))
+        // A 4-row previous line and a 3-row current one (7 rows): the current line's bottom at the bottom.
+        assertEquals(100, lyricsPreviewScrollDistance(previousTop = 0, currentTop = 400, currentBottom = 700, contentBottom = null, viewportHeight = v))
+        // The previous line alone fills the viewport: the current line in the last row.
+        assertEquals(100, lyricsPreviewScrollDistance(previousTop = 0, currentTop = 600, currentBottom = 700, contentBottom = null, viewportHeight = v))
+        // The current line alone is taller (9 rows): its top at the top.
+        assertEquals(200, lyricsPreviewScrollDistance(previousTop = 0, currentTop = 200, currentBottom = 1_100, contentBottom = null, viewportHeight = v))
+        // From further down (a seek back a line): back to the previous line at the top.
+        assertEquals(-300, lyricsPreviewScrollDistance(previousTop = -300, currentTop = -100, currentBottom = 0, contentBottom = null, viewportHeight = v))
+    }
+
+    @Test
+    fun previewNeverHidesTheCurrentLine() {
+        val random = Random(7)
+        val songs = listOf(
+            // The 4-row line before a 3-row one, a line that fills the viewport, one taller than it.
+            listOf(1, 1, 4, 3, 1, 1, 6, 1, 1, 7, 1, 2, 1),
+            // Short lyrics whose first line wraps; short lyrics taller than the viewport.
+            listOf(2, 1),
+            listOf(3, 3, 3),
+            listOf(9),
+        ) + List(40) { List(random.nextInt(1, 30)) { random.nextInt(1, 8) } }
+        for (rows in songs) {
+            val song = PreviewSong(rows)
+            for (current in -1 until rows.size) {
+                val label = "rows $rows, current $current"
+                val top = song.restingTop(current)
+                val line = current.coerceAtLeast(0)
+                val lineTop = song.tops[line]
+                val lineBottom = song.tops[line + 1]
+                assertTrue("$label: in range, at $top", top >= 0 && top <= maxOf(0, song.contentBottom - song.viewport))
+                assertEquals("$label: on a row", 0, top % song.row)
+                if (lineBottom - lineTop <= song.viewport) {
+                    assertTrue("$label: whole, at $top", lineTop >= top && lineBottom <= top + song.viewport)
+                } else {
+                    assertEquals("$label: its top", lineTop, top)
+                }
+                // The previous line keeps the top whenever both fit (and the end doesn't stop it).
+                val previousTop = song.tops[lyricsPreviewTopLine(rows.size, current)]
+                if (lineBottom - previousTop <= song.viewport && previousTop <= song.contentBottom - song.viewport) {
+                    assertEquals("$label: previous line on top", previousTop, top)
+                }
             }
         }
     }
 
     @Test
     fun previewScrollsALineOrTwoAndSnapsFurther() {
-        assertEquals(LyricsPreviewMove.STAY, lyricsPreviewMove(fromTopLine = 4, toTopLine = 4))
-        // Playback: the next line, or two short ones at once.
-        assertEquals(LyricsPreviewMove.SCROLL, lyricsPreviewMove(fromTopLine = 4, toTopLine = 5))
-        assertEquals(LyricsPreviewMove.SCROLL, lyricsPreviewMove(fromTopLine = 4, toTopLine = 6))
+        assertEquals(LyricsPreviewMove.STAY, lyricsPreviewMove(fromLine = 4, toLine = 4))
+        // Playback: the next line, or two short ones at once (also the first lines: they can wrap).
+        assertEquals(LyricsPreviewMove.SCROLL, lyricsPreviewMove(fromLine = 4, toLine = 5))
+        assertEquals(LyricsPreviewMove.SCROLL, lyricsPreviewMove(fromLine = 4, toLine = 6))
+        assertEquals(LyricsPreviewMove.SCROLL, lyricsPreviewMove(fromLine = 0, toLine = 1))
+        assertEquals(LyricsPreviewMove.SCROLL, lyricsPreviewMove(fromLine = -1, toLine = 0))
         // A small seek back (or a corrected position) scrolls back.
-        assertEquals(LyricsPreviewMove.SCROLL, lyricsPreviewMove(fromTopLine = 4, toTopLine = 3))
+        assertEquals(LyricsPreviewMove.SCROLL, lyricsPreviewMove(fromLine = 4, toLine = 3))
         // Seeks, a restart, the card back in view later: no scrolling through the lines between.
-        assertEquals(LyricsPreviewMove.SNAP, lyricsPreviewMove(fromTopLine = 4, toTopLine = 7))
-        assertEquals(LyricsPreviewMove.SNAP, lyricsPreviewMove(fromTopLine = 4, toTopLine = 40))
-        assertEquals(LyricsPreviewMove.SNAP, lyricsPreviewMove(fromTopLine = 30, toTopLine = 0))
-        assertEquals(LyricsPreviewMove.SNAP, lyricsPreviewMove(fromTopLine = 4, toTopLine = 1))
+        assertEquals(LyricsPreviewMove.SNAP, lyricsPreviewMove(fromLine = 4, toLine = 7))
+        assertEquals(LyricsPreviewMove.SNAP, lyricsPreviewMove(fromLine = 4, toLine = 40))
+        assertEquals(LyricsPreviewMove.SNAP, lyricsPreviewMove(fromLine = 30, toLine = -1))
+        assertEquals(LyricsPreviewMove.SNAP, lyricsPreviewMove(fromLine = 4, toLine = 1))
     }
 
     @Test
     fun previewScrollStopsWhereTheLastLineMeetsTheBottom() {
-        // Last line not laid out yet: the whole way.
-        assertEquals(90, lyricsPreviewScrollDistance(lineTop = 90, contentBottom = null, viewportHeight = 540))
-        // Plenty of lines below.
-        assertEquals(90, lyricsPreviewScrollDistance(lineTop = 90, contentBottom = 900, viewportHeight = 540))
+        // The previous line 90 px below the viewport's top, the current one below it.
+        fun distance(contentBottom: Int?) =
+            lyricsPreviewScrollDistance(previousTop = 90, currentTop = 190, currentBottom = 290, contentBottom = contentBottom, viewportHeight = 540)
+        // The last line far below (or not that near): the whole way.
+        assertEquals(90, distance(contentBottom = null))
+        assertEquals(90, distance(contentBottom = 900))
         // Only 40 px left before the last line's bottom reaches the viewport's.
-        assertEquals(40, lyricsPreviewScrollDistance(lineTop = 90, contentBottom = 580, viewportHeight = 540))
+        assertEquals(40, distance(contentBottom = 580))
         // Already at the end: nothing to scroll.
-        assertEquals(0, lyricsPreviewScrollDistance(lineTop = 90, contentBottom = 540, viewportHeight = 540))
+        assertEquals(0, distance(contentBottom = 540))
         // Back up is never cut.
-        assertEquals(-90, lyricsPreviewScrollDistance(lineTop = -90, contentBottom = 540, viewportHeight = 540))
-        assertEquals(-90, lyricsPreviewScrollDistance(lineTop = -90, contentBottom = 300, viewportHeight = 540))
+        assertEquals(-90, lyricsPreviewScrollDistance(previousTop = -90, currentTop = 10, currentBottom = 110, contentBottom = 540, viewportHeight = 540))
+        assertEquals(-90, lyricsPreviewScrollDistance(previousTop = -90, currentTop = 10, currentBottom = 110, contentBottom = 300, viewportHeight = 540))
     }
 
     @Test
