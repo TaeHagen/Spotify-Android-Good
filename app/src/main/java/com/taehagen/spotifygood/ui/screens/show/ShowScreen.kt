@@ -243,7 +243,14 @@ private fun ShowList(
                 }
             }
         }
-        FastScroller(listState, topPadding = detailTopInset(), bottomPadding = contentPadding.calculateBottomPadding())
+        // The rows are the episodes; the header, About, the title, notices and footer are measured apart.
+        FastScroller(
+            listState,
+            contentStart = 2 + (if (!header.description.isEmpty) 1 else 0) + (if (state.downloadedCopy) 1 else 0) + (if (state.partial) 1 else 0),
+            contentCount = state.list.episodes.size,
+            topPadding = detailTopInset(),
+            bottomPadding = contentPadding.calculateBottomPadding(),
+        )
     }
 }
 

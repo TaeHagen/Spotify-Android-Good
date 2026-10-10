@@ -768,6 +768,12 @@ private fun YourEpisodesList(
                 }
             }
         }
-        FastScroller(listState, bottomPadding = contentPadding.calculateBottomPadding())
+        // The rows: the episodes after the back row (and the notice); the footer is measured apart.
+        FastScroller(
+            listState,
+            contentStart = 1 + (if (state.episodesPartial) 1 else 0),
+            contentCount = episodes.items.size,
+            bottomPadding = contentPadding.calculateBottomPadding(),
+        )
     }
 }

@@ -38,6 +38,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
@@ -96,7 +97,8 @@ data class LikedSongsUiState(
     val playPending: Boolean = false,
     /**
      * Rows shown after [tracks] as placeholders, to the end of Liked Songs: in its own order while
-     * ONLINE, past the loaded pages, they load by window as they come on screen ([windows]).
+     * not offline, past the loaded pages, they load by window as they come on screen while ONLINE
+     * ([windows]).
      */
     val placeholders: Int = 0,
     /** Songs past the loaded pages, loaded where the list is looked at (fast scroll). */
@@ -108,10 +110,11 @@ const val LIKED_PAGE_SIZE = 100
 
 /**
  * Placeholder rows after the [loaded] songs of [total]: only in the server's own order (no filter,
- * not sorted: those load every page), for the server's list while ONLINE.
+ * not sorted: those load every page), for the server's list while not [offline] (kept while the
+ * session reconnects, so the list keeps its length and place; they load once it is ONLINE).
  */
-internal fun likedPlaceholders(loaded: Int, total: Int?, fromDownload: Boolean, filter: String, sort: TrackSort, online: Boolean): Int =
-    if (total == null || fromDownload || filter.isNotEmpty() || sort != TrackSort.RECENTLY_ADDED || !online) 0 else (total - loaded).coerceAtLeast(0)
+internal fun likedPlaceholders(loaded: Int, total: Int?, fromDownload: Boolean, filter: String, sort: TrackSort, offline: Boolean): Int =
+    if (total == null || fromDownload || filter.isNotEmpty() || sort != TrackSort.RECENTLY_ADDED || offline) 0 else (total - loaded).coerceAtLeast(0)
 
 /**
  * The fast scroller's bubble for the song at [index] of [count] ([track] null: not loaded yet): the
@@ -297,9 +300,15 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         noteLikedAt(page.items)
         PageResult(page.items, page.total)
     }
-    /** Songs past the loaded pages, by page, where the list is looked at ([onRowsVisible]). */
-    private val windows = PageWindows(viewModelScope, PAGE_SIZE) { offset, limit ->
-        graph.library.likedTracks(offset, limit).items.also(::noteLikedAt)
+    /** Songs past the loaded pages, by page, where the list is looked at ([onRowsVisible]); retries wait for the session. */
+    private val windows = PageWindows(
+        viewModelScope,
+        PAGE_SIZE,
+        ready = { graph.engineReachFlow().first { it == EngineReach.ONLINE } },
+    ) { offset, limit ->
+        val page = graph.library.likedTracks(offset, limit)
+        noteLikedAt(page.items)
+        WindowPage(page.items, page.partial)
     }
     /** The rows on screen last reported ([onRowsVisible]): asked again after the windows were dropped. */
     private var visibleRows: Pair<Int, Int>? = null
@@ -456,7 +465,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             listIsCurrent = isListPlaying(ListSortStore.LIKED_SONGS, contextUri, meta.listPlayback, lastSorted),
             online = online,
             playPending = meta.playPending,
-            placeholders = likedPlaceholders(source.tracks.size, source.total, source.fromDownload, filter, sort, online),
+            placeholders = likedPlaceholders(source.tracks.size, source.total, source.fromDownload, filter, sort, offline),
             windows = meta.windows,
         )
     }.flowOn(Dispatchers.Default)
@@ -503,6 +512,10 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         pager.state.onEach { if (!it.isLoading) refreshing.value = false }.launchIn(viewModelScope)
         // Pages loaded since cover their windows.
         pager.state.map { it.items.size }.distinctUntilChanged().onEach { windows.dropBelow(it) }.launchIn(viewModelScope)
+        // ONLINE again (the placeholders stayed while it reconnected): the rows on screen load.
+        reach.filter { it == EngineReach.ONLINE }
+            .onEach { visibleRows?.let { (first, last) -> onRowsVisible(first, last) } }
+            .launchIn(viewModelScope)
         // A downloaded Liked Songs follows likes made elsewhere (another device): a loaded server page
         // asks the download to sync (at most every few minutes; pull-to-refresh always does).
         combine(contextUri, pager.state.map { !it.isLoading && it.error == null && it.items.isNotEmpty() }.distinctUntilChanged(), ::Pair)
@@ -563,21 +576,33 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
      * Rows [first]..[last] (positions in the shown list) are on screen. In the own order the next
      * page continues the loaded ones when they come near their end; rows farther down
      * (placeholders reached by scrolling or a fast scroll) load by window ([PageWindows]), only
-     * their pages. A filter or a sort loads every page itself.
+     * their pages. A filter or a sort loads every page itself. Without windows the window loads
+     * and retries stop ([PageWindows.hide]).
      */
     fun onRowsVisible(first: Int, last: Int) {
         visibleRows = first to last
         val current = state.value
-        if (current.fromDownload || current.filter.isNotEmpty() || sorted) return
+        if (current.fromDownload || current.filter.isNotEmpty() || sorted) {
+            windows.hide()
+            return
+        }
         val page = pager.state.value
         val loaded = page.items.size
         val nextPage = page.canLoadMore && page.items.isNotEmpty() && last >= loaded - LOAD_AHEAD && first < loaded + PAGE_SIZE
         if (nextPage) pager.loadMore()
-        val total = page.total ?: return
-        if (graph.engineReach() == EngineReach.ONLINE && total > loaded) {
+        val total = page.total
+        if (total != null && graph.engineReach() == EngineReach.ONLINE && total > loaded) {
             val continued = nextPage || page.isLoading
             windows.show(first, last, from = if (continued) loaded + PAGE_SIZE else loaded, total = total)
+        } else {
+            windows.hide()
         }
+    }
+
+    /** The list left the screen (or the app went to the background): window loads and retries stop. */
+    fun onRowsHidden() {
+        visibleRows = null
+        windows.hide()
     }
 
     /**

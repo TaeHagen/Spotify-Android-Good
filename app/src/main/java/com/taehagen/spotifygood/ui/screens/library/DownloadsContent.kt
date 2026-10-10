@@ -333,7 +333,8 @@ private fun DownloadsList(
                 }
             }
         }
-        FastScroller(listState, bottomPadding = contentPadding.calculateBottomPadding())
+        // The rows: the sections after the storage header (and the offline banner).
+        FastScroller(listState, contentStart = 1 + (if (state.offline) 1 else 0), bottomPadding = contentPadding.calculateBottomPadding())
     }
 }
 

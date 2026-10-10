@@ -1878,7 +1878,11 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
   Downloads page, the library list, Your Episodes, a show's episodes and (long) albums. A slim
   track and a pill thumb on the right edge, between the top bar and the mini player / navigation
   bar. The thumb's length is the screen's share of the list (at least 48 dp). It shows while the
-  list moves and fades 1.5 s after; lists shorter than three screens have none. Only a touch
+  list moves and fades 1.5 s after; lists shorter than three screens have none (once there, it
+  stays down to 2.5 screens, and while its thumb is held, so sizes measured on the way don't
+  make it flicker or go under the finger). Each list gives its row range (the lazy items after
+  its header, notices and section titles, before its footer): an album's tracks and disc titles,
+  a show's or Your Episodes' episodes, Downloads' sections after its header. Only a touch
   that starts on the thumb, or within 24 dp above or below it in its 48 dp strip, grabs it, and
   only while it shows: its touch node is just that area, moving with the thumb, so every other
   touch on the strip reaches the rows (overflow buttons, taps, long presses, drags that scroll
@@ -1890,18 +1894,31 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
   "1,234 / 5,000". A letter change gives a soft haptic tick. The thumb is computed from the
   `LazyListState` in derived state, read in layout and placement only, so a scroll frame
   re-lays out the thumb and not the list. TalkBack gets an adjustable control (progress in 5 %
-  steps) with "Scroll to top / bottom". It is off in a playlist's edit mode, whose drag handles
-  sit on that edge. Its screenshots (Robolectric + Roborazzi, test dependencies only) render
-  with `./gradlew :app:testDebugUnitTest -Pscreenshots --tests '*FastScrollerScreenshotTest'`
-  into `app/build/outputs/roborazzi` (not in git); the plain unit test run skips them.
-* Random access in long paged lists. In their own order while ONLINE, a playlist and Liked
-  Songs list every row to the end: the loaded rows, then placeholders sized like a row, so the
-  scroller spans `total`. The rows on screen (`VisibleRowsEffect`) drive the loading. Near the
+  steps) with "Scroll to top / bottom", also while the thumb is faded: its node lies over the
+  thumb across the 48 dp strip, outside the faded layer (Compose hides a transparent node from
+  accessibility), and draws nothing and takes no touches. It is off in a playlist's edit mode,
+  whose drag handles sit on that edge. Its screenshots (Robolectric + Roborazzi, test
+  dependencies only) and a check that TalkBack reaches it faded run with
+  `./gradlew :app:testDebugUnitTest -Pscreenshots --tests '*FastScrollerScreenshotTest'`
+  (images in `app/build/outputs/roborazzi`, not in git); the plain unit test run skips them.
+* Random access in long paged lists. In their own order, unless offline (offline mode, no
+  network), a playlist and Liked Songs list every row to the end: the loaded rows, then
+  placeholders sized like a row, so the scroller spans `total`. The placeholders stay while the
+  session (re)connects, so the list keeps its length and place; they load once it is ONLINE
+  (the rows on screen are reported again then). The rows on screen (`VisibleRowsEffect`) drive
+  the loading. Near the
   loaded end, the next page continues them. Further down, the pages holding those rows load by
   offset (`PageWindows`, 100 rows a page). A page loads once the rows on screen have stayed put
   150 ms (a fast drag loads nothing on the way). A load for a page scrolled away is cancelled.
-  At most 8 pages are kept (the farthest go). A failed page loads again every 3 s while it is
-  on screen, and pages the loaded rows reach are dropped. A window row plays and acts like a
+  At most 8 pages are kept (the farthest go). A failed page loads again while it is on screen
+  and the session is ONLINE: after 3 s, then twice as long after each failure, at most every
+  60 s. A page with placeholder rows (`partial`) shows them and loads again twice while on
+  screen (after 15 s, then 30 s, as `ResponseCache` does), each result replacing it; a playlist's
+  Retry on its partial notice loads the windows on screen again too. Leaving the list or the app
+  going to the background (`VisibleRowsEffect`: ON_STOP or dispose), or the list not taking
+  windows now (a sort, a filter, edit mode, the download, not ONLINE), stops every window load
+  and retry (`PageWindows.hide`); loaded pages stay, and rows back on screen load what is
+  missing. Pages the loaded rows reach are dropped. A window row plays and acts like a
   loaded one (context with its index and uid; positional removal with the page's revision).
   Windows belong to one version of the list: a playlist page of another revision reloads the
   loaded rows, and a new revision or total, the explicit filter, a reload or pull-to-refresh

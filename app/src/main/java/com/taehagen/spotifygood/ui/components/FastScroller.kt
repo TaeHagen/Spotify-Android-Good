@@ -69,6 +69,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleStartEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.taehagen.spotifygood.R
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -89,6 +93,9 @@ import kotlin.math.roundToInt
 
 /** Lists shorter than this many screens have no fast scroller. */
 internal const val FAST_SCROLL_MIN_SCREENS = 3f
+
+/** Once it is there, the scroller stays down to this many screens (measured sizes move the total). */
+internal const val FAST_SCROLL_KEEP_SCREENS = 2.5f
 
 /** How long the scroller stays after the list stopped moving. */
 internal const val FAST_SCROLL_HIDE_MS = 1_500L
@@ -136,7 +143,11 @@ internal class FastScrollGeometry(
     val visibleRatio: Float = if (totalPx <= 0f) 1f else (viewportPx / totalPx).coerceIn(0f, 1f)
 
     /** Long enough for a fast scroller ([FAST_SCROLL_MIN_SCREENS]). */
-    val isLong: Boolean = viewportPx > 0 && contentCount > 0 && totalPx >= viewportPx * FAST_SCROLL_MIN_SCREENS
+    val isLong: Boolean get() = isLong(had = false)
+
+    /** [isLong]; while the list [had] a scroller, down to [FAST_SCROLL_KEEP_SCREENS] (no flicker as sizes are measured). */
+    fun isLong(had: Boolean): Boolean =
+        viewportPx > 0 && contentCount > 0 && totalPx >= viewportPx * (if (had) FAST_SCROLL_KEEP_SCREENS else FAST_SCROLL_MIN_SCREENS)
 
     /** Scroll offset of the start of lazy item [index]. */
     fun offsetOf(index: Int): Float {
@@ -303,7 +314,7 @@ fun rememberFastScrollDatePattern(): String {
  * the row on top ([label], null: none). Only the thumb, with [ThumbHitMargin] above and below it
  * in its 48 dp strip, takes touches, and only while it shows ([thumbHitArea]): every other touch
  * goes to the rows (overflow buttons, taps, long presses, list drags). TalkBack gets it as an
- * adjustable control with "scroll to top / bottom" actions.
+ * adjustable control with "scroll to top / bottom" actions, also while it is faded.
  */
 @Composable
 fun FastScroller(
@@ -364,11 +375,15 @@ internal fun FastScroller(
             )
         }
     }
-    val long by remember(geometry) { derivedStateOf { geometry.value.isLong } }
-    if (!enabled || !long) return
-
+    val long by remember(geometry) {
+        var had = false
+        derivedStateOf { geometry.value.isLong(had).also { had = it } }
+    }
     var dragFraction by remember { mutableStateOf(previewDrag) }
     val dragging = dragFraction != null
+    // A held thumb stays under the finger.
+    if (!enabled || !(long || dragging)) return
+
     var trackPx by remember { mutableIntStateOf(0) }
     val minThumbPx = with(density) { MinThumbHeight.toPx() }
     val thumbPx: State<Float> = remember(geometry) {
@@ -464,21 +479,31 @@ internal fun FastScroller(
                             val placeable = measurable.measure(Constraints.fixed(w, h))
                             layout(placeable.width, placeable.height) { placeable.place(0, thumbTopPx().roundToInt()) }
                         }
-                        .background(thumbColor, CircleShape)
-                        .semantics {
-                            contentDescription = description
-                            progressBarRangeInfo = ProgressBarRangeInfo(a11yFraction, 0f..1f)
-                            setProgress { value ->
-                                jump(value)
-                                true
-                            }
-                            customActions = listOf(
-                                CustomAccessibilityAction(toTop) { jump(0f); true },
-                                CustomAccessibilityAction(toBottom) { jump(1f); true },
-                            )
-                        },
+                        .background(thumbColor, CircleShape),
                 )
             }
+            // TalkBack's control, over the thumb across the strip: outside the faded layer (a
+            // transparent node is hidden from accessibility), so it is there while the thumb is
+            // faded too. It draws nothing and takes no touches.
+            Box(
+                Modifier
+                    .layout { measurable, constraints ->
+                        val placeable = measurable.measure(Constraints.fixed(constraints.maxWidth, thumbPx.value.roundToInt().coerceAtLeast(0)))
+                        layout(placeable.width, placeable.height) { placeable.place(0, thumbTopPx().roundToInt()) }
+                    }
+                    .semantics {
+                        contentDescription = description
+                        progressBarRangeInfo = ProgressBarRangeInfo(a11yFraction, 0f..1f)
+                        setProgress { value ->
+                            jump(value)
+                            true
+                        }
+                        customActions = listOf(
+                            CustomAccessibilityAction(toTop) { jump(0f); true },
+                            CustomAccessibilityAction(toBottom) { jump(1f); true },
+                        )
+                    },
+            )
             // What grabs the scroller: the thumb and a margin around it, while it shows. Placed
             // over the thumb (it moves with it), so touches elsewhere on the strip reach the rows.
             if (shown || dragging) {
@@ -615,17 +640,29 @@ fun PlaceholderTrackRow(modifier: Modifier = Modifier) {
 /**
  * Reports the rows on screen (indices from 0 at lazy item [contentStart], [contentCount] rows):
  * a paged list loads what is looked at ([onVisible] with the first and last row), also rows a
- * fast scroll jumped to.
+ * fast scroll jumped to. Leaving the screen or the app going to the background calls [onHidden]
+ * (its loads stop); back in the foreground, the rows are reported again.
  */
 @Composable
-fun VisibleRowsEffect(listState: LazyListState, contentStart: Int, contentCount: Int, onVisible: (first: Int, last: Int) -> Unit) {
+fun VisibleRowsEffect(
+    listState: LazyListState,
+    contentStart: Int,
+    contentCount: Int,
+    onHidden: () -> Unit,
+    onVisible: (first: Int, last: Int) -> Unit,
+) {
     val callback by rememberUpdatedState(onVisible)
-    LaunchedEffect(listState, contentStart, contentCount) {
-        snapshotFlow { visibleRows(listState.layoutInfo.visibleItemsInfo.map(LazyListItemInfo::toFastScrollItem), contentStart, contentCount) }
-            .filterNotNull()
-            .distinctUntilChanged()
-            .collect { (first, last) -> callback(first, last) }
+    val hidden by rememberUpdatedState(onHidden)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(listState, contentStart, contentCount, lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            snapshotFlow { visibleRows(listState.layoutInfo.visibleItemsInfo.map(LazyListItemInfo::toFastScrollItem), contentStart, contentCount) }
+                .filterNotNull()
+                .distinctUntilChanged()
+                .collect { (first, last) -> callback(first, last) }
+        }
     }
+    LifecycleStartEffect(listState, lifecycleOwner = lifecycleOwner) { onStopOrDispose { hidden() } }
 }
 
 /** The first and last row among [items] (rows: lazy items [contentStart] on, [contentCount]). */
