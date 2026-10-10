@@ -40,7 +40,8 @@ class App : Application() {
 /**
  * One-time process initialisation (owned by the foundation): calls `NativeBridge.nativeInit`,
  * registers the UI engine holder with ProcessLifecycleOwner, sets up Coil and the notification
- * channels. Runs on the main thread in `Application.onCreate`, so it only does cheap work; every
+ * channels, and checks that the output switcher's route provider is enabled exactly while logged
+ * in. Runs on the main thread in `Application.onCreate`, so it only does cheap work; every
  * repository stays lazy (periodic download sync is scheduled by the download component itself).
  */
 object AppInitializer {
@@ -56,6 +57,10 @@ object AppInitializer {
         initNative(app, graph)
         setUpImageLoader(graph)
         registerUiHolder(graph)
+        // The output switcher's route provider is enabled while logged in: checked against the
+        // stored credentials off the main thread, written only when it differs (a login or logout
+        // the previous process didn't apply), so an ordinary start sends no PACKAGE_CHANGED.
+        graph.routeProviderSwitch.reconcile()
     }
 
     private fun initNative(app: App, graph: AppGraph) {

@@ -17,6 +17,15 @@ over JNI). Requires a Spotify Premium account.
   offers "Sign in". It is updated only when what plays changes, never on a schedule.
 - **Output switching:** speaker, Bluetooth, wired or USB from the app's device sheet or the
   system output switcher; routing follows device changes.
+- **Android's output switcher (Android 12 and later):** your Spotify Connect devices are listed in
+  the system's own picker, the "This phone" chip of the media controls in quick settings and on
+  the lock screen (and the volume panel's media output). Picking one moves playback there, picking
+  "This phone" or a headset brings it back, and while another device plays the chip shows its
+  name and the switcher's slider sets its volume. From Android 14 the list keeps the app's order,
+  shows devices that can't play as such, and "Other devices on your network" opens the app's device
+  sheet to sign in speakers and TVs. Nothing scans for it: the list is the one the app already has
+  while playback runs, and with nothing playing the system part lists nothing and does no work. Not
+  on Android 11, where Android would keep the app running all day for it.
 - **Spotify Connect:**
   - send: pick a device, transfer playback, control the remote device including volume
     keys. With nothing playing, picking a device makes the next play start there.
@@ -116,6 +125,12 @@ Screenshots (Robolectric + Roborazzi, test dependencies only): `./gradlew :app:t
   session last read playing (sooner when the device was resumed after a pause). The fully
   expanded quick settings and the app keep working, and the controls come back when the phone
   itself plays, or when the Bluetooth device disconnects while the other device plays. Details in docs/ARCHITECTURE.md §9.4.
+- In Android's output switcher, from Android 15, a device that starts playing while the app is in
+  the background (started from another Spotify app) shows as "Other device" on the media chip until
+  the app is opened or the switcher is opened from the volume panel: Android only lets the app's
+  device list reach the system then. Speakers and Cast devices not yet signed in are not listed
+  there (the app's device sheet signs them in). The integration follows the Android sources; it has
+  not been tried on a phone yet (details in docs/ARCHITECTURE.md §8).
 - Podcast progress made on this phone (offline above all) is kept on the phone and resumes
   there, but is not reported back to Spotify: other devices don't see it. The same goes for
   "Mark as played" / "Mark as unplayed". Spotify's own resume points are shown when its web

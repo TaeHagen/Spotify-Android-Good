@@ -9,6 +9,7 @@ import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
 import android.util.Log
+import androidx.annotation.RequiresApi
 
 /**
  * The hardware volume keys for another Connect device while it plays (docs/ARCHITECTURE.md §9.4).
@@ -39,12 +40,18 @@ internal class RemoteVolumeKeys(
 ) {
     private var session: MediaSession? = null
     private var provider: VolumeProvider? = null
+    /** The volume control id [provider] was made with (it can't change on a provider). */
+    private var providerControlId: String? = null
     private var active = false
     /** The title and artist last set (the update runs on most engine and snapshot events). */
     private var shown: Pair<String?, String?>? = null
 
-    /** Takes the volume keys ([active]) at [percent], showing [title] / [artist]; or lets them go. */
-    fun update(active: Boolean, percent: Int, title: String?, artist: String?) {
+    /**
+     * Takes the volume keys ([active]) at [percent], showing [title] / [artist]; or lets them go.
+     * [volumeControlId]: the app's routing session for the device (API 30+, [SystemRouting]), as
+     * the media session's, so whichever of the two a system surface picks names the same device.
+     */
+    fun update(active: Boolean, percent: Int, title: String?, artist: String?, volumeControlId: String? = null) {
         if (!active) {
             if (this.active) {
                 this.active = false
@@ -55,8 +62,11 @@ internal class RemoteVolumeKeys(
         val s = session ?: create() ?: return
         val volume = percent.coerceIn(0, MAX_VOLUME)
         val p = provider
-        if (p == null) {
-            provider = newProvider(volume).also { s.setPlaybackToRemote(it) }
+        val controlId = volumeControlId.takeIf { Build.VERSION.SDK_INT >= 30 }
+        if (p == null || controlId != providerControlId) {
+            val next = if (controlId != null && Build.VERSION.SDK_INT >= 30) KeysVolume(volume, controlId) else KeysVolume(volume)
+            provider = next.also { s.setPlaybackToRemote(it) }
+            providerControlId = controlId
         } else if (p.currentVolume != volume) {
             p.currentVolume = volume
         }
@@ -86,6 +96,7 @@ internal class RemoteVolumeKeys(
         runCatching { session?.release() }
         session = null
         provider = null
+        providerControlId = null
         shown = null
     }
 
@@ -111,7 +122,13 @@ internal class RemoteVolumeKeys(
     private fun caller(s: MediaSession): String? =
         if (Build.VERSION.SDK_INT >= 28) runCatching { s.currentControllerInfo.packageName }.getOrNull() else null
 
-    private fun newProvider(volume: Int) = object : VolumeProvider(VolumeProvider.VOLUME_CONTROL_ABSOLUTE, MAX_VOLUME, volume) {
+    /** Remote volume in percent, with the routing session's id as its volume control id (API 30+). */
+    private inner class KeysVolume : VolumeProvider {
+        constructor(volume: Int) : super(VolumeProvider.VOLUME_CONTROL_ABSOLUTE, MAX_VOLUME, volume)
+
+        @RequiresApi(30)
+        constructor(volume: Int, controlId: String) : super(VolumeProvider.VOLUME_CONTROL_ABSOLUTE, MAX_VOLUME, volume, controlId)
+
         override fun onSetVolumeTo(volume: Int) {
             val target = volume.coerceIn(0, MAX_VOLUME)
             currentVolume = target

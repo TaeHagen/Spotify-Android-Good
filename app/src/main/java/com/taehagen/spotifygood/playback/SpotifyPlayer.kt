@@ -80,6 +80,12 @@ internal class SpotifyPlayer(
     private val requester: () -> String? = { null },
     /** A Bluetooth audio output is connected (null: not watched) ([RemotePlayback.readsPaused]). */
     private val bluetoothOutput: () -> Boolean? = { null },
+    /**
+     * The app's routing session for the device that plays ([SystemRouting.controllerId]): the
+     * remote `DeviceInfo` carries it (Media3 makes it the volume control id), so Android's output
+     * switcher and media controls name the device. Null without one.
+     */
+    private val routingControllerId: () -> String? = { null },
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
 
     private val context = context.applicationContext
@@ -93,6 +99,8 @@ internal class SpotifyPlayer(
     /** Last remote volume we sent, so quick volume-key steps accumulate before the snapshot catches up. */
     private val remoteVolume = RemoteVolumeTarget(SystemClock::elapsedRealtime)
     private var remoteVolumeExpiry: Job? = null
+    /** The remote `DeviceInfo` last published (a new one only when the routing controller changes). */
+    private var remoteInfo: DeviceInfo = REMOTE_DEVICE_INFO
     /**
      * The media session's last load ([handleSetMediaItems]): it plays on this phone
      * ([localLoadPending]). Replaced by the next one.
@@ -204,7 +212,7 @@ internal class SpotifyPlayer(
             // (the system volume UI would otherwise bounce between old and new).
             val percent = remoteVolume.reported(s.activeDevice?.id, VolumeMath.connectToPercent(s.volume))
             if (percent > 0) mutedByUs = false
-            builder.setDeviceInfo(REMOTE_DEVICE_INFO)
+            builder.setDeviceInfo(remoteDeviceInfo())
                 .setDeviceVolume(percent)
                 .setIsDeviceMuted(mutedByUs && percent == 0)
         } else {
@@ -245,6 +253,19 @@ internal class SpotifyPlayer(
                 .setPlayerError(error)
         }
         return builder.build()
+    }
+
+    /** [REMOTE_DEVICE_INFO] with the routing controller id ([routingControllerId]). */
+    private fun remoteDeviceInfo(): DeviceInfo {
+        val id = routingControllerId()
+        if (remoteInfo.routingControllerId != id) {
+            remoteInfo = DeviceInfo.Builder(DeviceInfo.PLAYBACK_TYPE_REMOTE)
+                .setMinVolume(REMOTE_DEVICE_INFO.minVolume)
+                .setMaxVolume(REMOTE_DEVICE_INFO.maxVolume)
+                .setRoutingControllerId(id)
+                .build()
+        }
+        return remoteInfo
     }
 
     /**

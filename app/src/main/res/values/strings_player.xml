@@ -126,6 +126,8 @@
     <string name="player_pending_device">Next play goes to %1$s</string>
     <string name="player_pending_device_cancel">Play on this phone instead</string>
     <string name="player_devices_switcher_unavailable">The system output picker isn\'t available on this phone</string>
+    <!-- Android's output switcher (API 34+): the last entry under the Spotify Connect devices, opens the devices sheet -->
+    <string name="system_route_more_devices">Other devices on your network</string>
     <string name="player_output_speaker">Phone speaker</string>
     <string name="player_output_selected">Selected</string>
 

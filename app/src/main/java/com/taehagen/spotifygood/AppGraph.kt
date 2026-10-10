@@ -10,6 +10,7 @@ import com.taehagen.spotifygood.auth.AuthRepository
 import com.taehagen.spotifygood.auth.CredentialStore
 import com.taehagen.spotifygood.connect.DevicesRepository
 import com.taehagen.spotifygood.connect.LocalDeviceDiscovery
+import com.taehagen.spotifygood.connect.RouteProviderSwitch
 import com.taehagen.spotifygood.data.CatalogRepository
 import com.taehagen.spotifygood.data.EpisodeProgressStore
 import com.taehagen.spotifygood.data.HomeRepository
@@ -97,6 +98,11 @@ class AppGraph(val app: Application) {
             engine.setOfflineIndexProvider { downloads.offlineRecords() }
             // Library changes made elsewhere come from the running engine: followed from its start.
             appScope.launch { libraryPushes }
+            // The output switcher's route provider follows the login (once the credentials are read).
+            appScope.launch {
+                engine.awaitReady()
+                engine.isLoggedIn.collect { routeProviderSwitch.update(it) }
+            }
         }
     }
     val engine: SpotifyEngine by engineLazy
@@ -154,6 +160,15 @@ class AppGraph(val app: Application) {
 
     /** Spotify Connect local-network discovery (the "send" side); runs only while the sheet is up. */
     val localDiscovery: LocalDeviceDiscovery by localDiscoveryLazy
+
+    /**
+     * Enables the output switcher's route provider while an account is logged in (docs §8): checked
+     * at every process start against the stored credentials, then following the engine's login.
+     * It writes only at a login or logout (each write is a package-wide PACKAGE_CHANGED).
+     */
+    internal val routeProviderSwitch: RouteProviderSwitch by lazy {
+        RouteProviderSwitch(appScope, RouteProviderSwitch.Provider(app), credentialStore::hasCredentials)
+    }
     val outputs: OutputRouteManager by lazy {
         OutputRouteManager(app, appScope, audioSink, rpc).also { manager ->
             appScope.launch(Dispatchers.Main) {
