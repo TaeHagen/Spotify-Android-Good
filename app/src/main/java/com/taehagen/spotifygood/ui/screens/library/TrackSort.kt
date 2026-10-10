@@ -12,18 +12,23 @@ import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.isSameContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.text.CollationKey
 import java.text.Collator
 
@@ -186,6 +191,93 @@ fun planSortedPlay(uris: List<String>, startUri: String?, reach: EngineReach, do
     return when (val plan = planListPlay(list, list.indexOf(startUri), reach, downloaded)) {
         is ListPlay.Tracks -> sortedPlayRequest(plan.uris, plan.index)?.let(SortedStart::Load) ?: SortedStart.Nothing
         ListPlay.NotDownloaded -> SortedStart.NotDownloaded
+    }
+}
+
+/** How long a sorted play waits for the rest of its list's pages ([SortedPlayStarter]). */
+internal const val SORTED_PLAY_WAIT_MS = 25_000L
+
+/**
+ * Runs the plays of a list page (Play, a row tap), on the main thread. A sorted list plays as a
+ * snapshot of its rows ([sortedPlayRequest]), so while pages are still loading a sorted play first
+ * waits for every page (`awaitRows` of [play]), at most [timeoutMs]: then, or once loading stopped
+ * (an error, the session not ONLINE), it plays what is loaded by then. A tap made while one waits
+ * replaces it and keeps its wait (only the latest one plays, once); a tap that doesn't wait drops
+ * it, and so does any playback command the user issues meanwhile, here or elsewhere
+ * ([userCommands], e.g. an album played after leaving the page, a pause from the notification).
+ */
+internal class SortedPlayStarter(
+    private val scope: CoroutineScope,
+    private val userCommands: StateFlow<Long>,
+    private val timeoutMs: Long = SORTED_PLAY_WAIT_MS,
+) {
+    private var job: Job? = null
+    /** Bumped by every play that doesn't join a waiting one, and by [cancel]. */
+    private var plays = 0
+    /** What the waiting [job] starts: the latest tap. */
+    private var pending: (suspend () -> Unit)? = null
+    private val _waiting = MutableStateFlow(false)
+
+    /** A play waits for the list's pages (the Play button shows it). */
+    val waiting: StateFlow<Boolean> = _waiting.asStateFlow()
+
+    /**
+     * Runs [start] now when [awaitRows] is null; otherwise once [awaitRows] returned (every page is
+     * in, or loading stopped) or [timeoutMs] passed. [start] reads the rows and the order itself.
+     */
+    fun play(awaitRows: (suspend () -> Unit)?, start: suspend () -> Unit) {
+        if (awaitRows != null && _waiting.value) {
+            pending = start
+            return
+        }
+        job?.cancel()
+        val id = ++plays
+        if (awaitRows == null) {
+            pending = null
+            _waiting.value = false
+            job = scope.launch { start() }
+            return
+        }
+        pending = start
+        _waiting.value = true
+        val commandsAtTap = userCommands.value
+        job = scope.launch {
+            val superseded = try {
+                withTimeoutOrNull(timeoutMs) {
+                    channelFlow {
+                        launch {
+                            try {
+                                awaitRows()
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                // Loading broke: the rows loaded so far play.
+                            }
+                            send(false)
+                        }
+                        launch {
+                            userCommands.first { it != commandsAtTap }
+                            send(true)
+                        }
+                    }.first()
+                } ?: false
+            } finally {
+                if (id == plays) _waiting.value = false
+            }
+            if (id != plays) return@launch
+            val action = pending
+            pending = null
+            if (superseded || startSuperseded(commandsAtTap, userCommands.value)) return@launch
+            action?.invoke()
+        }
+    }
+
+    /** Drops a waiting play (e.g. the Play button toggled what plays instead). */
+    fun cancel() {
+        job?.cancel()
+        plays++
+        pending = null
+        _waiting.value = false
     }
 }
 

@@ -309,6 +309,7 @@ private fun LikedActions(
         PlayFab(
             isPlaying = state.listIsCurrent && state.nowPlaying.isPlaying,
             onClick = onPlay,
+            busy = state.playPending,
         )
     }
 }
