@@ -1190,11 +1190,20 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     broadcasts; with none nothing is collected. Equal states are dropped and pushes throttled: the
     first at once, then at most one per 500 ms, the latest winning (a track change brings several
     snapshots). When the service goes the widget shows the stored session (its other buttons would
-    find the session gone). The receiver draws on placement, reboot, app update and (below 12) a
-    resize: the live state while the service runs, else from the credential file check and the
-    resume store, without the engine. Artwork: Coil, 256 px exactly, corners rounded (a tenth of
-    the side), from the memory or disk cache or a downloaded cover, else fetched (≤ 5 s), a software
-    bitmap all layouts share, the last one reused while the item stays; none → a placeholder.
+    find the session gone). The receiver draws every widget on placement, reboot and app update,
+    and on a resize below 12 (from 12 only when the artwork's size step changes): the live state
+    while the service runs, else from the credential file check and the resume store, without the
+    engine. Artwork: one software bitmap all widgets and layouts share, decoded by Coil square
+    and exactly at a step of 256 / 384 / 512 / 640 px (`WidgetArtSize`; a stable cache key while
+    sizes move a little): the smallest covering the largest artwork any placed widget shows
+    (`WidgetLayout.artDp`) at any size its options report (`OPTION_APPWIDGET_SIZES` from 12, else
+    the portrait and landscape min / max), times the density, and at most what a quarter of the
+    update's bitmap limit (screen w × h × 4 × 1.5) holds. Its source is the smallest of the
+    track's covers (64 / 300 / 640) that covers the step; the stored session has its one 300 px
+    cover. Corners rounded (a tenth of the side); from the memory or disk cache or a downloaded
+    cover, else fetched (≤ 5 s); the last one reused while the item and the step stay; none → a
+    placeholder. The small and one-row play buttons shrink with a widget lower than their size
+    (`adjustViewBounds` and a maximum size) instead of being clipped.
   * A tap on the widget opens Now Playing with the session activity's intent
     (`MainActivity.launchIntent` + `EXTRA_OPEN_PLAYER`, `SINGLE_TOP | CLEAR_TOP`); logged out or with
     nothing to show, `launchIntent` as it is (a login in progress stays on top). Buttons are

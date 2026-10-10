@@ -18,12 +18,17 @@
         android:scaleType="centerCrop"
         android:src="@drawable/widget_art_placeholder" />
 
+    <!-- 40dp (the icon and its padding), smaller where the widget is lower than that and its
+         margins (adjustViewBounds keeps it round): it never clips -->
     <ImageButton
         android:id="@+id/widget_play"
         style="@style/Widget.SpotifyGood.NowPlaying.Play"
-        android:layout_width="40dp"
-        android:layout_height="40dp"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
         android:layout_gravity="bottom|end"
         android:layout_margin="6dp"
+        android:adjustViewBounds="true"
+        android:maxWidth="40dp"
+        android:maxHeight="40dp"
         android:src="@drawable/media3_icon_play" />
 </FrameLayout>

@@ -14,6 +14,7 @@ import android.appwidget.AppWidgetManager
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.RemoteViews
+import com.taehagen.spotifygood.model.Image
 import com.taehagen.spotifygood.playback.ShuffleMode
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -49,13 +50,17 @@ class NowPlayingWidgetScreenshotTest {
         "4x2" to WidgetSize(276f, 220f),
         "4x2 land" to WidgetSize(553f, 117f),
         "4x3" to WidgetSize(276f, 338f),
+        // The lowest heights: the smallest resize (40dp) and one landscape row.
+        "2x1 40dp" to WidgetSize(110f, 40f),
+        "2x1 51dp" to WidgetSize(130f, 51f),
+        "row 40dp" to WidgetSize(220f, 40f),
     ) + WidgetLayout.entries.map { "${it.name.lowercase()} min" to it.minSize }
 
     private val local = WidgetModel.Item(
         uri = "spotify:track:t",
         title = "Midnight City",
         subtitle = "M83",
-        artUrl = "https://i.scdn.co/image/a",
+        art = listOf(Image("https://i.scdn.co/image/a", 300, 300)),
         live = true,
         playing = true,
         liked = true,
@@ -76,7 +81,7 @@ class NowPlayingWidgetScreenshotTest {
             shuffle = ShuffleMode.SMART,
         ),
         "episode" to local.copy(title = "Episode 12: The Widget", subtitle = "The Show", isEpisode = true, liked = null, shuffle = null),
-        "resume" to WidgetModel.Item(uri = "spotify:track:r", title = "Stored Song", subtitle = "Stored Artist", artUrl = null, live = false),
+        "resume" to WidgetModel.Item(uri = "spotify:track:r", title = "Stored Song", subtitle = "Stored Artist", art = emptyList(), live = false),
         "idle" to WidgetModel.Idle,
         "signed-out" to WidgetModel.SignedOut,
     )

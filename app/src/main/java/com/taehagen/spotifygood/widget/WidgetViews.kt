@@ -13,6 +13,7 @@ import android.view.View
 import android.widget.RemoteViews
 import androidx.annotation.IdRes
 import androidx.annotation.RequiresApi
+import androidx.core.os.BundleCompat
 import com.taehagen.spotifygood.MainActivity
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.playback.PlaybackService
@@ -35,16 +36,26 @@ internal object WidgetViews {
         )
     }
 
+    /** Every size (dp) the launcher reports for one widget ([options]); the default size without any. */
+    fun sizesOf(options: Bundle?): List<WidgetSize> {
+        if (options == null) return listOf(WidgetLayout.DEFAULT_SIZE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val sizes = BundleCompat.getParcelableArrayList(options, AppWidgetManager.OPTION_APPWIDGET_SIZES, SizeF::class.java)
+            if (!sizes.isNullOrEmpty()) return sizes.map { WidgetSize(it.width, it.height) }
+        }
+        return orientationSizes(options)?.toList() ?: listOf(WidgetLayout.DEFAULT_SIZE)
+    }
+
+    private fun orientationSizes(options: Bundle): Pair<WidgetSize, WidgetSize>? = WidgetLayout.orientationSizes(
+        minWidth = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH),
+        minHeight = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT),
+        maxWidth = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_WIDTH),
+        maxHeight = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT),
+    )
+
     /** Below Android 12: the layouts for the portrait and landscape sizes of one widget ([options]). */
     fun forOptions(context: Context, model: WidgetModel, art: Bitmap?, options: Bundle?): RemoteViews {
-        val sizes = options?.let {
-            WidgetLayout.orientationSizes(
-                minWidth = it.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH),
-                minHeight = it.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT),
-                maxWidth = it.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_WIDTH),
-                maxHeight = it.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT),
-            )
-        }
+        val sizes = options?.let(::orientationSizes)
         val portrait = WidgetLayout.bestFit(sizes?.first ?: WidgetLayout.DEFAULT_SIZE)
         val landscape = WidgetLayout.bestFit(sizes?.second ?: WidgetLayout.DEFAULT_SIZE)
         val actions = WidgetActions(context)

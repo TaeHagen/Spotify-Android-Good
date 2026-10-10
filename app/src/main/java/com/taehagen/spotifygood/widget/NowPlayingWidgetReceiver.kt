@@ -42,14 +42,30 @@ class NowPlayingWidgetReceiver : AppWidgetProvider() {
 
     // ---- the system's widget broadcasts ----------------------------------------------------------
 
-    /** Placed, after a reboot or an app update (never on a schedule: updatePeriodMillis is 0). */
+    /**
+     * Placed, after a reboot or an app update (never on a schedule: updatePeriodMillis is 0).
+     * Every widget is drawn: a larger one may need a larger artwork, which they all share.
+     */
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
-        redraw(context, appWidgetIds, idsChanged = true)
+        redraw(context, null, idsChanged = true)
     }
 
     override fun onAppWidgetOptionsChanged(context: Context, appWidgetManager: AppWidgetManager, appWidgetId: Int, newOptions: Bundle) {
-        // From Android 12 the launcher picks the layout for a new size itself (sized RemoteViews).
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) redraw(context, intArrayOf(appWidgetId))
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return redraw(context, intArrayOf(appWidgetId))
+        // From Android 12 the launcher picks the layout for a new size itself (sized RemoteViews);
+        // only a new artwork size draws again.
+        val pending = goAsync()
+        (context.applicationContext as App).graph.appScope.launch {
+            try {
+                withTimeoutOrNull(REDRAW_TIMEOUT_MS) { NowPlayingWidgets.resized(context) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Widget redraw after a resize failed", e)
+            } finally {
+                pending.finish()
+            }
+        }
     }
 
     override fun onDeleted(context: Context, appWidgetIds: IntArray) = idsChanged(context)

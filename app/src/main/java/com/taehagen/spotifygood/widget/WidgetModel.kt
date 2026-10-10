@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.widget
 
+import com.taehagen.spotifygood.model.Image
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.PlaybackStatus
@@ -29,7 +30,8 @@ internal sealed interface WidgetModel {
         val title: String,
         /** Artists, or the show of an episode. */
         val subtitle: String,
-        val artUrl: String?,
+        /** The artwork in the sizes there are (the widget picks one for its size); empty: none. */
+        val art: List<Image>,
         val live: Boolean,
         /** Play/pause shows Pause: playing, or loading to play. */
         val playing: Boolean = false,
@@ -73,7 +75,8 @@ internal object WidgetModels {
             uri = track.uri,
             title = track.name.orEmpty(),
             subtitle = track.artistLine,
-            artUrl = track.imageUrl,
+            // What imageUrl picks from (the album's covers, or the show's).
+            art = (track.album?.images ?: track.show?.images).orEmpty(),
             live = true,
             playing = snapshot.status == PlaybackStatus.PLAYING || snapshot.status == PlaybackStatus.LOADING,
             device = snapshot.activeDevice?.name?.takeIf { snapshot.source == PlaybackSource.REMOTE && it.isNotBlank() },
@@ -90,7 +93,8 @@ internal object WidgetModels {
         uri = state.trackUri,
         title = state.title.orEmpty(),
         subtitle = state.artist.orEmpty(),
-        artUrl = state.artworkUrl,
+        // The one stored size (the snapshot's imageUrl).
+        art = listOfNotNull(state.artworkUrl?.takeIf { it.isNotBlank() }?.let { Image(it) }),
         live = false,
         isEpisode = state.isEpisode,
     )

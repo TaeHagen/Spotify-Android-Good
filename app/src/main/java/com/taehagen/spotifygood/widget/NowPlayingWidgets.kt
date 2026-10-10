@@ -15,7 +15,9 @@ import coil3.size.Precision
 import coil3.toBitmap
 import coil3.transform.RoundedCornersTransformation
 import com.taehagen.spotifygood.App
+import com.taehagen.spotifygood.model.Image
 import com.taehagen.spotifygood.model.PlaybackSnapshot
+import com.taehagen.spotifygood.model.best
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
@@ -45,10 +47,7 @@ internal object NowPlayingWidgets {
     /** At most one push per this long: a track change brings several snapshots. */
     private const val PUSH_INTERVAL_MS = 500L
 
-    /** The artwork is decoded at this size (px, square) from the cached or downloaded image. */
-    private const val ART_PX = 256
-
-    /** Its corners: a tenth of its side, so that they scale with the layouts' artwork sizes. */
+    /** The artwork's corners: a tenth of its side, so that they scale with the layouts' artwork sizes. */
     private const val ART_CORNER = 0.1f
     private const val ART_TIMEOUT_MS = 5_000L
 
@@ -60,8 +59,13 @@ internal object NowPlayingWidgets {
     /** One update at a time, in order. */
     private val publishing = Mutex()
 
-    /** The last artwork (url, bitmap), reused while the item stays. Guarded by [publishing]. */
-    private var lastArt: Pair<String, Bitmap>? = null
+    /** The last artwork, reused while the item and the size step stay. Guarded by [publishing]. */
+    private var lastArt: Art? = null
+
+    /** The artwork size (px) of the last update; a resize that changes it draws again. Guarded by [publishing]. */
+    private var publishedArtPx = 0
+
+    private class Art(val url: String, val px: Int, val bitmap: Bitmap)
 
     /** The placed widgets of this process (read once, then on the provider's broadcasts). */
     fun ids(context: Context): WidgetIds = widgetIds ?: synchronized(this) {
@@ -113,6 +117,18 @@ internal object NowPlayingWidgets {
         publish(context.applicationContext, ids) { live ?: restingModel(context) }
     }
 
+    /**
+     * A widget was resized on Android 12+, where the launcher picks the layout itself: the widgets
+     * are drawn again only when the artwork's size step changes with it.
+     */
+    suspend fun resized(context: Context) {
+        val app = context.applicationContext
+        val placed = ids(app).current()
+        val manager = AppWidgetManager.getInstance(app) ?: return
+        val px = withContext(Dispatchers.IO) { artPx(app, manager, placed) }
+        if (px != publishing.withLock { publishedArtPx }) render(app, placed)
+    }
+
     /** Without the playback service: logged out, the stored session (Play resumes it), or nothing. */
     private suspend fun restingModel(context: Context): WidgetModel = withContext(Dispatchers.IO) {
         val graph = (context.applicationContext as App).graph
@@ -128,7 +144,10 @@ internal object NowPlayingWidgets {
             publishing.withLock {
                 val manager = AppWidgetManager.getInstance(context) ?: return@withLock
                 val shown = model()
-                val art = art(context, (shown as? WidgetModel.Item)?.artUrl)
+                // One bitmap for every widget and layout, as large as the largest placed widget shows it.
+                val px = artPx(context, manager, ids(context).current())
+                val art = art(context, (shown as? WidgetModel.Item)?.art.orEmpty(), px)
+                publishedArtPx = px
                 try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                         manager.updateAppWidget(ids, WidgetViews.responsive(context, shown, art))
@@ -144,25 +163,36 @@ internal object NowPlayingWidgets {
     }
 
     /**
-     * The artwork at [ART_PX], from Coil's memory or disk cache or a downloaded cover when there
-     * is one (the app's loader maps those), else fetched; never the full-size image. Null without
-     * one: the layouts show the placeholder.
+     * The artwork's size step (px, [WidgetArtSize]) for the placed widgets [ids]: every size their
+     * options report (one binder call per widget), at the screen's density, within a quarter of the
+     * update's bitmap limit.
      */
-    private suspend fun art(context: Context, url: String?): Bitmap? {
-        if (url.isNullOrBlank()) return null
-        lastArt?.let { (lastUrl, bitmap) -> if (lastUrl == url) return bitmap }
+    private fun artPx(context: Context, manager: AppWidgetManager, ids: IntArray): Int {
+        val sizes = ids.flatMap { id -> WidgetViews.sizesOf(runCatching { manager.getAppWidgetOptions(id) }.getOrNull()) }
+        val metrics = context.resources.displayMetrics
+        return WidgetArtSize.px(sizes, metrics.density, WidgetArtSize.budgetBytes(metrics.widthPixels, metrics.heightPixels))
+    }
+
+    /**
+     * The artwork decoded at [px] (square, exactly) from the smallest of [images] that covers it,
+     * from Coil's memory or disk cache or a downloaded cover when there is one (the app's loader
+     * maps those), else fetched; never larger. Null without one: the layouts show the placeholder.
+     */
+    private suspend fun art(context: Context, images: List<Image>, px: Int): Bitmap? {
+        val url = images.best(px)?.takeIf { it.isNotBlank() } ?: return null
+        lastArt?.let { if (it.url == url && it.px == px) return it.bitmap }
         val request = ImageRequest.Builder(context)
             .data(url)
-            .size(ART_PX)
+            .size(px)
             .precision(Precision.EXACT)
             // RemoteViews are parcelled: no hardware bitmaps.
             .allowHardware(false)
-            .transformations(RoundedCornersTransformation(ART_PX * ART_CORNER))
+            .transformations(RoundedCornersTransformation(px * ART_CORNER))
             .build()
         val bitmap = withTimeoutOrNull(ART_TIMEOUT_MS) {
             (SingletonImageLoader.get(context).execute(request) as? SuccessResult)?.image?.toBitmap()
         }
-        if (bitmap != null) lastArt = url to bitmap
+        if (bitmap != null) lastArt = Art(url, px, bitmap)
         return bitmap
     }
 }

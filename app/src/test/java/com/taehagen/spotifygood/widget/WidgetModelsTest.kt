@@ -13,6 +13,7 @@ import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.model.ShowRef
+import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.playback.ResumeState
 import com.taehagen.spotifygood.playback.ShuffleMode
 import org.junit.Assert.assertEquals
@@ -26,7 +27,11 @@ class WidgetModelsTest {
         uri = "spotify:track:t",
         name = "Song",
         artists = listOf(ArtistRef(uri = "spotify:artist:a", name = "Artist A"), ArtistRef(uri = "spotify:artist:b", name = "Artist B")),
-        album = AlbumRef(uri = "spotify:album:al", name = "Album", images = listOf(Image("https://i.scdn.co/image/cover", 300, 300))),
+        album = AlbumRef(
+            uri = "spotify:album:al",
+            name = "Album",
+            images = listOf(Image("https://i.scdn.co/image/small", 64, 64), Image("https://i.scdn.co/image/cover", 300, 300), Image("https://i.scdn.co/image/large", 640, 640)),
+        ),
     )
 
     private fun playing(
@@ -74,7 +79,10 @@ class WidgetModelsTest {
         assertEquals("spotify:track:t", model.uri)
         assertEquals("Song", model.title)
         assertEquals("Artist A, Artist B", model.subtitle)
-        assertEquals("https://i.scdn.co/image/cover", model.artUrl)
+        // Every size, so that a large widget can use the large cover.
+        assertEquals(track.album!!.images, model.art)
+        assertEquals("https://i.scdn.co/image/cover", model.art.best(256))
+        assertEquals("https://i.scdn.co/image/large", model.art.best(512))
         assertTrue(model.live)
         assertTrue(model.playing)
         assertNull(model.device)
@@ -121,7 +129,7 @@ class WidgetModelsTest {
         assertEquals("spotify:track:r", model.uri)
         assertEquals("Stored song", model.title)
         assertEquals("Stored artist", model.subtitle)
-        assertEquals("https://i.scdn.co/image/stored", model.artUrl)
+        assertEquals(listOf(Image("https://i.scdn.co/image/stored")), model.art)
         assertFalse(model.live)
         assertFalse(model.playing)
         assertNull(model.device)

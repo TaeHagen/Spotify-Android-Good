@@ -74,6 +74,53 @@ class WidgetLayoutsTest {
         assertFalse(WidgetSize(251f, 40f).fitsIn(WidgetSize(249.5f, 40f)))
     }
 
+    /** A 1080 × 2400 phone at 420 dpi. */
+    private val density = 2.625f
+    private val budget = WidgetArtSize.budgetBytes(1080, 2400)
+
+    @Test
+    fun theArtworkBudgetIsAQuarterOfTheUpdatesBitmapLimit() {
+        // 1080 × 2400 × 4 bytes × 1.5, a quarter of it.
+        assertEquals(3_888_000L, budget)
+    }
+
+    @Test
+    fun theArtworkIsDecodedForTheLargestPlacedWidgetInSteps() {
+        // 4x1: 86dp of artwork → 226 px.
+        assertEquals(256, WidgetArtSize.px(listOf(portrait(4, 1)), density, budget))
+        // 2x1: the artwork fills the 130dp wide widget → 341 px.
+        assertEquals(384, WidgetArtSize.px(listOf(portrait(2, 1)), density, budget))
+        // 4x2: 120dp → 315 px; its landscape size (the 4x1 layout) needs less.
+        assertEquals(384, WidgetArtSize.px(listOf(portrait(4, 2), landscape(4, 2)), density, budget))
+        // 4x3: 209dp → 549 px; larger widgets stay at the largest step.
+        assertEquals(640, WidgetArtSize.px(listOf(portrait(4, 3)), density, budget))
+        assertEquals(640, WidgetArtSize.px(listOf(portrait(5, 4)), density, budget))
+        // One bitmap for every widget: the largest wins.
+        assertEquals(640, WidgetArtSize.px(listOf(portrait(4, 1), portrait(4, 3)), density, budget))
+        // A small resize keeps the step (and the image cache key).
+        assertEquals(384, WidgetArtSize.px(listOf(WidgetSize(282f, 226f)), density, budget))
+        assertEquals(256, WidgetArtSize.px(emptyList(), density, budget))
+    }
+
+    @Test
+    fun theStepStaysWithinTheBitmapBudget() {
+        // 480 × 800: 576 000 bytes, room for 256 px (262 144) but not 384 px (589 824).
+        assertEquals(256, WidgetArtSize.px(listOf(portrait(4, 3)), 1.5f, WidgetArtSize.budgetBytes(480, 800)))
+        // Never below the smallest step.
+        assertEquals(256, WidgetArtSize.px(listOf(portrait(4, 3)), density, 1_000))
+    }
+
+    @Test
+    fun theArtworkSizeOfEachLayoutFollowsItsXml() {
+        assertEquals(130f, WidgetLayout.SMALL.artDp(portrait(2, 1)))
+        assertEquals(114f, WidgetLayout.SMALL_TALL.artDp(portrait(2, 2)))
+        assertEquals(72f, WidgetLayout.ROW.artDp(portrait(3, 1)))
+        assertEquals(86f, WidgetLayout.STACKED.artDp(portrait(4, 1)))
+        assertEquals(120f, WidgetLayout.LARGE.artDp(portrait(4, 2)))
+        assertEquals(209f, WidgetLayout.TALL.artDp(portrait(4, 3)))
+        assertEquals(0f, WidgetLayout.TALL.artDp(WidgetSize(20f, 20f)))
+    }
+
     @Test
     fun theOptionsGiveThePortraitAndTheLandscapeSize() {
         val (portrait, landscape) = WidgetLayout.orientationSizes(minWidth = 276, minHeight = 117, maxWidth = 554, maxHeight = 220)!!

@@ -56,13 +56,17 @@
         android:contentDescription="@string/widget_previous"
         android:src="@drawable/media3_icon_previous" />
 
+    <!-- 36dp, smaller in a lower row (adjustViewBounds keeps it round): it never clips -->
     <ImageButton
         android:id="@+id/widget_play"
         style="@style/Widget.SpotifyGood.NowPlaying.Play"
-        android:layout_width="36dp"
-        android:layout_height="36dp"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
         android:layout_marginStart="2dp"
         android:layout_marginEnd="2dp"
+        android:adjustViewBounds="true"
+        android:maxWidth="36dp"
+        android:maxHeight="36dp"
         android:src="@drawable/media3_icon_play" />
 
     <ImageButton
