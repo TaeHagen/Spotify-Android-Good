@@ -8,8 +8,11 @@
 //! never interrupts the playing track. Playback is paused, the Player stopped (cancelling the
 //! in-flight load), an `error` event emitted and `lastError` set after
 //! * 3 permanent denials (`PLAYBACK_REFUSED`), or
-//! * 3 transient failures (audio key timeout / rate limit, network): `RATE_LIMITED` with
-//!   `retryAfterMs`, or `NETWORK`. Each such load already costs several key requests.
+//! * 3 transient failures (audio key timeout, network): `RATE_LIMITED` with `retryAfterMs`, or
+//!   `NETWORK`. Each such load already costs two key requests, or
+//! * 1 key Spotify refused for now (`KeyThrottled`: its key budget for the account is spent, every
+//!   following load would be refused the same way until it refilled): `RATE_LIMITED`, with
+//!   `retryAfterMs` the time one key takes to refill (see `offline::key_retry_after`).
 //!
 //! While latched, any further counted failure stops again (the skip chain may have queued one
 //! more load). A successful `Playing` or a new user load resets the state.
@@ -25,9 +28,10 @@ use std::time::{Duration, Instant};
 
 /// Consecutive permanent denials before playback is stopped.
 const REFUSALS_BEFORE_STOP: u32 = 3;
-/// Consecutive transiently failed loads (key timeout / rate limit, network) before playback is
-/// stopped.
+/// Consecutive transiently failed loads (key timeout, network) before playback is stopped.
 const TRANSIENT_BEFORE_STOP: u32 = 3;
+/// Loads failed by a throttled key before playback is stopped: the next ones would be too.
+const THROTTLED_BEFORE_STOP: u32 = 1;
 /// `retryAfterMs` of the error after transient key failures.
 const TRANSIENT_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// An unavailable track counts for "queue exhausted" reporting for this long.
@@ -36,6 +40,8 @@ const UNAVAILABLE_WINDOW: Duration = Duration::from_secs(15);
 pub(crate) const REFUSED_MESSAGE: &str =
     "Spotify refused to provide playback keys for this account. Playback was stopped.";
 const THROTTLED_MESSAGE: &str = "Spotify is temporarily refusing playback. Playback was stopped, try again later.";
+const LIMITED_MESSAGE: &str =
+    "Spotify is limiting how fast songs that aren't downloaded can start. Playback was stopped, try again in a minute.";
 const NETWORK_MESSAGE: &str = "Tracks couldn't be loaded (network error). Playback was stopped.";
 
 #[derive(Debug, Default)]
@@ -54,7 +60,10 @@ pub(crate) enum RefusalAction {
 }
 
 fn is_transient(reason: UnavailableReason) -> bool {
-    matches!(reason, UnavailableReason::KeyTemporarilyDenied | UnavailableReason::NetworkError)
+    matches!(
+        reason,
+        UnavailableReason::KeyTemporarilyDenied | UnavailableReason::KeyThrottled | UnavailableReason::NetworkError
+    )
 }
 
 impl Refusal {
@@ -62,6 +71,7 @@ impl Refusal {
     pub fn on_unavailable(&mut self, reason: UnavailableReason) -> RefusalAction {
         let (count, limit) = match reason {
             UnavailableReason::KeyDenied => (&mut self.consecutive, REFUSALS_BEFORE_STOP),
+            UnavailableReason::KeyThrottled => (&mut self.transient, THROTTLED_BEFORE_STOP),
             r if is_transient(r) => (&mut self.transient, TRANSIENT_BEFORE_STOP),
             _ => return RefusalAction::None,
         };
@@ -124,6 +134,9 @@ pub(crate) fn unavailable_error(reason: UnavailableReason) -> AppError {
         UnavailableReason::KeyTemporarilyDenied => {
             (ErrorCode::RateLimited, "Spotify is temporarily refusing playback. Try again later")
         }
+        UnavailableReason::KeyThrottled => {
+            (ErrorCode::RateLimited, "Spotify is limiting how fast songs that aren't downloaded can start. Try again in a minute")
+        }
         UnavailableReason::DecodeError => (ErrorCode::Unavailable, "The audio couldn't be decoded"),
         UnavailableReason::OfflineFileError => (ErrorCode::Unavailable, "The downloaded file couldn't be read"),
         UnavailableReason::Other => (ErrorCode::Unavailable, "This track can't be played"),
@@ -138,6 +151,10 @@ pub(crate) fn halted_error(reason: UnavailableReason) -> AppError {
         UnavailableReason::KeyTemporarilyDenied => {
             error.message = THROTTLED_MESSAGE.into();
             error.retry_after_ms = Some(TRANSIENT_RETRY_AFTER.as_millis() as u64);
+        }
+        UnavailableReason::KeyThrottled => {
+            error.message = LIMITED_MESSAGE.into();
+            error.retry_after_ms = Some(crate::offline::key_retry_after().as_millis() as u64);
         }
         UnavailableReason::NetworkError => error.message = NETWORK_MESSAGE.into(),
         _ => {}
@@ -289,6 +306,19 @@ mod tests {
     }
 
     #[test]
+    fn a_throttled_key_stops_at_once_instead_of_skipping_on() {
+        use UnavailableReason::*;
+        let mut r = Refusal::default();
+        // The next loads would be refused the same way: no skip chain through the queue.
+        assert_eq!(r.on_unavailable(KeyThrottled), stop(KeyThrottled, true));
+        assert_eq!(r.on_unavailable(KeyThrottled), stop(KeyThrottled, false));
+        assert!(r.reset());
+        // After network failures too.
+        assert_eq!(r.on_unavailable(NetworkError), RefusalAction::None);
+        assert_eq!(r.on_unavailable(KeyThrottled), stop(KeyThrottled, true));
+    }
+
+    #[test]
     fn failed_preloads_never_stop_the_playing_track() {
         let mut st = State::new();
         // track 1 (request 5) loads and plays
@@ -333,5 +363,9 @@ mod tests {
         assert_eq!(throttled.retry_after_ms, Some(60_000));
         assert_eq!(halted_error(UnavailableReason::KeyDenied).message, REFUSED_MESSAGE);
         assert_eq!(halted_error(UnavailableReason::NetworkError).code, ErrorCode::Network);
+        let limited = halted_error(UnavailableReason::KeyThrottled);
+        assert_eq!((limited.code, limited.message.as_str()), (ErrorCode::RateLimited, LIMITED_MESSAGE));
+        assert!(limited.retry_after_ms.is_some_and(|ms| ms >= 10_000), "{:?}", limited.retry_after_ms);
+        assert_eq!(unavailable_error(UnavailableReason::KeyThrottled).code, ErrorCode::RateLimited);
     }
 }

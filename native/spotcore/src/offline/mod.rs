@@ -6,7 +6,8 @@
 //!
 //! RPCs:
 //! * `download.track {uri, bitrate, dir, imageDir}` → `OfflineTrackRecord` (see [`download`]).
-//!   The record is *not* registered; Kotlin persists it and then calls `offline.add`.
+//!   The record is *not* registered; Kotlin persists it and then calls `offline.add`. Its audio
+//!   key is paced by the process's key budget (see [`keys`], [`key_budget`]).
 //! * `download.fileId {uri}` → `{"fileId"}` (omitted when unknown): the file the last
 //!   `download.track` of `uri` in this process chose, also when it failed or was cancelled, so
 //!   Kotlin knows which `<fileId>.part` belongs to an unfinished download.
@@ -33,6 +34,7 @@ mod download;
 mod fetch;
 pub mod format;
 mod index;
+mod key_budget;
 mod keys;
 mod progress;
 mod transport;
@@ -69,6 +71,22 @@ pub fn all_records() -> Vec<OfflineTrackRecord> {
 /// index changes.
 pub fn source() -> OfflineSourceRef {
     Arc::new(index::IndexSource(index::global().clone()))
+}
+
+/// Lets the downloads' audio-key budget see every key request of the process, the player's
+/// included (docs/ARCHITECTURE.md §9.7). Idempotent; called before a Player is created.
+pub(crate) fn observe_audio_keys() {
+    keys::observe_audio_keys();
+}
+
+/// Logout or another account: the keys received so far and the key budget are forgotten.
+pub(crate) fn forget_audio_keys() {
+    keys::forget_account();
+}
+
+/// How long the player should wait before asking for a key again after Spotify throttled keys.
+pub(crate) fn key_retry_after() -> std::time::Duration {
+    keys::playback_retry_after()
 }
 
 pub async fn handle(method: &str, args: Value) -> AppResult<Value> {

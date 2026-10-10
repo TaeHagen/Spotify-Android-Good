@@ -28,7 +28,10 @@ use crate::{
     convert::Converter,
     core::{Error, Session, SpotifyId, SpotifyUri, util::SeqGenerator},
     // SPOTIFYGOOD: for the audio-key retry and for classifying load failures.
-    core::{FileId, audio_key::AudioKey, audio_key::is_permanent_denial, session::SessionError},
+    core::{
+        FileId, audio_key::AudioKey, audio_key::is_permanent_denial, audio_key::key_error_code,
+        session::SessionError,
+    },
     metadata::MetadataError,
     // SPOTIFYGOOD: DecoderError for the stall handling
     decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, SymphoniaDecoder},
@@ -64,13 +67,16 @@ const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 // `lock_load_handles()`, which ignores poisoning: a panic elsewhere must never turn into a
 // second panic in `PlayerInternal::drop` (a double panic aborts the host process).
 
-// SPOTIFYGOOD: audio-key retry policy for transient failures (librespot #1649 / PR #1763).
-const AUDIO_KEY_RETRIES: u32 = 3;
-const AUDIO_KEY_RETRY_DELAY: Duration = Duration::from_secs(1);
+// SPOTIFYGOOD: audio-key retry policy for unanswered requests (librespot #1649 / PR #1763). A key
+// Spotify refused for now (`AesKeyError` other than 0x0001: its key budget for the account is
+// spent, librespot #1319) is not retried at all: the budget refills about one key per 30 s, a
+// retry a second later only spends another request (`KeyThrottled`).
+const AUDIO_KEY_RETRIES: u32 = 1;
+const AUDIO_KEY_RETRY_DELAY: Duration = Duration::from_secs(2);
 // SPOTIFYGOOD: after the retries ran out on a transient failure (Spotify throttling keys, the AP
 // struggling), key requests in the next AUDIO_KEY_COOLDOWN make a single attempt instead of
 // 1 + AUDIO_KEY_RETRIES, so a run of skipped tracks doesn't multiply the requests. Shared by all
-// loaders and Players of the process (AUDIO_KEY_BRAKE).
+// loaders and Players of the process (AUDIO_KEY_BRAKE). A throttled key starts it too.
 const AUDIO_KEY_COOLDOWN: Duration = Duration::from_secs(30);
 
 // SPOTIFYGOOD: the key-retry cool-down of the process (see AUDIO_KEY_COOLDOWN).
@@ -140,9 +146,13 @@ pub enum UnavailableReason {
     /// Spotify refused the audio key for this account and file (permanent denial). Do not retry.
     /// Tell the user that Spotify refused playback.
     KeyDenied,
-    /// The audio-key request failed transiently (timeout, rate limit, AP not connected) after
-    /// all retries, and the file could not be played without a key.
+    /// The audio-key request failed transiently (timeout, AP not connected) after all retries,
+    /// and the file could not be played without a key.
     KeyTemporarilyDenied,
+    /// Spotify refused the audio key for now (`AesKeyError` other than 0x0001: the account's key
+    /// budget is spent, it refills about one key per 30 s), and the file could not be played
+    /// without a key. Not retried. Tell the user that Spotify limits playback for a moment.
+    KeyThrottled,
     /// The file was opened but could not be decoded (corrupt, wrong key, unsupported sample
     /// rate or channel count) or could not seek to the start position.
     DecodeError,
@@ -158,18 +168,24 @@ pub enum UnavailableReason {
 enum KeyFailure {
     /// Spotify refused the key permanently (`AesKeyError` code 0x0001): abort the load at once.
     Permanent,
-    /// Throttled (`AesKeyError` code 0x0002 or another code), timeout or channel error: retry.
+    /// Refused for now (`AesKeyError` code 0x0002 or another code): don't retry.
+    Throttled,
+    /// Timeout or channel error: retry.
     Transient,
     /// No live access-point connection: retrying with this session cannot help.
     NoSession,
 }
 
-// SPOTIFYGOOD: classify an audio-key error with vendored librespot-core's `is_permanent_denial`.
-fn classify_audio_key_error(err: &Error, session: &Session) -> KeyFailure {
+// SPOTIFYGOOD: classify an audio-key error with vendored librespot-core's `is_permanent_denial`
+// and `key_error_code`. `session_invalid`: the session ended.
+fn classify_audio_key_error(err: &Error, session_invalid: bool) -> KeyFailure {
     if is_permanent_denial(err) {
         return KeyFailure::Permanent;
     }
-    if session.is_invalid()
+    if key_error_code(err).is_some() {
+        return KeyFailure::Throttled;
+    }
+    if session_invalid
         || matches!(
             err.error.downcast_ref::<SessionError>(),
             Some(SessionError::NotConnected { .. })
@@ -673,6 +689,7 @@ fn reopen_waits(reason: UnavailableReason) -> bool {
         reason,
         UnavailableReason::NetworkError
             | UnavailableReason::KeyTemporarilyDenied
+            | UnavailableReason::KeyThrottled
             | UnavailableReason::Other
     )
 }
@@ -1756,9 +1773,11 @@ impl PlayerTrackLoader {
         }
     }
 
-    // SPOTIFYGOOD: audio-key request with retries for transient failures (librespot #1649,
-    // PR #1763). A permanent denial is returned at once as `KeyDenied`. While the shared
-    // cool-down runs (AUDIO_KEY_COOLDOWN) only one attempt is made.
+    // SPOTIFYGOOD: audio-key request with a retry for an unanswered request (librespot #1649,
+    // PR #1763). A permanent denial is returned at once as `KeyDenied`, a key refused for now as
+    // `KeyThrottled` (librespot #1319). While the shared cool-down runs (AUDIO_KEY_COOLDOWN) only
+    // one attempt is made. The request goes through core's known keys first (a track played
+    // again needs no request) and counts for the app's key budget (its downloads yield to it).
     async fn request_audio_key(
         &self,
         track_id: SpotifyId,
@@ -1774,10 +1793,15 @@ impl PlayerTrackLoader {
                 }
                 Err(err) => err,
             };
-            match classify_audio_key_error(&err, &self.session) {
+            match classify_audio_key_error(&err, self.session.is_invalid()) {
                 KeyFailure::Permanent => {
                     error!("Spotify refused the audio key for file {file_id}: {err}");
                     return Err(UnavailableReason::KeyDenied);
+                }
+                KeyFailure::Throttled => {
+                    warn!("Spotify refused the audio key for now (throttled): {err}");
+                    audio_key_brake().exhausted(Instant::now());
+                    return Err(UnavailableReason::KeyThrottled);
                 }
                 KeyFailure::NoSession => {
                     warn!("Unable to request audio key, session is not connected: {err}");
@@ -4349,6 +4373,37 @@ mod spotifygood_tests {
     }
 
     #[test]
+    fn key_failures_are_classified_by_their_code() {
+        use librespot_core::audio_key::{
+            AES_KEY_ERROR_PERMANENT, AES_KEY_ERROR_TRANSIENT, AudioKeyError,
+        };
+        let refused = |code| Error::from(AudioKeyError::AesKey { code });
+        assert_eq!(
+            classify_audio_key_error(&refused(AES_KEY_ERROR_PERMANENT), false),
+            KeyFailure::Permanent
+        );
+        // Refused for now (Spotify's key budget): never retried, also not while connected.
+        assert_eq!(
+            classify_audio_key_error(&refused(AES_KEY_ERROR_TRANSIENT), false),
+            KeyFailure::Throttled
+        );
+        assert_eq!(
+            classify_audio_key_error(&refused(0x0007), true),
+            KeyFailure::Throttled
+        );
+        let timeout = Error::from(AudioKeyError::Timeout);
+        assert_eq!(
+            classify_audio_key_error(&timeout, false),
+            KeyFailure::Transient
+        );
+        assert_eq!(
+            classify_audio_key_error(&timeout, true),
+            KeyFailure::NoSession
+        );
+        assert_eq!(AUDIO_KEY_RETRIES, 1, "one retry of an unanswered request");
+    }
+
+    #[test]
     fn key_brake_is_shared() {
         let now = Instant::now();
         audio_key_brake().succeeded();
@@ -5344,7 +5399,7 @@ mod spotifygood_tests {
     #[test]
     fn only_a_reopen_failure_that_can_pass_keeps_the_track() {
         use UnavailableReason::*;
-        for reason in [NetworkError, KeyTemporarilyDenied, Other] {
+        for reason in [NetworkError, KeyTemporarilyDenied, KeyThrottled, Other] {
             assert!(reopen_waits(reason), "{reason:?}");
         }
         for reason in [NotAvailable, KeyDenied, DecodeError, OfflineFileError] {

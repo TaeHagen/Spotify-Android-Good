@@ -67,4 +67,5 @@ protobuf-codegen = "3.7"
 vergen = { version = "=9.0.6", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# test-util: tests of the audio-key pacing run on tokio's paused clock.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }

@@ -12,8 +12,12 @@
 //!    shown and played, never to downloading them.
 //! 3. File choice per bitrate with fallbacks (Ogg Vorbis 320/160/96, MP3; ≤ 160 kbps for
 //!    non-Premium sessions).
-//! 4. Audio key: reused from the offline index when the same file is registered, otherwise
-//!    requested (serialised, retried; permanent denial → `PLAYBACK_REFUSED`).
+//! 4. Audio key: reused from the offline index when the same file is registered, or from the
+//!    keys this process received (a streamed track), otherwise requested when this file's
+//!    download starts, paced by the key budget (`super::keys`): a pause longer than a few seconds
+//!    returns `RATE_LIMITED` (context `keyPacing` / `keyThrottled`, `retryAfterMs`) without a
+//!    request; a refusal of the file is `UNAVAILABLE` (context `keyRefused`), of the account
+//!    `PLAYBACK_REFUSED`.
 //! 5. Existing `<dir>/<fileId>` that verifies → reused. Otherwise the encrypted file is
 //!    downloaded into `<dir>/<fileId>.part` (resumable, see `super::fetch`), verified, its Ogg
 //!    normalisation read, synced and renamed to `<dir>/<fileId>`.
@@ -156,7 +160,11 @@ pub async fn download_track(args: DownloadArgs) -> AppResult<OfflineTrackRecord>
             Ok(record)
         }
         Err(e) => {
-            log::warn!("download of {uri_str} failed: {e}");
+            if e.context.as_deref() == Some("keyPacing") {
+                log::info!("download of {uri_str} waits {:?} ms for its audio-key turn", e.retry_after_ms);
+            } else {
+                log::warn!("download of {uri_str} failed: {e}");
+            }
             progress.failed(&e);
             Err(e)
         }
