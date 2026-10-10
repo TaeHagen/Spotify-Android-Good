@@ -3,7 +3,11 @@ package com.taehagen.spotifygood.ui.screens.playlist
 import com.taehagen.spotifygood.model.Playlist
 import com.taehagen.spotifygood.model.PlaylistItem
 import com.taehagen.spotifygood.model.Track
+import com.taehagen.spotifygood.ui.screens.album.RichText
 import com.taehagen.spotifygood.ui.screens.album.assignRowKeys
+import com.taehagen.spotifygood.ui.screens.album.matchesTokens
+import com.taehagen.spotifygood.ui.screens.album.searchTokens
+import com.taehagen.spotifygood.ui.screens.library.TrackSort
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
@@ -17,7 +21,8 @@ import org.junit.Test
 /**
  * An open playlist page and changes made elsewhere (docs §9.9): a push of another revision
  * refreshes the rows in place, the revision already shown does nothing, the page start's revision
- * check refreshes only when it changed, and nothing happens while the page is off screen.
+ * check refreshes only when it changed, and nothing happens while the page is off screen. A sorted
+ * or filtered list that had every row still has every row after the refresh.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlaylistFreshnessTest {
@@ -261,7 +266,8 @@ class PlaylistFreshnessTest {
 
     // ---- the refresh keeps the list's place -------------------------------------------------------
 
-    private fun item(i: Int) = PlaylistItem(uid = "u$i", track = Track(uri = "spotify:track:${i.toString().padStart(22, '0')}", name = "Song $i"))
+    private fun item(i: Int, addedAt: Long? = null, name: String = "Song $i") =
+        PlaylistItem(uid = "u$i", addedAt = addedAt, track = Track(uri = "spotify:track:${i.toString().padStart(22, '0')}", name = name))
 
     /** A playlist [items] long, served in pages as `catalog.playlist` serves them. */
     private class Server(var items: List<PlaylistItem>, val revision: String) {
@@ -309,6 +315,86 @@ class PlaylistFreshnessTest {
         val shorter = fetchLoadedRange(loaded = 30, pageSize = 100) { offset, limit -> server.page(offset, limit) }
         assertEquals(listOf(0 to 100), server.requests)
         assertEquals(10, shorter.items.size)
+    }
+
+    // ---- a sorted or filtered list stays complete ------------------------------------------------
+
+    /** The page showing every one of [items] (the server's rows, revision r1). */
+    private fun showing(items: List<PlaylistItem>) = PlaylistData(
+        Playlist(uri = "spotify:playlist:x", name = "x", revision = "r1", total = items.size),
+        RichText.EMPTY,
+        assignRowKeys(items, HashSet()).zip(items, ::PlaylistRow),
+        total = items.size,
+        revision = "r1",
+    )
+
+    /** What [shown] lists after a refresh in place, built as PlaylistViewModel.refreshLoaded builds it. */
+    private suspend fun refresh(shown: PlaylistData, needsAll: Boolean, server: Server): PlaylistData {
+        val range = fetchLoadedRange(refreshedRowCount(shown, needsAll), pageSize = 100) { offset, limit -> server.page(offset, limit) }
+        val rows = assignRowKeys(range.items, HashSet()).zip(range.items, ::PlaylistRow)
+        return PlaylistData(range.first.copy(items = emptyList()), RichText.EMPTY, rows, range.first.total, range.first.revision, range.partial)
+    }
+
+    /** The rows the page lists: the loaded ones, then placeholders ([playlistPlaceholders]). */
+    private fun listed(playlist: PlaylistData, list: PlaylistListUi): Int =
+        playlist.rows.size + playlistPlaceholders(playlist, playlist.rows.size, list, editMode = false, offline = false)
+
+    @Test
+    fun aSortedListGetsTheSongsAddedElsewherePastItsLastPageNewestFirst() = runTest {
+        val before = (0 until 95).map { item(it, addedAt = 1_000L + it) }
+        // A 12-song album added on another device: the total passes the next page.
+        val album = (1000 until 1012).map { item(it, addedAt = 9_000L) }
+        val server = Server(before + album, revision = "r2")
+        val after = refresh(showing(before), needsAll = true, server = server)
+        assertEquals(listOf(0 to 100, 100 to 100), server.requests)
+        assertEquals(107, after.rows.size)
+        assertTrue(after.allLoaded)
+        assertEquals("sorted: every row is listed", 107, listed(after, PlaylistListUi(sortActive = true)))
+        // Recently added (as the list shows and plays it): the album first, in its order.
+        val order = sortedPlayableUris(after.rows, TrackSort.RECENTLY_ADDED)
+        assertEquals(album.map { it.uri }, order.take(12))
+        assertEquals(before.reversed().map { it.uri }, order.drop(12))
+    }
+
+    @Test
+    fun aFilteredListFindsTheSongsAddedElsewherePastItsLastPage() = runTest {
+        val before = (0 until 95).map(::item)
+        val added = (1000 until 1012).map { item(it, name = "Added $it") }
+        val server = Server(before + added, revision = "r2")
+        val after = refresh(showing(before), needsAll = true, server = server)
+        assertEquals(107, after.rows.size)
+        val tokens = searchTokens("added")
+        assertEquals(added.map { it.uri }, after.rows.filter { matchesTokens(it.searchText, tokens) }.map { it.item.uri })
+    }
+
+    @Test
+    fun aSortedListOfExactlyOnePageShowsOneSongAddedElsewhere() = runTest {
+        val before = (0 until 100).map(::item)
+        val server = Server(before + item(1000), revision = "r2")
+        val after = refresh(showing(before), needsAll = true, server = server)
+        assertEquals(listOf(0 to 100, 100 to 100), server.requests)
+        assertEquals(101, after.rows.size)
+        assertEquals(item(1000).uri, after.rows.last().item.uri)
+    }
+
+    @Test
+    fun inItsOwnOrderTheRefreshKeepsTheLoadedRangeAndTheRestArePlaceholders() = runTest {
+        val before = (0 until 95).map(::item)
+        val server = Server(before + (1000 until 1012).map(::item), revision = "r2")
+        val after = refresh(showing(before), needsAll = false, server = server)
+        assertEquals("one page, as before", listOf(0 to 100), server.requests)
+        assertEquals(100, after.rows.size)
+        assertEquals(107, after.total)
+        // The list (and its fast scroller) still reaches the new end: the rest load by window.
+        assertEquals(107, listed(after, PlaylistListUi()))
+    }
+
+    @Test
+    fun aSortedListStillLoadingRefreshesItsLoadedRowsOnly() {
+        // 200 of 500 loaded: the page goes on loading the rest (with progress) after the refresh.
+        val loading = showing((0 until 200).map(::item)).copy(total = 500)
+        assertEquals(200, refreshedRowCount(loading, needsAll = true))
+        assertEquals(200, refreshedRowCount(loading, needsAll = false))
     }
 
     private companion object {

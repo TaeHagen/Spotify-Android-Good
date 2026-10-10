@@ -2053,7 +2053,9 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
   refresh isn't retried by itself (the next push, start or reconnect does).
   * A push names the playlist at a revision other than the one shown: 1 s after the first push of
     a burst, the loaded range is fetched again (at least the first page, as many rows as are
-    loaded) and replaces the rows in place: no loading state, row keys come from the items' uids
+    loaded; a sorted or filtered list, which lists every row, that had them all gets them all, up
+    to the new total, and one that didn't loads the rest as for the sort, §9.8) and replaces the
+    rows in place: no loading state, row keys come from the items' uids
     so the rows that stay keep theirs and the list keeps its place; the windows of the old
     revision are dropped (`PageWindows.clear`, their loads cancelled) and the rows on screen load
     again; the cached page is marked stale. Not while edits are queued or a row is dragged (the

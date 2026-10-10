@@ -977,16 +977,18 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     }
 
     /**
-     * Re-fetches the loaded range (always, to learn the new revision). Rows are replaced only when
-     * [force]d (after a failure) or when no local edit is pending; otherwise only the revision is
-     * taken over so the next queued mutation applies to the latest version.
+     * Re-fetches the loaded range ([refreshedRowCount]; always, to learn the new revision). Rows are
+     * replaced only when [force]d (after a failure) or when no local edit is pending (a sort or a
+     * filter then loads the rows still missing); otherwise only the revision is taken over so the
+     * next queued mutation applies to the latest version.
      */
     private suspend fun refreshLoaded(force: Boolean): Boolean {
         val before = data.value.dataOrNull() ?: return false
         try {
             val applyRows = force || canApplyServerRows()
             // Only the revision is needed while local edits are pending.
-            val range = fetchLoadedRange(if (applyRows) before.rows.size else 0, if (applyRows) PAGE_SIZE else 1) { offset, limit ->
+            val loaded = if (applyRows) refreshedRowCount(before, needsAll = needsAllRows()) else 0
+            val range = fetchLoadedRange(loaded, if (applyRows) PAGE_SIZE else 1) { offset, limit ->
                 graph.catalog.playlistPage(uri, offset, limit)
             }
             val first = range.first
@@ -1002,6 +1004,9 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
                 )
                 // Mutations queued against the replaced optimistic list are no longer valid.
                 if (force) generation++
+                // A sort or a filter lists every row (no placeholders): the rest of a list that
+                // didn't have them all loads as for the sort, with progress.
+                if (needsAllRows() && data.value.dataOrNull()?.allLoaded == false) ensureAllLoaded()
             } else {
                 data.value = LoadState.Ready(latest.copy(revision = first.revision))
             }
@@ -1089,7 +1094,7 @@ internal class LoadedRange(val first: Playlist, val items: List<PlaylistItem>, v
  * The first [loaded] rows of a playlist as the server has them now (at least its first page of
  * [pageSize]), in pages of [pageSize]: as many as the page shows, so a refresh doesn't shrink the
  * list under the user (a shorter playlist ends sooner). [loaded] 0 with [pageSize] 1 is the
- * revision alone.
+ * revision alone; [Int.MAX_VALUE] is every row ([refreshedRowCount]).
  */
 internal suspend fun fetchLoadedRange(loaded: Int, pageSize: Int, fetch: suspend (offset: Int, limit: Int) -> Playlist): LoadedRange {
     val first = fetch(0, pageSize)
@@ -1104,6 +1109,15 @@ internal suspend fun fetchLoadedRange(loaded: Int, pageSize: Int, fetch: suspend
     }
     return LoadedRange(first, items, partial)
 }
+
+/**
+ * The rows a refresh of [playlist] fetches again ([fetchLoadedRange]): as many as are loaded, so the
+ * list doesn't shrink under the user (in its own order the rest are placeholders). Sorted or
+ * filtered ([needsAll]: every row is listed, no placeholders), a list that had every row gets every
+ * row again, songs added elsewhere past its last page included, so it stays complete.
+ */
+internal fun refreshedRowCount(playlist: PlaylistData, needsAll: Boolean): Int =
+    if (needsAll && playlist.allLoaded) Int.MAX_VALUE else playlist.rows.size
 
 /** The loaded rows begin with [items] (same items, same playable flags). */
 private fun PlaylistData.startsWith(items: List<PlaylistItem>): Boolean {
