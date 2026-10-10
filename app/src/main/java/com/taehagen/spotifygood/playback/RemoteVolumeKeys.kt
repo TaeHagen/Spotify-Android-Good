@@ -15,8 +15,9 @@ import android.util.Log
  *
  * Android routes the volume keys to the first session in an active playback state that handles
  * them (`MediaSessionStack.getDefaultVolumeSession`). The media session reads paused while another
- * device plays ([RemotePlayback]: Bluetooth passes "playing" on to the headset), so the keys would
- * set the phone's own volume. This small platform session takes them meanwhile: remote volume
+ * device plays with a Bluetooth output connected ([RemotePlayback]: Bluetooth passes "playing" on
+ * to the headset), so the keys would set the phone's own volume. This small platform session takes
+ * them meanwhile (and only then: otherwise the media session reads playing and has them): remote volume
  * ([VolumeProvider], percent), "connecting" as its state, the one active state that Bluetooth
  * reports as stopped (`PlayStatus.playbackStateToAvrcpState`) and no notification, so nothing shows
  * it. Its transport controls (Bluetooth, an assistant, a watch may pick it, as the first active

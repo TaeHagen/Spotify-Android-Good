@@ -812,9 +812,10 @@ For a remote active device, smart shuffle is not supported (the command reports
   device becomes active, when this phone is picked, and on logout.
 * **Remote playback in the app**: `PlaybackSnapshot.source == "remote"` is built from the
   cluster's `player_state` (position extrapolated with `session.time_delta()`); the
-  MediaSession switches to `DeviceInfo(PLAYBACK_TYPE_REMOTE)`, and while that device plays its
-  platform state reads paused, so Bluetooth never sees this phone as a playing source (§9.4,
-  Remote playback and Bluetooth); hardware volume keys control the remote device; the
+  MediaSession switches to `DeviceInfo(PLAYBACK_TYPE_REMOTE)`, and while that device plays with
+  a Bluetooth audio output connected its platform state reads paused, so Bluetooth never sees
+  this phone as a playing source (§9.4, Remote playback and Bluetooth); hardware volume keys
+  control the remote device; the
   notification says "Playing on <device>". The stored session
   (§9.4) follows the mirrored session, so when that device leaves and nothing is active, Play
   on the phone continues what it played (Spotify resumes the account's last session).
@@ -1112,15 +1113,26 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   and the phone mirrored the pause). Nothing else on the phone takes part: remote playback
   requests no audio focus (it is abandoned), starts no AudioTrack (only the local player starts
   the sink), holds no wake or Wi-Fi lock and registers no noisy receiver. So while another
-  device plays or loads (`playsElsewhere`), `SpotifyPlayer` reports its playback as suppressed
+  device plays or loads (`playsElsewhere`) and a Bluetooth audio output is connected
+  (`readsPaused`), `SpotifyPlayer` reports its playback as suppressed
   (`PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS`): `playWhenReady` stays (Media3's
   media foreground, notification and lifecycle as before) and the platform state reads PAUSED
   (Media3 maps a suppressed READY or BUFFERING to paused, `Util.shouldShowPlayButton` with
   `showPlayButtonIfPlaybackIsSuppressed` at its default), which Bluetooth passes on. Local
-  playback is never suppressed. What follows from the paused platform state:
-  * The surfaces drawn from it (SysUI's notification and lock-screen controls from API 33,
-    Auto, Wear, a headset's play key) show play while the device plays. Their play is then a
-    toggle and pauses it (`playMeansPause`, in `handleSetPlayWhenReady`), except a voice
+  playback is never suppressed.
+  * The Bluetooth output: `OutputRouteManager.bluetoothOutput`, from the `AudioDeviceCallback`
+    of §9.5 (outputs of type A2DP, LE Audio headset or speaker, or a broadcast sink:
+    `isBluetoothMediaOutput`; AudioManager lists the A2DP active device, the one AVRCP reports
+    the real state to). Without one no headset or car reads the session, so it reads PLAYING
+    as before: pause shown, a moving position, the volume keys on the media session itself.
+    Not watched (the engine starting or stopping: null) counts as connected, the safe side. A
+    change while the device plays is one state change of the session (one notification
+    update); the volume key session follows what the session then publishes (a player
+    listener), so the keys move between the two sessions in that same step.
+  * What follows from the paused state: the surfaces drawn from it (SysUI's notification and
+    lock-screen controls from API 33, Auto, Wear, a headset's play key) show play while the
+    device plays. Their play is then a toggle and pauses it (`playMeansPause`, in
+    `handleSetPlayWhenReady`: only while the published state is suppressed), except a voice
     assistant's (Google app, Assistant, car assistant, Gemini), an explicit "play" or "resume".
     Media3 controllers send that play although `playWhenReady` is set (they do for a transient
     focus suppression), and a play/pause key toggles on `playWhenReady`, so pauses. Bluetooth
@@ -1129,8 +1141,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     advance while suppressed (speed 0; each update moves it), and the notification shows no
     chronometer.
   * Volume keys go to a session in an active state that handles them
-    (`MediaSessionStack.getDefaultVolumeSession`), which a paused one is not. Meanwhile
-    `RemoteVolumeKeys` keeps a hidden platform `MediaSession` active: remote volume
+    (`MediaSessionStack.getDefaultVolumeSession`), which a paused one is not. While the session
+    reads paused, `RemoteVolumeKeys` keeps a hidden platform `MediaSession` active: remote volume
     (`VolumeProvider`, absolute 0..100, following the device's volume) → `setDeviceVolume` or a
     step; state CONNECTING (active for the volume keys, STOPPED for AVRCP, no notification);
     the title and artist; transport controls forwarded to the player (play with the same
@@ -1139,8 +1151,12 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     reach the media session (`findMediaButtonSession` prefers the app's session whose state
     matches its audio activity, and nothing plays here).
   * `onTaskRemoved`: Media3 keeps its foreground service only while a session `isPlaying`,
-    which a suppressed one is not; the service applies that rule with "plays elsewhere", so
-    swiping the app away keeps mirroring instead of pausing the device.
+    which a suppressed one is not; the service applies that rule with "plays elsewhere" (with
+    or without a Bluetooth output), so swiping the app away keeps mirroring instead of pausing
+    the device.
+  * Left open: when a Bluetooth output becomes active while the device plays, the session reads
+    playing until the app hears of it (the device callback, then one state update), so a headset
+    asking for the play status in that moment may still see playing.
   * Where the platform ties the media foreground to an engaged session
     (`enableNotifyingActivityManagerWithMediaSessionStatusChange`: an inactive state for 10 min
     → `notifyInactiveMediaForegroundService`), the service may leave the foreground after 10 min
@@ -1366,7 +1382,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   speaker, wired headset/headphones, BT A2DP / BLE headset/speaker / hearing aid, USB,
   HDMI, line out, dock), tracks the current route via `AudioTrack.getRoutedDevice()` +
   `OnRoutingChangedListener`, and listens with `AudioDeviceCallback` (registered only
-  while the engine runs).
+  while the engine runs). `bluetoothOutput` says whether a Bluetooth media output (A2DP, LE
+  Audio, broadcast) is connected (null while not watched), for remote playback (§9.4).
 * User selection → `AudioSinkBridge.setPreferredDevice(AudioDeviceInfo?)` (`null` =
   system default; best effort — verify with `routedDevice()`). A pick is temporary, like the
   system switcher's (`OutputPick`): it lasts until that device goes away, a new external output
@@ -1397,9 +1414,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `Settings.System` + `VOLUME_CHANGED_ACTION`, registered only while the engine runs) and
   sends `player.setVolume {fromSystem:true}`.
 * Remote active device: MediaSession `DeviceInfo(REMOTE, 0..100)`; `handleSetDeviceVolume`
-  / increase / decrease → `player.setVolume`. While the device plays, the hardware volume keys
-  reach it through `RemoteVolumeKeys` (§9.4, Remote playback and Bluetooth), since the media
-  session then reads paused. In-app slider in the device sheet.
+  / increase / decrease → `player.setVolume`. While the device plays with a Bluetooth output
+  connected, the hardware volume keys reach it through `RemoteVolumeKeys` (§9.4, Remote playback
+  and Bluetooth), since the media session then reads paused. In-app slider in the device sheet.
 
 ### 9.7 Downloads
 
