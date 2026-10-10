@@ -1733,6 +1733,25 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
   Add-to-playlist sheet, Create playlist dialog, Settings, Profile.
 * Mini player above the navigation bar (swipe/tap to expand, progress line, play/pause,
   device indicator).
+* Swipe to queue (`ui/components/SwipeToQueue.kt`, built into `TrackRow` and `EpisodeRow`): in
+  every vertical list of tracks or episodes, including search results, artist top tracks, album
+  tracks, playlists and Liked Songs (window rows too once loaded), Downloads, a show's episodes
+  and Your Episodes. Swiping a row start→end (mirrored right to left) slides it with the finger
+  over a green background with the queue icon on the leading side. Past the threshold (28 % of
+  the row's width or 96 dp, whichever is smaller) the icon pops, the green deepens and a soft
+  haptic tick plays; coming back below it reverts. Letting go there adds the item through the
+  row menu's "Add to queue" (`MediaActionRunner.addToQueue`: "Added to queue", a full queue,
+  offline and unavailable items alike) and springs the row back; the row is never dismissed.
+  Short of the threshold it only springs back. A fling counts when it is faster than 800 dp/s,
+  has moved a quarter of the threshold, and its distance projected 150 ms ahead reaches the
+  threshold. The swipe locks after the touch slop only to a mostly horizontal start→end move: a
+  vertical one scrolls the list, an end→start one is left alone, and a press held for a long
+  press keeps its long press. Taps, long presses and the fast scroller's thumb work as before,
+  and the system's back gesture is not excluded. The swipe is not offered on the Queue screen,
+  in a playlist's edit mode, in the add-songs picker, on placeholders, or on rows that can't
+  start (unavailable, or not downloaded while offline). TalkBack gets an "Add to queue" custom
+  action on the row. The offset is read in layer and draw blocks only, so a swipe recomposes
+  neither the row nor the list.
 * Fast scroller (`ui/components/FastScroller.kt`) on long lists: playlists and Liked Songs, the
   Downloads page, the library list, Your Episodes, a show's episodes and (long) albums. A slim
   track and a pill thumb on the right edge, between the top bar and the mini player / navigation
