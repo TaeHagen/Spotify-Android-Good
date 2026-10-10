@@ -5,8 +5,11 @@
 //! ([`observe_audio_keys`]); the player's requests never wait for it. The budget is measured on
 //! the boot-time clock ([`super::clock`]: it counts suspend, like Kotlin's wall-clock pauses), and
 //! a snapshot of it is kept in `<noBackupDir>/key_budget.json` (written after each answer, read
-//! once when the process first needs it, deleted with the account), so a restarted process does
-//! not burst again into the keys a killed one spent. A download's request:
+//! once the process first uses the budget with the account known, deleted with the account), so a
+//! restarted process does not burst again into the keys a killed one spent. A budget built before
+//! the account is known (a process started in the background, before its session) is never
+//! stored, and is replaced by the snapshot at the first use that knows the account
+//! ([`OwnedBudget`]). A download's request:
 //! * waits for its turn inline when that comes within [`INLINE_WAIT`] (spacing, the player's
 //!   quiet period, a refill about to complete); a longer wait returns at once with
 //!   `RATE_LIMITED`, `retryAfterMs` and `context` `keyPacing` (the app's own pacing) or
@@ -51,8 +54,9 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The budget's snapshot, in the no-backup directory.
 const BUDGET_FILE: &str = "key_budget.json";
 
-/// The process's key budget (all requests, the player's included), restored from its snapshot.
-static BUDGET: LazyLock<Mutex<KeyBudget>> = LazyLock::new(|| Mutex::new(load()));
+/// The process's key budget (all requests, the player's included), restored from its snapshot once
+/// the account is known ([`own`]).
+static BUDGET: LazyLock<OwnedBudget> = LazyLock::new(|| OwnedBudget::new(clock::now()));
 /// One download key request at a time.
 static KEY_SLOT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 
@@ -60,11 +64,13 @@ struct BudgetObserver;
 
 impl KeyObserver for BudgetObserver {
     fn requested(&self, requester: KeyRequester) {
-        BUDGET.lock().requested(requester, clock::now());
+        own(true);
+        BUDGET.budget.lock().requested(requester, clock::now());
     }
 
     fn answered(&self, requester: KeyRequester, answer: KeyAnswer) {
-        BUDGET.lock().answered(requester, answer, clock::now());
+        own(true);
+        BUDGET.budget.lock().answered(requester, answer, clock::now());
         persist();
     }
 }
@@ -88,23 +94,97 @@ pub fn forget_account() {
             }
         }
     }
-    *BUDGET.lock() = KeyBudget::new(clock::now());
+    // Built before the next account is known: restored (or new) for it at its first use.
+    BUDGET.reset(clock::now());
 }
 
 /// Whether a download's `file` was refused within the day (relinking skips it).
 pub fn was_refused(file: FileId) -> bool {
-    BUDGET.lock().was_refused(file.0, clock::now())
+    own(false);
+    BUDGET.budget.lock().was_refused(file.0, clock::now())
 }
 
-/// How long until downloads may take `keys` keys in a row ([`KeyBudget::keys_ready_at`]).
-pub fn keys_ready_in(keys: u32) -> Duration {
+/// How long until downloads may take `keys` keys in a row ([`KeyBudget::keys_ready_at`]); None
+/// while the account is not known (no session yet: the budget would be a guess, its snapshot is
+/// the account's).
+pub fn keys_ready_in(keys: u32) -> Option<Duration> {
+    if !own(false) {
+        return None;
+    }
     let now = clock::now();
-    BUDGET.lock().keys_ready_at(now, keys).since(now)
+    Some(BUDGET.budget.lock().keys_ready_at(now, keys).since(now))
 }
 
 /// How long the player should wait before it asks for a key again after a throttle.
 pub fn playback_retry_after() -> Duration {
-    BUDGET.lock().playback_retry_after(clock::now())
+    own(false);
+    BUDGET.budget.lock().playback_retry_after(clock::now())
+}
+
+/// Whose the budget is: the account it was restored (or built) for, None while built before the
+/// account was known; and whether a request or answer changed it since.
+#[derive(Debug, Default)]
+struct Owner {
+    account: Option<String>,
+    touched: bool,
+}
+
+/// A key budget tied to the account it belongs to. The snapshot is the account's: a budget built
+/// before the account was known (a `download.keyBatch` of a process started in the background,
+/// before its session) is replaced by the account's snapshot at the first use that knows the
+/// account, unless a request or answer changed it already; and it is never stored.
+pub struct OwnedBudget {
+    budget: Mutex<KeyBudget>,
+    owner: Mutex<Owner>,
+}
+
+impl OwnedBudget {
+    pub fn new(now: Stamp) -> Self {
+        Self { budget: Mutex::new(KeyBudget::new(now)), owner: Mutex::new(Owner::default()) }
+    }
+
+    /// Before a use by `account` (None: not known yet) at `now` (`now_wall` on the wall clock);
+    /// `touch`: a request or answer follows. `load` reads the snapshot. True when the account is known.
+    fn own(&self, account: Option<&str>, touch: bool, now: Stamp, now_wall: i64, load: impl FnOnce() -> Option<Snapshot>) -> bool {
+        let mut owner = self.owner.lock();
+        if let Some(account) = account {
+            if owner.account.is_none() && !owner.touched {
+                if let Some(snap) = load() {
+                    let restored = KeyBudget::restore(&snap, now, now_wall, account);
+                    log::info!("key budget restored: {restored:?}");
+                    *self.budget.lock() = restored;
+                }
+                owner.account = Some(account.to_owned());
+            }
+        }
+        owner.touched |= touch;
+        account.is_some()
+    }
+
+    /// The snapshot to store for `account` (None: not known) now: none for a budget built before
+    /// the account was known, or for another account.
+    fn store(&self, account: Option<&str>, now: Stamp, now_wall: i64) -> Option<Snapshot> {
+        let owner = self.owner.lock();
+        let account = account?;
+        if owner.account.as_deref() != Some(account) {
+            return None;
+        }
+        Some(self.budget.lock().snapshot(now, now_wall, account))
+    }
+
+    /// A new budget, for whichever account is known next.
+    fn reset(&self, now: Stamp) {
+        let mut owner = self.owner.lock();
+        *owner = Owner::default();
+        *self.budget.lock() = KeyBudget::new(now);
+    }
+}
+
+/// Makes the process's budget the logged-in account's ([`OwnedBudget::own`]); true when the
+/// account is known.
+fn own(touch: bool) -> bool {
+    let account = account();
+    BUDGET.own(account.as_deref(), touch, clock::now(), clock::wall_ms(), read_snapshot)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -120,20 +200,10 @@ fn account() -> Option<String> {
     engine::username().map(|user| hex::encode(&Sha1::digest(user.as_bytes())[..8]))
 }
 
-/// The budget as the snapshot left it (a full bucket without one, or for another account).
-fn load() -> KeyBudget {
-    let now = clock::now();
-    let (Some(path), Some(account)) = (budget_file(), account()) else {
-        return KeyBudget::new(now);
-    };
-    match std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Snapshot>(&bytes).ok()) {
-        Some(snap) => {
-            let budget = KeyBudget::restore(&snap, now, clock::wall_ms(), &account);
-            log::info!("key budget restored: {budget:?}");
-            budget
-        }
-        None => KeyBudget::new(now),
-    }
+/// The stored snapshot, if any (whichever account it names: [`KeyBudget::restore`] checks).
+fn read_snapshot() -> Option<Snapshot> {
+    let path = budget_file()?;
+    std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Snapshot>(&bytes).ok())
 }
 
 static PERSIST_DIRTY: AtomicBool = AtomicBool::new(false);
@@ -162,8 +232,8 @@ fn persist() {
 }
 
 fn write_snapshot(path: &Path) {
-    let Some(account) = account() else { return };
-    let snap = BUDGET.lock().snapshot(clock::now(), clock::wall_ms(), &account);
+    // Never a budget built before the account was known: it would overwrite the account's.
+    let Some(snap) = BUDGET.store(account().as_deref(), clock::now(), clock::wall_ms()) else { return };
     let Ok(json) = serde_json::to_vec(&snap) else { return };
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, path)) {
@@ -247,7 +317,8 @@ pub fn turn_error(budget: &Mutex<KeyBudget>, clock: &(dyn Fn() -> Stamp + Sync))
 /// Before a download's metadata requests: fails with the wait when the key's turn is more than
 /// [`INLINE_WAIT`] away (a queue that woke during a cool-down returns without any request).
 pub fn check_turn() -> AppResult<()> {
-    turn_error(&BUDGET, &clock::now).map_or(Ok(()), Err)
+    own(false);
+    turn_error(&BUDGET.budget, &clock::now).map_or(Ok(()), Err)
 }
 
 /// Waits for the downloads' turn in `budget` (inline up to [`INLINE_WAIT`] at a time).
@@ -340,8 +411,9 @@ pub async fn request_key(session: &Session, item: SpotifyId, file: FileId, group
         return Ok(key);
     }
     let _slot = KEY_SLOT.acquire().await.map_err(|_| AppError::internal("key semaphore closed"))?;
+    own(false);
     request_with(
-        &BUDGET,
+        &BUDGET.budget,
         &clock::now,
         file.0,
         group,
@@ -561,6 +633,57 @@ mod tests {
         assert_eq!(refuse(&p, 4, 4).await.code, ErrorCode::Unavailable);
         assert_eq!(refuse(&p, 5, 5).await.code, ErrorCode::Unavailable);
         assert_eq!(refuse(&p, 6, 6).await.code, ErrorCode::Unavailable);
+    }
+
+    const WALL: i64 = 1_800_000_000_000;
+
+    /// A snapshot of account "a" taken at `WALL`, in the cool-down of a throttle (level 1).
+    fn cooling_snapshot() -> Snapshot {
+        let mut b = KeyBudget::new(Stamp::ZERO);
+        b.requested(KeyRequester::Download, Stamp::ZERO);
+        b.answered(KeyRequester::Download, KeyAnswer::Refused(AES_KEY_ERROR_TRANSIENT), Stamp::ZERO);
+        b.snapshot(Stamp::ZERO, WALL, "a")
+    }
+
+    #[test]
+    fn a_budget_used_before_login_is_restored_once_the_account_is_known() {
+        let snap = cooling_snapshot();
+        let now = Stamp::ZERO + Duration::from_secs(60);
+        let wall = WALL + 60_000;
+        let owned = OwnedBudget::new(now);
+        // download.keyBatch in a process started in the background, before its session.
+        assert!(!owned.own(None, false, now, wall, || panic!("no snapshot read without an account")));
+        assert!(!owned.budget.lock().throttled(now), "a fresh guess meanwhile");
+        assert!(owned.store(None, now, wall).is_none(), "never stored for nobody");
+        // The session comes online: the account's snapshot (its cool-down) is restored.
+        assert!(owned.own(Some("a"), false, now, wall, || Some(snap.clone())));
+        assert!(owned.budget.lock().throttled(now));
+        // Once: later uses don't read it again, and what is stored is the restored budget.
+        assert!(owned.own(Some("a"), true, now, wall, || panic!("read again")));
+        assert_eq!(owned.store(Some("a"), now, wall).map(|s| s.level), Some(1));
+    }
+
+    #[test]
+    fn a_budget_built_before_login_never_overwrites_the_snapshot() {
+        let now = Stamp::ZERO;
+        // A request answered before the account was known changed the budget: not replaced ...
+        let owned = OwnedBudget::new(now);
+        owned.own(None, true, now, WALL, || None);
+        owned.budget.lock().requested(KeyRequester::Playback, now);
+        owned.own(Some("a"), false, now, WALL, || panic!("not restored over the requests it saw"));
+        // ... and never stored: the account's snapshot stays as it was.
+        assert!(owned.store(Some("a"), now, WALL).is_none());
+        // A budget restored for another account isn't stored for this one.
+        let other = OwnedBudget::new(now);
+        other.own(Some("b"), false, now, WALL, || None);
+        assert!(other.store(Some("a"), now, WALL).is_none());
+        assert!(other.store(Some("b"), now, WALL).is_some());
+        // After a logout the next account gets its own, restored at its first use.
+        other.reset(now);
+        assert!(other.store(Some("b"), now, WALL).is_none());
+        other.own(Some("a"), false, now, WALL + 60_000, || Some(cooling_snapshot()));
+        assert!(other.budget.lock().throttled(now));
+        assert!(other.store(Some("a"), now, WALL + 60_000).is_some());
     }
 
     #[tokio::test(start_paused = true)]
