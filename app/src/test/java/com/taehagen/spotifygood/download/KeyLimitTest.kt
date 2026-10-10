@@ -5,6 +5,7 @@ import com.taehagen.spotifygood.download.DownloadRules.FailureAction
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -47,9 +48,71 @@ class KeyLimitTest {
     }
 
     @Test
-    fun aRefusedSongFailsAloneAndAnAccountRefusalStopsTheRun() {
+    fun aRefusedSongFailsAloneAndAnAccountRefusalKeepsTheRestQueued() {
         assertEquals(FailureAction.Fail(1), DownloadRules.onFailure(NativeErrorCode.UNAVAILABLE, 0, online = true, null, DownloadRules.KEY_REFUSED))
-        assertEquals(FailureAction.StopRun, DownloadRules.onFailure(NativeErrorCode.PLAYBACK_REFUSED, 0, online = true))
+        // The engine's account judgement stops the run without failing what was not tried.
+        assertEquals(FailureAction.AccountRefused, DownloadRules.onFailure(NativeErrorCode.PLAYBACK_REFUSED, 0, online = true))
+        assertEquals(FailureAction.AccountRefused, DownloadRules.onFailure(NativeErrorCode.PLAYBACK_REFUSED, 2, online = false))
+    }
+
+    @Test
+    fun retryQueuesRefusedSongsAfterTheOthers() {
+        val refusedSong = "Spotify refused to provide this song's audio."
+        val rows = listOf(
+            RetryRow("spotify:track:gated1", DownloadState.FAILED, refusedSong),
+            RetryRow("spotify:track:gated2", DownloadState.FAILED, refusedSong),
+            RetryRow("spotify:track:net", DownloadState.FAILED, "Network error. Will retry."),
+            RetryRow("spotify:track:cancelled", DownloadState.CANCELLED, null),
+        )
+        val uris = listOf("spotify:track:gated1", "spotify:track:net", "spotify:track:cancelled")
+        // gated2 is not retried here (not in uris): only what is requeued is split.
+        assertEquals(setOf("spotify:track:gated1"), DownloadRules.keepsAttempts(uris, rows, refusedSong))
+    }
+
+    @Test
+    fun theEnginesKeyCoolDownIsFollowedInFullUpToAnHour() {
+        // Level 4: a 30 min cool-down plus the refill after it, longer than the queue's own cap.
+        val engine = 50 * 60_000L
+        assertEquals(engine, QueueBreaker().onFailure(rateLimited, true, engine, DownloadRules.KEY_THROTTLED))
+        assertEquals(DownloadRules.MAX_KEY_PAUSE_MS, QueueBreaker().onFailure(rateLimited, true, 5 * 3_600_000L, DownloadRules.KEY_THROTTLED))
+        // A CDN 429 keeps the queue's cap.
+        assertEquals(DownloadRules.MAX_QUEUE_PAUSE_MS, QueueBreaker().onFailure(rateLimited, true, engine))
+    }
+
+    @Test
+    fun aLongPauseEndsTheRunUntilItEnds() {
+        val now = 1_000_000L
+        assertEquals(DownloadRules.IdleStep.Finish, DownloadRules.idleStep(null, now))
+        assertEquals(DownloadRules.IdleStep.Wait(90_000L), DownloadRules.idleStep(now + 90_000L, now))
+        assertEquals(DownloadRules.IdleStep.Wait(DownloadRules.MAX_INLINE_WAIT_MS), DownloadRules.idleStep(now + DownloadRules.MAX_INLINE_WAIT_MS, now))
+        assertEquals(DownloadRules.IdleStep.Wait(DownloadRules.MIN_WAIT_MS), DownloadRules.idleStep(now - 5_000L, now))
+        // A key cool-down (10 min): the run ends PAUSED, the resume comes at retryAt.
+        assertEquals(DownloadRules.IdleStep.Pause, DownloadRules.idleStep(now + 10 * 60_000L, now))
+        assertEquals(10 * 60_000L, DownloadRules.resumeDelayMs(now + 10 * 60_000L, now))
+        assertEquals(0L, DownloadRules.resumeDelayMs(now - 1L, now))
+        assertEquals(DownloadRules.MAX_KEY_PAUSE_MS, DownloadRules.resumeDelayMs(now + 24 * 3_600_000L, now))
+    }
+
+    @Test
+    fun aPauseIsResumedWithoutSpendingTheWorkersRetries() {
+        val step = { outcome: RunOutcome, attempts: Int -> DownloadRules.workerStep(outcome, attempts, maxRetries = 8) }
+        // However many times the queue paused: one resume at its time, never the backoff, never the cap.
+        listOf(0, 7, 8, 50).forEach { assertEquals(DownloadRules.WorkerStep.RESUME, step(RunOutcome.PAUSED, it)) }
+        // Failing to make progress (no network, not online) keeps the bounded system backoff.
+        assertEquals(DownloadRules.WorkerStep.RETRY, step(RunOutcome.RESCHEDULE, 7))
+        assertEquals(DownloadRules.WorkerStep.SUCCESS, step(RunOutcome.RESCHEDULE, 8))
+        assertEquals(DownloadRules.WorkerStep.SUCCESS, step(RunOutcome.FINISHED, 0))
+        assertEquals(DownloadRules.WorkerStep.SUCCESS, step(RunOutcome.STOPPED, 0))
+    }
+
+    @Test
+    fun aUserActionStartsAWaitingResumeAtOnce() {
+        // The delayed resume waits (fresh request: no run attempts) ...
+        assertTrue(DownloadRules.replaceWork(replace = false, kick = true, enqueued = true, stale = false, runAttempts = 0, resume = true))
+        // ... but other scheduling (a sync adding songs) leaves it to its time.
+        assertFalse(DownloadRules.replaceWork(replace = false, kick = false, enqueued = true, stale = false, runAttempts = 0, resume = true))
+        // A resume already running is never replaced.
+        assertFalse(DownloadRules.replaceWork(replace = false, kick = true, enqueued = false, stale = false, runAttempts = 0, resume = true))
     }
 
     @Test

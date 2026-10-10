@@ -46,8 +46,12 @@ class DownloadsLogicTest {
         // After a throttle the run was handed back to the system: still said while nothing runs.
         val limited = DownloadActivity(running = false, pause = DownloadPause(DownloadPause.Reason.LIMITED, now + 10 * 60_000L))
         assertEquals(DownloadPauseNotice(DownloadPause.Reason.LIMITED, 10), downloadPauseNotice(limited, pendingCount = 40, now = now))
-        // The pause is over but the system has not run the queue yet: "continuing shortly".
-        assertEquals(0, downloadPauseNotice(limited, pendingCount = 40, now = now + 11 * 60_000L)?.minutes)
+        // The pause is over but the resume has not run the queue yet: "continuing shortly" ...
+        assertEquals(0, downloadPauseNotice(limited, pendingCount = 40, now = now + 10 * 60_000L + 30_000L)?.minutes)
+        // ... for a minute: a resume that waits for its network doesn't keep the promise up.
+        assertNull(downloadPauseNotice(limited, pendingCount = 40, now = now + 10 * 60_000L + PAUSE_NOTICE_GRACE_MS + 1))
+        // While a run waits inline the pause is shown as long as it lasts.
+        assertEquals(0, downloadPauseNotice(limited.copy(running = true), pendingCount = 40, now = now + 20 * 60_000L)?.minutes)
         // Nothing waits, or nothing is paused: no note (not a failure either).
         assertNull(downloadPauseNotice(limited, pendingCount = 0, now = now))
         assertNull(downloadPauseNotice(DownloadActivity(running = true), pendingCount = 40, now = now))

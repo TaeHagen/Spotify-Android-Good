@@ -19,6 +19,8 @@ import kotlinx.coroutines.isActive
  * start is refused, it continues as ordinary work within the job window. When WorkManager stops
  * the worker (constraints lost, Android 15 dataSync `onTimeout` after 6 h, quota) the coroutine is
  * cancelled, the runner requeues its item (partial files are kept) and WorkManager reschedules.
+ * A run that ends because the whole queue waits until a known time ([RunOutcome.PAUSED]: Spotify's
+ * key limit, a rate limit) schedules one delayed request for then and succeeds.
  */
 class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     private val manager: DownloadManager get() = (applicationContext as App).graph.downloads
@@ -50,10 +52,15 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
             Log.e(TAG, "Download run failed", e)
             RunOutcome.RESCHEDULE
         }
-        return when (outcome) {
-            RunOutcome.FINISHED, RunOutcome.STOPPED -> Result.success()
-            // Bounded: afterwards the queue waits for the next enqueue / app start / daily sync.
-            RunOutcome.RESCHEDULE -> if (runAttemptCount < MAX_RETRIES) Result.retry() else Result.success()
+        // Bounded retries: afterwards the queue waits for the next enqueue / app start / daily sync.
+        // A pause until a known time is resumed then, by a new request (no backoff, no retry spent).
+        return when (DownloadRules.workerStep(outcome, runAttemptCount, MAX_RETRIES)) {
+            DownloadRules.WorkerStep.SUCCESS -> Result.success()
+            DownloadRules.WorkerStep.RETRY -> Result.retry()
+            DownloadRules.WorkerStep.RESUME -> {
+                manager.scheduleResume()
+                Result.success()
+            }
         }
     }
 

@@ -65,6 +65,9 @@ class DownloadJobService : JobService() {
                 Log.e(TAG, "Download run failed", e)
                 RunOutcome.RESCHEDULE
             }
+            // A queue paused until a known time resumes then through WorkManager (a user-initiated
+            // job can't be delayed, nor scheduled from the background), not on the job's backoff.
+            if (outcome == RunOutcome.PAUSED) manager.scheduleResume()
             manager.jobExecuting = false
             if (!stopped) jobFinished(params, outcome == RunOutcome.RESCHEDULE)
         }

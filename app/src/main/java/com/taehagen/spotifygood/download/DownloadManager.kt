@@ -665,8 +665,12 @@ class DownloadManager(
     private suspend fun retryFailedNow() {
         mutex.withLock {
             val unavailable = collectionDao.unavailableUrisJsons().flatMapTo(HashSet()) { decodeItems(it) }
-            val uris = DownloadRules.retryable(dao.retryRows(), unavailable, appContext.getString(R.string.data_dl_error_unplayable))
-            uris.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+            val rows = dao.retryRows()
+            val uris = DownloadRules.retryable(rows, unavailable, appContext.getString(R.string.data_dl_error_unplayable))
+            // Songs Spotify refused queue after the others (see DownloadRules.keepsAttempts).
+            val keep = DownloadRules.keepsAttempts(uris, rows, appContext.getString(R.string.data_dl_error_refused_item))
+            uris.filter { it !in keep }.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+            keep.toList().chunked(SQL_CHUNK).forEach { dao.requeueFailedKeepingAttempts(it) }
         }
         // Downloads on an SD card that is no longer used count as failed: downloaded again.
         if (missingCard.value.stranded.isNotEmpty()) downloadItemsNow(missingCard.value.stranded.toList())
@@ -2012,15 +2016,51 @@ class DownloadManager(
         }
     }
 
+    /**
+     * The run ended because the whole queue waits until the earliest `retryAt` ([RunOutcome.PAUSED]:
+     * Spotify's audio-key pacing or cool-down, a rate limit, a connectivity pause): one delayed
+     * WorkManager request wakes the queue then. Called by the host before it finishes. No backoff and
+     * a fresh request, so a pause never counts against the worker's retries; WorkManager because a
+     * user-initiated job can neither be delayed nor scheduled from the background. A user action,
+     * coming back to the app or coming online may start the queue earlier ([DownloadRules.replaceWork]
+     * replaces the waiting resume); removals that empty the queue cancel it.
+     */
+    internal suspend fun scheduleResume(): Unit = withContext(Dispatchers.IO) {
+        try {
+            val retryAt = dao.earliestRetryAt() ?: return@withContext
+            if (dao.pendingCount() == 0 || storage.target.value is DownloadStorage.Target.Missing) return@withContext
+            val current = settings.awaitLoaded()
+            if (current.offlineMode) return@withContext
+            val delayMs = DownloadRules.resumeDelayMs(retryAt, System.currentTimeMillis())
+            val request = OneTimeWorkRequestBuilder<DownloadWorker>()
+                .setConstraints(workConstraints(current.downloadOverCellular, needsInternalStorage()))
+                .setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, WORK_BACKOFF_S, TimeUnit.SECONDS)
+                .addTag(RESUME_TAG)
+                .build()
+            val workManager = WorkManager.getInstance(appContext)
+            // The worker that asks is still running: replacing it would cancel it. The resume is
+            // appended instead and starts its delay when the worker succeeds a moment later.
+            val running = workManager.getWorkInfosForUniqueWork(WORK_NAME).get().any { it.state == WorkInfo.State.RUNNING }
+            workManager.enqueueUniqueWork(WORK_NAME, if (running) ExistingWorkPolicy.APPEND_OR_REPLACE else ExistingWorkPolicy.REPLACE, request)
+            Log.i(TAG, "The download queue resumes in $delayMs ms")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Scheduling the download resume failed", e)
+        }
+    }
+
+    private fun workConstraints(cellular: Boolean, storageNotLow: Boolean): Constraints = Constraints.Builder()
+        .setRequiredNetworkType(if (cellular) NetworkType.CONNECTED else NetworkType.UNMETERED)
+        .setRequiresStorageNotLow(storageNotLow)
+        .build()
+
     /** Blocking (reads the pending work): call off the main thread. See [scheduleExecution]. */
     private fun enqueueWorker(cellular: Boolean, storageNotLow: Boolean, replace: Boolean, kick: Boolean) {
         val network = if (cellular) NetworkType.CONNECTED else NetworkType.UNMETERED
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(network)
-            .setRequiresStorageNotLow(storageNotLow)
-            .build()
         val request = OneTimeWorkRequestBuilder<DownloadWorker>()
-            .setConstraints(constraints)
+            .setConstraints(workConstraints(cellular, storageNotLow))
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, WORK_BACKOFF_S, TimeUnit.SECONDS)
             .build()
         val workManager = WorkManager.getInstance(appContext)
@@ -2037,6 +2077,7 @@ class DownloadManager(
             stale = existing != null &&
                 (existing.constraints.requiredNetworkType != network || existing.constraints.requiresStorageNotLow() != storageNotLow),
             runAttempts = existing?.runAttemptCount ?: 0,
+            resume = existing?.tags?.contains(RESUME_TAG) == true,
         )
         workManager.enqueueUniqueWork(WORK_NAME, if (recreate) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP, request)
     }
@@ -2078,6 +2119,9 @@ class DownloadManager(
     internal companion object {
         private const val TAG = "DownloadManager"
         const val WORK_NAME = "downloads"
+
+        /** Tag of the delayed request that resumes a paused queue ([scheduleResume]). */
+        const val RESUME_TAG = "downloads-resume"
         const val SYNC_WORK_NAME = "download-sync"
         const val JOB_ID = 0x5D0D
         private const val EMPTY_ITEMS = "[]"

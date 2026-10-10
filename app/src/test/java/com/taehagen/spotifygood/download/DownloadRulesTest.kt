@@ -32,7 +32,7 @@ class DownloadRulesTest {
 
     @Test
     fun accountWideErrorsStopTheRun() {
-        listOf(NativeErrorCode.PREMIUM_REQUIRED, NativeErrorCode.PLAYBACK_REFUSED, NativeErrorCode.BAD_CREDENTIALS).forEach {
+        listOf(NativeErrorCode.PREMIUM_REQUIRED, NativeErrorCode.BAD_CREDENTIALS, NativeErrorCode.NOT_LOGGED_IN).forEach {
             assertEquals(FailureAction.StopRun, DownloadRules.onFailure(it, previousAttempts = 0, online = true))
         }
     }
