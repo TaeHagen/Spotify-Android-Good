@@ -85,10 +85,28 @@ internal class VolumeThrottle(scope: CoroutineScope, private val intervalMs: Lon
 }
 
 /**
+ * The commands the mini player and Now Playing send. [PlayerViewModel] in the app; the surfaces
+ * take them separately from their state so they also render from plain state (screenshot tests).
+ */
+internal interface PlayerCommands {
+    fun togglePlayPause()
+    fun next()
+    fun previous()
+    fun seekTo(positionMs: Long)
+    fun seekBy(deltaMs: Long)
+    fun cycleShuffle()
+    fun cycleRepeat()
+    fun setVolume(volume: Int)
+    fun startRadio(uri: String)
+    fun setPodcastSpeed(speed: Float)
+    fun toggleLike()
+}
+
+/**
  * Shared state and commands of the player surfaces (mini player, now playing, queue, lyrics, sleep
  * timer). Position updates are exposed as cold tickers that only run while a visible UI collects them.
  */
-internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
+internal class PlayerViewModel(graph: AppGraph) : ViewModel(), PlayerCommands {
     private val playback = graph.playback
     private val player = graph.player
     private val library = graph.library
@@ -236,7 +254,7 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
     /** The speed episodes play at here: the chosen one, or the highest the audio output takes below it. */
     val podcastSpeedInEffect: StateFlow<Float> = speedControl.inEffect
 
-    fun setPodcastSpeed(speed: Float) = speedControl.set(speed)
+    override fun setPodcastSpeed(speed: Float) = speedControl.set(speed)
 
     // ----------------------------------------------------------------------------------------- lyrics
 
@@ -318,7 +336,7 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
 
     // --------------------------------------------------------------------------------------- commands
 
-    fun togglePlayPause() {
+    override fun togglePlayPause() {
         if (shownPlaceholder() != null) resumeLastSession() else player.togglePlayPause()
     }
 
@@ -344,9 +362,9 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
         // After the watcher subscribed (immediate dispatcher), so a fast failure is not missed.
         player.resume()
     }
-    fun next() = player.next()
-    fun previous() = player.previous()
-    fun seekTo(positionMs: Long) {
+    override fun next() = player.next()
+    override fun previous() = player.previous()
+    override fun seekTo(positionMs: Long) {
         pendingSeek = null
         if (shownPlaceholder() != null) return // nothing loaded yet (seeking is disabled there)
         player.seekTo(positionMs.coerceAtLeast(0))
@@ -356,7 +374,7 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
     private var pendingSeek: PendingSeek? = null
 
     /** Podcast skip back / forward by [deltaMs] (e.g. ±[SEEK_STEP_MS]). */
-    fun seekBy(deltaMs: Long) {
+    override fun seekBy(deltaMs: Long) {
         val s = playback.snapshot.value
         val uri = s.track?.uri ?: return
         if (!s.restrictions.canSeek) return
@@ -366,13 +384,13 @@ internal class PlayerViewModel(graph: AppGraph) : ViewModel() {
         pendingSeek = PendingSeek(uri, target, now)
         player.seekTo(target)
     }
-    fun cycleShuffle() = player.cycleShuffle()
-    fun cycleRepeat() = player.cycleRepeat()
-    fun setVolume(volume: Int) = volumeThrottle.offer(volume)
-    fun startRadio(uri: String) = player.startRadio(uri)
+    override fun cycleShuffle() = player.cycleShuffle()
+    override fun cycleRepeat() = player.cycleRepeat()
+    override fun setVolume(volume: Int) = volumeThrottle.offer(volume)
+    override fun startRadio(uri: String) = player.startRadio(uri)
 
     /** Heart tap: writes the opposite of what the heart showed for the current item; nothing while unknown. */
-    fun toggleLike() {
+    override fun toggleLike() {
         val uri = snapshot.value.track?.uri ?: return
         val shown = likeState.value.shownFor(uri) ?: return
         viewModelScope.launch {

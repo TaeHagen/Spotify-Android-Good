@@ -1,10 +1,7 @@
 package com.taehagen.spotifygood.ui.screens.player
 
-import android.os.SystemClock
-import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
-import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
@@ -55,28 +52,27 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.collapse
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.heading
@@ -105,14 +101,14 @@ import com.taehagen.spotifygood.model.TrackProvider
 import com.taehagen.spotifygood.playback.PodcastSpeeds
 import com.taehagen.spotifygood.playback.SleepTimerState
 import com.taehagen.spotifygood.ui.appViewModel
-import com.taehagen.spotifygood.ui.components.Artwork
 import com.taehagen.spotifygood.ui.components.EmptyState
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
+/**
+ * Now Playing inside the expanding player (which draws its background and handles back and the
+ * collapse gestures): view model state in, [NowPlayingBody] out.
+ */
 @Composable
 internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modifier) {
     val viewModel = appViewModel { graph -> PlayerViewModel(graph) }
@@ -126,46 +122,11 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
     // Ungated by the preview setting: decides whether the lyrics button can open anything.
     val lyricsState by viewModel.lyrics.collectAsStateWithLifecycle()
     val sleepTimer by viewModel.sleepTimerState.collectAsStateWithLifecycle()
+    val podcastSpeed by viewModel.podcastSpeed.collectAsStateWithLifecycle()
+    val podcastSpeedInEffect by viewModel.podcastSpeedInEffect.collectAsStateWithLifecycle()
     val navigator = LocalAppNavigator.current
     val context = LocalContext.current
     var showSleepTimer by rememberSaveable { mutableStateOf(false) }
-
-    // The scaffold may also collapse on back: only the first request within a short window counts.
-    val currentOnCollapse by rememberUpdatedState(onCollapse)
-    val lastCollapse = remember { longArrayOf(0L) }
-    val collapse: () -> Unit = remember {
-        {
-            val now = SystemClock.uptimeMillis()
-            if (now - lastCollapse[0] > 600) {
-                lastCollapse[0] = now
-                currentOnCollapse()
-            }
-        }
-    }
-
-    // Predictive back: shrink with the gesture, collapse on commit. Only enabled while this screen
-    // really covers the window, so a host that keeps it composed while collapsed keeps back working.
-    val coverage = rememberWindowCoverage()
-    val scope = rememberCoroutineScope()
-    val backProgress = remember { Animatable(0f) }
-    var backCommits by remember { mutableIntStateOf(0) }
-    PredictiveBackHandler(enabled = coverage.coversWindow) { events ->
-        try {
-            events.collect { event -> backProgress.snapTo(event.progress) }
-            collapse()
-            backCommits++
-        } catch (e: CancellationException) {
-            scope.launch { backProgress.animateTo(0f) }
-            throw e
-        }
-    }
-    LaunchedEffect(backCommits) {
-        // Still on screen after a committed back (e.g. the host ignored it): restore the layout.
-        if (backCommits > 0) {
-            delay(700)
-            backProgress.animateTo(0f)
-        }
-    }
 
     LaunchedEffect(viewModel) {
         viewModel.messages.collect { message ->
@@ -180,28 +141,12 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
     val artworkColor = rememberArtworkColor(artwork)
 
     PlayerSurfaceTheme {
-        Box(
-            modifier
-                .fillMaxSize()
-                .then(coverage.modifier)
-                .graphicsLayer {
-                    val p = backProgress.value
-                    val scale = 1f - 0.08f * p
-                    scaleX = scale
-                    scaleY = scale
-                    translationY = p * 48.dp.toPx()
-                    shape = RoundedCornerShape((28 * p).dp)
-                    clip = p > 0f
-                }
-                .drawBehind {
-                    val topColor = artworkColor.value.toned(maxLightness = 0.36f, minLightness = 0.16f)
-                    drawRect(PlayerDefaults.Background)
-                    drawRect(Brush.verticalGradient(0f to topColor, 0.85f to PlayerDefaults.Background))
-                },
-        ) {
+        Box(modifier.fillMaxSize()) {
             if (track == null) {
-                NothingPlaying(onCollapse = collapse)
+                NothingPlaying(onCollapse = onCollapse)
             } else {
+                // One lifecycle-aware ticker feeds the seek bar and the lyrics preview (stops when not visible).
+                val position = viewModel.position.collectAsStateWithLifecycle(initialValue = remember { viewModel.positionNow() })
                 NowPlayingBody(
                     snapshot = snapshot,
                     track = track,
@@ -213,9 +158,12 @@ internal fun NowPlayingContent(onCollapse: () -> Unit, modifier: Modifier = Modi
                     lyricsUnavailable = lyricsState == LyricsState.Unavailable,
                     lyricsFallbackColor = artworkColor,
                     sleepTimer = sleepTimer,
-                    viewModel = viewModel,
+                    position = position,
+                    podcastSpeed = podcastSpeed,
+                    podcastSpeedInEffect = podcastSpeedInEffect,
+                    commands = viewModel,
                     navigator = navigator,
-                    onCollapse = collapse,
+                    onCollapse = onCollapse,
                     onShowSleepTimer = { showSleepTimer = true },
                 )
             }
@@ -241,8 +189,14 @@ private fun NothingPlaying(onCollapse: () -> Unit) {
     }
 }
 
+/**
+ * Now Playing from plain state. Inside the expanding player ([LocalPlayerSheet]) its parts follow
+ * p: the top bar and the details fade in late (riding the surface's top edge and the moving art),
+ * the art slot reports its bounds and shows its own art only at rest. Draws no background (the
+ * player surface does).
+ */
 @Composable
-private fun NowPlayingBody(
+internal fun NowPlayingBody(
     snapshot: PlaybackSnapshot,
     track: PlaybackTrack,
     artwork: String?,
@@ -253,11 +207,16 @@ private fun NowPlayingBody(
     lyricsUnavailable: Boolean,
     lyricsFallbackColor: State<Color>,
     sleepTimer: SleepTimerState,
-    viewModel: PlayerViewModel,
+    position: State<Long>,
+    podcastSpeed: Float,
+    podcastSpeedInEffect: Float,
+    commands: PlayerCommands,
     navigator: AppNavigator,
     onCollapse: () -> Unit,
     onShowSleepTimer: () -> Unit,
 ) {
+    val sheet = LocalPlayerSheet.current
+    DisposableEffect(sheet) { onDispose { sheet?.updateLargeArtwork(null) } }
     val context = LocalContext.current
     val shareFailed = stringResource(R.string.player_share_failed)
     val shareChooser = stringResource(R.string.player_share_chooser)
@@ -268,10 +227,6 @@ private fun NowPlayingBody(
     }
     val restrictions = snapshot.restrictions
     val isRemote = snapshot.source == PlaybackSource.REMOTE
-    // One lifecycle-aware ticker feeds the seek bar and the lyrics preview (stops when not visible).
-    val position = viewModel.position.collectAsStateWithLifecycle(initialValue = remember { viewModel.positionNow() })
-    val podcastSpeed by viewModel.podcastSpeed.collectAsStateWithLifecycle()
-    val podcastSpeedInEffect by viewModel.podcastSpeedInEffect.collectAsStateWithLifecycle()
 
     val topBar: @Composable () -> Unit = {
         NowPlayingTopBar(
@@ -279,6 +234,7 @@ private fun NowPlayingBody(
             isPlayingAutoplay = snapshot.isPlayingAutoplay,
             onCollapse = onCollapse,
             onOpenContext = snapshot.context?.uri?.let { uri -> { openAndCollapse(uri) } },
+            modifier = Modifier.playerTopBarMotion(sheet),
         ) {
             NowPlayingMenu(
                 track = track,
@@ -287,84 +243,101 @@ private fun NowPlayingBody(
                 onOpenUri = openAndCollapse,
                 onShare = onShare,
                 onSleepTimer = onShowSleepTimer,
-                onStartRadio = { viewModel.startRadio(track.uri) },
+                onStartRadio = { commands.startRadio(track.uri) },
                 onMoreActions = {
                     navigator.showActions(track.toActionTarget(placeholderName, contextUri = snapshot.context?.uri))
                 },
             )
         }
     }
+    // The art's slot: the moving art lands here, and the art drawn in it shows once at rest.
     val artwork: @Composable (Modifier) -> Unit = { artworkModifier ->
-        NowPlayingArtwork(
-            track = track,
-            artwork = artwork,
-            canNext = restrictions.canSkipNext,
-            canPrevious = restrictions.canSkipPrev,
-            onNext = viewModel::next,
-            onPrevious = viewModel::previous,
-            modifier = artworkModifier,
-        )
-    }
-    val details: @Composable () -> Unit = {
-        TitleRow(
-            track = track,
-            liked = liked,
-            onToggleLike = viewModel::toggleLike,
-            onOpenUri = openAndCollapse,
-        )
-        PlaybackProblem(snapshot)
-        Spacer(Modifier.height(12.dp))
-        PlayerSeekBar(
-            position = position,
-            durationMs = snapshot.effectiveDurationMs(),
-            enabled = restrictions.canSeek,
-            onSeek = viewModel::seekTo,
-            trackKey = track.uri,
-        )
-        TransportControls(
-            snapshot = snapshot,
-            onShuffle = viewModel::cycleShuffle,
-            onPrevious = viewModel::previous,
-            onPlayPause = viewModel::togglePlayPause,
-            onNext = viewModel::next,
-            onRepeat = viewModel::cycleRepeat,
-            onSeekBy = viewModel::seekBy,
-        )
-        // Fixed-volume receivers and some groups ignore volume changes (the thumb would snap back).
-        if (isRemote && remoteVolumeSupported) {
-            VolumeSlider(
-                volume = snapshot.volume,
-                onVolumeChange = viewModel::setVolume,
-                modifier = Modifier.fillMaxWidth(),
+        Box(artworkModifier.then(if (sheet != null) Modifier.onGloballyPositioned(sheet::updateLargeArtwork) else Modifier)) {
+            NowPlayingArtwork(
+                track = track,
+                artwork = artwork,
+                canNext = restrictions.canSkipNext,
+                canPrevious = restrictions.canSkipPrev,
+                onNext = commands::next,
+                onPrevious = commands::previous,
+                onCollapse = onCollapse,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .playerArtworkAtRest(sheet),
             )
         }
-        BottomActions(
-            indicator = indicator,
-            showDeviceName = !isRemote,
-            onDevices = navigator::openDevices,
-            // Always reachable (the preview card can be turned off or missing after a failed
-            // load; the full screen offers Retry). Disabled once Spotify has none for the track.
-            lyricsButton = if (track.isEpisode) null else !lyricsUnavailable,
-            onLyrics = navigator::openLyrics,
-            // Episodes played here (Spotify Connect has no speed command for other devices).
-            speed = if (track.isEpisode && !isRemote) podcastSpeedInEffect else null,
-            chosenSpeed = podcastSpeed,
-            onSpeed = viewModel::setPodcastSpeed,
-            onShare = onShare,
-            onQueue = navigator::openQueue,
-        )
-        if (isRemote && indicator is DeviceIndicator.Remote) {
-            RemoteBanner(indicator = indicator, onClick = navigator::openDevices)
+    }
+    val details: @Composable (besideArtwork: Boolean) -> Unit = { besideArtwork ->
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .playerDetailsMotion(sheet, besideArtwork),
+        ) {
+            TitleRow(
+                track = track,
+                liked = liked,
+                onToggleLike = commands::toggleLike,
+                onOpenUri = openAndCollapse,
+            )
+            PlaybackProblem(snapshot)
+            Spacer(Modifier.height(12.dp))
+            PlayerSeekBar(
+                position = position,
+                durationMs = snapshot.effectiveDurationMs(),
+                enabled = restrictions.canSeek,
+                onSeek = commands::seekTo,
+                trackKey = track.uri,
+                modifier = Modifier.keepDragsLocal(),
+            )
+            TransportControls(
+                snapshot = snapshot,
+                onShuffle = commands::cycleShuffle,
+                onPrevious = commands::previous,
+                onPlayPause = commands::togglePlayPause,
+                onNext = commands::next,
+                onRepeat = commands::cycleRepeat,
+                onSeekBy = commands::seekBy,
+            )
+            // Fixed-volume receivers and some groups ignore volume changes (the thumb would snap back).
+            if (isRemote && remoteVolumeSupported) {
+                VolumeSlider(
+                    volume = snapshot.volume,
+                    onVolumeChange = commands::setVolume,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .keepDragsLocal(),
+                )
+            }
+            BottomActions(
+                indicator = indicator,
+                showDeviceName = !isRemote,
+                onDevices = navigator::openDevices,
+                // Always reachable (the preview card can be turned off or missing after a failed
+                // load; the full screen offers Retry). Disabled once Spotify has none for the track.
+                lyricsButton = if (track.isEpisode) null else !lyricsUnavailable,
+                onLyrics = navigator::openLyrics,
+                // Episodes played here (Spotify Connect has no speed command for other devices).
+                speed = if (track.isEpisode && !isRemote) podcastSpeedInEffect else null,
+                chosenSpeed = podcastSpeed,
+                onSpeed = commands::setPodcastSpeed,
+                onShare = onShare,
+                onQueue = navigator::openQueue,
+            )
+            if (isRemote && indicator is DeviceIndicator.Remote) {
+                RemoteBanner(indicator = indicator, onClick = navigator::openDevices)
+            }
         }
     }
-    val lyricsCard: @Composable () -> Unit = {
+    val lyricsCard: @Composable (besideArtwork: Boolean) -> Unit = { besideArtwork ->
         if (lyrics != null) {
             LyricsPreviewCard(
                 lyrics = lyrics,
                 position = position,
                 fallbackColor = lyricsFallbackColor,
                 onOpen = navigator::openLyrics,
-                modifier = Modifier.padding(top = 16.dp, bottom = 24.dp),
+                modifier = Modifier
+                    .padding(top = 16.dp, bottom = 24.dp)
+                    .playerDetailsMotion(sheet, besideArtwork),
             )
         }
     }
@@ -375,8 +348,9 @@ private fun NowPlayingBody(
             .windowInsetsPadding(WindowInsets.safeDrawing),
     ) {
         val wide = maxWidth > maxHeight && maxWidth >= 600.dp
-        // Too short to give the artwork a useful share of one screen (split screen, huge fonts).
-        val compact = !wide && maxHeight < 560.dp
+        // Too short to give the artwork a useful share of one screen (split screen, huge fonts:
+        // the details grow with the font scale and would squeeze the art to nothing).
+        val compact = !wide && maxHeight < 560.dp * LocalDensity.current.fontScale.coerceAtLeast(1f)
         when {
             wide -> Row(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
                 Column(Modifier.weight(1f).fillMaxHeight()) {
@@ -402,8 +376,8 @@ private fun NowPlayingBody(
                             .verticalScroll(rememberScrollState())
                             .padding(horizontal = 24.dp, vertical = 16.dp),
                     ) {
-                        details()
-                        lyricsCard()
+                        details(true)
+                        lyricsCard(true)
                     }
                 }
             }
@@ -421,8 +395,8 @@ private fun NowPlayingBody(
                         .fillMaxWidth(0.6f)
                         .aspectRatio(1f),
                 )
-                details()
-                lyricsCard()
+                details(false)
+                lyricsCard(false)
             }
             else -> {
                 // The first screen holds artwork + controls; the lyrics card follows when scrolling.
@@ -444,10 +418,10 @@ private fun NowPlayingBody(
                         ) {
                             artwork(Modifier.aspectRatio(1f))
                         }
-                        details()
+                        details(false)
                         Spacer(Modifier.height(8.dp))
                     }
-                    lyricsCard()
+                    lyricsCard(false)
                 }
             }
         }
@@ -460,13 +434,15 @@ private fun NowPlayingTopBar(
     isPlayingAutoplay: Boolean,
     onCollapse: () -> Unit,
     onOpenContext: (() -> Unit)?,
+    modifier: Modifier = Modifier,
     menu: @Composable () -> Unit,
 ) {
     val header = stringResource(contextHeaderRes(playbackContext?.type))
     val name = contextName(playbackContext, isPlayingAutoplay)
     val openLabel = stringResource(R.string.player_open_context, name.ifEmpty { header })
+    val collapseLabel = stringResource(R.string.player_collapse)
     Row(
-        Modifier
+        modifier
             .fillMaxWidth()
             .heightIn(min = 64.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -474,7 +450,7 @@ private fun NowPlayingTopBar(
         IconButton(onClick = onCollapse) {
             Icon(
                 Icons.Rounded.KeyboardArrowDown,
-                contentDescription = stringResource(R.string.player_collapse),
+                contentDescription = collapseLabel,
                 modifier = Modifier.size(32.dp),
             )
         }
@@ -492,7 +468,10 @@ private fun NowPlayingTopBar(
                 )
                 .heightIn(min = 48.dp)
                 .padding(horizontal = 8.dp, vertical = 4.dp)
-                .semantics(mergeDescendants = true) { heading() },
+                .semantics(mergeDescendants = true) {
+                    heading()
+                    collapse(collapseLabel) { onCollapse(); true }
+                },
             verticalArrangement = Arrangement.Center,
         ) {
             Text(
@@ -709,11 +688,13 @@ private fun NowPlayingArtwork(
     canPrevious: Boolean,
     onNext: () -> Unit,
     onPrevious: () -> Unit,
+    onCollapse: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val title = track.name.orEmpty()
     val nextLabel = stringResource(R.string.player_next)
     val previousLabel = stringResource(R.string.player_previous)
+    val collapseLabel = stringResource(R.string.player_collapse)
     val artworkDescription = stringResource(R.string.player_artwork, title)
     SwipeToSkipBox(
         canNext = canNext,
@@ -721,6 +702,7 @@ private fun NowPlayingArtwork(
         onNext = onNext,
         onPrevious = onPrevious,
         modifier = modifier.semantics {
+            collapse(collapseLabel) { onCollapse(); true }
             customActions = buildList {
                 if (canNext) add(CustomAccessibilityAction(nextLabel) { onNext(); true })
                 if (canPrevious) add(CustomAccessibilityAction(previousLabel) { onPrevious(); true })
@@ -728,13 +710,13 @@ private fun NowPlayingArtwork(
         },
     ) {
         Crossfade(targetState = artwork, animationSpec = tween(durationMillis = 450), label = "nowPlayingArtwork") { url ->
-            Artwork(
+            PlayerArtwork(
                 url = url,
                 contentDescription = artworkDescription,
-                shape = RoundedCornerShape(8.dp),
+                shape = RoundedCornerShape(LargeArtworkCorner),
                 modifier = Modifier
                     .fillMaxSize()
-                    .shadow(elevation = 24.dp, shape = RoundedCornerShape(8.dp)),
+                    .shadow(elevation = LargeArtworkElevation, shape = RoundedCornerShape(LargeArtworkCorner)),
             )
         }
     }

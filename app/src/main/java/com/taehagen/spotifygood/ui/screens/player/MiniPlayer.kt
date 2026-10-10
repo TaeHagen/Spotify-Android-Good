@@ -3,6 +3,7 @@ package com.taehagen.spotifygood.ui.screens.player
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -12,11 +13,9 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -24,7 +23,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -33,6 +31,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.expand
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -43,13 +42,16 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.ui.appViewModel
-import com.taehagen.spotifygood.ui.components.Artwork
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import kotlinx.coroutines.flow.Flow
 
-/** Mini player card: artwork colour background, swipe to skip, tap to expand. */
+/**
+ * Mini player content of the docked card: swipe to skip, tap (or swipe up) to expand. The card
+ * itself (art-toned background, corners, shadow) is the expanding player's surface.
+ */
 @Composable
 internal fun MiniPlayerContent(onExpand: () -> Unit, modifier: Modifier = Modifier) {
     val viewModel = appViewModel { graph -> PlayerViewModel(graph) }
@@ -69,9 +71,42 @@ internal fun MiniPlayerContent(onExpand: () -> Unit, modifier: Modifier = Modifi
         }
     }
 
+    PlayerSurfaceTheme {
+        MiniPlayerBar(
+            snapshot = snapshot,
+            liked = liked,
+            indicator = indicator,
+            artwork = artwork,
+            position = viewModel.position,
+            initialPositionMs = viewModel::positionNow,
+            commands = viewModel,
+            onExpand = onExpand,
+            onDevices = navigator::openDevices,
+            modifier = modifier,
+        )
+    }
+}
+
+/**
+ * The mini player's row and progress line, from plain state. Inside the expanding player the
+ * thumbnail hands over to the moving art and the text is pushed aside by it ([LocalPlayerSheet]);
+ * the thumbnail's place is mirrored by [miniArtworkBounds].
+ */
+@Composable
+internal fun MiniPlayerBar(
+    snapshot: PlaybackSnapshot,
+    liked: Boolean?,
+    indicator: DeviceIndicator,
+    artwork: String?,
+    position: Flow<Long>,
+    initialPositionMs: () -> Long,
+    commands: PlayerCommands,
+    onExpand: () -> Unit,
+    onDevices: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val track = snapshot.track ?: return
-    // Read only in the draw phase: the colour animates on every track change.
-    val artworkColor = rememberArtworkColor(artwork)
+    val sheet = LocalPlayerSheet.current
     val restrictions = snapshot.restrictions
     val title = track.name ?: stringResource(R.string.player_track_loading)
     val artists = track.artistLine
@@ -80,77 +115,66 @@ internal fun MiniPlayerContent(onExpand: () -> Unit, modifier: Modifier = Modifi
     val previousLabel = stringResource(R.string.player_previous)
     val expandLabel = stringResource(R.string.player_open_now_playing)
 
-    PlayerSurfaceTheme {
-        Surface(
-            shape = RoundedCornerShape(8.dp),
-            color = Color.Transparent,
-            contentColor = PlayerDefaults.PrimaryText,
-            shadowElevation = 4.dp,
-            modifier = modifier
-                .padding(horizontal = 8.dp, vertical = 4.dp)
-                .fillMaxWidth(),
+    Column(modifier.fillMaxWidth()) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 56.dp)
+                .padding(start = MiniArtworkStartInset, end = 4.dp, top = 4.dp, bottom = 4.dp),
         ) {
-            Column(
-                Modifier.drawBehind {
-                    drawRect(artworkColor.value.toned(maxLightness = 0.24f, minLightness = 0.12f))
-                },
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 56.dp)
-                        .padding(start = 8.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
-                ) {
-                    SwipeToSkipBox(
-                        canNext = restrictions.canSkipNext,
-                        canPrevious = restrictions.canSkipPrev,
-                        onNext = viewModel::next,
-                        onPrevious = viewModel::previous,
-                        modifier = Modifier
-                            .weight(1f)
-                            .clickable(onClickLabel = expandLabel, onClick = onExpand)
-                            .semantics(mergeDescendants = true) {
-                                customActions = buildList {
-                                    if (restrictions.canSkipNext) add(CustomAccessibilityAction(nextLabel) { viewModel.next(); true })
-                                    if (restrictions.canSkipPrev) add(CustomAccessibilityAction(previousLabel) { viewModel.previous(); true })
-                                }
-                            },
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Artwork(
-                                url = artwork,
-                                contentDescription = null,
-                                modifier = Modifier.size(40.dp),
-                            )
-                            Spacer(Modifier.width(10.dp))
-                            MiniPlayerText(title = title, artists = artists, indicator = indicator, accent = accent)
+            SwipeToSkipBox(
+                canNext = restrictions.canSkipNext,
+                canPrevious = restrictions.canSkipPrev,
+                onNext = commands::next,
+                onPrevious = commands::previous,
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(onClickLabel = expandLabel, onClick = onExpand)
+                    .semantics(mergeDescendants = true) {
+                        expand(expandLabel) { onExpand(); true }
+                        customActions = buildList {
+                            if (restrictions.canSkipNext) add(CustomAccessibilityAction(nextLabel) { commands.next(); true })
+                            if (restrictions.canSkipPrev) add(CustomAccessibilityAction(previousLabel) { commands.previous(); true })
                         }
-                    }
-                    IconButton(onClick = navigator::openDevices) {
-                        Icon(
-                            imageVector = indicator.icon(),
-                            contentDescription = stringResource(R.string.player_devices),
-                            tint = if (indicator is DeviceIndicator.None) PlayerDefaults.PrimaryText else accent,
-                        )
-                    }
-                    LikeButton(liked = liked, onToggle = viewModel::toggleLike)
-                    PlayPauseButton(
-                        status = snapshot.status,
-                        onClick = viewModel::togglePlayPause,
-                        enabled = !(snapshot.status == PlaybackStatus.PLAYING && !restrictions.canPause),
-                        size = 48.dp,
-                        filled = false,
+                    },
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    PlayerArtwork(
+                        url = artwork,
+                        contentDescription = null,
+                        modifier = Modifier
+                            .size(MiniArtworkSize)
+                            .miniArtworkAtRest(sheet),
                     )
+                    Spacer(Modifier.width(10.dp))
+                    Box(Modifier.miniTextMotion(sheet)) {
+                        MiniPlayerText(title = title, artists = artists, indicator = indicator, accent = accent)
+                    }
                 }
-                MiniProgressLine(
-                    position = viewModel.position,
-                    initialPositionMs = viewModel::positionNow,
-                    durationMs = snapshot.effectiveDurationMs(),
-                    modifier = Modifier.padding(horizontal = 8.dp),
+            }
+            IconButton(onClick = onDevices) {
+                Icon(
+                    imageVector = indicator.icon(),
+                    contentDescription = stringResource(R.string.player_devices),
+                    tint = if (indicator is DeviceIndicator.None) PlayerDefaults.PrimaryText else accent,
                 )
             }
+            LikeButton(liked = liked, onToggle = commands::toggleLike)
+            PlayPauseButton(
+                status = snapshot.status,
+                onClick = commands::togglePlayPause,
+                enabled = !(snapshot.status == PlaybackStatus.PLAYING && !restrictions.canPause),
+                size = 48.dp,
+                filled = false,
+            )
         }
+        MiniProgressLine(
+            position = position,
+            initialPositionMs = initialPositionMs,
+            durationMs = snapshot.effectiveDurationMs(),
+            modifier = Modifier.padding(horizontal = 8.dp),
+        )
     }
 }
 
@@ -221,7 +245,7 @@ private fun MiniProgressLine(
     Canvas(
         modifier
             .fillMaxWidth()
-            .height(2.dp)
+            .height(MiniProgressLineHeight)
             .clearAndSetSemantics {},
     ) {
         drawRect(PlayerDefaults.TrackInactive)

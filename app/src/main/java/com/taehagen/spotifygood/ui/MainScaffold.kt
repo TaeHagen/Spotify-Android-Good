@@ -25,52 +25,67 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBarDefaults
+import androidx.compose.material3.NavigationRailDefaults
+import androidx.compose.material3.ShortNavigationBarDefaults
 import androidx.compose.material3.ShortNavigationBarItemDefaults
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.WideNavigationRailDefaults
 import androidx.compose.material3.adaptive.currentWindowAdaptiveInfoV2
+import androidx.compose.material3.adaptive.navigationsuite.NavigationSuite
+import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteColors
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteDefaults
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteItem
-import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteScaffold
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteScaffoldDefaults
+import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteScaffoldLayout
+import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteType
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -92,14 +107,17 @@ import com.taehagen.spotifygood.ui.components.AlreadyAddedDialog
 import com.taehagen.spotifygood.ui.components.MediaActionsSheet
 import com.taehagen.spotifygood.ui.screens.player.DevicePicks
 import com.taehagen.spotifygood.ui.screens.player.DevicesSheet
+import com.taehagen.spotifygood.ui.screens.player.ExpandingPlayer
 import com.taehagen.spotifygood.ui.screens.player.LyricsScreen
-import com.taehagen.spotifygood.ui.screens.player.MiniPlayer
-import com.taehagen.spotifygood.ui.screens.player.NowPlayingScreen
 import com.taehagen.spotifygood.ui.screens.player.PendingDeviceBanner
+import com.taehagen.spotifygood.ui.screens.player.PlayerDock
+import com.taehagen.spotifygood.ui.screens.player.PlayerSheetState
 import com.taehagen.spotifygood.ui.screens.player.pendingTargetNameFlow
 import com.taehagen.spotifygood.ui.screens.player.QueueScreen
 import com.taehagen.spotifygood.ui.screens.player.SleepTimerSheet
 import com.taehagen.spotifygood.ui.screens.player.rememberPlayerHasContent
+import com.taehagen.spotifygood.ui.screens.player.rememberPlayerSheetState
+import com.taehagen.spotifygood.ui.screens.player.surfaceCoversStatusBar
 import com.taehagen.spotifygood.ui.screens.status.PlaybackRefusedBanner
 import com.taehagen.spotifygood.ui.screens.status.PlaybackRefusedScreen
 import com.taehagen.spotifygood.ui.theme.LocalSystemBarsController
@@ -111,12 +129,14 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * The signed-in app: adaptive navigation (bottom bar / rail), the navigation host, the docked
- * mini player, full-screen overlays (Now Playing, Queue, Lyrics), global sheets and snackbars.
+ * The signed-in app: adaptive navigation (bottom bar / rail), the navigation host, the expanding
+ * player (docked mini player ↔ Now Playing), full-screen overlays (Queue, Lyrics), global sheets
+ * and snackbars.
  */
 @Composable
 fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
@@ -141,6 +161,20 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
         .collectAsStateWithLifecycle(initialValue = null)
     val overlayOpen = navigator.isNowPlayingOpen || navigator.isQueueOpen || navigator.isLyricsOpen ||
         refusal == PlaybackRefusal.SCREEN
+    // The expanding player: its progress follows the finger, its target the saved Now Playing flag.
+    val sheet = rememberPlayerSheetState(initiallyExpanded = navigator.isNowPlayingOpen)
+    SideEffect {
+        sheet.onSettle = { expanded -> if (expanded) navigator.openNowPlaying() else navigator.closeNowPlaying() }
+    }
+    LaunchedEffect(sheet, navigator) {
+        // Taps, back, the notification, links and navigation change the flag; a settled gesture
+        // already set it together with the sheet's target.
+        snapshotFlow { navigator.isNowPlayingOpen }.collectLatest { open ->
+            if (open != sheet.isExpanded) sheet.animateTo(open)
+        }
+    }
+    // The player covers the page: keep accessibility services off what is underneath.
+    val playerCoversPage by remember(sheet) { derivedStateOf { sheet.progress >= 1f } }
 
     // Deep links received by the activity (also those that arrived before login).
     val unsupportedLink = stringResource(R.string.shell_msg_unsupported_link)
@@ -207,7 +241,15 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
                 unselectedIconColor = colors.onSurfaceVariant,
                 unselectedTextColor = colors.onSurfaceVariant,
             )
-            NavigationSuiteScaffold(
+            NavigationScaffold(
+                navigationSuiteType = suiteType,
+                navigationSuiteColors = NavigationSuiteDefaults.colors(
+                    shortNavigationBarContainerColor = colors.surfaceContainerLowest,
+                    shortNavigationBarContentColor = colors.onSurface,
+                ),
+                containerColor = colors.background,
+                playerProgress = { sheet.progress },
+                modifier = if (playerCoversPage) Modifier.clearAndSetSemantics {} else Modifier,
                 navigationItems = {
                     MainTab.entries.forEach { tab ->
                         val selected = tab == currentTab
@@ -226,15 +268,10 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
                         )
                     }
                 },
-                navigationSuiteType = suiteType,
-                navigationSuiteColors = NavigationSuiteDefaults.colors(
-                    shortNavigationBarContainerColor = colors.surfaceContainerLowest,
-                    shortNavigationBarContentColor = colors.onSurface,
-                ),
-                containerColor = colors.background,
             ) {
                 MainContent(
                     navigator = navigator,
+                    sheet = sheet,
                     navController = navController,
                     snackbarHostState = snackbarHostState,
                     showSnackbars = !overlayOpen,
@@ -252,7 +289,7 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
                 )
             }
 
-            NowPlayingOverlay(navigator)
+            PlayerOverlay(navigator = navigator, sheet = sheet, hasTrack = hasTrack)
             FullScreenOverlay(visible = navigator.isQueueOpen, onBack = navigator::closeQueue) {
                 QueueScreen(onDismiss = navigator::closeQueue)
             }
@@ -297,6 +334,7 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
 @Composable
 private fun MainContent(
     navigator: MainNavigator,
+    sheet: PlayerSheetState,
     navController: androidx.navigation.NavHostController,
     snackbarHostState: SnackbarHostState,
     showSnackbars: Boolean,
@@ -356,12 +394,14 @@ private fun MainContent(
                     PendingDeviceBanner(deviceName = name, onClick = onPendingDeviceClick, onCancel = onPendingDeviceCancel)
                 }
             }
+            // The mini player's card is drawn by the expanding player above everything; the dock
+            // keeps its place (and the pages' bottom padding).
             AnimatedVisibility(
                 visible = hasTrack,
-                enter = slideInVertically(tween(260)) { it } + fadeIn(tween(260)),
-                exit = slideOutVertically(tween(200)) { it } + fadeOut(tween(200)),
+                enter = expandVertically(tween(260)) + fadeIn(tween(260)),
+                exit = shrinkVertically(tween(200)) + fadeOut(tween(200)),
             ) {
-                MiniPlayer(onExpand = navigator::openNowPlaying, modifier = Modifier.fillMaxWidth())
+                PlayerDock(sheet = sheet, modifier = Modifier.fillMaxWidth())
             }
         }
 
@@ -397,60 +437,97 @@ private fun Modifier.blockTouches(): Modifier = pointerInput(Unit) {
 }
 
 /**
- * Full-screen Now Playing: slides up over everything, scrim behind, predictive back scales and
- * lowers it with the gesture before collapsing. Requests light system-bar icons while shown.
+ * The expanding player above the shell, while something is loaded or Now Playing is open (it then
+ * shows "nothing playing"). Back collapses it; on Android 14+ the predictive back gesture shrinks
+ * it toward the mini player as it goes and springs it back when cancelled. The system-bar icons
+ * turn light once the (always dark) player reaches under the status bar.
  */
 @Composable
-private fun NowPlayingOverlay(navigator: MainNavigator) {
-    val open = navigator.isNowPlayingOpen
-    val scrimAlpha by animateFloatAsState(if (open) 0.6f else 0f, tween(300), label = "nowPlayingScrim")
-    if (scrimAlpha > 0.01f) {
-        Box(
-            Modifier
-                .fillMaxSize()
-                .drawBehind { drawRect(Color.Black.copy(alpha = scrimAlpha)) },
+private fun PlayerOverlay(navigator: MainNavigator, sheet: PlayerSheetState, hasTrack: Boolean) {
+    val wanted = hasTrack || navigator.isNowPlayingOpen
+    val shown = animateFloatAsState(if (wanted) 1f else 0f, tween(if (wanted) 260 else 200), label = "player")
+    val composed by remember { derivedStateOf { shown.value > 0f } }
+    if (!wanted && !composed) return
+
+    val scope = rememberCoroutineScope()
+    PredictiveBackHandler(enabled = navigator.isNowPlayingOpen && !navigator.isQueueOpen && !navigator.isLyricsOpen) { events ->
+        try {
+            events.collect { event -> sheet.previewBack(event.progress) }
+            navigator.closeNowPlaying()
+        } catch (e: CancellationException) {
+            // Cancelled gesture: spring back (unless the player is closing anyway).
+            scope.launch { if (navigator.isNowPlayingOpen) sheet.animateTo(expanded = true) }
+            throw e
+        }
+    }
+
+    val barsController = LocalSystemBarsController.current
+    val statusBarHeight = rememberUpdatedState(WindowInsets.statusBars.getTop(LocalDensity.current).toFloat())
+    val darkBars by remember(sheet) {
+        derivedStateOf { surfaceCoversStatusBar(sheet.progress, sheet.collapsedBounds.top, statusBarHeight.value) }
+    }
+    DisposableEffect(barsController, darkBars) {
+        barsController.forceDarkBars = darkBars
+        onDispose { barsController.forceDarkBars = false }
+    }
+
+    ExpandingPlayer(
+        sheet = sheet,
+        onExpand = navigator::openNowPlaying,
+        onCollapse = navigator::closeNowPlaying,
+        modifier = Modifier.graphicsLayer { alpha = shown.value },
+    )
+}
+
+/**
+ * NavigationSuiteScaffold's own layout, with the navigation bar sliding down (a rail: toward the
+ * start edge) and out as the player expands. [playerProgress] is read in the layer only.
+ */
+@Composable
+private fun NavigationScaffold(
+    navigationSuiteType: NavigationSuiteType,
+    navigationSuiteColors: NavigationSuiteColors,
+    containerColor: Color,
+    playerProgress: () -> Float,
+    navigationItems: @Composable () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    val bar = navigationSuiteType == NavigationSuiteType.ShortNavigationBarCompact ||
+        navigationSuiteType == NavigationSuiteType.ShortNavigationBarMedium ||
+        navigationSuiteType == NavigationSuiteType.NavigationBar
+    val towardStart = if (LocalLayoutDirection.current == LayoutDirection.Rtl) 1f else -1f
+    Surface(modifier = modifier, color = containerColor, contentColor = NavigationSuiteScaffoldDefaults.contentColor) {
+        NavigationSuiteScaffoldLayout(
+            navigationSuite = {
+                NavigationSuite(
+                    navigationSuiteType = navigationSuiteType,
+                    colors = navigationSuiteColors,
+                    modifier = Modifier.graphicsLayer {
+                        val p = playerProgress()
+                        if (bar) translationY = size.height * p else translationX = size.width * p * towardStart
+                    },
+                    content = navigationItems,
+                )
+            },
+            navigationSuiteType = navigationSuiteType,
+            content = {
+                Box(Modifier.consumeWindowInsets(navigationSuiteInsets(navigationSuiteType))) { content() }
+            },
         )
     }
-    AnimatedVisibility(
-        visible = open,
-        enter = slideInVertically(tween(320)) { it },
-        exit = slideOutVertically(tween(260)) { it },
-    ) {
-        val barsController = LocalSystemBarsController.current
-        DisposableEffect(barsController) {
-            barsController.forceDarkBars = true
-            onDispose { barsController.forceDarkBars = false }
-        }
-        var backProgress by remember { mutableFloatStateOf(0f) }
-        PredictiveBackHandler(enabled = open && !navigator.isQueueOpen && !navigator.isLyricsOpen) { events ->
-            try {
-                events.collect { event -> backProgress = event.progress }
-                navigator.closeNowPlaying()
-            } catch (e: CancellationException) {
-                backProgress = 0f
-                throw e
-            }
-        }
-        Box(
-            Modifier
-                .fillMaxSize()
-                .graphicsLayer {
-                    val p = backProgress
-                    val scale = 1f - 0.1f * p
-                    scaleX = scale
-                    scaleY = scale
-                    translationY = size.height * 0.08f * p
-                    if (p > 0f) {
-                        shape = RoundedCornerShape((32 * p).dp)
-                        clip = true
-                    }
-                }
-                .background(MaterialTheme.colorScheme.background)
-                .blockTouches(),
-        ) {
-            NowPlayingScreen(onCollapse = navigator::closeNowPlaying, modifier = Modifier.fillMaxSize())
-        }
-    }
+}
+
+/** The insets the navigation component takes from the content (as NavigationSuiteScaffold does). */
+@Composable
+private fun navigationSuiteInsets(type: NavigationSuiteType): WindowInsets = when (type) {
+    NavigationSuiteType.ShortNavigationBarCompact, NavigationSuiteType.ShortNavigationBarMedium ->
+        ShortNavigationBarDefaults.windowInsets.only(WindowInsetsSides.Bottom)
+    NavigationSuiteType.WideNavigationRailCollapsed, NavigationSuiteType.WideNavigationRailExpanded ->
+        WideNavigationRailDefaults.windowInsets.only(WindowInsetsSides.Start)
+    NavigationSuiteType.NavigationBar -> NavigationBarDefaults.windowInsets.only(WindowInsetsSides.Bottom)
+    NavigationSuiteType.NavigationRail -> NavigationRailDefaults.windowInsets.only(WindowInsetsSides.Start)
+    else -> WindowInsets(0, 0, 0, 0)
 }
 
 /** Generic full-screen overlay with slide-up animation and back handling. */
