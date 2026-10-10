@@ -425,6 +425,7 @@ private fun PlaylistActions(t: MediaActionTarget.PlaylistTarget, s: ActionScope)
         title = playlist.name,
         subtitle = if (owner != null) stringResource(R.string.shell_playlist_by, owner) else stringResource(R.string.shell_type_playlist),
         placeholder = Icons.AutoMirrored.Rounded.QueueMusic,
+        playlistUri = playlist.uri,
     )
     SheetAction(Icons.Rounded.PlayArrow, stringResource(R.string.shell_action_play)) {
         s.dismiss()
@@ -697,6 +698,8 @@ private fun SheetHeader(
     subtitle: String?,
     shape: Shape = RoundedCornerShape(4.dp),
     placeholder: ImageVector = Icons.Rounded.Album,
+    /** A playlist's: without [imageUrl], its mosaic. */
+    playlistUri: String? = null,
 ) {
     Row(
         modifier = Modifier
@@ -704,7 +707,11 @@ private fun SheetHeader(
             .padding(horizontal = 20.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Artwork(imageUrl, null, Modifier.size(56.dp), shape, placeholder)
+        if (playlistUri != null) {
+            PlaylistArtwork(playlistUri, imageUrl, null, Modifier.size(56.dp), shape, placeholderIcon = placeholder)
+        } else {
+            Artwork(imageUrl, null, Modifier.size(56.dp), shape, placeholder)
+        }
         Spacer(Modifier.width(16.dp))
         Column(Modifier.weight(1f)) {
             Text(
@@ -924,7 +931,7 @@ fun AddToPlaylistSheet(uris: List<String>, onDismiss: () -> Unit, excludeUri: St
                             .padding(start = 20.dp + (entry.depth * 16).dp, end = 20.dp, top = 8.dp, bottom = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Artwork(entry.entry.images.best(120), null, Modifier.size(48.dp), placeholderIcon = Icons.AutoMirrored.Rounded.QueueMusic)
+                        PlaylistArtwork(entry.uri, entry.entry.images.best(120), null, Modifier.size(48.dp), tilePx = 64)
                         Spacer(Modifier.width(16.dp))
                         Column(Modifier.weight(1f)) {
                             Text(entry.entry.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)

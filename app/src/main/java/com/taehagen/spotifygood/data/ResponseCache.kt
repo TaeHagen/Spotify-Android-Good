@@ -233,6 +233,8 @@ internal object CacheKeys {
     /** Prefix of every cached page size of a playlist. */
     fun playlistPrefix(uri: String) = "catalog.playlist:$uri:"
     fun playlist(uri: String, pageSize: Int) = "${playlistPrefix(uri)}$pageSize"
+    /** The mosaic of a playlist without an image (under the playlist's prefix: its edits make it stale). */
+    fun playlistMosaic(uri: String) = "${playlistPrefix(uri)}mosaic"
 
     const val MINUTE = 60_000L
     const val TTL_HOME = 15 * MINUTE

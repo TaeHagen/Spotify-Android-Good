@@ -744,7 +744,9 @@ SearchResults {"tracks","artists","albums","playlists","shows","episodes" (array
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
 HomeSection  {"id","title","items":[MediaRef]}
 RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit",
-              "isPublic"?:bool (playlists: the item's `public` attribute)}
+              "isPublic"?:bool (playlists: the item's `public` attribute),
+              "revision"?:hex (playlists: the playlist's own revision, `revision` decoration; what the
+              app's mosaic of it was learned at is compared with it)}
 Lyrics       {"syncType":"LINE_SYNCED|UNSYNCED|SYLLABLE_SYNCED","lines":[{"startTimeMs","words"}],
               "provider"?,"colors"?:{"background","text","highlightText"}}
 User         {"username","displayName","images","product","country","explicitFilter",
@@ -1570,7 +1572,23 @@ refetched twice while on screen (after 15 s and 30 s). The home feed is treated 
 when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
-app scope, so they complete even if their screen closes. "Add to playlist" (a song, an episode,
+app scope, so they complete even if their screen closes.
+Playlist art: a playlist's own image when it has one (also the server's generated covers, the
+`picture_size` URLs such as `mosaic.scdn.co`, when its attributes carry them). Without one the app
+draws Spotify's: a 2x2 mosaic of the first 4 distinct album covers among its first 20 items (local
+files, rows without art and unavailable rows skipped; one hidden only by Hide explicit content
+counts), edge to edge as one square; fewer than 4 distinct covers: the first song's cover alone;
+none: the placeholder. Liked Songs keeps its own art. `PlaylistMosaicStore` learns it only for a
+playlist without an image that is shown (one `catalog.playlist` page of 20, at most 3 playlists at
+a time, once per playlist at a time), from the playlist page's own first rows when it is open, and
+offline from the downloaded rows (their covers through `OfflineCovers`). It is kept in memory and in
+the response cache (`catalog.playlist:<uri>:mosaic`, made stale by the app's own edits with the
+playlist's other rows) and learned again when the rootlist lists the playlist at another revision,
+after a failed fetch not before 5 min, and after a day for a playlist whose revision isn't known
+(Home, Search). Compose draws 4 images in exact quarters (`MosaicArtwork`); Android Auto and other
+media browsers get one composed JPEG (`ArtworkProvider` `…/mosaic?u=…`, `MosaicBitmaps`: each cover
+decoded at tile size, kept in the app cache keyed by the cover ids, wiped with the account), from
+what memory holds (a browse never waits: the first one starts the learn). "Add to playlist" (a song, an episode,
 an album's tracks, another playlist's items — "Add to other playlist") lists the playlist picked
 first, item URIs only (`catalog.playlistUris`: one request when the server answers the whole
 list, at most 101; a source playlist the same way, at most 10,000 items; bounded at 20 s): items

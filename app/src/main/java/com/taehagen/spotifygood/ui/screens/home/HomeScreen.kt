@@ -55,6 +55,7 @@ import com.taehagen.spotifygood.ui.components.Artwork
 import com.taehagen.spotifygood.ui.components.EmptyState
 import com.taehagen.spotifygood.ui.components.ErrorState
 import com.taehagen.spotifygood.ui.components.MediaCarousel
+import com.taehagen.spotifygood.ui.components.PlaylistArtwork
 import com.taehagen.spotifygood.ui.components.OfflineBanner
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
@@ -308,16 +309,27 @@ private fun QuickAccessTile(
                     shape = RoundedCornerShape(topStart = 6.dp, bottomStart = 6.dp),
                     modifier = Modifier.size(56.dp),
                 )
-                is QuickAccessItem.Media -> Artwork(
-                    url = item.ref.images.best(160),
-                    contentDescription = null,
-                    shape = if (item.ref.type == MediaType.ARTIST) {
-                        RoundedCornerShape(28.dp)
-                    } else {
-                        RoundedCornerShape(topStart = 6.dp, bottomStart = 6.dp)
-                    },
-                    modifier = Modifier.size(56.dp),
-                )
+                is QuickAccessItem.Media -> if (item.ref.type == MediaType.PLAYLIST) {
+                    PlaylistArtwork(
+                        uri = item.ref.uri,
+                        imageUrl = item.ref.images.best(160),
+                        contentDescription = null,
+                        modifier = Modifier.size(56.dp),
+                        shape = RoundedCornerShape(topStart = 6.dp, bottomStart = 6.dp),
+                        tilePx = 64,
+                    )
+                } else {
+                    Artwork(
+                        url = item.ref.images.best(160),
+                        contentDescription = null,
+                        shape = if (item.ref.type == MediaType.ARTIST) {
+                            RoundedCornerShape(28.dp)
+                        } else {
+                            RoundedCornerShape(topStart = 6.dp, bottomStart = 6.dp)
+                        },
+                        modifier = Modifier.size(56.dp),
+                    )
+                }
             }
             Text(
                 text = title,

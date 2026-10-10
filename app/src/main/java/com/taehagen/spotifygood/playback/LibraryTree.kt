@@ -17,6 +17,7 @@ import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.RecentSearch
 import com.taehagen.spotifygood.data.Resource
 import com.taehagen.spotifygood.data.dataOrNull
+import com.taehagen.spotifygood.data.needsMosaic
 import com.taehagen.spotifygood.data.db.DownloadEntity
 import com.taehagen.spotifygood.download.CollectionType
 import com.taehagen.spotifygood.download.DownloadedCollection
@@ -397,7 +398,13 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
             .setMediaMetadata(
                 MediaMetadata.Builder()
                     .setTitle(title)
-                    .setArtworkUri(if (liked) resourceUri(R.drawable.pb_ic_auto_liked) else artworkUri(context, ref.imageUrl))
+                    .setArtworkUri(
+                        when {
+                            liked -> resourceUri(R.drawable.pb_ic_auto_liked)
+                            ref.imageUrl.isNullOrBlank() && ref.type == CollectionType.PLAYLIST -> playlistArtwork(ref.uri)
+                            else -> artworkUri(context, ref.imageUrl)
+                        },
+                    )
                     .setIsBrowsable(true)
                     .setIsPlayable(true)
                     .setMediaType(
@@ -833,7 +840,7 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
                 .setTitle(title)
                 .setSubtitle(subtitle)
                 .setArtist(subtitle)
-                .setArtworkUri(artwork(images))
+                .setArtworkUri(if (mediaType == MediaMetadata.MEDIA_TYPE_PLAYLIST && images.isEmpty()) playlistArtwork(uri) else artwork(images))
                 .setIsBrowsable(true)
                 .setIsPlayable(true)
                 .setMediaType(mediaType)
@@ -939,6 +946,24 @@ internal class LibraryTree(context: Context, private val graph: AppGraph) {
     private fun groupExtras(group: String) = Bundle().apply { putString(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_GROUP_TITLE, group) }
 
     private fun artwork(images: List<Image>): Uri? = artworkUri(context, images.best(ARTWORK_PX))
+
+    /**
+     * The art of a playlist without an image of its own (docs §9.8): its mosaic as one composed
+     * image, or its first song's cover. What memory holds now; otherwise it is learned in the
+     * background (shown on the next load), so a browse never waits for it.
+     */
+    private fun playlistArtwork(uri: String): Uri? {
+        if (!needsMosaic(uri, imageUrl = null)) return null // Liked Songs keeps its own
+        val store = graph.playlistMosaics
+        val mosaic = store.peek(uri) ?: run {
+            store.prefetch(uri)
+            return null
+        }
+        return when {
+            mosaic.isMosaic -> ArtworkProvider.mosaicUri(context, mosaic.covers.map { it.url(MosaicBitmaps.SIZE_PX / 2) })
+            else -> mosaic.covers.firstOrNull()?.let { artworkUri(context, it.url(ARTWORK_PX)) }
+        }
+    }
 
     private fun resourceUri(@DrawableRes res: Int): Uri = Uri.Builder()
         .scheme(ContentResolver.SCHEME_ANDROID_RESOURCE)
