@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.onEach
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
@@ -60,8 +61,11 @@ class LibraryRepository(
 ) {
     private val saved = SavedStateStore()
 
-    /** Every rootlist fetched (the playlists' current revisions, for their mosaics). Installed by the app graph. */
-    @Volatile var onRootlist: ((Rootlist) -> Unit)? = null
+    /**
+     * Every rootlist fetched, or read from the cache (not `fetched`): the playlists' revisions, for
+     * their mosaics. Installed by the app graph.
+     */
+    @Volatile var onRootlist: ((rootlist: Rootlist, fetched: Boolean) -> Unit)? = null
     private val lookups = CoalescingBatcher(scope, LOOKUP_WINDOW_MS, LOOKUP_BATCH, ::resolveSaved)
 
     private val _changes = MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
@@ -75,6 +79,10 @@ class LibraryRepository(
     fun playlists(): Flow<Resource<Rootlist>> =
         cache.liveOf(CacheKeys.LIBRARY_PLAYLISTS, Rootlist.serializer(), CacheKeys.TTL_LIBRARY) {
             fetchRootlist().let { CacheFill(it, it.partial) }
+        }.onEach { resource ->
+            // The cached rootlist's revisions count until a fetch tells others (all there is while it
+            // is fresh or the session is offline).
+            if (resource !is Resource.Success || resource.fromCache) resource.dataOrNull?.let { onRootlist?.invoke(it, false) }
         }
 
     suspend fun likedTracks(offset: Int, limit: Int = 100): Page<SavedTrack> {
@@ -301,7 +309,7 @@ class LibraryRepository(
         val seq = saved.currentSeq()
         val rootlist = rpc.callOffMain<Rootlist>("library.playlists")
         saved.applyLookup(rootlist.flatPlaylists().mapNotNull { it.uri }.associateWith { true }, seq)
-        onRootlist?.invoke(rootlist)
+        onRootlist?.invoke(rootlist, true)
         return rootlist
     }
 

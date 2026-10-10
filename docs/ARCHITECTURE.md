@@ -1709,12 +1709,16 @@ files, rows without art and unavailable rows skipped; one hidden only by Hide ex
 counts), edge to edge as one square; fewer than 4 distinct covers: the first song's cover alone;
 none: the placeholder. Liked Songs keeps its own art. `PlaylistMosaicStore` learns it only for a
 playlist without an image that is shown (one `catalog.playlist` page of 20, at most 3 playlists at
-a time, once per playlist at a time), from the playlist page's own first rows when it is open, and
-offline from the downloaded rows (their covers through `OfflineCovers`). It is kept in memory and in
-the response cache (`catalog.playlist:<uri>:mosaic`, made stale by the app's own edits with the
-playlist's other rows) and learned again when the rootlist lists the playlist at another revision,
-after a failed fetch not before 5 min, and after a day for a playlist whose revision isn't known
-(Home, Search). Compose draws 4 images in exact quarters (`MosaicArtwork`); Android Auto and other
+a time, once per playlist at a time; one still waiting for its turn when no row awaits it any more,
+its rows scrolled away, is dropped, so the rows on screen don't wait behind it), from the playlist
+page's own first rows when it is open, and offline from the downloaded rows (their covers through
+`OfflineCovers`); one shown while the session isn't online and not downloaded (a cold start) is
+asked for again by its rows once it is. It is kept in memory and in the response cache
+(`catalog.playlist:<uri>:mosaic`, made stale by the app's own edits with the playlist's other rows)
+and learned again when the rootlist lists the playlist at another revision (the cached rootlist's
+until one is fetched, then the fetched one's; the rows showing it ask again), after a failed fetch
+not before 5 min, and after a day for a playlist whose revision isn't known (Home, Search).
+Compose draws 4 images in exact quarters (`MosaicArtwork`); Android Auto and other
 media browsers get one composed JPEG (`ArtworkProvider` `…/mosaic?u=…`, `MosaicBitmaps`: each cover
 decoded at tile size, kept in the app cache keyed by the cover ids, wiped with the account), from
 what memory holds (a browse never waits: the first one starts the learn). "Add to playlist" (a song, an episode,

@@ -20,7 +20,7 @@ import org.junit.Test
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 
-private class FakeResponseCacheDao : ResponseCacheDao {
+internal class FakeResponseCacheDao : ResponseCacheDao {
     val rows = ConcurrentHashMap<String, ResponseCacheEntity>()
     override suspend fun get(key: String) = rows[key]
     override suspend fun put(entity: ResponseCacheEntity) {

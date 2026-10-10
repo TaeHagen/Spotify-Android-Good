@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -124,11 +125,27 @@ class PlaylistMosaicStoreTest {
     private fun TestScope.store(
         concurrency: Int = PlaylistMosaicStore.MAX_CONCURRENT_FETCHES,
         downloaded: suspend (String) -> List<PlaylistItem>? = { null },
+        cache: ResponseCache? = null,
         firstPage: suspend (String) -> Playlist = { uri ->
             fetched += uri
             Playlist(uri = uri, name = "P", revision = revision, items = items)
         },
-    ) = PlaylistMosaicStore(backgroundScope, cache = null, firstPage, downloaded, online = { online }, clock = { now }, concurrency)
+    ) = PlaylistMosaicStore(backgroundScope, cache, firstPage, downloaded, online = { online }, clock = { now }, concurrency)
+
+    /** A row showing [uri]'s art as `rememberPlaylistMosaic` does; gives what it shows now. */
+    private fun TestScope.row(store: PlaylistMosaicStore, uri: String): () -> PlaylistMosaic? {
+        var shown: PlaylistMosaic? = null
+        backgroundScope.launch {
+            shown = store.mosaic(uri)
+            store.changesOf(uri).collect { shown = store.mosaic(uri) }
+        }
+        return { shown }
+    }
+
+    /** A response cache holding [P]'s mosaic as an earlier process learned it, the library listing it at r1. */
+    private suspend fun learnedEarlier(): ResponseCache = ResponseCache(FakeResponseCacheDao(), Json).also {
+        it.put(CacheKeys.playlistMosaic(P), PlaylistMosaic.serializer(), PlaylistMosaic("r1", mosaicCovers(items), listed = "r1"))
+    }
 
     @Test
     fun aPlaylistShownAgainIsNotFetchedAgain() = runTest {
@@ -144,21 +161,70 @@ class PlaylistMosaicStoreTest {
         val store = store()
         store.noteRevisions(mapOf(P to "r1"))
         store.mosaic(P)
-        val changes = mutableListOf<String>()
-        backgroundScope.launch { store.changes.collect { changes += it } }
+        var asks = 0
+        backgroundScope.launch { store.changesOf(P).collect { asks++ } }
         runCurrent()
         // Same revision: kept.
         store.noteRevisions(mapOf(P to "r1"))
         store.mosaic(P)
+        runCurrent()
+        assertEquals(0, asks)
         assertEquals(1, fetched.size)
         // Edited elsewhere: its rows ask again, and it is learned again.
         items = listOf(song(9, "q")) + items
         store.noteRevisions(mapOf(P to "r2"))
         runCurrent()
-        assertEquals(listOf(P), changes)
+        assertEquals(1, asks)
         assertEquals(listOf("q", "w", "x", "y"), store.mosaic(P)!!.covers.map { it.album() })
         assertEquals(2, fetched.size)
         store.mosaic(P)
+        assertEquals(2, fetched.size)
+    }
+
+    @Test
+    fun aPlaylistEditedElsewhereIsLearnedAgainWhenTheFirstRootlistAfterAColdStartListsIt() = runTest {
+        val store = store(cache = learnedEarlier())
+        // Shown before any rootlist is known (a new process): kept, the day's TTL.
+        assertEquals(listOf("w", "x", "y", "z"), store.mosaic(P)!!.covers.map { it.album() })
+        val shown = row(store, P)
+        runCurrent()
+        assertTrue(fetched.isEmpty())
+        // Edited on another device: the first rootlist fetched lists it at r2. Its row asks again.
+        items = listOf(song(9, "q")) + items
+        store.noteRevisions(mapOf(P to "r2"))
+        runCurrent()
+        assertEquals(listOf("q", "w", "x", "y"), shown()!!.covers.map { it.album() })
+        assertEquals(listOf(P), fetched)
+        // Pull-to-refresh listing the same revision: nothing more.
+        store.noteRevisions(mapOf(P to "r2"))
+        runCurrent()
+        assertEquals(listOf(P), fetched)
+    }
+
+    @Test
+    fun theCachedRootlistsRevisionsCountUntilAFetchedOneTellsOthers() = runTest {
+        val store = store(cache = learnedEarlier())
+        // A new process: the cached rootlist (fresh, so nothing is fetched) lists it at r2 already,
+        // as the earlier process saw after it learned this mosaic.
+        items = listOf(song(9, "q")) + items
+        store.noteRevisions(mapOf(P to "r2"), fetched = false)
+        assertEquals(listOf("q", "w", "x", "y"), store.mosaic(P)!!.covers.map { it.album() })
+        assertEquals(1, fetched.size)
+        val shown = row(store, P)
+        runCurrent()
+        // Edited elsewhere again: pull-to-refresh fetches the rootlist, at r3. Its row asks again.
+        items = listOf(song(8, "u")) + items
+        store.noteRevisions(mapOf(P to "r2"), fetched = false)
+        runCurrent()
+        assertEquals(1, fetched.size)
+        store.noteRevisions(mapOf(P to "r3"))
+        runCurrent()
+        assertEquals(listOf("u", "q", "w", "x"), shown()!!.covers.map { it.album() })
+        assertEquals(2, fetched.size)
+        // The cached rootlist read again (another screen) doesn't undo what the fetch told.
+        store.noteRevisions(mapOf(P to "r2"), fetched = false)
+        store.mosaic(P)
+        runCurrent()
         assertEquals(2, fetched.size)
     }
 
@@ -211,6 +277,43 @@ class PlaylistMosaicStoreTest {
     }
 
     @Test
+    fun rowsShownWhileTheSessionConnectsFillInOnceItIsOnline() = runTest {
+        online = false
+        val store = store()
+        // A cold start: the rows show from the cache before the session is online, more of them
+        // than the per-playlist changes buffer holds.
+        val uris = (0 until 200).map { "spotify:playlist:$it" }
+        val rows = uris.map { row(store, it) }
+        runCurrent()
+        assertTrue(rows.all { it() == null })
+        assertTrue(fetched.isEmpty())
+        online = true
+        store.onOnline()
+        runCurrent()
+        assertTrue("every row fills in", rows.all { it()?.isMosaic == true })
+        assertEquals("each learned once", uris.toSet(), fetched.toSet())
+        assertEquals(uris.size, fetched.size)
+        // Online again later (a reconnect): nothing learned is asked for again.
+        store.onOnline()
+        runCurrent()
+        assertEquals(uris.size, fetched.size)
+    }
+
+    @Test
+    fun aRowListeningOnlyOnceTheSessionIsOnlineStillAsksAgain() = runTest {
+        online = false
+        val store = store()
+        assertNull(store.mosaic(P))
+        online = true
+        store.onOnline()
+        // Its row starts listening for changes only now.
+        var asks = 0
+        backgroundScope.launch { store.changesOf(P).collect { asks++ } }
+        runCurrent()
+        assertEquals(1, asks)
+    }
+
+    @Test
     fun aFailedFetchIsNotRetriedAtOnce() = runTest {
         var calls = 0
         val store = store(firstPage = { calls++; error("offline") })
@@ -245,5 +348,37 @@ class PlaylistMosaicStoreTest {
         assertTrue(results.awaitAll().all { it!!.isMosaic })
         assertEquals(PlaylistMosaicStore.MAX_CONCURRENT_FETCHES, most)
         assertEquals("once per playlist", 10, calls)
+    }
+
+    @Test
+    fun aLearnNoRowAwaitsAnyMoreGivesWayToTheRowsOnScreen() = runTest {
+        val gate = CompletableDeferred<Unit>()
+        val started = mutableListOf<String>()
+        val store = store(firstPage = { uri ->
+            started += uri
+            gate.await()
+            Playlist(uri = uri, name = "P", items = items)
+        })
+        // A fling through the library: 10 rows composed on the way, 3 learning, 7 waiting their turn.
+        val uris = (0 until 10).map { "spotify:playlist:$it" }
+        val rows = uris.map { uri -> launch { store.mosaic(uri) } }
+        // Row 4's playlist shows elsewhere too (Home): still awaited.
+        val home = async { store.mosaic(uris[4]) }
+        runCurrent()
+        assertEquals(uris.take(3), started)
+        // The fling stops at row 9: the others left the screen.
+        rows.take(9).forEach { it.cancel() }
+        runCurrent()
+        gate.complete(Unit)
+        rows[9].join()
+        assertTrue(home.await()!!.isMosaic)
+        // The 3 learning finished (kept for when they show again); of those waiting, only the ones
+        // still awaited were learned, once each.
+        assertEquals(uris.take(3) + uris[4] + uris[9], started)
+        assertTrue(uris.take(3).all { store.peek(it)!!.isMosaic })
+        assertNull(store.peek(uris[5]))
+        // Shown again later: learned then.
+        assertTrue(store.mosaic(uris[5])!!.isMosaic)
+        assertEquals(uris[5], started.last())
     }
 }
