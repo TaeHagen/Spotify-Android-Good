@@ -122,7 +122,9 @@ internal class RouteProviderSwitch(
     /** [ComponentSetting] of [ConnectRouteProviderService] through PackageManager. */
     class Provider(context: Context) : ComponentSetting {
         private val pm = context.applicationContext.packageManager
-        private val component = ComponentName(context.applicationContext, ConnectRouteProviderService::class.java)
+        // By name: a class literal would load ConnectRouteProviderService, whose superclass is
+        // API 30, and crash the process start below Android 11 (this runs from App.onCreate).
+        private val component = ComponentName(context.applicationContext.packageName, PROVIDER_CLASS)
 
         override fun get(): Int = pm.getComponentEnabledSetting(component)
 
@@ -135,5 +137,8 @@ internal class RouteProviderSwitch(
 
         /** A login and a logout right after it write nothing. */
         const val SETTLE_MS = 2_000L
+
+        /** [ConnectRouteProviderService]'s name (a manifest component, so R8 keeps it). */
+        const val PROVIDER_CLASS = "com.taehagen.spotifygood.connect.ConnectRouteProviderService"
     }
 }
