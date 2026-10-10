@@ -65,8 +65,9 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalUriHandler
@@ -162,6 +163,9 @@ private fun DetailTopBar(
         Modifier
             .fillMaxWidth()
             .drawBehind { drawRect(barColor.copy(alpha = solid)) }
+            // The bar takes every touch over it, also where it is see-through, so a tap that
+            // misses Back never reaches the row behind it.
+            .pointerInput(Unit) {}
             .windowInsetsPadding(WindowInsets.statusBars),
     ) {
         Row(
