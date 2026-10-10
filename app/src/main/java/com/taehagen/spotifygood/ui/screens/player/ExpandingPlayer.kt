@@ -30,16 +30,19 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -88,11 +91,13 @@ import coil3.compose.AsyncImagePainter
 import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
 import coil3.request.ImageResult
+import coil3.request.SuccessResult
 import coil3.request.transitionFactory
 import coil3.transition.CrossfadeTransition
 import coil3.transition.Transition
 import coil3.transition.TransitionTarget
 import com.taehagen.spotifygood.ui.components.imageData
+import kotlinx.coroutines.flow.first
 import kotlin.math.roundToInt
 
 /** The two anchors of the expanding player. */
@@ -163,6 +168,12 @@ class PlayerSheetState internal constructor(initiallyExpanded: Boolean, density:
 
     /** Natural height of the mini player's content; the shell's dock reserves this much. */
     internal var miniHeight by mutableIntStateOf(0)
+
+    /**
+     * The cover a player art copy loaded last ([PlayerArtwork]): a copy still loading the same one
+     * then takes it from the memory cache instead of waiting for its own download.
+     */
+    internal var loadedArtwork: String? by mutableStateOf(null)
 
     /** The player's own bounds (the window), in player coordinates. */
     internal val fullBounds: Rect get() = Rect(Offset.Zero, windowInRoot.size)
@@ -626,12 +637,16 @@ private const val PLAYER_ARTWORK_PX = 640
 /**
  * Cover art of the player surfaces. The mini player's thumbnail, the moving art and Now Playing's
  * art make this same request (same data, fixed size), so a copy composed after another has loaded
- * the cover gets that bitmap from the memory cache. A new cover reaches the composed copies at
- * once, and each may decode it before any is cached.
+ * the cover gets that bitmap from the memory cache. Coil joins no request in flight, though, and
+ * the copies start theirs at different times (Now Playing's only once the player moves): a copy
+ * still loading when another gets the cover ([PlayerSheetState.loadedArtwork]) asks again, now a
+ * memory-cache hit, which drops its own download. So Now Playing's art has the cover the moving
+ * art lands with.
  *
- * A cover that loads while this copy is [shown] fades in; one that loads while it is hidden shows
- * at once, since Coil's fade starts at the painter's first draw: it would otherwise run, from the
- * grey placeholder, only when the copy appears. [shape] null: the caller clips.
+ * A cover that loads while this copy is [shown] fades in (one taken from another copy too, as its
+ * own load would have); one that loads while it is hidden shows at once, since Coil's fade starts
+ * at the painter's first draw: it would otherwise run, from the grey placeholder, only when the
+ * copy appears. [shape] null: the caller clips.
  */
 @Composable
 internal fun PlayerArtwork(
@@ -642,17 +657,27 @@ internal fun PlayerArtwork(
     shown: () -> Boolean = { true },
 ) {
     val context = LocalPlatformContext.current
+    val sheet = LocalPlayerSheet.current
     val currentShown by rememberUpdatedState(shown)
-    val request = remember(url, context) {
+    var loaded by remember(url) { mutableStateOf(false) }
+    var takenFromAnotherCopy by remember(url) { mutableStateOf(false) }
+    if (sheet != null && url != null) {
+        LaunchedEffect(sheet, url) {
+            // A copy composed with the cover already cached has it by now (Coil reads the memory
+            // cache at once), as has the copy that loaded it.
+            snapshotFlow { sheet.loadedArtwork == url }.first { it }
+            if (!loaded) takenFromAnotherCopy = true
+        }
+    }
+    val request = remember(url, context, takenFromAnotherCopy) {
         url?.takeIf { it.isNotBlank() }?.let {
             ImageRequest.Builder(context)
                 .data(imageData(it))
                 .size(PLAYER_ARTWORK_PX)
-                .transitionFactory(CrossfadeWhileShown { currentShown() })
+                .transitionFactory(CrossfadeWhileShown(takenFromAnotherCopy) { currentShown() })
                 .build()
         }
     }
-    var loaded by remember(url) { mutableStateOf(false) }
     Box(
         modifier = modifier
             .then(if (shape != null) Modifier.clip(shape) else Modifier)
@@ -678,21 +703,39 @@ internal fun PlayerArtwork(
             )
         }
         if (request != null) {
-            AsyncImage(
-                model = request,
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.matchParentSize(),
-                onState = { state -> loaded = state is AsyncImagePainter.State.Success },
-            )
+            // A painter of its own for the cover taken from another copy: Coil restarts none for a
+            // request that differs only in its transition. The one replaced drops its download.
+            key(takenFromAnotherCopy) {
+                AsyncImage(
+                    model = request,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.matchParentSize(),
+                    onState = { state ->
+                        loaded = state is AsyncImagePainter.State.Success
+                        if (loaded) sheet?.loadedArtwork = url
+                    },
+                )
+            }
         }
     }
 }
 
-/** Coil's crossfade for a cover that loads while [shown]; any other shows at once (see [PlayerArtwork]). */
-private class CrossfadeWhileShown(private val shown: () -> Boolean) : Transition.Factory {
-    override fun create(target: TransitionTarget, result: ImageResult): Transition =
-        (if (shown()) PlayerArtworkCrossfade else Transition.Factory.NONE).create(target, result)
+/**
+ * Coil's crossfade for a cover that loads while [shown]; any other shows at once (see
+ * [PlayerArtwork]). One [takenFromAnotherCopy] is a memory-cache hit, which Coil never fades, but
+ * it replaces this copy's placeholder, so it fades in as the copy's own load would have.
+ */
+private class CrossfadeWhileShown(
+    private val takenFromAnotherCopy: Boolean,
+    private val shown: () -> Boolean,
+) : Transition.Factory {
+    override fun create(target: TransitionTarget, result: ImageResult): Transition = when {
+        !shown() -> Transition.Factory.NONE.create(target, result)
+        takenFromAnotherCopy && result is SuccessResult ->
+            CrossfadeTransition(target, result, PlayerArtworkCrossfade.durationMillis)
+        else -> PlayerArtworkCrossfade.create(target, result)
+    }
 }
 
 /** The fade the app's image loader gives every other image (a memory-cache hit never fades). */
