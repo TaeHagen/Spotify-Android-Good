@@ -74,7 +74,11 @@ class NowPlayingWidgetReceiver : AppWidgetProvider() {
 
     override fun onDisabled(context: Context) = idsChanged(context)
 
-    override fun onRestored(context: Context, oldWidgetIds: IntArray, newWidgetIds: IntArray) = idsChanged(context)
+    /**
+     * Nothing here: the same broadcast calls [onUpdate] right after, which takes the broadcast's
+     * one goAsync() and refreshes the ids itself (a second goAsync() would return null).
+     */
+    override fun onRestored(context: Context, oldWidgetIds: IntArray, newWidgetIds: IntArray) = Unit
 
     private fun idsChanged(context: Context) {
         val pending = goAsync()
