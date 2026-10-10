@@ -1,7 +1,9 @@
 // SPOTIFYGOOD: + AudioOutputKind, AutoplayContextRequest (smart shuffle suggestions) and the
 // published snapshot types
 use crate::{
-    LoadContextOptions, LoadRequestOptions, PlayContext,
+    LoadContextOptions,
+    LoadRequestOptions,
+    PlayContext,
     context_resolver::{ContextAction, ContextResolver, ResolveContext},
     core::{
         Error,
@@ -18,7 +20,8 @@ use crate::{
         // SPOTIFYGOOD: + SpClientResult (state puts next to the loop)
         spclient::{SpClientResult, TransferRequest},
     },
-    model::{AudioOutputKind, LoadRequest, PlayingTrack, SpircPlayStatus},
+    // SPOTIFYGOOD: StartAt and StartTrack (was PlayingTrack)
+    model::{AudioOutputKind, LoadRequest, SpircPlayStatus, StartAt, StartTrack},
     playback::{
         mixer::Mixer,
         // SPOTIFYGOOD: + UnavailableReason
@@ -453,6 +456,86 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
 // SPOTIFYGOOD: moved out of load_context_from_tracks (see handle_transfer)
 /// The context uri of a plain track list (it can't be resolved)
 const WEB_API_URI: &str = "spotify:web-api";
+
+// SPOTIFYGOOD: see the Play arm of SpircTask::handle_request
+/// A line for the log of what a remote play names: its context, its start track (as sent and as
+/// understood), the tracks its pages carry, its options and where it was started (no tokens, no
+/// personal data)
+pub(crate) fn describe_remote_play(
+    context: &Context,
+    origin: &crate::protocol::player::PlayOrigin,
+    options: &crate::core::dealer::protocol::PlayOptions,
+    start: &StartTrack,
+) -> String {
+    const SHOWN: usize = 3;
+    let tracks = context
+        .pages
+        .iter()
+        .map(|page| page.tracks.len())
+        .sum::<usize>();
+    let shown = context
+        .pages
+        .iter()
+        .flat_map(|page| page.tracks.iter())
+        .take(SHOWN)
+        .map(|t| {
+            format!(
+                "{}|{}",
+                t.uri.as_deref().unwrap_or("-"),
+                t.uid.as_deref().unwrap_or("-")
+            )
+        })
+        .collect::<Vec<_>>();
+    let short = |value: &serde_json::Value| {
+        let text = value.to_string();
+        match text.char_indices().nth(120) {
+            Some((at, _)) => format!("{}...", &text[..at]),
+            None => text,
+        }
+    };
+    let skip_to_other = options
+        .skip_to
+        .as_ref()
+        .map(|s| {
+            s.other
+                .iter()
+                .map(|(k, v)| format!("{k}={}", short(v)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let options_other = options
+        .other
+        .iter()
+        .map(|(k, v)| format!("{k}={}", short(v)))
+        .collect::<Vec<_>>();
+    format!(
+        "remote play of <{}>: skip_to uri {:?} uid {:?} index {:?} {skip_to_other:?} (start {:?} {:?} {:?}); \
+         {} pages, {tracks} tracks {shown:?}; seek_to {:?}, overrides {:?}, other options {options_other:?}; \
+         origin <{}> <{}>",
+        context.uri.as_deref().unwrap_or("-"),
+        options
+            .skip_to
+            .as_ref()
+            .and_then(|s| s.track_uri.as_deref()),
+        options
+            .skip_to
+            .as_ref()
+            .and_then(|s| s.track_uid.as_deref()),
+        options.skip_to.as_ref().and_then(|s| s.track_index),
+        start.uri,
+        start.uid,
+        start.index,
+        context.pages.len(),
+        options.seek_to,
+        options.player_options_override.as_ref().map(|o| (
+            o.shuffling_context,
+            o.repeating_context,
+            o.repeating_track
+        )),
+        origin.feature_identifier,
+        origin.referrer_identifier,
+    )
+}
 
 // SPOTIFYGOOD: see handle_transfer
 /// Whether a transferred context uri can be resolved (a plain track list can't)
@@ -1598,7 +1681,11 @@ impl SpircTask {
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
-            SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+            // SPOTIFYGOOD: StartTrack (was the fallback index), the load names its track itself
+            SpircCommand::Load(command) => {
+                self.handle_load(command, None, StartTrack::default())
+                    .await?
+            }
             // SPOTIFYGOOD: local queue commands
             SpircCommand::AddToQueue(uri) => {
                 self.connect_state.queue_add_uri(&uri)?;
@@ -2130,6 +2217,16 @@ impl SpircTask {
                     self.handle_activate()
                 }
 
+                // SPOTIFYGOOD: everything the play names of its start track (see StartTrack),
+                // and in the log: a remote play that doesn't start where it should shows what came
+                // in (no tokens or personal data in it)
+                let mut start = StartTrack::from_skip_to(play.options.skip_to.as_ref());
+                start.learn_from_pages(&play.context.pages);
+                info!(
+                    "{}",
+                    describe_remote_play(&play.context, &play.play_origin, &play.options, &start)
+                );
+
                 let context = match play.context.uri {
                     Some(s) => PlayContext::Uri(s),
                     None if !play.context.pages.is_empty() => PlayContext::Tracks(
@@ -2150,13 +2247,6 @@ impl SpircTask {
                     .map(Into::into)
                     .map(LoadContextOptions::Options);
 
-                let fallback_index = play
-                    .options
-                    .skip_to
-                    .as_ref()
-                    .and_then(|s| s.track_index)
-                    .map(|i| i as usize);
-
                 self.handle_load(
                     LoadRequest {
                         context,
@@ -2168,7 +2258,7 @@ impl SpircTask {
                         },
                     },
                     play.context.pages.pop(),
-                    fallback_index,
+                    start,
                 )
                 .await?;
 
@@ -2187,6 +2277,10 @@ impl SpircTask {
             SetRepeatingTrack(repeat_track) => self.handle_repeat_track(repeat_track.value),
             // SPOTIFYGOOD: preload the new next track after queue changes
             AddToQueue(add_to_queue) => {
+                // SPOTIFYGOOD: a track without a uri can't be played (its load failed later)
+                if add_to_queue.track.uri.trim().is_empty() {
+                    Err(Error::invalid_argument("the track to queue has no uri"))?
+                }
                 // SPOTIFYGOOD: fails (instead of dropping the track) when the queue is full
                 self.connect_state.add_to_queue(add_to_queue.track, true)?;
                 self.handle_next_tracks_changed();
@@ -2209,7 +2303,13 @@ impl SpircTask {
                     self.handle_shuffle(shuffle)?;
                 }
             }
-            SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri))?,
+            // SPOTIFYGOOD: a blank uri names no track (see StartTrack)
+            SkipNext(skip_next) => self.handle_next(
+                skip_next
+                    .track
+                    .map(|t| t.uri)
+                    .filter(|uri| !uri.trim().is_empty()),
+            )?,
             SkipPrev(_) => self.handle_prev()?,
             // SPOTIFYGOOD: shared with the local play (see play_action), fails without a track
             Resume(_) => self.handle_play_command(false)?,
@@ -2506,11 +2606,13 @@ impl SpircTask {
         );
     }
 
+    // SPOTIFYGOOD: `start` (was `fallback_index`): what a remote play names of its start track
+    // besides `cmd`'s playing_track (see StartTrack)
     async fn handle_load(
         &mut self,
         cmd: LoadRequest,
         page: Option<ContextPage>,
-        fallback_index: Option<usize>,
+        start: StartTrack,
     ) -> Result<(), Error> {
         let autoplay = matches!(cmd.context_options, Some(LoadContextOptions::Autoplay));
 
@@ -2576,66 +2678,69 @@ impl SpircTask {
 
         debug!("play track <{:?}>", cmd_options.playing_track);
 
-        // SPOTIFYGOOD: the start track may be on a further page (an artist's albums), which is
-        // resolved later. A uid can't be played without its track: those pages are resolved
-        // here until it is found.
-        if let Some(PlayingTrack::Uid(ref uid)) = cmd_options.playing_track {
-            if fallback_index.is_none() {
-                self.resolve_pages_until(|t| &t.uid == uid).await;
-            }
+        // SPOTIFYGOOD: the start track is everything the load names of it (see StartTrack). It
+        // may be on a further page (a long playlist, an artist's albums), which is resolved
+        // later: a uid, or an index past the pages there are, can't be played without its
+        // track, so those pages are resolved here until it is there (an index refers to the
+        // context's order, the context isn't shuffled here).
+        let start = start.with_playing_track(cmd_options.playing_track.as_ref());
+        let wants_more_pages = self
+            .connect_state
+            .get_context(ContextType::Default)
+            .is_ok_and(|ctx| start.wants_more_pages(&ctx.tracks));
+        if wants_more_pages {
+            let wanted = start.clone();
+            self.resolve_pages_until(move |tracks| !wanted.wants_more_pages(tracks))
+                .await;
         }
-
-        let find = |playing_track: &PlayingTrack| -> Result<usize, Error> {
-            Ok(match playing_track {
-                PlayingTrack::Index(i) => *i as usize,
-                PlayingTrack::Uri(uri) => {
-                    let ctx = self.connect_state.get_context(ContextType::Default)?;
-                    ConnectState::find_index_in_context(ctx, |t| &t.uri == uri)?
-                }
-                PlayingTrack::Uid(uid) => {
-                    let ctx = self.connect_state.get_context(ContextType::Default)?;
-                    ConnectState::find_index_in_context(ctx, |t| &t.uid == uid)?
-                }
-            })
+        let (start_at, context_len) = match self.connect_state.get_context(ContextType::Default) {
+            Ok(ctx) => (start.start_at(&ctx.tracks), ctx.tracks.len()),
+            Err(_) => (start.start_at(&[]), 0),
         };
+
         // SPOTIFYGOOD: a start uri that isn't (yet) in the context is played itself, as a track
         // outside the context: the context goes on after it, and once the further pages are
         // there it is placed in the context (ContextResolver::try_finish). It fell back to the
         // first track, at the position of the requested one (a restore of an artist session).
+        // A start track that can't be found otherwise starts at its index, if it is one of the
+        // context's, else at the first track (a random one when shuffled), from its start;
+        // nothing without a uri is loaded (an empty uri failed the load). See StartTrack.
         let mut seek_to = cmd_options.seek_to;
         let mut start_outside = None;
-        let index = match cmd_options.playing_track {
+        let index = match start_at {
             None => None,
-            Some(ref playing_track) => match find(playing_track) {
-                Ok(i) => Some(i),
-                Err(why) => {
-                    warn!(
-                        "Failed to resolve index by {:?}, using fallback index: {:?} (Error: {why})",
-                        cmd_options.playing_track, fallback_index
-                    );
-                    match (fallback_index, playing_track) {
-                        (Some(i), _) => Some(i),
-                        (None, PlayingTrack::Uri(uri)) => {
-                            start_outside = Some(self.connect_state.context_to_provided_track(
-                                &ContextTrack {
-                                    uri: Some(uri.clone()),
-                                    ..Default::default()
-                                },
-                                Some(self.connect_state.context_uri()),
-                                None,
-                                None,
-                                None,
-                            )?);
-                            None
-                        }
-                        (None, _) => {
-                            // SPOTIFYGOOD: never the position of the requested track in another one
-                            seek_to = 0;
-                            Some(0)
-                        }
+            Some(StartAt::Index(index)) => Some(index),
+            Some(StartAt::Outside(uri)) => {
+                warn!("the start track {start:?} isn't in the context of {context_len} tracks");
+                let outside = self.connect_state.context_to_provided_track(
+                    &ContextTrack {
+                        uri: Some(uri.clone()),
+                        uid: start.uid.clone(),
+                        ..Default::default()
+                    },
+                    Some(self.connect_state.context_uri()),
+                    None,
+                    None,
+                    None,
+                );
+                match outside {
+                    Ok(track) => start_outside = Some(track),
+                    Err(why) => {
+                        warn!("the start track <{uri}> can't be played: {why}");
+                        seek_to = 0;
                     }
                 }
-            },
+                None
+            }
+            Some(StartAt::First) => {
+                warn!(
+                    "the start track {start:?} isn't in the context of {context_len} tracks, \
+                     starting at its first"
+                );
+                // SPOTIFYGOOD: never the position of the requested track in another one
+                seek_to = 0;
+                None
+            }
         };
         let pages_pending = self
             .context_resolver
@@ -2812,13 +2917,14 @@ impl SpircTask {
     // SPOTIFYGOOD: see handle_load
     /// Resolves the further pages of the default context right away, until a track matches, a
     /// fetch fails (it is left to the loop), or [LOAD_PAGES_TIMEOUT] is over
-    async fn resolve_pages_until(&mut self, matches: impl Fn(&ProvidedTrack) -> bool) {
+    // SPOTIFYGOOD: `found` looks at all the tracks there are (was a match of one track)
+    async fn resolve_pages_until(&mut self, found: impl Fn(&[ProvidedTrack]) -> bool) {
         let deadline = Instant::now() + LOAD_PAGES_TIMEOUT;
         loop {
             let found = self
                 .connect_state
                 .get_context(ContextType::Default)
-                .is_ok_and(|ctx| ctx.tracks.iter().any(&matches));
+                .is_ok_and(|ctx| found(&ctx.tracks));
             if found
                 || !self.context_resolver.next_is_page(ContextType::Default)
                 || Instant::now() >= deadline
