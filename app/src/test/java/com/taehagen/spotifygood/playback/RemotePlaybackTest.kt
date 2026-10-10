@@ -118,6 +118,42 @@ class RemotePlaybackTest {
     }
 
     @Test
+    fun aPendingPlayOfAPausedDeviceReadsPausedWithABluetoothOutput() {
+        val remotePaused = remotePlaying.copy(status = PlaybackStatus.PAUSED)
+        listOf(true, null).forEach { bluetooth ->
+            // Media3's placeholder of a play: the paused state with playWhenReady set. It lasts
+            // until the device reports playing, so it reads paused like the state that follows.
+            assertEquals("$bluetooth", suppressed, RemotePlayback.placeholderSuppression(remotePaused, true, none, bluetooth, localLoadPending = false))
+            assertEquals("$bluetooth", suppressed, RemotePlayback.placeholderSuppression(remotePlaying.copy(status = PlaybackStatus.STOPPED), true, none, bluetooth, false))
+            // While it plays or loads (a seek, a skip, a queue change): never unsuppressed.
+            assertEquals("$bluetooth", suppressed, RemotePlayback.placeholderSuppression(remotePlaying, true, suppressed, bluetooth, false))
+            assertEquals("$bluetooth", suppressed, RemotePlayback.placeholderSuppression(remoteLoading, true, none, bluetooth, false))
+            // A pause (or a seek while paused) reads paused anyway.
+            assertEquals("$bluetooth", none, RemotePlayback.placeholderSuppression(remotePaused, false, none, bluetooth, false))
+        }
+        // No Bluetooth output: nothing reads the session, the play shows pause at once, as before.
+        assertEquals(none, RemotePlayback.placeholderSuppression(remotePaused, true, none, bluetoothOutput = false, localLoadPending = false))
+        assertEquals(none, RemotePlayback.placeholderSuppression(remotePlaying, true, none, false, false))
+    }
+
+    @Test
+    fun localPlaybackAndAMediaSessionLoadKeepTheirPlaceholder() {
+        listOf(true, false, null).forEach { bluetooth ->
+            // Playing here: the placeholder reads playing as before.
+            assertEquals("$bluetooth", none, RemotePlayback.placeholderSuppression(localPlaying.copy(status = PlaybackStatus.PAUSED), true, none, bluetooth, false))
+            assertEquals("$bluetooth", none, RemotePlayback.placeholderSuppression(localPlaying, true, none, bluetooth, false))
+            // Auto's (a watch's, resumption's) load and its play while another device is shown:
+            // they play on this phone.
+            assertEquals("$bluetooth", none, RemotePlayback.placeholderSuppression(remotePlaying.copy(status = PlaybackStatus.PAUSED), true, none, bluetooth, localLoadPending = true))
+            // Nothing shown.
+            assertEquals("$bluetooth", none, RemotePlayback.placeholderSuppression(PlaybackSnapshot(), true, none, bluetooth, false))
+            assertEquals("$bluetooth", none, RemotePlayback.placeholderSuppression(remotePlaying.copy(track = null), true, none, bluetooth, false))
+        }
+        // A suppression the placeholder starts from is never lifted here.
+        assertEquals(suppressed, RemotePlayback.placeholderSuppression(remotePlaying, true, suppressed, true, localLoadPending = true))
+    }
+
+    @Test
     fun aBluetoothOutputComingOrGoingSwitchesEveryRuleTogether() {
         // The mode follows the output while the device plays; the toggle and the volume key session
         // follow the state the session then publishes.

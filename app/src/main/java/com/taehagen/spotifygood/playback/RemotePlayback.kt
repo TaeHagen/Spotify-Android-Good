@@ -18,13 +18,14 @@ import com.taehagen.spotifygood.model.PlaybackStatus
  * device plays and a Bluetooth audio output is connected ([readsPaused]), the session reports its
  * playback as suppressed ([suppressionReason]): Media3 keeps `playWhenReady` (the media
  * foreground, the notification and Media3 controllers stay as they are), and the platform
- * `PlaybackState` reads paused, which Bluetooth passes on as paused. Without a Bluetooth output no
- * headset or car reads the session, so it reads playing as it should (pause button, moving
- * position). The surfaces that show the paused state (the notification and lock screen, Auto,
- * Wear, a headset's AVRCP play) offer "play" while the device plays: their play is a toggle there
- * and pauses it ([playMeansPause]), except a voice assistant's explicit play. Volume keys only
- * reach a session in an active playback state, which the paused one is not: [RemoteVolumeKeys]
- * takes them meanwhile ([volumeKeysSession]).
+ * `PlaybackState` reads paused, which Bluetooth passes on as paused. So does Media3's placeholder
+ * of a pending command, above all a play of the paused device ([placeholderSuppression]). Without
+ * a Bluetooth output no headset or car reads the session, so it reads playing as it should (pause
+ * button, moving position). The surfaces that show the paused state (the notification and lock
+ * screen, Auto, Wear, a headset's AVRCP play) offer "play" while the device plays: their play is a
+ * toggle there and pauses it ([playMeansPause]), except a voice assistant's explicit play. Volume
+ * keys only reach a session in an active playback state, which the paused one is not:
+ * [RemoteVolumeKeys] takes them meanwhile ([volumeKeysSession]).
  */
 internal object RemotePlayback {
     /** Another device plays (or loads) what the session shows. */
@@ -51,6 +52,32 @@ internal object RemotePlayback {
             Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS
         } else {
             Player.PLAYBACK_SUPPRESSION_REASON_NONE
+        }
+
+    /**
+     * The suppression of a placeholder state ([suggested]: Media3's, published while a command is
+     * pending): one that reads playing ([playWhenReady], not suppressed) while the session shows
+     * another device and a Bluetooth audio output is connected reads paused, as the state that
+     * follows does ([suppressionReason]). A play sent through the session to a paused device stays
+     * pending until that device reports playing (the Connect round trip, then the next snapshot);
+     * reading playing meanwhile would tell a headset that the phone started playing. Seeks, skips
+     * and queue changes keep the state they start from, so they read paused too. Except while a
+     * media session load is in flight ([localLoadPending]): that one plays on this phone (as does
+     * the play that follows it), so it reads playing as local playback does.
+     */
+    fun placeholderSuppression(
+        s: PlaybackSnapshot,
+        playWhenReady: Boolean,
+        suggested: Int,
+        bluetoothOutput: Boolean?,
+        localLoadPending: Boolean,
+    ): Int =
+        if (playWhenReady && suggested == Player.PLAYBACK_SUPPRESSION_REASON_NONE &&
+            s.source == PlaybackSource.REMOTE && s.track != null && bluetoothOutput != false && !localLoadPending
+        ) {
+            Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS
+        } else {
+            suggested
         }
 
     /**

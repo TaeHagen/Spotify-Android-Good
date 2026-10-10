@@ -105,6 +105,13 @@ Screenshots (Robolectric + Roborazzi, test dependencies only): `./gradlew :app:t
 - Smart shuffle is computed locally; other Connect clients see the suggestions as ordinary
   tracks.
 - Downloads can only be played inside the app.
+- While the phone controls another Connect device with a Bluetooth headset, speaker or car
+  connected, its media session reads paused (otherwise a multipoint headset would pause that
+  device). Android hides paused media controls from the lock screen and the first pull-down of
+  quick settings after 10 minutes, so for remote playback they disappear 10 minutes after the
+  session last read playing (sooner when the device was resumed after a pause). The fully
+  expanded quick settings and the app keep working, and the controls come back when the phone
+  itself plays, or when the Bluetooth device disconnects while the other device plays. Details in docs/ARCHITECTURE.md §9.4.
 - Podcast progress made on this phone (offline above all) is kept on the phone and resumes
   there, but is not reported back to Spotify: other devices don't see it. The same goes for
   "Mark as played" / "Mark as unplayed". Spotify's own resume points are shown when its web

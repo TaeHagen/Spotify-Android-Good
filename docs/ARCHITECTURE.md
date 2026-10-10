@@ -813,10 +813,11 @@ For a remote active device, smart shuffle is not supported (the command reports
 * **Remote playback in the app**: `PlaybackSnapshot.source == "remote"` is built from the
   cluster's `player_state` (position extrapolated with `session.time_delta()`); the
   MediaSession switches to `DeviceInfo(PLAYBACK_TYPE_REMOTE)`, and while that device plays with
-  a Bluetooth audio output connected its platform state reads paused, so Bluetooth never sees
-  this phone as a playing source (§9.4, Remote playback and Bluetooth); hardware volume keys
-  control the remote device; the
-  notification says "Playing on <device>". The stored session
+  a Bluetooth audio output connected its platform state reads paused, as does a play of it still
+  pending through the media session (notification, lock screen, widget, Auto, Wear, a headset),
+  so Bluetooth does not see this phone as a playing source (§9.4, Remote playback and
+  Bluetooth; left open: a Bluetooth output appearing mid-playback); hardware volume keys
+  control the remote device; the notification says "Playing on <device>". The stored session
   (§9.4) follows the mirrored session, so when that device leaves and nothing is active, Play
   on the phone continues what it played (Spotify resumes the account's last session).
 * **Audio output reporting**: Kotlin reports the current local output (speaker /
@@ -1140,6 +1141,21 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     draws its own buttons, it shows pause (`getMediaButtons`). The platform position does not
     advance while suppressed (speed 0; each update moves it), and the notification shows no
     chronometer.
+  * Pending commands: while a handler's future is pending Media3 publishes a placeholder, the
+    current state with the command's likely outcome (`SimpleBasePlayer`; `invalidateState` is
+    ignored meanwhile). A play of the paused device through the session (notification and lock
+    screen from API 33, the QS player, the widget's `KEYCODE_MEDIA_PLAY`, Auto, Wear, a
+    headset's play) is pending for the Connect command's round trip and then until the next
+    snapshot (`SETTLE_MS`, 2 s at most); its placeholder (`playWhenReady` set, nothing
+    suppressed) read PLAYING for that long, right when the other device starts its stream: the
+    reported bug again. `getPlaceholderState` suppresses every placeholder that reads playing
+    while the session shows another device with a Bluetooth output connected
+    (`placeholderSuppression`), so the play, and the seeks, skips and queue changes after it,
+    read paused until the confirmed (suppressed) state follows. Not while a media-session load
+    is in flight (`handleSetMediaItems`, `onThisPhone`: Auto's load and play while mirroring),
+    which plays on this phone; without a Bluetooth output and for local playback the
+    placeholders read playing as before. The in-app buttons call `PlayerController` directly
+    and publish no placeholder.
   * Volume keys go to a session in an active state that handles them
     (`MediaSessionStack.getDefaultVolumeSession`), which a paused one is not. While the session
     reads paused, `RemoteVolumeKeys` keeps a hidden platform `MediaSession` active: remote volume
@@ -1162,6 +1178,26 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     → `notifyInactiveMediaForegroundService`), the service may leave the foreground after 10 min
     of remote playback, as after 10 min of a pause; Media3's next foreground start is refused,
     and the notification is posted without it (`onForegroundStartNotAllowed`, mirroring).
+  * Known limitation, SystemUI's media timeout (API 30+, checked in the Android 13, 14 and 15
+    sources): `MediaTimeoutListener` marks a player inactive once its session has read not
+    playing for 10 minutes (`PAUSED_MEDIA_TIMEOUT`; armed when the state turns not playing, not
+    re-armed while it stays so, cancelled only by a state `NotificationMediaManager.isPlayingState`
+    counts as playing), and an inactive player is hidden from the lock screen
+    (`KeyguardMediaController`: `showsOnlyActiveMedia`) and the first pull-down (QQS); the fully
+    expanded quick settings still list it, as inactive. Notification updates keep it inactive.
+    So with a Bluetooth output connected, the lock-screen and QQS controls for another device
+    disappear 10 minutes after the session last read playing: after 10 minutes of remote
+    playback, sooner when the device was paused before it was resumed (that pause read not
+    playing too, and its timer keeps running). The app's own controls are unaffected. They come
+    back when the session next reads playing: playback on this phone, or the Bluetooth output
+    going away while the device plays (a pause and resume of the device does not). Without a
+    Bluetooth output nothing changes. There is no way around it: every state SystemUI counts as
+    playing (PLAYING, FAST_FORWARDING, REWINDING, SKIPPING_*) is playing or seeking for AVRCP
+    (`PlayStatus.playbackStateToAvrcpState`: PLAYING, FWD_SEEK, REV_SEEK), and a second session
+    carrying the player (SystemUI builds players from a session's media notification) would be
+    the one Bluetooth reads: `MediaPlayerList` keeps one controller per package, the first one
+    `onActiveSessionsChanged` lists, and `MediaSessionStack.getPriorityList` lists a session that
+    reads playing first. A periodic un-suppress would tell the headset "playing" again.
 * **Home-screen widget** (`widget/`): `NowPlayingWidgetReceiver`, an `AppWidgetProvider` (not
   exported; `xml/widget_now_playing_info.xml`), draws hand-written RemoteViews. Glance does not
   fit: it runs every update in a WorkManager session worker that stays up ≥ 45 s, and its
