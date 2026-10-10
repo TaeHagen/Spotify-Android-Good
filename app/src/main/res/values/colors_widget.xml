@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Home-screen widget (owner: widget). Below Android 12 the app's light palette; values-night has
+     the dark one, values-v31 / values-night-v31 the system's dynamic colours. -->
+<resources>
+    <color name="widget_background">#FFF4F4F4</color>
+    <color name="widget_on_surface">#FF121212</color>
+    <color name="widget_on_surface_variant">#FF5A5A5A</color>
+    <color name="widget_primary">#FF0E7A39</color>
+    <color name="widget_on_primary">#FFFFFFFF</color>
+    <!-- Artwork placeholder -->
+    <color name="widget_surface_variant">#FFE2E2E2</color>
+</resources>

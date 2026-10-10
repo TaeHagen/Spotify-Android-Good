@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Now-playing widget: the control row of the large layouts (included). Like and shuffle are two
+     views each, one per colour, of which the widget shows one; their slots keep the row's spacing
+     while hidden. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="48dp"
+    android:layout_marginTop="8dp"
+    android:gravity="center_vertical"
+    android:orientation="horizontal">
+
+    <FrameLayout
+        android:id="@+id/widget_like_slot"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1">
+
+        <ImageButton
+            android:id="@+id/widget_like"
+            style="@style/Widget.SpotifyGood.NowPlaying.Button"
+            android:layout_gravity="center"
+            android:contentDescription="@string/playback_action_like"
+            android:src="@drawable/media3_icon_heart_unfilled"
+            android:tint="@color/widget_on_surface_variant" />
+
+        <ImageButton
+            android:id="@+id/widget_liked"
+            style="@style/Widget.SpotifyGood.NowPlaying.Button"
+            android:layout_gravity="center"
+            android:contentDescription="@string/playback_action_unlike"
+            android:src="@drawable/media3_icon_heart_filled"
+            android:tint="@color/widget_primary"
+            android:visibility="gone" />
+    </FrameLayout>
+
+    <FrameLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1">
+
+        <ImageButton
+            android:id="@+id/widget_skip_back"
+            style="@style/Widget.SpotifyGood.NowPlaying.Button"
+            android:layout_gravity="center"
+            android:contentDescription="@string/widget_previous"
+            android:src="@drawable/media3_icon_previous" />
+    </FrameLayout>
+
+    <FrameLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1">
+
+        <ImageButton
+            android:id="@+id/widget_play"
+            style="@style/Widget.SpotifyGood.NowPlaying.Play"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_gravity="center"
+            android:contentDescription="@string/widget_pause"
+            android:padding="10dp"
+            android:src="@drawable/media3_icon_pause" />
+    </FrameLayout>
+
+    <FrameLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1">
+
+        <ImageButton
+            android:id="@+id/widget_skip_forward"
+            style="@style/Widget.SpotifyGood.NowPlaying.Button"
+            android:layout_gravity="center"
+            android:contentDescription="@string/widget_next"
+            android:src="@drawable/media3_icon_next" />
+    </FrameLayout>
+
+    <FrameLayout
+        android:id="@+id/widget_shuffle_slot"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1">
+
+        <ImageButton
+            android:id="@+id/widget_shuffle"
+            style="@style/Widget.SpotifyGood.NowPlaying.Button"
+            android:layout_gravity="center"
+            android:contentDescription="@string/playback_action_shuffle_on"
+            android:src="@drawable/media3_icon_shuffle_off"
+            android:tint="@color/widget_on_surface_variant" />
+
+        <ImageButton
+            android:id="@+id/widget_shuffle_on"
+            style="@style/Widget.SpotifyGood.NowPlaying.Button"
+            android:layout_gravity="center"
+            android:contentDescription="@string/playback_action_shuffle_off"
+            android:src="@drawable/media3_icon_shuffle_on"
+            android:tint="@color/widget_primary"
+            android:visibility="gone" />
+    </FrameLayout>
+</LinearLayout>

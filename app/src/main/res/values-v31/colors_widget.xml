@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Home-screen widget from Android 12, light: the wallpaper's dynamic colours in the Material 3
+     roles widget background, on-surface, on-surface-variant, primary, on-primary, surface-variant. -->
+<resources>
+    <color name="widget_background">@android:color/system_accent2_50</color>
+    <color name="widget_on_surface">@android:color/system_neutral1_900</color>
+    <color name="widget_on_surface_variant">@android:color/system_neutral2_700</color>
+    <color name="widget_primary">@android:color/system_accent1_600</color>
+    <color name="widget_on_primary">@android:color/system_accent1_0</color>
+    <color name="widget_surface_variant">@android:color/system_accent2_100</color>
+</resources>

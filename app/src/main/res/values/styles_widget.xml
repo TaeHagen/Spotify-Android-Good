@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Home-screen widget views (owner: widget); the layouts are inflated by the launcher. -->
+<resources>
+    <style name="Widget.SpotifyGood.NowPlaying.Title" parent="">
+        <item name="android:textColor">@color/widget_on_surface</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+        <item name="android:includeFontPadding">false</item>
+    </style>
+
+    <style name="Widget.SpotifyGood.NowPlaying.Subtitle" parent="">
+        <item name="android:textColor">@color/widget_on_surface_variant</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+        <item name="android:includeFontPadding">false</item>
+    </style>
+
+    <!-- "Playing on <device>" -->
+    <style name="Widget.SpotifyGood.NowPlaying.Device" parent="Widget.SpotifyGood.NowPlaying.Subtitle">
+        <item name="android:textColor">@color/widget_primary</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+    </style>
+
+    <!-- Previous / next, like, shuffle: a 24dp icon on a borderless ripple -->
+    <style name="Widget.SpotifyGood.NowPlaying.Button" parent="">
+        <item name="android:layout_width">40dp</item>
+        <item name="android:layout_height">40dp</item>
+        <item name="android:background">?android:attr/selectableItemBackgroundBorderless</item>
+        <item name="android:scaleType">center</item>
+        <item name="android:tint">@color/widget_on_surface</item>
+    </style>
+
+    <!-- Play / pause: the primary-coloured circle -->
+    <style name="Widget.SpotifyGood.NowPlaying.Play" parent="">
+        <item name="android:background">@drawable/widget_play_background</item>
+        <item name="android:scaleType">fitCenter</item>
+        <item name="android:padding">8dp</item>
+        <item name="android:tint">@color/widget_on_primary</item>
+        <item name="android:contentDescription">@string/widget_play</item>
+    </style>
+</resources>

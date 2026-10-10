@@ -1162,6 +1162,56 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     → `notifyInactiveMediaForegroundService`), the service may leave the foreground after 10 min
     of remote playback, as after 10 min of a pause; Media3's next foreground start is refused,
     and the notification is posted without it (`onForegroundStartNotAllowed`, mirroring).
+* **Home-screen widget** (`widget/`): `NowPlayingWidgetReceiver`, an `AppWidgetProvider` (not
+  exported; `xml/widget_now_playing_info.xml`), draws hand-written RemoteViews. Glance does not
+  fit: it runs every update in a WorkManager session worker that stays up ≥ 45 s, and its
+  `actionStartActivity` gives a data-less intent a data URI, which would break
+  `MainActivity.launchIntent`'s root match (§9.3). 4x2 by default, resizable from 2x1. From Android 12
+  every layout goes out in one sized RemoteViews and the launcher shows the best fit, also while
+  resizing; below 12 `WidgetLayout.bestFit` (the same rule) picks the portrait and the landscape
+  layout from the widget's options, drawn again when they change. 2x1: the artwork filling the
+  widget with play/pause; 2x2: artwork, play/pause below; 3x1: + title and artist; 4x1: artwork
+  beside title, artist and previous / play-pause / next (one row in landscape); 3x2: artwork
+  across the top, title, artist, "Playing on <device>" for another Connect device, the controls;
+  4x2: large artwork beside the text, the controls with like and shuffle (three-state, as the
+  notification's); 4x3 and up: 3x2's arrangement with like and shuffle. Episodes have −15 s / +15 s
+  instead of previous / next. The notification's icons (Media3's) and strings; the system corner
+  radius and dynamic colours from Android 12, the app's light and dark palette below. Picker:
+  `previewLayout` (the 4x2 layout, its defaults a sample), a drawn `previewImage` below 12, a
+  description. No generated preview on Android 15: a static one only repeats previewLayout, a
+  personal one would cost pushes while no widget is placed.
+  * What it shows (`WidgetModels`, pure): logged out → "Sign in" (opens the app); something loaded,
+    here or on the device this phone mirrors → it, live; nothing loaded → the `ResumeStore` session
+    with Play alone; nothing stored → "Nothing playing" (opens the app). It holds no position.
+  * Updates are pushed, never scheduled (`updatePeriodMillis` 0, no alarm, polling or job). While
+    the playback service runs, one collector (`NowPlayingWidgets.follow`) maps the snapshot, the
+    like state and the login to the widget's state, only while a widget is placed: the ids are
+    read once per process and again on the provider's update, delete, enable, disable and restore
+    broadcasts; with none nothing is collected. Equal states are dropped and pushes throttled: the
+    first at once, then at most one per 500 ms, the latest winning (a track change brings several
+    snapshots). When the service goes the widget shows the stored session (its other buttons would
+    find the session gone). The receiver draws on placement, reboot, app update and (below 12) a
+    resize: the live state while the service runs, else from the credential file check and the
+    resume store, without the engine. Artwork: Coil, 256 px exactly, corners rounded (a tenth of
+    the side), from the memory or disk cache or a downloaded cover, else fetched (≤ 5 s), a software
+    bitmap all layouts share, the last one reused while the item stays; none → a placeholder.
+  * A tap on the widget opens Now Playing with the session activity's intent
+    (`MainActivity.launchIntent` + `EXTRA_OPEN_PLAYER`, `SINGLE_TOP | CLEAR_TOP`); logged out or with
+    nothing to show, `launchIntent` as it is (a login in progress stays on top). Buttons are
+    immutable broadcasts to the receiver. Playback keys become media-button intents for
+    `PlaybackService` (`ACTION_MEDIA_BUTTON` + `KeyEvent`; explicit PLAY or PAUSE: Media3's
+    double-tap wait for play-pause does not apply, and the widget, drawn from the snapshot and not
+    from the suppressed session state, shows Pause while another device plays), handled as a
+    headset's. Play is a `startForegroundService`: a widget tap allows a foreground-service start
+    on Android 12–15 (the launcher, in the foreground, sends the PendingIntent), and on a dead
+    process Media3 turns the Play into the playback resumption of the stored session, played here,
+    which takes the media foreground at once; with nothing to resume the service meets the start's
+    contract itself. Pause and the skips need the session the widget showed: a plain start while
+    the service is in the foreground, while it runs without one a plain start or, refused in the
+    background, a foreground start (its 3 s contract deadline covers a key that leaves nothing
+    playing); without the service nothing is started and the widget is drawn again. Like
+    (`toggleSaved` with the state shown) and shuffle (`cycleShuffle`) run in the process, only while
+    the service runs. Logged out meanwhile: drawn again ("Sign in").
 * Player error (only while nothing plays; STATE_IDLE, playlist kept): logged out →
   `AUTHENTICATION_EXPIRED` + "Sign in" action; `PREMIUM_REQUIRED`; `PLAYBACK_REFUSED`; else
   the last failed attempt to start playback (`PlayerController.failure`, also native
@@ -1831,12 +1881,13 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
 | Presence opt-in, idle (also restored after an app update, and after a reboot up to Android 14; from Android 15 a notification asks to open the app) | Online | yes | connectedDevice (low-importance) | none |
+| Home-screen widget placed (§9.4) | unchanged: pushed by the running playback service when the track, play state, like or device change, ≤ 1 per 500 ms; no `updatePeriodMillis`, alarm, polling or job; no widget, nothing collected | unchanged | none (Play from a dead process: the stored session, like a headset Play) | none |
 | Nothing | stopped | no | none | none |
 
 ## 11. Feature checklist
 
 Login (OAuth, other-device), Premium gate, logout, background play, notification &
-lock-screen controls, Bluetooth/headset buttons, Android Auto, playback resumption,
+lock-screen controls, home-screen widget, Bluetooth/headset buttons, Android Auto, playback resumption,
 audio focus & ducking, becoming-noisy pause, output switching (speaker/BT/wired/USB +
 system switcher), Connect send (device list, transfer, remote control incl. volume keys, signing
 in local-network ZeroConf speakers and Google Cast devices)

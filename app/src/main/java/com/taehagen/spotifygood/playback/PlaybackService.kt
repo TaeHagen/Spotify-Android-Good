@@ -54,6 +54,7 @@ import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.model.PlaybackSource
 import com.taehagen.spotifygood.model.PlaybackStatus
 import com.taehagen.spotifygood.nativebridge.NativeErrorCode
+import com.taehagen.spotifygood.widget.NowPlayingWidgets
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -540,6 +541,11 @@ class PlaybackService : MediaLibraryService() {
                 buttons = PlaybackSessionCommands.buttons(this@PlaybackService, state)
                 session?.setMediaButtonPreferences(buttons)
             }
+        }
+        lifecycleScope.launch {
+            // Home-screen widgets (docs §9.4): track, play state, like and device, only while one is
+            // placed; once the service is gone they show the stored session.
+            NowPlayingWidgets.follow(this@PlaybackService, likedState())
         }
         lifecycleScope.launch {
             // Resume state: the local session on every relevant change and every 15 s while it

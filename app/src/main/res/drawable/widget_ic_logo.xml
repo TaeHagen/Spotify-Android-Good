@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Home-screen widget: the app's mark (the launcher icon's tile, without the adaptive-icon margin). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <group
+        android:translateX="-30"
+        android:translateY="-30">
+        <path
+            android:fillColor="#FF1ED760"
+            android:fillType="evenOdd"
+            android:pathData="M42,30h24a12,12 0,0 1,12 12v24a12,12 0,0 1,-12 12h-24a12,12 0,0 1,-12 -12v-24a12,12 0,0 1,12 -12z M42,55h2a2.5,2.5 0,0 1,2.5 2.5v9a2.5,2.5 0,0 1,-2.5 2.5h-2a2.5,2.5 0,0 1,-2.5 -2.5v-9a2.5,2.5 0,0 1,2.5 -2.5z M53,42h2a2.5,2.5 0,0 1,2.5 2.5v22a2.5,2.5 0,0 1,-2.5 2.5h-2a2.5,2.5 0,0 1,-2.5 -2.5v-22a2.5,2.5 0,0 1,2.5 -2.5z M64,49h2a2.5,2.5 0,0 1,2.5 2.5v15a2.5,2.5 0,0 1,-2.5 2.5h-2a2.5,2.5 0,0 1,-2.5 -2.5v-15a2.5,2.5 0,0 1,2.5 -2.5z" />
+    </group>
+</vector>
