@@ -10,6 +10,11 @@ over JNI). Requires a Spotify Premium account.
   Bluetooth/headset buttons, Android Auto, playback resumption, audio focus and ducking,
   pause on headphone unplug, gapless, normalisation, streaming quality, sleep timer, system
   equalizer.
+- **Home-screen widget:** what plays on the phone or a Spotify Connect device ("Playing on
+  Kitchen"), resizable from 2x1 (artwork and play/pause) through 4x1 (title, artist, previous /
+  next) to 4x2 and larger (like and shuffle), in the wallpaper's colours from Android 12. With
+  nothing playing it offers the last session, whose Play works with the app closed; logged out it
+  offers "Sign in". It is updated only when what plays changes, never on a schedule.
 - **Output switching:** speaker, Bluetooth, wired or USB from the app's device sheet or the
   system output switcher; routing follows device changes.
 - **Spotify Connect:**
@@ -87,6 +92,7 @@ Gradle properties:
 
 Tests: `./gradlew :app:testDebugUnitTest` and
 `cd native && cargo test -p spotcore -p librespot-connect -p librespot-playback -p librespot-audio`.
+Screenshots (Robolectric + Roborazzi, test dependencies only): `./gradlew :app:testDebugUnitTest -Pscreenshots --tests '*ScreenshotTest'` writes PNGs to `app/build/outputs/roborazzi` (build output, not committed); the plain test run skips them.
 
 ## Known limitations
 

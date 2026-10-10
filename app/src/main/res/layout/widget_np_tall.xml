@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Now-playing widget, TALL_NARROW (3x2) and TALL (4x3 and taller, with like and shuffle): the
+     artwork across the top, then title, artist, the Connect device and the controls. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@android:id/background"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_background"
+    android:clipToOutline="true"
+    android:gravity="center_horizontal"
+    android:orientation="vertical"
+    android:padding="@dimen/widget_padding_large"
+    tools:targetApi="31">
+
+    <ImageView
+        android:id="@+id/widget_art"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:importantForAccessibility="no"
+        android:scaleType="fitCenter"
+        android:src="@drawable/widget_art_placeholder" />
+
+    <TextView
+        android:id="@+id/widget_title"
+        style="@style/Widget.SpotifyGood.NowPlaying.Title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:gravity="center_horizontal"
+        android:text="@string/widget_preview_title"
+        android:textSize="16sp" />
+
+    <TextView
+        android:id="@+id/widget_subtitle"
+        style="@style/Widget.SpotifyGood.NowPlaying.Subtitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:gravity="center_horizontal"
+        android:text="@string/widget_preview_artist"
+        android:textSize="14sp" />
+
+    <LinearLayout
+        android:id="@+id/widget_device"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <ImageView
+            android:layout_width="14dp"
+            android:layout_height="14dp"
+            android:importantForAccessibility="no"
+            android:src="@drawable/widget_ic_device"
+            android:tint="@color/widget_primary" />
+
+        <TextView
+            android:id="@+id/widget_device_text"
+            style="@style/Widget.SpotifyGood.NowPlaying.Device"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp" />
+    </LinearLayout>
+
+    <include layout="@layout/widget_np_controls" />
+</LinearLayout>

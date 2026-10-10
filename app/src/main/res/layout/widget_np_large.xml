@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Now-playing widget, LARGE (4x2): large artwork beside title, artist and the Connect device; like,
+     the skips around play / pause, and shuffle below. Also the picker's preview (previewLayout), so
+     its defaults are the sample. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@android:id/background"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_background"
+    android:clipToOutline="true"
+    android:orientation="vertical"
+    android:padding="@dimen/widget_padding_large"
+    tools:targetApi="31">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:id="@+id/widget_art"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:adjustViewBounds="true"
+            android:importantForAccessibility="no"
+            android:maxWidth="120dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/widget_art_placeholder" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginStart="12dp"
+            android:layout_weight="1"
+            android:gravity="center_vertical"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/widget_title"
+                style="@style/Widget.SpotifyGood.NowPlaying.Title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:maxLines="2"
+                android:text="@string/widget_preview_title"
+                android:textSize="16sp" />
+
+            <TextView
+                android:id="@+id/widget_subtitle"
+                style="@style/Widget.SpotifyGood.NowPlaying.Subtitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/widget_preview_artist"
+                android:textSize="14sp" />
+
+            <LinearLayout
+                android:id="@+id/widget_device"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:visibility="gone">
+
+                <ImageView
+                    android:layout_width="14dp"
+                    android:layout_height="14dp"
+                    android:importantForAccessibility="no"
+                    android:src="@drawable/widget_ic_device"
+                    android:tint="@color/widget_primary" />
+
+                <TextView
+                    android:id="@+id/widget_device_text"
+                    style="@style/Widget.SpotifyGood.NowPlaying.Device"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="4dp"
+                    android:layout_weight="1" />
+            </LinearLayout>
+        </LinearLayout>
+    </LinearLayout>
+
+    <include layout="@layout/widget_np_controls" />
+</LinearLayout>

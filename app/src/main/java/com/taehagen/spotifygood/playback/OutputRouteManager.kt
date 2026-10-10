@@ -62,6 +62,15 @@ class OutputRouteManager(
     val outputs: StateFlow<List<AudioOutput>> = _outputs.asStateFlow()
     val current: StateFlow<AudioOutput?> = _current.asStateFlow()
 
+    private val _bluetoothOutput = MutableStateFlow<Boolean?>(null)
+
+    /**
+     * A Bluetooth audio output (A2DP, LE Audio, a broadcast sink) is connected, so a headset or car
+     * may read the media session ([RemotePlayback.readsPaused]); null while not watched (between
+     * [stop] and [start]).
+     */
+    val bluetoothOutput: StateFlow<Boolean?> = _bluetoothOutput.asStateFlow()
+
     @Volatile private var started = false
     private val pick = OutputPick()
     @Volatile private var routedDevice: AudioDeviceInfo? = null
@@ -112,6 +121,7 @@ class OutputRouteManager(
         audioManager.unregisterAudioDeviceCallback(deviceCallback)
         audioSink.removeRoutingListener(routingListener)
         lastReported = null
+        _bluetoothOutput.value = null
     }
 
     /** null = follow the system default route. */
@@ -155,6 +165,7 @@ class OutputRouteManager(
         }
         val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
             .filter { it.isSink && kindOf(it.type) != null }
+        _bluetoothOutput.value = if (started) devices.any { RemotePlayback.isBluetoothMediaOutput(it.type) } else null
         val unique = dedupe(devices)
         val routed = routedDevice?.takeIf { r -> unique.any { matches(it, r) } }
             ?: fallbackRoute(unique)

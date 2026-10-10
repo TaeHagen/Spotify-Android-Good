@@ -606,8 +606,6 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         if (tracks.isNullOrEmpty()) reloadPager() else likedPatch.update { it.liked(tracks) }
     }
 
-    fun loadMore() = pager.loadMore()
-
     fun refresh() {
         viewModelScope.launch {
             if (graph.engineReach() != EngineReach.ONLINE) return@launch

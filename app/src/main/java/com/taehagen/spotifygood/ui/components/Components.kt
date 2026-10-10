@@ -89,8 +89,10 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.role
@@ -114,6 +116,7 @@ import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
 import coil3.request.crossfade
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.data.MOSAIC_TILES
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.MediaRef
@@ -253,6 +256,11 @@ fun TrackRow(
      * item's actions remain reachable. Kept before [trailing] so trailing-lambda calls still work.
      */
     enabled: Boolean = true,
+    /**
+     * The row can be swiped start→end to add the track to the queue ([SwipeToQueueRow]) when it
+     * can start; false for lists where that doesn't fit (the Queue, playlist edit mode, pickers).
+     */
+    swipeToQueue: Boolean = true,
     trailing: (@Composable () -> Unit)? = null,
 ) {
     val colors = MaterialTheme.colorScheme
@@ -267,110 +275,116 @@ fun TrackRow(
     // A placeholder has nothing to act on (no metadata): no long press and no overflow.
     val onMoreClick = onMoreClick.takeUnless { placeholder }
     val onLongClick = onLongClick.takeUnless { placeholder }
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .combinedClickable(
-                enabled = enabled && !placeholder,
-                onClick = { if (track.playable && !placeholder) onClick() },
-                onLongClick = onLongClick ?: onMoreClick,
-                onLongClickLabel = if (onLongClick != null || onMoreClick != null) moreLabel else null,
-            )
-            .semantics {
-                when {
-                    !track.playable || placeholder -> stateDescription = unavailableLabel
-                    isCurrent -> stateDescription = nowPlayingLabel
-                }
-            }
-            .heightIn(min = 64.dp)
-            .padding(start = 16.dp, end = if (onMoreClick != null) 4.dp else 16.dp, top = 6.dp, bottom = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
+    val onQueue = rememberRowQueueAdd(swipeToQueueEligible(swipeToQueue, placeholder, track.playable, enabled), track.uri)
+    val queueLabel = stringResource(R.string.shell_action_add_to_queue)
+    SwipeToQueueRow(onQueue, modifier) { slide ->
         Row(
-            modifier = Modifier
-                .weight(1f)
-                .alpha(if (dimmed) DISABLED_ALPHA else 1f),
+            modifier = slide
+                .fillMaxWidth()
+                .combinedClickable(
+                    enabled = enabled && !placeholder,
+                    onClick = { if (track.playable && !placeholder) onClick() },
+                    onLongClick = onLongClick ?: onMoreClick,
+                    onLongClickLabel = if (onLongClick != null || onMoreClick != null) moreLabel else null,
+                )
+                .semantics {
+                    when {
+                        !track.playable || placeholder -> stateDescription = unavailableLabel
+                        isCurrent -> stateDescription = nowPlayingLabel
+                    }
+                    // TalkBack's way to the swipe.
+                    if (onQueue != null) customActions = listOf(CustomAccessibilityAction(queueLabel) { onQueue(); true })
+                }
+                .heightIn(min = 64.dp)
+                .padding(start = 16.dp, end = if (onMoreClick != null) 4.dp else 16.dp, top = 6.dp, bottom = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            when {
-                showArtwork -> Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
-                    Artwork(
-                        url = track.album?.images?.best(120),
-                        contentDescription = null,
-                        modifier = Modifier.matchParentSize(),
-                    )
-                    if (isCurrent && isPlaying) {
-                        Box(
-                            Modifier
-                                .matchParentSize()
-                                .clip(RoundedCornerShape(4.dp))
-                                .background(Color.Black.copy(alpha = 0.45f)),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            NowPlayingBars(isPlaying = true, color = AppColors.Brand)
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .alpha(if (dimmed) DISABLED_ALPHA else 1f),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                when {
+                    showArtwork -> Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                        Artwork(
+                            url = track.album?.images?.best(120),
+                            contentDescription = null,
+                            modifier = Modifier.matchParentSize(),
+                        )
+                        if (isCurrent && isPlaying) {
+                            Box(
+                                Modifier
+                                    .matchParentSize()
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(Color.Black.copy(alpha = 0.45f)),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                NowPlayingBars(isPlaying = true, color = AppColors.Brand)
+                            }
+                        }
+                    }
+                    index != null -> Box(Modifier.widthIn(min = 32.dp), contentAlignment = Alignment.Center) {
+                        if (isCurrent && isPlaying) {
+                            NowPlayingBars(isPlaying = true)
+                        } else {
+                            Text(
+                                text = index.toString(),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (isCurrent) colors.primary else colors.onSurfaceVariant,
+                                maxLines = 1,
+                            )
                         }
                     }
                 }
-                index != null -> Box(Modifier.widthIn(min = 32.dp), contentAlignment = Alignment.Center) {
-                    if (isCurrent && isPlaying) {
-                        NowPlayingBars(isPlaying = true)
-                    } else {
+                if (showArtwork || index != null) Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (isCurrent && isPlaying && !showArtwork && index == null) {
+                            NowPlayingBars(isPlaying = true, modifier = Modifier.size(14.dp))
+                            Spacer(Modifier.width(6.dp))
+                        }
                         Text(
-                            text = index.toString(),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (isCurrent) colors.primary else colors.onSurfaceVariant,
+                            text = title,
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Medium,
+                            color = titleColor,
                             maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        if (isSuggestion) {
+                            Icon(
+                                imageVector = Icons.Rounded.AutoAwesome,
+                                contentDescription = stringResource(R.string.shell_cd_suggested),
+                                tint = colors.primary,
+                                modifier = Modifier.size(14.dp),
+                            )
+                        }
+                        if (track.explicit) ExplicitBadge()
+                        DownloadIndicator(downloadState)
+                        Text(
+                            text = subtitle,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = colors.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                 }
             }
-            if (showArtwork || index != null) Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (isCurrent && isPlaying && !showArtwork && index == null) {
-                        NowPlayingBars(isPlaying = true, modifier = Modifier.size(14.dp))
-                        Spacer(Modifier.width(6.dp))
-                    }
-                    Text(
-                        text = title,
-                        style = MaterialTheme.typography.bodyLarge,
-                        fontWeight = FontWeight.Medium,
-                        color = titleColor,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    if (isSuggestion) {
-                        Icon(
-                            imageVector = Icons.Rounded.AutoAwesome,
-                            contentDescription = stringResource(R.string.shell_cd_suggested),
-                            tint = colors.primary,
-                            modifier = Modifier.size(14.dp),
-                        )
-                    }
-                    if (track.explicit) ExplicitBadge()
-                    DownloadIndicator(downloadState)
-                    Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = colors.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
+            // Trailing slot sits at the END of the row (queue remove / drag handle / suggestion actions).
+            if (trailing != null) {
+                Box(Modifier.alpha(if (enabled) 1f else DISABLED_ALPHA), contentAlignment = Alignment.Center) { trailing() }
             }
-        }
-        // Trailing slot sits at the END of the row (queue remove / drag handle / suggestion actions).
-        if (trailing != null) {
-            Box(Modifier.alpha(if (enabled) 1f else DISABLED_ALPHA), contentAlignment = Alignment.Center) { trailing() }
-        }
-        if (onMoreClick != null) {
-            IconButton(onClick = onMoreClick) {
-                Icon(Icons.Rounded.MoreVert, contentDescription = moreLabel, tint = colors.onSurfaceVariant)
+            if (onMoreClick != null) {
+                IconButton(onClick = onMoreClick) {
+                    Icon(Icons.Rounded.MoreVert, contentDescription = moreLabel, tint = colors.onSurfaceVariant)
+                }
             }
         }
     }
@@ -394,6 +408,8 @@ fun EpisodeRow(
      * parameters precede [onMoreClick] for trailing-lambda calls.
      */
     enabled: Boolean = true,
+    /** Swipe start→end to add the episode to the queue (see [TrackRow]). */
+    swipeToQueue: Boolean = true,
     onMoreClick: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
@@ -420,84 +436,89 @@ fun EpisodeRow(
     // A placeholder has nothing to act on (no metadata): no long press and no overflow.
     val onMoreClick = onMoreClick.takeUnless { placeholder }
     val onLongClick = onLongClick.takeUnless { placeholder }
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .combinedClickable(
-                enabled = enabled && !placeholder,
-                onClick = { if (episode.playable && !placeholder) onClick() },
-                onLongClick = onLongClick ?: onMoreClick,
-                onLongClickLabel = if (onLongClick != null || onMoreClick != null) moreLabel else null,
-            )
-            .semantics {
-                when {
-                    placeholder -> stateDescription = unavailableLabel
-                    isCurrent -> stateDescription = nowPlayingLabel
-                }
-            }
-            .padding(start = 16.dp, end = if (onMoreClick != null) 4.dp else 16.dp, top = 10.dp, bottom = 10.dp),
-        verticalAlignment = Alignment.Top,
-    ) {
-        Row(Modifier.weight(1f).alpha(if (enabled && episode.playable && !placeholder) 1f else DISABLED_ALPHA)) {
-            Artwork(
-                url = episode.images.best(160) ?: episode.show?.images?.best(160),
-                contentDescription = null,
-                modifier = Modifier.size(72.dp),
-                shape = RoundedCornerShape(8.dp),
-                placeholderIcon = Icons.Rounded.Podcasts,
-            )
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.titleSmall,
-                    color = if (isCurrent) colors.primary else colors.onSurface,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
+    val onQueue = rememberRowQueueAdd(swipeToQueueEligible(swipeToQueue, placeholder, episode.playable, enabled), episode.uri)
+    val queueLabel = stringResource(R.string.shell_action_add_to_queue)
+    SwipeToQueueRow(onQueue, modifier) { slide ->
+        Row(
+            modifier = slide
+                .fillMaxWidth()
+                .combinedClickable(
+                    enabled = enabled && !placeholder,
+                    onClick = { if (episode.playable && !placeholder) onClick() },
+                    onLongClick = onLongClick ?: onMoreClick,
+                    onLongClickLabel = if (onLongClick != null || onMoreClick != null) moreLabel else null,
                 )
-                episode.show?.name?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                .semantics {
+                    when {
+                        placeholder -> stateDescription = unavailableLabel
+                        isCurrent -> stateDescription = nowPlayingLabel
+                    }
+                    if (onQueue != null) customActions = listOf(CustomAccessibilityAction(queueLabel) { onQueue(); true })
                 }
-                if (description.isNotEmpty()) {
+                .padding(start = 16.dp, end = if (onMoreClick != null) 4.dp else 16.dp, top = 10.dp, bottom = 10.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Row(Modifier.weight(1f).alpha(if (enabled && episode.playable && !placeholder) 1f else DISABLED_ALPHA)) {
+                Artwork(
+                    url = episode.images.best(160) ?: episode.show?.images?.best(160),
+                    contentDescription = null,
+                    modifier = Modifier.size(72.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    placeholderIcon = Icons.Rounded.Podcasts,
+                )
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
-                        text = description,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = colors.onSurfaceVariant,
+                        text = title,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = if (isCurrent) colors.primary else colors.onSurface,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
-                }
-                Row(
-                    modifier = Modifier.padding(top = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    if (isCurrent) NowPlayingBars(isPlaying = isPlaying, modifier = Modifier.size(14.dp))
-                    if (played) {
-                        Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = colors.primary, modifier = Modifier.size(14.dp))
+                    episode.show?.name?.let {
+                        Text(it, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
-                    if (episode.explicit) ExplicitBadge()
-                    DownloadIndicator(downloadState)
-                    Text(meta, style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-                if (!played && resume > 0 && episode.durationMs > 0) {
-                    LinearProgressIndicator(
-                        progress = { (resume.toFloat() / episode.durationMs).coerceIn(0f, 1f) },
-                        modifier = Modifier
-                            .padding(top = 4.dp)
-                            .fillMaxWidth(0.5f)
-                            .height(3.dp)
-                            .clip(CircleShape),
-                        color = colors.primary,
-                        trackColor = colors.surfaceVariant,
-                        drawStopIndicator = {},
-                    )
+                    if (description.isNotEmpty()) {
+                        Text(
+                            text = description,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = colors.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.padding(top = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        if (isCurrent) NowPlayingBars(isPlaying = isPlaying, modifier = Modifier.size(14.dp))
+                        if (played) {
+                            Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = colors.primary, modifier = Modifier.size(14.dp))
+                        }
+                        if (episode.explicit) ExplicitBadge()
+                        DownloadIndicator(downloadState)
+                        Text(meta, style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    if (!played && resume > 0 && episode.durationMs > 0) {
+                        LinearProgressIndicator(
+                            progress = { (resume.toFloat() / episode.durationMs).coerceIn(0f, 1f) },
+                            modifier = Modifier
+                                .padding(top = 4.dp)
+                                .fillMaxWidth(0.5f)
+                                .height(3.dp)
+                                .clip(CircleShape),
+                            color = colors.primary,
+                            trackColor = colors.surfaceVariant,
+                            drawStopIndicator = {},
+                        )
+                    }
                 }
             }
-        }
-        if (onMoreClick != null) {
-            IconButton(onClick = onMoreClick) {
-                Icon(Icons.Rounded.MoreVert, contentDescription = moreLabel, tint = colors.onSurfaceVariant)
+            if (onMoreClick != null) {
+                IconButton(onClick = onMoreClick) {
+                    Icon(Icons.Rounded.MoreVert, contentDescription = moreLabel, tint = colors.onSurfaceVariant)
+                }
             }
         }
     }
@@ -520,6 +541,8 @@ fun MediaThumbnail(ref: MediaRef, modifier: Modifier = Modifier, cornerRadius: D
     when {
         ref.type == MediaType.COLLECTION && url == null -> LikedSongsTile(modifier, RoundedCornerShape(cornerRadius))
         ref.type == MediaType.ARTIST -> Artwork(url, null, modifier, CircleShape, Icons.Rounded.Person)
+        // Without an image of its own: the mosaic of its first songs (docs §9.8).
+        ref.type == MediaType.PLAYLIST && url == null -> PlaylistArtwork(ref.uri, null, null, modifier, RoundedCornerShape(cornerRadius))
         else -> Artwork(url, null, modifier, RoundedCornerShape(cornerRadius), ref.type.placeholderIcon())
     }
 }
@@ -906,11 +929,13 @@ fun DetailHeader(
     subtitle: String? = null,
     description: String? = null,
     circularImage: Boolean = false,
+    /** Four covers shown as a 2x2 mosaic when there is no [imageUrl] (a playlist without an image). */
+    mosaic: List<String> = emptyList(),
     actions: @Composable () -> Unit = {},
 ) {
     val colors = MaterialTheme.colorScheme
     val dark = LocalIsDarkTheme.current
-    val dominant = rememberDominantColor(imageUrl)
+    val dominant = rememberDominantColor(imageUrl ?: mosaic.firstOrNull())
     val tint by animateColorAsState(
         targetValue = (dominant ?: colors.surfaceContainerHighest).copy(alpha = if (dark) 0.9f else 0.45f),
         animationSpec = tween(600),
@@ -942,17 +967,22 @@ fun DetailHeader(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         val shape = if (circularImage) CircleShape else RoundedCornerShape(6.dp)
-        Artwork(
-            url = imageUrl,
-            contentDescription = null,
-            modifier = Modifier
-                .fillMaxWidth(0.62f)
-                .widthIn(max = 300.dp)
-                .aspectRatio(1f)
-                .shadow(elevation = 18.dp, shape = shape),
-            shape = shape,
-            placeholderIcon = if (circularImage) Icons.Rounded.Person else Icons.Rounded.MusicNote,
-        )
+        val artModifier = Modifier
+            .fillMaxWidth(0.62f)
+            .widthIn(max = 300.dp)
+            .aspectRatio(1f)
+            .shadow(elevation = 18.dp, shape = shape)
+        if (imageUrl == null && mosaic.size == MOSAIC_TILES) {
+            MosaicArtwork(mosaic, null, artModifier, shape)
+        } else {
+            Artwork(
+                url = imageUrl,
+                contentDescription = null,
+                modifier = artModifier,
+                shape = shape,
+                placeholderIcon = if (circularImage) Icons.Rounded.Person else Icons.Rounded.MusicNote,
+            )
+        }
         Spacer(Modifier.height(20.dp))
         Text(
             text = title,

@@ -514,6 +514,8 @@ pub(crate) struct RootItem {
     pub status_code: Option<i32>,
     /// The item's `public` attribute: the playlist is shown on the user's profile.
     pub public: Option<bool>,
+    /// The playlist's own revision (`revision` decoration, hex), when present.
+    pub revision: Option<String>,
 }
 
 impl RootItem {
@@ -595,6 +597,7 @@ pub(crate) fn parse_rootlist_page(list: &p4::SelectedListContent) -> Vec<RootIte
                 can_edit_items: meta.and_then(|m| m.capabilities.as_ref()).and_then(|c| c.can_edit_items),
                 status_code: meta.and_then(|m| m.status_code),
                 public: item.attributes.as_ref().and_then(|a| a.public),
+                revision: meta.and_then(|m| revision_hex(m.revision())),
             }
         })
         .collect()
@@ -665,6 +668,7 @@ pub(crate) fn build_tree(items: &[RootItem], username: &str, extra: &HashMap<Str
                     collaborative: false,
                     can_edit: false,
                     is_public: None,
+                    revision: None,
                 },
             });
         } else if let Some(id) = item.uri.strip_prefix("spotify:end-group:") {
@@ -691,6 +695,7 @@ pub(crate) fn build_tree(items: &[RootItem], username: &str, extra: &HashMap<Str
                         collaborative,
                         can_edit: item.can_edit_items.unwrap_or(owned_by(&item.owner) || collaborative),
                         is_public: Some(item.public == Some(true)),
+                        revision: item.revision.clone(),
                     })
                 }
                 (_, Some(r)) => {
@@ -706,6 +711,7 @@ pub(crate) fn build_tree(items: &[RootItem], username: &str, extra: &HashMap<Str
                         collaborative: false,
                         can_edit: item.can_edit_items.unwrap_or(owned),
                         is_public: Some(item.public == Some(true)),
+                        revision: item.revision.clone(),
                     })
                 }
                 _ => None,
@@ -1316,6 +1322,7 @@ mod tests {
                     meta.attributes = MessageField::some(a);
                     meta.set_owner_username("spotify".into());
                     meta.set_length(50);
+                    meta.set_revision(vec![0x01, 0xab]);
                 }
                 2 => {
                     let mut a = attrs("Bob's mix");
@@ -1354,6 +1361,9 @@ mod tests {
         assert_eq!(v[0]["name"], "Today's Top Hits");
         assert_eq!(v[0]["owner"]["displayName"], "Spotify");
         assert_eq!(v[0]["images"][0]["width"], 300);
+        // The playlist's own revision, for what the app derives from its items (its mosaic).
+        assert_eq!(v[0]["revision"], "01ab");
+        assert!(v[1]["children"][0].get("revision").is_none(), "no decoration, no revision");
         assert_eq!(v[1]["type"], "folder");
         assert_eq!(v[1]["name"], "My Folder!");
         assert_eq!(v[1]["uri"], "spotify:user:alice:folder:abc123");
@@ -1464,6 +1474,7 @@ mod tests {
                 can_edit_items: None,
                 status_code: None,
                 public: None,
+                revision: None,
             })
             .collect();
         let tree = build_tree(&items, "u", &HashMap::new());

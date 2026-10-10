@@ -282,8 +282,9 @@ internal fun EditableRow(
             val track = item.track
             val episode = item.episode
             when {
-                track != null -> TrackRow(track = track, onClick = {}, showArtwork = false)
-                episode != null -> EpisodeRow(episode = episode, onClick = {})
+                // Edit mode: rows move and go, they don't queue.
+                track != null -> TrackRow(track = track, onClick = {}, showArtwork = false, swipeToQueue = false)
+                episode != null -> EpisodeRow(episode = episode, onClick = {}, swipeToQueue = false)
                 else -> Spacer(Modifier.height(56.dp))
             }
         }
@@ -515,6 +516,8 @@ internal fun AddSongsSheet(
                         TrackRow(
                             track = track,
                             onClick = { if (!added) onAdd(track) },
+                            // A picker: its rows add to the playlist.
+                            swipeToQueue = false,
                             trailing = {
                                 IconButton(onClick = { if (!added) onAdd(track) }) {
                                     Icon(

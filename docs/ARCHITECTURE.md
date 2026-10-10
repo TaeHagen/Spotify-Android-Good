@@ -744,7 +744,9 @@ SearchResults {"tracks","artists","albums","playlists","shows","episodes" (array
 MediaRef     {"type":"track|album|artist|playlist|show|episode|collection","uri","name","subtitle"?,"images"}
 HomeSection  {"id","title","items":[MediaRef]}
 RootlistEntry {"type":"playlist|folder","uri"?,"name","images"?,"owner"?,"children"?:[RootlistEntry],"collaborative","canEdit",
-              "isPublic"?:bool (playlists: the item's `public` attribute)}
+              "isPublic"?:bool (playlists: the item's `public` attribute),
+              "revision"?:hex (playlists: the playlist's own revision, `revision` decoration; what the
+              app's mosaic of it was learned at is compared with it)}
 Lyrics       {"syncType":"LINE_SYNCED|UNSYNCED|SYLLABLE_SYNCED","lines":[{"startTimeMs","words"}],
               "provider"?,"colors"?:{"background","text","highlightText"}}
 User         {"username","displayName","images","product","country","explicitFilter",
@@ -810,8 +812,11 @@ For a remote active device, smart shuffle is not supported (the command reports
   device becomes active, when this phone is picked, and on logout.
 * **Remote playback in the app**: `PlaybackSnapshot.source == "remote"` is built from the
   cluster's `player_state` (position extrapolated with `session.time_delta()`); the
-  MediaSession switches to `DeviceInfo(PLAYBACK_TYPE_REMOTE)` so hardware volume keys
-  control the remote device; the notification says "Playing on <device>". The stored session
+  MediaSession switches to `DeviceInfo(PLAYBACK_TYPE_REMOTE)`, and while that device plays with
+  a Bluetooth audio output connected its platform state reads paused, so Bluetooth never sees
+  this phone as a playing source (§9.4, Remote playback and Bluetooth); hardware volume keys
+  control the remote device; the
+  notification says "Playing on <device>". The stored session
   (§9.4) follows the mirrored session, so when that device leaves and nothing is active, Play
   on the phone continues what it played (Spotify resumes the account's last session).
 * **Audio output reporting**: Kotlin reports the current local output (speaker /
@@ -1094,6 +1099,128 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   toggles like. Remote playback: the current item's artist reads "<artists> • Playing on
   <device>" on API 30+ (SysUI shows only title/artist), the notification text adds it below
   API 30; the subtitle carries the device line. Downloaded tracks use their downloaded cover.
+* **Remote playback and Bluetooth** (`RemotePlayback`, `RemoteVolumeKeys`). Bluetooth's AVRCP
+  target tells the headset or car the play status of one session: `MediaPlayerList`'s
+  `getCurrentPlayStatus()` returns the active player's `PlaybackState` as it is, whatever its
+  playback type (only navigation speech overrides it); the active player is the media-key
+  session (`onMediaKeyEventSessionChanged`), else the highest-priority one, one controller per
+  package. `PlayStatus.playbackStateToAvrcpState` maps PLAYING and BUFFERING to playing, and
+  `avrcp_device.cc` sends each change (PLAYBACK_STATUS_CHANGED) to the A2DP active device.
+  Mirroring another device, the session read PLAYING (Media3 maps READY + `playWhenReady` to
+  it; `DeviceInfo(REMOTE)` only calls `setPlaybackToRemote`), so a tap on play told the headset
+  that the phone started playing: a multipoint headset switched to the phone and paused its
+  other source, which may be the very device controlled (it played for a second, then paused,
+  and the phone mirrored the pause). Nothing else on the phone takes part: remote playback
+  requests no audio focus (it is abandoned), starts no AudioTrack (only the local player starts
+  the sink), holds no wake or Wi-Fi lock and registers no noisy receiver. So while another
+  device plays or loads (`playsElsewhere`) and a Bluetooth audio output is connected
+  (`readsPaused`), `SpotifyPlayer` reports its playback as suppressed
+  (`PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS`): `playWhenReady` stays (Media3's
+  media foreground, notification and lifecycle as before) and the platform state reads PAUSED
+  (Media3 maps a suppressed READY or BUFFERING to paused, `Util.shouldShowPlayButton` with
+  `showPlayButtonIfPlaybackIsSuppressed` at its default), which Bluetooth passes on. Local
+  playback is never suppressed.
+  * The Bluetooth output: `OutputRouteManager.bluetoothOutput`, from the `AudioDeviceCallback`
+    of §9.5 (outputs of type A2DP, LE Audio headset or speaker, or a broadcast sink:
+    `isBluetoothMediaOutput`; AudioManager lists the A2DP active device, the one AVRCP reports
+    the real state to). Without one no headset or car reads the session, so it reads PLAYING
+    as before: pause shown, a moving position, the volume keys on the media session itself.
+    Not watched (the engine starting or stopping: null) counts as connected, the safe side. A
+    change while the device plays is one state change of the session (one notification
+    update); the volume key session follows what the session then publishes (a player
+    listener), so the keys move between the two sessions in that same step.
+  * What follows from the paused state: the surfaces drawn from it (SysUI's notification and
+    lock-screen controls from API 33, Auto, Wear, a headset's play key) show play while the
+    device plays. Their play is then a toggle and pauses it (`playMeansPause`, in
+    `handleSetPlayWhenReady`: only while the published state is suppressed), except a voice
+    assistant's (Google app, Assistant, car assistant, Gemini), an explicit "play" or "resume".
+    Media3 controllers send that play although `playWhenReady` is set (they do for a transient
+    focus suppression), and a play/pause key toggles on `playWhenReady`, so pauses. Bluetooth
+    keys arrive as the media notification controller. Below API 33, where the notification
+    draws its own buttons, it shows pause (`getMediaButtons`). The platform position does not
+    advance while suppressed (speed 0; each update moves it), and the notification shows no
+    chronometer.
+  * Volume keys go to a session in an active state that handles them
+    (`MediaSessionStack.getDefaultVolumeSession`), which a paused one is not. While the session
+    reads paused, `RemoteVolumeKeys` keeps a hidden platform `MediaSession` active: remote volume
+    (`VolumeProvider`, absolute 0..100, following the device's volume) → `setDeviceVolume` or a
+    step; state CONNECTING (active for the volume keys, STOPPED for AVRCP, no notification);
+    the title and artist; transport controls forwarded to the player (play with the same
+    toggle), since a watch or the volume dialog may pick it as the first active session. It is
+    inactive otherwise, created on first use (never during local playback). Media keys still
+    reach the media session (`findMediaButtonSession` prefers the app's session whose state
+    matches its audio activity, and nothing plays here).
+  * `onTaskRemoved`: Media3 keeps its foreground service only while a session `isPlaying`,
+    which a suppressed one is not; the service applies that rule with "plays elsewhere" (with
+    or without a Bluetooth output), so swiping the app away keeps mirroring instead of pausing
+    the device.
+  * Left open: when a Bluetooth output becomes active while the device plays, the session reads
+    playing until the app hears of it (the device callback, then one state update), so a headset
+    asking for the play status in that moment may still see playing.
+  * Where the platform ties the media foreground to an engaged session
+    (`enableNotifyingActivityManagerWithMediaSessionStatusChange`: an inactive state for 10 min
+    → `notifyInactiveMediaForegroundService`), the service may leave the foreground after 10 min
+    of remote playback, as after 10 min of a pause; Media3's next foreground start is refused,
+    and the notification is posted without it (`onForegroundStartNotAllowed`, mirroring).
+* **Home-screen widget** (`widget/`): `NowPlayingWidgetReceiver`, an `AppWidgetProvider` (not
+  exported; `xml/widget_now_playing_info.xml`), draws hand-written RemoteViews. Glance does not
+  fit: it runs every update in a WorkManager session worker that stays up ≥ 45 s, and its
+  `actionStartActivity` gives a data-less intent a data URI, which would break
+  `MainActivity.launchIntent`'s root match (§9.3). 4x2 by default, resizable from 2x1. From Android 12
+  every layout goes out in one sized RemoteViews and the launcher shows the best fit, also while
+  resizing; below 12 `WidgetLayout.bestFit` (the same rule) picks the portrait and the landscape
+  layout from the widget's options, drawn again when they change. 2x1: the artwork filling the
+  widget with play/pause; 2x2: artwork, play/pause below; 3x1: + title and artist; 4x1: artwork
+  beside title, artist and previous / play-pause / next (one row in landscape); 3x2: artwork
+  across the top, title, artist, "Playing on <device>" for another Connect device, the controls;
+  4x2: large artwork beside the text, the controls with like and shuffle (three-state, as the
+  notification's); 4x3 and up: 3x2's arrangement with like and shuffle. Episodes have −15 s / +15 s
+  instead of previous / next. The notification's icons (Media3's) and strings; the system corner
+  radius and dynamic colours from Android 12, the app's light and dark palette below. Picker:
+  `previewLayout` (the 4x2 layout, its defaults a sample), a drawn `previewImage` below 12, a
+  description. No generated preview on Android 15: a static one only repeats previewLayout, a
+  personal one would cost pushes while no widget is placed.
+  * What it shows (`WidgetModels`, pure): logged out → "Sign in" (opens the app); something loaded,
+    here or on the device this phone mirrors → it, live; nothing loaded → the `ResumeStore` session
+    with Play alone; nothing stored → "Nothing playing" (opens the app). It holds no position.
+  * Updates are pushed, never scheduled (`updatePeriodMillis` 0, no alarm, polling or job). While
+    the playback service runs, one collector (`NowPlayingWidgets.follow`) maps the snapshot, the
+    like state and the login to the widget's state, only while a widget is placed: the ids are
+    read once per process and again on the provider's update, delete, enable, disable and restore
+    broadcasts; with none nothing is collected. Equal states are dropped and pushes throttled: the
+    first at once, then at most one per 500 ms, the latest winning (a track change brings several
+    snapshots). When the service goes the widget shows the stored session (its other buttons would
+    find the session gone). The receiver draws every widget on placement, reboot and app update,
+    and on a resize below 12 (from 12 only when the artwork's size step changes): the live state
+    while the service runs, else from the credential file check and the resume store, without the
+    engine. Artwork: one software bitmap all widgets and layouts share, decoded by Coil square
+    and exactly at a step of 256 / 384 / 512 / 640 px (`WidgetArtSize`; a stable cache key while
+    sizes move a little): the smallest covering the largest artwork any placed widget shows
+    (`WidgetLayout.artDp`) at any size its options report (`OPTION_APPWIDGET_SIZES` from 12, else
+    the portrait and landscape min / max), times the density, and at most what a quarter of the
+    update's bitmap limit (screen w × h × 4 × 1.5) holds. Its source is the smallest of the
+    track's covers (64 / 300 / 640) that covers the step; the stored session has its one 300 px
+    cover. Corners rounded (a tenth of the side); from the memory or disk cache or a downloaded
+    cover, else fetched (≤ 5 s); the last one reused while the item and the step stay; none → a
+    placeholder. The small and one-row play buttons shrink with a widget lower than their size
+    (`adjustViewBounds` and a maximum size) instead of being clipped.
+  * A tap on the widget opens Now Playing with the session activity's intent
+    (`MainActivity.launchIntent` + `EXTRA_OPEN_PLAYER`, `SINGLE_TOP | CLEAR_TOP`); logged out or with
+    nothing to show, `launchIntent` as it is (a login in progress stays on top). Buttons are
+    immutable broadcasts to the receiver. Playback keys become media-button intents for
+    `PlaybackService` (`ACTION_MEDIA_BUTTON` + `KeyEvent`; explicit PLAY or PAUSE: Media3's
+    double-tap wait for play-pause does not apply, and the widget, drawn from the snapshot and not
+    from the suppressed session state, shows Pause while another device plays), handled as a
+    headset's. Play is a `startForegroundService`: a widget tap allows a foreground-service start
+    on Android 12–15 (the launcher, in the foreground, sends the PendingIntent), and on a dead
+    process Media3 turns the Play into the playback resumption of the stored session, played here,
+    which takes the media foreground at once; with nothing to resume the service meets the start's
+    contract itself. Pause and the skips need the session the widget showed: a plain start while
+    the service is in the foreground, while it runs without one a plain start or, refused in the
+    background, a foreground start (its 3 s contract deadline covers a key that leaves nothing
+    playing); without the service nothing is started and the widget is drawn again. Like
+    (`toggleSaved` with the state shown) and shuffle (`cycleShuffle`) run in the process, only while
+    the service runs. Logged out meanwhile: drawn again ("Sign in").
 * Player error (only while nothing plays; STATE_IDLE, playlist kept): logged out →
   `AUTHENTICATION_EXPIRED` + "Sign in" action; `PREMIUM_REQUIRED`; `PLAYBACK_REFUSED`; else
   the last failed attempt to start playback (`PlayerController.failure`, also native
@@ -1233,7 +1360,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   player so Media3 goes foreground at once). `onForegroundServiceStartNotAllowedException`
   → for local playback pause + "Tap to resume"; while mirroring a remote device the notification
   is posted without the foreground (the remote device is never paused).
-  `onTaskRemoved` default behaviour. The `PLAYBACK` engine holder is taken on the first
+  `onTaskRemoved`: Media3's rule, except while presence keeps the service up and while another
+  device plays (Remote playback and Bluetooth). The `PLAYBACK` engine holder is taken on the first
   playback command (play, load, seek, queue, modes, volume; a pause or stop does not count),
   a playback resumption for playback, voice "play", Tap to resume, our LOCAL_PLAYBACK start,
   the media foreground, or a local / mirrored snapshot, and released when the service is
@@ -1313,7 +1441,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   speaker, wired headset/headphones, BT A2DP / BLE headset/speaker / hearing aid, USB,
   HDMI, line out, dock), tracks the current route via `AudioTrack.getRoutedDevice()` +
   `OnRoutingChangedListener`, and listens with `AudioDeviceCallback` (registered only
-  while the engine runs).
+  while the engine runs). `bluetoothOutput` says whether a Bluetooth media output (A2DP, LE
+  Audio, broadcast) is connected (null while not watched), for remote playback (§9.4).
 * User selection → `AudioSinkBridge.setPreferredDevice(AudioDeviceInfo?)` (`null` =
   system default; best effort — verify with `routedDevice()`). A pick is temporary, like the
   system switcher's (`OutputPick`): it lasts until that device goes away, a new external output
@@ -1344,7 +1473,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `Settings.System` + `VOLUME_CHANGED_ACTION`, registered only while the engine runs) and
   sends `player.setVolume {fromSystem:true}`.
 * Remote active device: MediaSession `DeviceInfo(REMOTE, 0..100)`; `handleSetDeviceVolume`
-  / increase / decrease → `player.setVolume`. In-app slider in the device sheet.
+  / increase / decrease → `player.setVolume`. While the device plays with a Bluetooth output
+  connected, the hardware volume keys reach it through `RemoteVolumeKeys` (§9.4, Remote playback
+  and Bluetooth), since the media session then reads paused. In-app slider in the device sheet.
 
 ### 9.7 Downloads
 
@@ -1570,7 +1701,23 @@ refetched twice while on screen (after 15 s and 30 s). The home feed is treated 
 when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
-app scope, so they complete even if their screen closes. "Add to playlist" (a song, an episode,
+app scope, so they complete even if their screen closes.
+Playlist art: a playlist's own image when it has one (also the server's generated covers, the
+`picture_size` URLs such as `mosaic.scdn.co`, when its attributes carry them). Without one the app
+draws Spotify's: a 2x2 mosaic of the first 4 distinct album covers among its first 20 items (local
+files, rows without art and unavailable rows skipped; one hidden only by Hide explicit content
+counts), edge to edge as one square; fewer than 4 distinct covers: the first song's cover alone;
+none: the placeholder. Liked Songs keeps its own art. `PlaylistMosaicStore` learns it only for a
+playlist without an image that is shown (one `catalog.playlist` page of 20, at most 3 playlists at
+a time, once per playlist at a time), from the playlist page's own first rows when it is open, and
+offline from the downloaded rows (their covers through `OfflineCovers`). It is kept in memory and in
+the response cache (`catalog.playlist:<uri>:mosaic`, made stale by the app's own edits with the
+playlist's other rows) and learned again when the rootlist lists the playlist at another revision,
+after a failed fetch not before 5 min, and after a day for a playlist whose revision isn't known
+(Home, Search). Compose draws 4 images in exact quarters (`MosaicArtwork`); Android Auto and other
+media browsers get one composed JPEG (`ArtworkProvider` `…/mosaic?u=…`, `MosaicBitmaps`: each cover
+decoded at tile size, kept in the app cache keyed by the cover ids, wiped with the account), from
+what memory holds (a browse never waits: the first one starts the learn). "Add to playlist" (a song, an episode,
 an album's tracks, another playlist's items — "Add to other playlist") lists the playlist picked
 first, item URIs only (`catalog.playlistUris`: one request when the server answers the whole
 list, at most 101; a source playlist the same way, at most 10,000 items; bounded at 20 s): items
@@ -1708,15 +1855,36 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
     '*ExpandingPlayerScreenshotTest'`) renders p = 0, 0.15, 0.35, 0.5, 0.75, 1 (light, dark, a
     Connect device, font scale 1.6, landscape; fake state, no network) and drives real touch
     events through the sheet (drag, fling, slow release, nested scroll, a slider, a tap).
+* Swipe to queue (`ui/components/SwipeToQueue.kt`, built into `TrackRow` and `EpisodeRow`): in
+  every vertical list of tracks or episodes, including search results, artist top tracks, album
+  tracks, playlists and Liked Songs (window rows too once loaded), Downloads, a show's episodes
+  and Your Episodes. Swiping a row start→end (mirrored right to left) slides it with the finger
+  over a green background with the queue icon on the leading side. Past the threshold (28 % of
+  the row's width or 96 dp, whichever is smaller) the icon pops, the green deepens and a soft
+  haptic tick plays; coming back below it reverts. Letting go there adds the item through the
+  row menu's "Add to queue" (`MediaActionRunner.addToQueue`: "Added to queue", a full queue,
+  offline and unavailable items alike) and springs the row back; the row is never dismissed.
+  Short of the threshold it only springs back. A fling counts when it is faster than 800 dp/s,
+  has moved a quarter of the threshold, and its distance projected 150 ms ahead reaches the
+  threshold. The swipe locks after the touch slop only to a mostly horizontal start→end move: a
+  vertical one scrolls the list, an end→start one is left alone, and a press held for a long
+  press keeps its long press. Taps, long presses and the fast scroller's thumb work as before,
+  and the system's back gesture is not excluded. The swipe is not offered on the Queue screen,
+  in a playlist's edit mode, in the add-songs picker, on placeholders, or on rows that can't
+  start (unavailable, or not downloaded while offline). TalkBack gets an "Add to queue" custom
+  action on the row. The offset is read in layer and draw blocks only, so a swipe recomposes
+  neither the row nor the list.
 * Fast scroller (`ui/components/FastScroller.kt`) on long lists: playlists and Liked Songs, the
   Downloads page, the library list, Your Episodes, a show's episodes and (long) albums. A slim
   track and a pill thumb on the right edge, between the top bar and the mini player / navigation
   bar. The thumb's length is the screen's share of the list (at least 48 dp). It shows while the
-  list moves and fades 1.5 s after; lists shorter than three screens have none. Its 48 dp touch
-  strip only takes touches while it shows, and it leaves horizontal moves alone. Dragging the
-  thumb seeks 1:1 over the whole list: the position maps to a row and its offset through the
-  measured header and footer and the average row height, both ways, so the thumb and the rows
-  agree. A drag on the track jumps there first; a tap jumps. A bubble beside the thumb names the
+  list moves and fades 1.5 s after; lists shorter than three screens have none. Only a touch
+  that starts on the thumb, or within 24 dp above or below it in its 48 dp strip, grabs it, and
+  only while it shows: its touch node is just that area, moving with the thumb, so every other
+  touch on the strip reaches the rows (overflow buttons, taps, long presses, drags that scroll
+  the list); the track itself takes none. Dragging the thumb seeks 1:1 over the whole list: the
+  position maps to a row and its offset through the measured header and footer and the average
+  row height, both ways, so the thumb and the rows agree. A bubble beside the thumb names the
   row on top while dragging: the first letter of the Title / Artist / Album sort key (accents
   dropped; digits and symbols "#"), the month it was added in Recently added, otherwise
   "1,234 / 5,000". A letter change gives a soft haptic tick. The thumb is computed from the
@@ -1768,12 +1936,13 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
 | Presence opt-in, idle (also restored after an app update, and after a reboot up to Android 14; from Android 15 a notification asks to open the app) | Online | yes | connectedDevice (low-importance) | none |
+| Home-screen widget placed (§9.4) | unchanged: pushed by the running playback service when the track, play state, like or device change, ≤ 1 per 500 ms; no `updatePeriodMillis`, alarm, polling or job; no widget, nothing collected | unchanged | none (Play from a dead process: the stored session, like a headset Play) | none |
 | Nothing | stopped | no | none | none |
 
 ## 11. Feature checklist
 
 Login (OAuth, other-device), Premium gate, logout, background play, notification &
-lock-screen controls, Bluetooth/headset buttons, Android Auto, playback resumption,
+lock-screen controls, home-screen widget, Bluetooth/headset buttons, Android Auto, playback resumption,
 audio focus & ducking, becoming-noisy pause, output switching (speaker/BT/wired/USB +
 system switcher), Connect send (device list, transfer, remote control incl. volume keys, signing
 in local-network ZeroConf speakers and Google Cast devices)

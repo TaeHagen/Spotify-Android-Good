@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Home-screen widget (owner: widget). From Android 12 the corner radius is the system's
+     (values-v31). -->
+<resources>
+    <dimen name="widget_background_radius">16dp</dimen>
+    <!-- Inside the background: the artwork's distance to the corners -->
+    <dimen name="widget_padding">8dp</dimen>
+    <!-- Text layouts -->
+    <dimen name="widget_padding_large">12dp</dimen>
+</resources>

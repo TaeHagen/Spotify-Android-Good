@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Now-playing widget, ROW (3x1) and ROW_FULL (4x1 in landscape, with the skips): one row of
+     artwork, title and artist, and the controls. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@android:id/background"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_background"
+    android:clipToOutline="true"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="6dp"
+    android:paddingTop="4dp"
+    android:paddingEnd="6dp"
+    android:paddingBottom="4dp"
+    tools:targetApi="31">
+
+    <ImageView
+        android:id="@+id/widget_art"
+        android:layout_width="wrap_content"
+        android:layout_height="match_parent"
+        android:adjustViewBounds="true"
+        android:importantForAccessibility="no"
+        android:maxWidth="72dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/widget_art_placeholder" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="10dp"
+        android:layout_marginEnd="4dp"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/widget_title"
+            style="@style/Widget.SpotifyGood.NowPlaying.Title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/widget_preview_title" />
+
+        <TextView
+            android:id="@+id/widget_subtitle"
+            style="@style/Widget.SpotifyGood.NowPlaying.Subtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="@string/widget_preview_artist" />
+    </LinearLayout>
+
+    <ImageButton
+        android:id="@+id/widget_skip_back"
+        style="@style/Widget.SpotifyGood.NowPlaying.Button"
+        android:contentDescription="@string/widget_previous"
+        android:src="@drawable/media3_icon_previous" />
+
+    <!-- 36dp, smaller in a lower row (adjustViewBounds keeps it round): it never clips -->
+    <ImageButton
+        android:id="@+id/widget_play"
+        style="@style/Widget.SpotifyGood.NowPlaying.Play"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="2dp"
+        android:layout_marginEnd="2dp"
+        android:adjustViewBounds="true"
+        android:maxWidth="36dp"
+        android:maxHeight="36dp"
+        android:src="@drawable/media3_icon_play" />
+
+    <ImageButton
+        android:id="@+id/widget_skip_forward"
+        style="@style/Widget.SpotifyGood.NowPlaying.Button"
+        android:contentDescription="@string/widget_next"
+        android:src="@drawable/media3_icon_next" />
+</LinearLayout>

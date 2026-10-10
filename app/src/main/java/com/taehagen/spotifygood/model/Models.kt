@@ -255,6 +255,8 @@ data class RootlistEntry(
     val canEdit: Boolean = false,
     /** Playlists: shown on the user's profile (null for folders). */
     val isPublic: Boolean? = null,
+    /** Playlists: the playlist's current revision, when the rootlist gives it (its mosaic is kept per revision). */
+    val revision: String? = null,
 )
 
 /** `library.playlists`; [partial]: some playlist names could not be looked up right now and are missing. */

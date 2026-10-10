@@ -372,6 +372,10 @@ pub struct RootlistEntry {
     /// Playlists: shown on the user's profile (the rootlist item's `public` attribute).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_public: Option<bool>,
+    /// Playlists: the playlist's current revision (hex), when the rootlist decorates it; what an
+    /// image derived from its items (the app's mosaic) was learned at is compared with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

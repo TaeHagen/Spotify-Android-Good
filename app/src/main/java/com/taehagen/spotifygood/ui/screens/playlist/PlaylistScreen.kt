@@ -57,7 +57,11 @@ import com.taehagen.spotifygood.model.PlaylistItem
 import com.taehagen.spotifygood.model.PlaylistOwner
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.ui.appViewModel
+import com.taehagen.spotifygood.data.MOSAIC_SCAN
+import com.taehagen.spotifygood.data.MOSAIC_TILES
+import com.taehagen.spotifygood.data.mosaicCovers
 import com.taehagen.spotifygood.ui.components.DetailHeader
+import com.taehagen.spotifygood.ui.components.rememberAppGraph
 import com.taehagen.spotifygood.ui.components.EmptyState
 import com.taehagen.spotifygood.ui.components.EpisodeRow
 import com.taehagen.spotifygood.ui.components.FastScroller
@@ -468,9 +472,18 @@ private fun PlaylistHeader(
     val meta = playlist.meta
     val description = rememberRichText(playlist.description)
     val isContext = state.playback.isContext(meta.uri)
+    // Without an image of its own: the mosaic of its first songs, also for the lists (docs §9.8).
+    val ownImage = meta.images.best(640)
+    val firstItems = playlist.rows.take(MOSAIC_SCAN).map { it.item }
+    val covers = remember(ownImage, firstItems) { if (ownImage == null) mosaicCovers(firstItems) else emptyList() }
+    val mosaics = rememberAppGraph().playlistMosaics
+    LaunchedEffect(meta.uri, playlist.revision, covers) {
+        if (ownImage == null && !playlist.partial && !playlist.downloadedCopy) mosaics.record(meta.uri, playlist.revision, firstItems)
+    }
     DetailHeader(
         title = meta.name,
-        imageUrl = meta.images.best(640),
+        imageUrl = ownImage ?: covers.singleOrNull()?.url(640),
+        mosaic = if (covers.size == MOSAIC_TILES) covers.map { it.url(320).orEmpty() } else emptyList(),
         modifier = Modifier.fillMaxWidth(),
         actions = {
             Column(Modifier.fillMaxWidth()) {
