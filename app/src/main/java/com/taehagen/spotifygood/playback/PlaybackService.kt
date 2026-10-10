@@ -22,7 +22,9 @@ import androidx.media3.common.HeartRating
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
 import androidx.media3.common.Rating
+import androidx.media3.common.util.Util
 import androidx.media3.session.CacheBitmapLoader
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
@@ -98,6 +100,8 @@ class PlaybackService : MediaLibraryService() {
     private lateinit var tree: LibraryTree
     private lateinit var resumeStore: ResumeStore
     private lateinit var presence: PresenceController
+    /** The volume keys for another device while it plays ([RemotePlayback]). */
+    private lateinit var remoteVolumeKeys: RemoteVolumeKeys
     private var session: MediaLibrarySession? = null
     /** Guarded by [holderLock]. */
     private var playbackHolder: EngineHolder? = null
@@ -167,6 +171,19 @@ class PlaybackService : MediaLibraryService() {
             onCommand = ::ensurePlaybackHolder,
             podcastSpeed = { graph.podcastSpeed.inEffect.value },
             onSpeed = graph.podcastSpeed::set,
+            requester = { session?.controllerForCurrentRequest?.packageName },
+        )
+        remoteVolumeKeys = RemoteVolumeKeys(
+            context = this,
+            sessionActivity = sessionActivity(),
+            setVolume = { percent -> player.setDeviceVolume(percent, 0) },
+            adjustVolume = { direction -> if (direction > 0) player.increaseDeviceVolume(0) else player.decreaseDeviceVolume(0) },
+            playRequested = { caller ->
+                if (RemotePlayback.playMeansPause(graph.playback.snapshot.value, caller)) graph.player.pause() else graph.player.resume()
+            },
+            pauseRequested = { graph.player.pause() },
+            nextRequested = { graph.player.next() },
+            previousRequested = { graph.player.previous() },
         )
 
         val provider = PlaybackNotificationProvider(this).apply { setSmallIcon(R.drawable.ic_notification) }
@@ -287,6 +304,10 @@ class PlaybackService : MediaLibraryService() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         // With Connect presence the user asked the phone to stay available: keep running.
         if (presence.isEnabled && (presence.isForeground || mediaForeground)) return
+        // Another device plays: Media3 keeps a foreground service whose session plays, but this one
+        // reads suppressed (RemotePlayback), so it would pause that device with the swiped-away
+        // app. Its own rule, with "plays elsewhere" for "plays": mirroring goes on.
+        if (isPlaybackOngoing && RemotePlayback.playsElsewhere(graph.playback.snapshot.value)) return
         super.onTaskRemoved(rootIntent)
     }
 
@@ -298,6 +319,7 @@ class PlaybackService : MediaLibraryService() {
         main.removeCallbacks(foregroundDeadline)
         coordinator.closeEffectSession()
         presence.release()
+        remoteVolumeKeys.release()
         clearListener()
         session?.release()
         session = null
@@ -313,6 +335,13 @@ class PlaybackService : MediaLibraryService() {
     }
 
     // ---- paused lifetime ----------------------------------------------------------------------
+
+    /** Hands the volume keys to [RemoteVolumeKeys] while another device plays. Main thread. */
+    private fun updateRemoteVolumeKeys() {
+        val s = graph.playback.snapshot.value
+        val supported = player.isCommandAvailable(Player.COMMAND_SET_DEVICE_VOLUME_WITH_FLAGS)
+        remoteVolumeKeys.update(RemotePlayback.volumeKeysSession(s, supported), player.deviceVolume, s.track?.name, s.track?.artistLine)
+    }
 
     /** Playing or loading (here or on the mirrored device), or Connect presence keeps it up. */
     private fun isBusy(): Boolean {
@@ -425,6 +454,7 @@ class PlaybackService : MediaLibraryService() {
                 graph.podcastSpeed.inEffect.map { },
             ).collect {
                 player.refresh()
+                updateRemoteVolumeKeys()
                 // Runs on most wake-ups (engine and snapshot events): a cheap check of the
                 // paused-idle deadline besides its alarm.
                 if (pausedIdle.isDue(isBusy(), SystemClock.elapsedRealtime())) updatePausedIdle()
@@ -736,6 +766,24 @@ class PlaybackService : MediaLibraryService() {
     ) {
         override fun getNotificationContentText(metadata: MediaMetadata): CharSequence? =
             DeviceLine.join(context, super.getNotificationContentText(metadata), metadata.subtitle)
+
+        /**
+         * Another device plays: the session reads paused ([RemotePlayback]), but where this
+         * notification draws its own buttons (below API 33) it shows pause, which (a play/pause
+         * key, toggled on `playWhenReady`) pauses that device. Unchanged otherwise: only remote
+         * playback is ever suppressed.
+         */
+        override fun getMediaButtons(
+            session: MediaSession,
+            playerCommands: Player.Commands,
+            mediaButtonPreferences: ImmutableList<CommandButton>,
+            showPauseButton: Boolean,
+        ): ImmutableList<CommandButton> = super.getMediaButtons(
+            session,
+            playerCommands,
+            mediaButtonPreferences,
+            showPauseButton || !Util.shouldShowPlayButton(session.player, /* shouldShowPlayIfSuppressed= */ false),
+        )
     }
 
     /** Drops late (artwork) updates of the media notification while presence owns the foreground. */
