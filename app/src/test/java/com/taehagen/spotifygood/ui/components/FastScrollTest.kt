@@ -97,14 +97,41 @@ class FastScrollTest {
         val thumb = thumbHeight(geometry.visibleRatio, track, minPx = 120f)
         // 2,000 px of 320,000: below the minimum.
         assertEquals(120f, thumb, 0f)
-        for (f in listOf(0f, 0.25f, 0.5f, 0.999f, 1f)) {
-            assertEquals(f, fractionAtThumb(thumbTop(f, track, thumb), track, thumb), 0.0001f)
+        val travel = track - thumb
+        // Grabbed at 25 %: the thumb moves exactly as far as the finger.
+        for (moved in listOf(-100f, 0f, 37f, 400f)) {
+            val f = draggedFraction(0.25f, moved, travel)
+            assertEquals(thumbTop(0.25f, track, thumb) + moved, thumbTop(f, track, thumb), 0.01f)
         }
-        assertEquals(0f, fractionAtThumb(-40f, track, thumb), 0f)
-        assertEquals(1f, fractionAtThumb(track + 40f, track, thumb), 0f)
+        // Held at the ends.
+        assertEquals(0f, draggedFraction(0.25f, -track, travel), 0f)
+        assertEquals(1f, draggedFraction(0.25f, track * 2, travel), 0f)
+        assertEquals(0.25f, draggedFraction(0.25f, 50f, travel = 0f), 0f)
         // A long viewport: the thumb is its share, never longer than the track.
         assertEquals(800f, thumbHeight(0.5f, track, 120f), 0f)
         assertEquals(track, thumbHeight(1f, track, 2_000f), 0f)
+    }
+
+    @Test
+    fun onlyATouchOnOrNearTheThumbGrabsIt() {
+        val track = 1_600f
+        val top = 700f
+        val thumb = 120f
+        val margin = 63f // 24 dp at xxhdpi
+        // On the thumb, and within the margin above and below it: the scroller takes it.
+        for (y in listOf(top, top + 60f, top + thumb, top - margin + 1f, top + thumb + margin - 1f)) {
+            assertTrue("y=$y", fastScrollGrabs(y, top, thumb, margin, track))
+        }
+        // Elsewhere on the strip (a row's overflow button, a tap, a drag): it passes to the rows.
+        for (y in listOf(0f, top - margin - 1f, top + thumb + margin + 1f, 1_200f, track)) {
+            assertFalse("y=$y", fastScrollGrabs(y, top, thumb, margin, track))
+        }
+        // The area stays on the track at its ends.
+        assertEquals(0f..(thumb + margin), thumbHitArea(0f, thumb, margin, track))
+        assertEquals((track - thumb - margin)..track, thumbHitArea(track - thumb, thumb, margin, track))
+        // Its touch node is that area: the thumb plus both margins.
+        val area = thumbHitArea(top, thumb, margin, track)
+        assertEquals(thumb + 2 * margin, area.endInclusive - area.start, 0f)
     }
 
     @Test

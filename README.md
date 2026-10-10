@@ -87,6 +87,7 @@ Gradle properties:
 
 Tests: `./gradlew :app:testDebugUnitTest` and
 `cd native && cargo test -p spotcore -p librespot-connect -p librespot-playback -p librespot-audio`.
+Screenshots (Robolectric + Roborazzi, test dependencies only): `./gradlew :app:testDebugUnitTest -Pscreenshots --tests '*ScreenshotTest'` writes PNGs to `app/build/outputs/roborazzi` (build output, not committed); the plain test run skips them.
 
 ## Known limitations
 
