@@ -1070,10 +1070,19 @@ fun DetailTopBar(
     )
 }
 
-/** Round play/pause button (green) used on detail headers. */
+/**
+ * Round play/pause button (green) used on detail headers. [busy]: a play was tapped and waits (a
+ * sorted list for its remaining pages): a spinner instead of the icon; a tap still works.
+ */
 @Composable
-fun PlayFab(isPlaying: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
-    val label = stringResource(if (isPlaying) R.string.shell_cd_pause else R.string.shell_cd_play)
+fun PlayFab(isPlaying: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier, busy: Boolean = false) {
+    val label = stringResource(
+        when {
+            busy -> R.string.shell_cd_play_waiting
+            isPlaying -> R.string.shell_cd_pause
+            else -> R.string.shell_cd_play
+        },
+    )
     Surface(
         onClick = onClick,
         modifier = modifier
@@ -1085,12 +1094,20 @@ fun PlayFab(isPlaying: Boolean, onClick: () -> Unit, modifier: Modifier = Modifi
         shadowElevation = 6.dp,
     ) {
         Box(contentAlignment = Alignment.Center) {
-            Crossfade(targetState = isPlaying, animationSpec = tween(150), label = "playFab") { playing ->
-                Icon(
-                    imageVector = if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                    contentDescription = null,
-                    modifier = Modifier.size(32.dp),
-                )
+            Crossfade(targetState = if (busy) null else isPlaying, animationSpec = tween(150), label = "playFab") { playing ->
+                if (playing == null) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp),
+                        color = AppColors.OnBrand,
+                        strokeWidth = 2.5.dp,
+                    )
+                } else {
+                    Icon(
+                        imageVector = if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                        contentDescription = null,
+                        modifier = Modifier.size(32.dp),
+                    )
+                }
             }
         }
     }

@@ -33,6 +33,7 @@ import com.taehagen.spotifygood.ui.screens.album.cachedPageMatchesDownload
 import com.taehagen.spotifygood.ui.screens.album.collectionUi
 import com.taehagen.spotifygood.ui.screens.album.dataOrNull
 import com.taehagen.spotifygood.ui.screens.album.engineReach
+import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
 import com.taehagen.spotifygood.ui.screens.album.failureReason
 import com.taehagen.spotifygood.ui.screens.album.insertBeforeIndex
 import com.taehagen.spotifygood.ui.screens.album.matchesTokens
@@ -48,6 +49,8 @@ import com.taehagen.spotifygood.ui.screens.library.listPlaybackFlow
 import com.taehagen.spotifygood.ui.screens.library.planSortedPlay
 import com.taehagen.spotifygood.ui.screens.library.SortedStart
 import com.taehagen.spotifygood.ui.screens.library.SortedPlays
+import com.taehagen.spotifygood.ui.screens.library.SortedPlayStarter
+import com.taehagen.spotifygood.ui.screens.library.SORTED_PLAY_WAIT_MS
 import com.taehagen.spotifygood.ui.screens.library.sortedPlayRequest
 import com.taehagen.spotifygood.ui.screens.library.sortOrder
 import com.taehagen.spotifygood.ui.screens.library.sortKey
@@ -69,12 +72,14 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
@@ -119,6 +124,25 @@ internal data class PlaylistData(
     val allLoaded: Boolean get() = rows.size >= total
 }
 
+/**
+ * A sorted play of this playlist waits for its remaining rows first ([SortedPlayStarter]): the
+ * session is ONLINE and the server's rows aren't all loaded (also after a failed page: the play
+ * fetches them once more).
+ */
+internal fun playlistPlayWaits(reach: EngineReach, playlist: PlaylistData?): Boolean =
+    reach == EngineReach.ONLINE && playlist != null && !playlist.allLoaded && !playlist.downloadedCopy
+
+/**
+ * The URIs a sorted play plays: [rows] (the loaded rows, in [sort] order) that can play; not local
+ * files, placeholders (metadata failed) or unplayable items.
+ */
+internal fun sortedPlayableUris(rows: List<PlaylistRow>, sort: TrackSort): List<String> =
+    sortOrder(rows.map { it.item.sortKey() }, sort, default = TrackSort.CUSTOM).mapNotNull { index ->
+        val item = rows[index].item
+        val playable = item.track?.let { it.playable && !it.isPlaceholder } ?: item.episode?.let { it.playable && !it.isPlaceholder } ?: false
+        item.uri?.takeIf { playable && !it.startsWith("spotify:local:") }
+    }
+
 /** A row to display with its absolute position in the playlist. */
 @Immutable
 internal data class VisibleRow(val index: Int, val row: PlaylistRow)
@@ -158,6 +182,8 @@ internal data class PlaylistUiState(
      * list started for it, also before the page was reopened ([isListPlaying]).
      */
     val listIsCurrent: Boolean = false,
+    /** A sorted play waits for the remaining rows ([SortedPlayStarter]): the Play button shows it. */
+    val playPending: Boolean = false,
 )
 
 @Immutable
@@ -214,6 +240,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     @Volatile private var cleared = false
     private var pageJob: Job? = null
     private var loadAllJob: Job? = null
+    /** Play and row taps: a sorted one waits for every row ([playlistPlayWaits]). */
+    private val listPlays = SortedPlayStarter(viewModelScope, graph.player.userCommands)
 
     private val listUi: Flow<PlaylistListUi> = combine(
         data,
@@ -242,13 +270,14 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         playbackInfo,
         graph.savedFlow(uri),
         graph.downloads.collectionUi(uri),
-        combine(graph.downloads.statesFor(itemUris), connectivity, ::Pair),
-    ) { core, playback, following, download, (rows, connectivity) ->
+        combine(graph.downloads.statesFor(itemUris), connectivity, listPlays.waiting, ::Triple),
+    ) { core, playback, following, download, (rows, connectivity, playPending) ->
         PlaylistUiState(
             core.load, core.list, core.paging, core.editMode, playback, following, download, rows,
             connectivity.offline, connectivity.online, connectivity.filterExplicit,
             sort = core.sort,
             listIsCurrent = isListPlaying(ListSortStore.playlist(uri), uri, core.listPlayback, core.lastSorted),
+            playPending = playPending,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlaylistUiState())
 
@@ -517,7 +546,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         return PlaylistListUi(rows, filterActive = tokens.isNotEmpty(), sortActive = sortActive, totalDurationMs = duration)
     }
 
-    /** Every loaded row in [sort] order, with its playlist index. */
+    /** Every loaded row in [sort] order, with its playlist index ([sortedPlayableUris] plays the same order). */
     private fun sortedRows(playlist: PlaylistData, sort: TrackSort): List<VisibleRow> =
         sortOrder(playlist.rows.map { it.item.sortKey() }, sort, default = TrackSort.CUSTOM)
             .map { VisibleRow(it, playlist.rows[it]) }
@@ -534,29 +563,56 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     private val sorted: Boolean get() = sort.value != TrackSort.CUSTOM && !editMode.value
 
     /**
-     * Plays the loaded rows in the shown order from [startUri] (else the first) as a track list: the
-     * playlist context plays its own order ([sortedPlayRequest]). Sorted off the main thread.
+     * Plays the rows in the shown order from [startUri] (else the first) as a track list: the
+     * playlist context plays its own order ([sortedPlayRequest]). The playlist and the order are
+     * read now (after [playlistPlayWaits]' wait: every row), sorted off the main thread.
      */
-    private fun playSorted(startUri: String?) {
+    private suspend fun playSorted(startUri: String?) {
         val playlist = data.value.dataOrNull() ?: return
         val order = sort.value
-        viewModelScope.launch {
-            val uris = withContext(Dispatchers.Default) {
-                sortedRows(playlist, order).mapNotNull { visible ->
-                    val item = visible.row.item
-                    val playable = item.track?.let { it.playable && !it.isPlaceholder } ?: item.episode?.let { it.playable && !it.isPlaceholder } ?: false
-                    item.uri?.takeIf { playable && !it.startsWith("spotify:local:") }
-                }
+        val uris = withContext(Dispatchers.Default) { sortedPlayableUris(playlist.rows, order) }
+        // Not ONLINE, a track list goes to the offline queue: planned like any plain list (the
+        // reach as of now, after the wait and the sort).
+        when (val plan = planSortedPlay(uris, startUri, graph.engineReach(), graph.downloads.downloadedUris.value)) {
+            is SortedStart.Load -> {
+                SortedPlays.record(graph, ListSortStore.playlist(uri), plan.request)
+                graph.player.play(plan.request)
             }
-            // Not ONLINE, a track list goes to the offline queue: planned like any plain list (the
-            // reach as of now, after the sort).
-            when (val plan = planSortedPlay(uris, startUri, graph.engineReach(), graph.downloads.downloadedUris.value)) {
-                is SortedStart.Load -> {
-                    SortedPlays.record(graph, ListSortStore.playlist(uri), plan.request)
-                    graph.player.play(plan.request)
-                }
-                SortedStart.NotDownloaded -> message(R.string.playback_error_not_available_offline)
-                SortedStart.Nothing -> Unit
+            SortedStart.NotDownloaded -> message(R.string.playback_error_not_available_offline)
+            SortedStart.Nothing -> Unit
+        }
+    }
+
+    /**
+     * Play ([row] null: from the top) or a row tap. Sorted, the shown order plays as a track list
+     * once every row is in ([playlistPlayWaits]: they are being fetched for the sort meanwhile,
+     * "Loading songs… n of total"), at most [SORTED_PLAY_WAIT_MS]; a newer tap replaces a waiting
+     * one ([SortedPlayStarter]). What plays is decided when it starts: the sort, edit mode or the
+     * session may have changed during the wait.
+     */
+    private fun play(row: VisibleRow?) {
+        val waits = sorted && playlistPlayWaits(graph.engineReach(), data.value.dataOrNull())
+        listPlays.play(awaitRows = if (waits) ::awaitAllRows else null) { startPlay(row) }
+    }
+
+    /** Returns once every row is loaded, or loading stopped (a failed page, the session not ONLINE). */
+    private suspend fun awaitAllRows() {
+        // Also after a failed page: the play fetches the rest once more.
+        ensureAllLoaded()
+        val loading = loadAllJob ?: return
+        merge(
+            flow { loading.join(); emit(Unit) },
+            graph.engineReachFlow().filter { it != EngineReach.ONLINE }.map { },
+        ).first()
+    }
+
+    private suspend fun startPlay(row: VisibleRow?) {
+        when {
+            sorted -> playSorted(row?.row?.item?.uri)
+            row == null -> super.playContext()
+            else -> {
+                val item = row.row.item
+                graph.player.play(PlayRequest(contextUri = uri, startUri = item.uri, startIndex = row.index, startUid = item.uid))
             }
         }
     }
@@ -566,10 +622,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         // This playlist plays: its context in any order (Shuffle, started before the sort, another
         // device) or a sorted list started for it, also after the page was reopened: toggle it.
         // Otherwise start it, sorted or as its context.
-        when {
-            state.value.listIsCurrent || currentPlayback().isContext(uri) -> graph.player.togglePlayPause()
-            sorted -> playSorted(startUri = null)
-            else -> super.playContext()
+        if (state.value.listIsCurrent || currentPlayback().isContext(uri)) {
+            listPlays.cancel()
+            graph.player.togglePlayPause()
+        } else {
+            play(row = null)
         }
     }
 
@@ -581,13 +638,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         val item = row.row.item
         // Placeholders (metadata failed) are not played; the row does not offer it either.
         if (item.track?.isPlaceholder == true || item.episode?.isPlaceholder == true) return
-        if (sorted) {
-            playSorted(item.uri)
-            return
-        }
-        graph.player.play(
-            PlayRequest(contextUri = uri, startUri = item.uri, startIndex = row.index, startUid = item.uid),
-        )
+        play(row)
     }
 
     fun setFilter(query: String) {

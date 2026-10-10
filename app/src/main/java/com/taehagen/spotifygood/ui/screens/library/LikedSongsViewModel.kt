@@ -35,6 +35,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
@@ -48,6 +49,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
 @Immutable
@@ -87,6 +89,8 @@ data class LikedSongsUiState(
     val listIsCurrent: Boolean = false,
     /** The session is ONLINE: songs that aren't downloaded can start ([canStartNow]). */
     val online: Boolean = true,
+    /** A sorted play waits for the rest of the pages ([SortedPlayStarter]): the Play button shows it. */
+    val playPending: Boolean = false,
 )
 
 /**
@@ -122,6 +126,14 @@ private data class LikedMeta(
     val lastSorted: SortedPlays.Entry?,
     val online: Boolean,
     val listPlayback: ListPlayback,
+    val playPending: Boolean,
+)
+
+private data class LikedListMeta(
+    val sort: TrackSort,
+    val lastSorted: SortedPlays.Entry?,
+    val listPlayback: ListPlayback,
+    val playPending: Boolean,
 )
 
 /** Likes and unlikes made in the app, applied to a fully loaded Liked Songs instead of paging it again. */
@@ -203,6 +215,34 @@ internal fun likedSongsNeedsFetch(reach: EngineReach, page: PagedState<*>, await
 /** How long Liked Songs shows a spinner for a connecting session before trying anyway. */
 private const val SESSION_WAIT_MS = 10_000L
 
+/**
+ * A sorted Liked Songs play waits for the rest of the pages first ([SortedPlayStarter]): the
+ * session is ONLINE, the list is the server's and more pages follow (also after an error: the
+ * play tries them once more).
+ */
+internal fun likedPlayWaits(reach: EngineReach, fromDownload: Boolean, page: PagedState<*>): Boolean =
+    reach == EngineReach.ONLINE && !fromDownload && !page.endReached
+
+/**
+ * Returns once every page of [pages] is in, or loading stopped: an error, the session not ONLINE,
+ * the list no longer [sorted] (the page then fetches no more).
+ */
+internal suspend fun awaitLikedPages(pages: Flow<PagedState<*>>, reach: Flow<EngineReach>, sorted: Flow<Boolean>) {
+    combine(pages, reach, sorted) { page, reach, sorted ->
+        (page.endReached && !page.isLoading) || page.error != null || reach != EngineReach.ONLINE || !sorted
+    }.first { it }
+}
+
+/**
+ * The playable Liked Songs in [sort] order, from the loaded pages themselves with the in-app
+ * likes applied ([applyLikedPatch]), not the shown list (it may lag the last page).
+ */
+internal fun likedSortedUris(pages: List<SavedTrack>, total: Int?, patch: LikedPatch, sort: TrackSort): List<String> =
+    applyLikedPatch(pages.map { it.track }, total, patch).first
+        .sortedFor(sort, default = TrackSort.RECENTLY_ADDED)
+        .filter { it.playable && !it.isPlaceholder }
+        .map { it.uri }
+
 private data class LikedDownload(
     val status: CollectionDownloadStatus,
     val downloaded: Boolean,
@@ -226,8 +266,8 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     private val sort = MutableStateFlow(TrackSort.RECENTLY_ADDED)
     /** Likes and unlikes since the list was fully loaded ([applyLikedPatch]). */
     private val likedPatch = MutableStateFlow(LikedPatch())
-    /** The loaded songs in the shown order (before the filter): what a sorted play plays. */
-    @Volatile private var sortedTracks: List<Track> = emptyList()
+    /** Play and row taps: a sorted one waits for every page ([likedPlayWaits]). */
+    private val plays = SortedPlayStarter(viewModelScope, graph.player.userCommands)
     private val messages = Channel<LibraryMessage>(Channel.BUFFERED)
     val events: Flow<LibraryMessage> = messages.receiveAsFlow()
     private val messenger = SessionMessenger(graph.app)
@@ -308,7 +348,6 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     private val sortedSource: Flow<LikedSource> = combine(source, sort, ::Pair)
         .mapLatest { (source, sort) -> source.copy(tracks = source.tracks.sortedFor(sort, default = TrackSort.RECENTLY_ADDED)) }
         .flowOn(Dispatchers.Default)
-        .onEach { sortedTracks = it.tracks }
 
     private val download: Flow<LikedDownload> = contextUri.flatMapLatest { uri ->
         if (uri == null) {
@@ -333,15 +372,16 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             refreshing,
             partialPages.partial,
             reach,
-            combine(sort, SortedPlays.last, graph.listPlaybackFlow(), ::Triple),
-        ) { download, refreshing, partial, reach, (sort, last, listPlayback) ->
+            combine(sort, SortedPlays.last, graph.listPlaybackFlow(), plays.waiting, ::LikedListMeta),
+        ) { download, refreshing, partial, reach, list ->
             LikedMeta(
                 download, refreshing, partial,
                 offline = reach == EngineReach.OFFLINE,
-                sort = sort,
-                lastSorted = last,
+                sort = list.sort,
+                lastSorted = list.lastSorted,
                 online = reach == EngineReach.ONLINE,
-                listPlayback = listPlayback,
+                listPlayback = list.listPlayback,
+                playPending = list.playPending,
             )
         },
         graph.nowPlayingFlow(),
@@ -371,6 +411,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             loadingAll = needsAll && !source.fromDownload && source.tracks.isNotEmpty() && (source.canLoadMore || source.isLoading),
             listIsCurrent = isListPlaying(ListSortStore.LIKED_SONGS, contextUri, meta.listPlayback, lastSorted),
             online = online,
+            playPending = meta.playPending,
         )
     }.flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LikedSongsUiState())
@@ -436,23 +477,21 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     private val sorted: Boolean get() = sort.value != TrackSort.RECENTLY_ADDED
 
     /**
-     * Plays the loaded songs in the shown order from [startUri] (else the first) as a track list:
-     * the Liked Songs context plays the server's order ([sortedPlayRequest]). False when there is
-     * nothing to play.
+     * Plays the songs in the shown order from [startUri] (else the first) as a track list: the
+     * Liked Songs context plays the server's order ([sortedPlayRequest]). The order is computed
+     * from the loaded pages now (after [likedPlayWaits]' wait: all of them), off the main thread.
      */
-    private fun playSorted(startUri: String?): Boolean {
-        val uris = sortedTracks.filter { it.playable && !it.isPlaceholder }.map { it.uri }
-        // Not ONLINE, a track list goes to the offline queue: planned like any plain list.
-        return when (val plan = planSortedPlay(uris, startUri, graph.engineReach(), graph.downloads.downloadedUris.value)) {
-            is SortedStart.Load -> {
-                startList(plan.request)
-                true
-            }
-            SortedStart.NotDownloaded -> {
-                messenger.post(R.string.playback_error_not_available_offline)
-                true
-            }
-            SortedStart.Nothing -> false
+    private suspend fun playSorted(startUri: String?) {
+        val page = pager.state.value
+        val patch = likedPatch.value
+        val order = sort.value
+        val uris = withContext(Dispatchers.Default) { likedSortedUris(page.items, page.total, patch, order) }
+        // Not ONLINE, a track list goes to the offline queue: planned like any plain list (the
+        // reach as of now, after the wait and the sort).
+        when (val plan = planSortedPlay(uris, startUri, graph.engineReach(), graph.downloads.downloadedUris.value)) {
+            is SortedStart.Load -> startList(plan.request)
+            SortedStart.NotDownloaded -> messenger.post(R.string.playback_error_not_available_offline)
+            SortedStart.Nothing -> if (startUri == null) messages.trySend(LibraryMessage.NOTHING_TO_PLAY)
         }
     }
 
@@ -514,9 +553,10 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
      */
     fun playOrToggle() {
         if (state.value.listIsCurrent) {
+            plays.cancel()
             graph.player.togglePlayPause()
         } else {
-            play(shuffle = false)
+            play(startUri = null, shuffle = false)
         }
     }
 
@@ -526,41 +566,58 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         graph.player.play(request)
     }
 
-    fun shuffle() = play(shuffle = true)
+    fun shuffle() = play(startUri = null, shuffle = true)
 
-    private fun play(shuffle: Boolean) {
+    fun playTrack(track: Track) {
+        if (track.isPlaceholder || !track.playable) return
+        play(startUri = track.uri, shuffle = false)
+    }
+
+    /**
+     * Play ([startUri] null: from the top, or [shuffle]d) or a row tap. Sorted, the shown order
+     * plays as a track list once every page is in ([likedPlayWaits]: the remaining pages are being
+     * fetched for the sort meanwhile, "Loading songs… n of total"), at most [SORTED_PLAY_WAIT_MS];
+     * a newer tap replaces a waiting one ([SortedPlayStarter]). What plays is decided when it
+     * starts: the sort or the session may have changed during the wait.
+     */
+    private fun play(startUri: String?, shuffle: Boolean) {
+        val waits = !shuffle && sorted && likedPlayWaits(graph.engineReach(), state.value.fromDownload, pager.state.value)
+        plays.play(awaitRows = if (waits) ::awaitAllPages else null) { startPlay(startUri, shuffle) }
+    }
+
+    private suspend fun awaitAllPages() {
+        // Pages that failed are tried once more (the sort loop fetches the rest).
+        if (pager.state.value.error != null) pager.loadMore()
+        awaitLikedPages(pager.state, reach, sort.map { it != TrackSort.RECENTLY_ADDED })
+    }
+
+    private suspend fun startPlay(startUri: String?, shuffle: Boolean) {
         val current = state.value
         val context = current.contextUri
         // Sorted: the shown order (shuffle has no order to keep: the context, below).
         if (!current.fromDownload && sorted && !shuffle) {
-            if (!playSorted(startUri = null)) messages.trySend(LibraryMessage.NOTHING_TO_PLAY)
+            playSorted(startUri)
             return
         }
         if (!current.fromDownload && context != null) {
-            graph.player.play(PlayRequest(contextUri = context, shuffle = shuffle))
+            if (startUri != null) {
+                graph.player.playContext(context, startUri = startUri)
+            } else {
+                graph.player.play(PlayRequest(contextUri = context, shuffle = shuffle))
+            }
             return
         }
         val uris = playableUris()
+        if (startUri != null) {
+            val index = uris.indexOf(startUri)
+            startList(if (index >= 0) PlayRequest(trackUris = uris, startIndex = index) else PlayRequest(trackUris = listOf(startUri)))
+            return
+        }
         if (uris.isEmpty()) {
             messages.trySend(LibraryMessage.NOTHING_TO_PLAY)
             return
         }
         startList(PlayRequest(trackUris = uris, startIndex = if (shuffle) null else 0, shuffle = shuffle))
-    }
-
-    fun playTrack(track: Track) {
-        if (track.isPlaceholder || !track.playable) return
-        val current = state.value
-        val context = current.contextUri
-        if (!current.fromDownload && sorted) {
-            playSorted(track.uri)
-        } else if (!current.fromDownload && context != null) {
-            graph.player.playContext(context, startUri = track.uri)
-        } else {
-            val uris = playableUris()
-            val index = uris.indexOf(track.uri)
-            startList(if (index >= 0) PlayRequest(trackUris = uris, startIndex = index) else PlayRequest(trackUris = listOf(track.uri)))
-        }
     }
 
     /** Download toggle (removal is confirmed by the UI first). */

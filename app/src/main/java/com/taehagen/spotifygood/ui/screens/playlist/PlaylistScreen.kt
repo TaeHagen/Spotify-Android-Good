@@ -461,6 +461,7 @@ private fun PlaylistHeader(
                             PlayFab(
                                 isPlaying = state.playback.isPlayingContext(meta.uri) || (state.listIsCurrent && state.playback.isPlaying),
                                 onClick = actions.onPlay,
+                                busy = state.playPending,
                             )
                         },
                     )

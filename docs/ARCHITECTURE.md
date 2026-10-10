@@ -1614,7 +1614,17 @@ accents ignored; rows that can't play last; ties keep the list order), then appl
 plays the server's order (Spirc resolves the context itself), so a non-default order plays as a
 `trackUris` list in the shown order, shuffle off, at most 500 tracks around the start item (50
 before it). That list has no context: Connect and the notification show no playlist, and it is
-a snapshot of what was loaded (later edits and likes don't reach it). Its start follows the
+a snapshot of the rows (later edits and likes don't reach it). So a sorted play (Play or a row
+tap) made while the pages still load waits for every page while ONLINE (`SortedPlayStarter`:
+the progress stays, the Play button shows a spinner), at most 25 s, then orders the complete
+rows (the loaded pages themselves, with Liked Songs' in-app likes, not the shown list, which may
+lag) and starts from the tapped song; after the timeout, a failed page (a page that failed
+before the tap is tried once more) or the session leaving ONLINE, the rows loaded by then play.
+A tap made while one waits replaces it within the same wait (only the latest plays, once); a
+play that doesn't wait (Shuffle, the default order) drops it, and so does any playback command
+the user issues meanwhile (`PlayerController.userCommands`: an album played after leaving the
+page, a pause from the notification). What plays is decided when it starts, by the order, edit
+mode and reach then. Its start follows the
 plain-list rule of §4.6 (`planListPlay`), since a track list loaded while the session isn't ONLINE
 goes to the offline queue: a tapped song that is downloaded plays the list's downloads from
 exactly there, one that isn't is sent alone while connecting ("not available offline" offline,

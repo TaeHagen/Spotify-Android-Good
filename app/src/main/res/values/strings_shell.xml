@@ -29,6 +29,7 @@
     <string name="shell_cd_back">Back</string>
     <string name="shell_cd_play">Play</string>
     <string name="shell_cd_pause">Pause</string>
+    <string name="shell_cd_play_waiting">Play: starting once every song is loaded</string>
     <string name="shell_cd_more_options_for">More options for %1$s</string>
     <string name="shell_cd_explicit">Explicit</string>
     <string name="shell_cd_suggested">Suggested</string>
