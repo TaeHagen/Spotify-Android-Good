@@ -125,6 +125,12 @@
                 <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
+            <!-- "More devices" in Android's output switcher (the route listing's linked item, API
+                 34+; the system requires it to resolve for this action): opens the devices sheet -->
+            <intent-filter>
+                <action android:name="android.media.action.TRANSFER_MEDIA" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
 
         <!-- Media playback + Spotify Connect presence (docs/ARCHITECTURE.md §9.4) -->
@@ -135,6 +141,23 @@
             <intent-filter>
                 <action android:name="androidx.media3.session.MediaLibraryService" />
                 <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+
+        <!-- Spotify Connect devices as routes of Android's output switcher (docs/ARCHITECTURE.md §8).
+             Disabled here; RouteProviderSwitch enables it while an account is logged in, from
+             Android 12 (Android 11 would bind it for good), and changes it only at a login or logout:
+             each change is a package-wide PACKAGE_CHANGED (widgets reset, launchers reload). Bound
+             only by the system (its binder checks the caller's uid); while the playback service
+             doesn't run it lists nothing and touches nothing. No foreground type: never started. -->
+        <service
+            android:name=".connect.ConnectRouteProviderService"
+            android:enabled="false"
+            android:exported="true"
+            tools:ignore="ExportedService"
+            tools:targetApi="30">
+            <intent-filter>
+                <action android:name="android.media.MediaRoute2ProviderService" />
             </intent-filter>
         </service>
 

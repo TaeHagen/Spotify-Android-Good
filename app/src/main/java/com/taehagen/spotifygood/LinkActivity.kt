@@ -9,7 +9,8 @@ import android.util.Log
 
 /**
  * Entry point for requests from outside the launcher: the `spotifygood://auth` login redirect,
- * `spotify:` and open.spotify.com links, shared text and voice search. It forwards them to the
+ * `spotify:` and open.spotify.com links, shared text, voice search and "More devices" in Android's
+ * output switcher (`ACTION_TRANSFER_MEDIA`, the linked item of the route listing, docs §8). It forwards them to the
  * one [MainActivity] in the app's own task and finishes (no UI, no history).
  *
  * It runs in the caller's task, or, when the caller starts it with `NEW_TASK` (Chrome, the

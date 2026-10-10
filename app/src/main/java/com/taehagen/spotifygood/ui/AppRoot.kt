@@ -100,6 +100,10 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     /** Requests to show Now Playing (media notification / lock-screen taps), also from before login. */
     val pendingOpenPlayer: Flow<Unit> = openPlayerRequests.receiveAsFlow()
 
+    private val openDevicesRequests = Channel<Unit>(Channel.CONFLATED)
+    /** Requests to show the devices sheet ("More devices" in Android's output switcher), also from before login. */
+    val pendingOpenDevices: Flow<Unit> = openDevicesRequests.receiveAsFlow()
+
     private val mainSessions = MainSessionStore()
 
     private val messageChannel = Channel<String>(Channel.BUFFERED)
@@ -183,6 +187,11 @@ class ShellViewModel(private val graph: AppGraph) : ViewModel() {
     /** Opens Now Playing once the main scaffold is up (and has something to show). */
     fun openPlayer() {
         openPlayerRequests.trySend(Unit)
+    }
+
+    /** Opens the devices sheet once the main scaffold is up. */
+    fun openDevices() {
+        openDevicesRequests.trySend(Unit)
     }
 
     fun dismissRefusal() {
