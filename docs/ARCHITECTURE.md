@@ -1666,11 +1666,13 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
   Downloads page, the library list, Your Episodes, a show's episodes and (long) albums. A slim
   track and a pill thumb on the right edge, between the top bar and the mini player / navigation
   bar. The thumb's length is the screen's share of the list (at least 48 dp). It shows while the
-  list moves and fades 1.5 s after; lists shorter than three screens have none. Its 48 dp touch
-  strip only takes touches while it shows, and it leaves horizontal moves alone. Dragging the
-  thumb seeks 1:1 over the whole list: the position maps to a row and its offset through the
-  measured header and footer and the average row height, both ways, so the thumb and the rows
-  agree. A drag on the track jumps there first; a tap jumps. A bubble beside the thumb names the
+  list moves and fades 1.5 s after; lists shorter than three screens have none. Only a touch
+  that starts on the thumb, or within 24 dp above or below it in its 48 dp strip, grabs it, and
+  only while it shows: its touch node is just that area, moving with the thumb, so every other
+  touch on the strip reaches the rows (overflow buttons, taps, long presses, drags that scroll
+  the list); the track itself takes none. Dragging the thumb seeks 1:1 over the whole list: the
+  position maps to a row and its offset through the measured header and footer and the average
+  row height, both ways, so the thumb and the rows agree. A bubble beside the thumb names the
   row on top while dragging: the first letter of the Title / Artist / Album sort key (accents
   dropped; digits and symbols "#"), the month it was added in Recently added, otherwise
   "1,234 / 5,000". A letter change gives a soft haptic tick. The thumb is computed from the

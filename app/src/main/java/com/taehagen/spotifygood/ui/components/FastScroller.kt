@@ -48,8 +48,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.input.pointer.changedToUp
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
@@ -80,7 +81,6 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
-import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.roundToInt
 
@@ -98,6 +98,8 @@ private val TrackWidth = 3.dp
 private val ThumbWidth = 6.dp
 private val ThumbWidthDragging = 10.dp
 private val MinThumbHeight = 48.dp
+/** The thumb grabs touches this far above and below it, too (within its 48 dp strip). */
+private val ThumbHitMargin = 24.dp
 private val RailEndGap = 6.dp
 private val RailWidth = 10.dp
 private val DefaultRowHeight = 64.dp
@@ -232,11 +234,25 @@ internal class FastScrollSizes(private val defaultRowPx: Float) {
 internal fun thumbTop(fraction: Float, trackPx: Float, thumbPx: Float): Float =
     ((trackPx - thumbPx).coerceAtLeast(0f) * fraction.coerceIn(0f, 1f))
 
-/** The fraction a thumb dragged to [top] (its top edge, on that track) stands for. */
-internal fun fractionAtThumb(top: Float, trackPx: Float, thumbPx: Float): Float {
-    val range = trackPx - thumbPx
-    return if (range <= 0f) 0f else (top / range).coerceIn(0f, 1f)
-}
+/**
+ * The thumb dragged [moved] px from where it was grabbed at [start]: it follows the finger 1:1 over
+ * its [travel] (track minus thumb), held at the ends.
+ */
+internal fun draggedFraction(start: Float, moved: Float, travel: Float): Float =
+    if (travel <= 0f) start.coerceIn(0f, 1f) else (start + moved / travel).coerceIn(0f, 1f)
+
+/**
+ * The part of the track (y, top to bottom) whose touches grab the scroller: the thumb and
+ * [marginPx] above and below it, within the track. Its touch node is only this big, so a touch
+ * anywhere else on the strip (a row's overflow button, a tap, a long press, a drag that scrolls
+ * the list) goes to the rows underneath.
+ */
+internal fun thumbHitArea(thumbTop: Float, thumbHeight: Float, marginPx: Float, trackPx: Float): ClosedFloatingPointRange<Float> =
+    (thumbTop - marginPx).coerceIn(0f, trackPx.coerceAtLeast(0f))..(thumbTop + thumbHeight + marginPx).coerceIn(0f, trackPx.coerceAtLeast(0f))
+
+/** Whether a touch at [y] on the strip grabs the scroller ([thumbHitArea]); otherwise it passes through. */
+internal fun fastScrollGrabs(y: Float, thumbTop: Float, thumbHeight: Float, marginPx: Float, trackPx: Float): Boolean =
+    y in thumbHitArea(thumbTop, thumbHeight, marginPx, trackPx)
 
 /** The thumb's height: the share of the list on screen, at least [minPx], at most the track. */
 internal fun thumbHeight(visibleRatio: Float, trackPx: Float, minPx: Float): Float =
@@ -283,10 +299,11 @@ fun rememberFastScrollDatePattern(): String {
  * from [contentStart] on, [contentCount] of them (-1: all of them; count rows not loaded yet when
  * the list shows placeholders for them, so the thumb spans the whole list). It shows while the
  * list scrolls and fades [FAST_SCROLL_HIDE_MS] after; lists shorter than
- * [FAST_SCROLL_MIN_SCREENS] screens have none. Dragging the thumb seeks 1:1 (a drag on the track
- * jumps there first, a tap jumps) with a bubble naming the row on top ([label], null: none).
- * Its 48 dp touch strip only takes touches while it shows, and leaves horizontal moves alone.
- * TalkBack gets it as an adjustable control with "scroll to top / bottom" actions.
+ * [FAST_SCROLL_MIN_SCREENS] screens have none. Dragging the thumb seeks 1:1 with a bubble naming
+ * the row on top ([label], null: none). Only the thumb, with [ThumbHitMargin] above and below it
+ * in its 48 dp strip, takes touches, and only while it shows ([thumbHitArea]): every other touch
+ * goes to the rows (overflow buttons, taps, long presses, list drags). TalkBack gets it as an
+ * adjustable control with "scroll to top / bottom" actions.
  */
 @Composable
 fun FastScroller(
@@ -359,6 +376,7 @@ internal fun FastScroller(
     }
     val fraction: () -> Float = { dragFraction ?: listFraction.value }
     val thumbTopPx: () -> Float = { thumbTop(fraction(), trackPx.toFloat(), thumbPx.value) }
+    val hitMarginPx = with(density) { ThumbHitMargin.toPx() }
 
     // Shown while the list moves or the thumb is held, then fades out.
     var shown by remember { mutableStateOf(previewShown || previewDrag != null) }
@@ -414,28 +432,13 @@ internal fun FastScroller(
     val trackColor = colors.onSurface.copy(alpha = 0.10f)
 
     Box(modifier.fillMaxSize().padding(top = topPadding, bottom = bottomPadding)) {
+        // The strip lays out the track; it takes no touches itself (no pointer input).
         Box(
             Modifier
                 .align(Alignment.TopEnd)
                 .fillMaxHeight()
                 .width(TouchWidth)
-                .onSizeChanged { trackPx = it.height }
-                .then(
-                    if (shown || dragging) {
-                        Modifier.pointerInput(listState) {
-                            fastScrollGestures(
-                                thumbTop = thumbTopPx,
-                                thumbHeight = { thumbPx.value },
-                                trackHeight = { trackPx.toFloat() },
-                                onDrag = { dragFraction = it },
-                                onDragEnd = { dragFraction = null },
-                                onTap = jump,
-                            )
-                        }
-                    } else {
-                        Modifier
-                    },
-                ),
+                .onSizeChanged { trackPx = it.height },
         ) {
             Box(
                 Modifier
@@ -476,6 +479,27 @@ internal fun FastScroller(
                         },
                 )
             }
+            // What grabs the scroller: the thumb and a margin around it, while it shows. Placed
+            // over the thumb (it moves with it), so touches elsewhere on the strip reach the rows.
+            if (shown || dragging) {
+                Box(
+                    Modifier
+                        .layout { measurable, constraints ->
+                            val area = thumbHitArea(thumbTopPx(), thumbPx.value, hitMarginPx, trackPx.toFloat())
+                            val height = (area.endInclusive - area.start).roundToInt().coerceAtLeast(0)
+                            val placeable = measurable.measure(Constraints.fixed(constraints.maxWidth, height))
+                            layout(placeable.width, placeable.height) { placeable.place(0, area.start.roundToInt()) }
+                        }
+                        .pointerInput(listState) {
+                            fastScrollDrag(
+                                fraction = fraction,
+                                travel = { (trackPx - thumbPx.value).coerceAtLeast(0f) },
+                                onDrag = { dragFraction = it },
+                                onDragEnd = { dragFraction = null },
+                            )
+                        },
+                )
+            }
         }
         // The bubble beside the thumb, kept on the track.
         Layout(
@@ -509,51 +533,27 @@ internal fun FastScroller(
 private fun LazyListItemInfo.toFastScrollItem() = FastScrollItem(index, offset, size)
 
 /**
- * The scroller's touches: a press on the thumb drags it at once; elsewhere on the strip a tap
- * jumps there and a vertical move past the slop jumps and drags (a horizontal one is left alone).
+ * The thumb's drag (its hit area only gets touches that start on or near it): grabbed at once,
+ * then it follows the finger 1:1 ([draggedFraction]) from where it was. Moves are summed as
+ * deltas, as the hit area moves with the thumb under the finger.
  */
-private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.fastScrollGestures(
-    thumbTop: () -> Float,
-    thumbHeight: () -> Float,
-    trackHeight: () -> Float,
+private suspend fun PointerInputScope.fastScrollDrag(
+    fraction: () -> Float,
+    travel: () -> Float,
     onDrag: (Float) -> Unit,
     onDragEnd: () -> Unit,
-    onTap: (Float) -> Unit,
 ) {
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false)
-        val slop = viewConfiguration.touchSlop
-        val top = thumbTop()
-        val height = thumbHeight()
-        val onThumb = down.position.y >= top - slop && down.position.y <= top + height + slop
-        val grab: Float
-        if (onThumb) {
-            down.consume()
-            grab = (down.position.y - top).coerceIn(0f, height)
-        } else {
-            grab = height / 2f
-            while (true) {
-                val event = awaitPointerEvent()
-                val change = event.changes.firstOrNull { it.id == down.id } ?: return@awaitEachGesture
-                if (change.changedToUp()) {
-                    change.consume()
-                    onTap(fractionAtThumb(down.position.y - grab, trackHeight(), height))
-                    return@awaitEachGesture
-                }
-                if (change.isConsumed) return@awaitEachGesture
-                val moved = change.position - down.position
-                if (moved.getDistance() > slop) {
-                    if (abs(moved.x) > abs(moved.y)) return@awaitEachGesture
-                    change.consume()
-                    break
-                }
-            }
-        }
+        down.consume()
+        val start = fraction()
+        var moved = 0f
         try {
-            onDrag(fractionAtThumb(down.position.y - grab, trackHeight(), height))
+            onDrag(start)
             drag(down.id) { change ->
+                moved += change.positionChange().y
                 change.consume()
-                onDrag(fractionAtThumb(change.position.y - grab, trackHeight(), thumbHeight()))
+                onDrag(draggedFraction(start, moved, travel()))
             }
         } finally {
             onDragEnd()
