@@ -85,6 +85,7 @@ import com.taehagen.spotifygood.ui.components.EpisodeRow
 import com.taehagen.spotifygood.ui.components.ErrorState
 import com.taehagen.spotifygood.ui.components.MediaRow
 import com.taehagen.spotifygood.ui.components.PlayFab
+import com.taehagen.spotifygood.ui.components.PlaylistArtwork
 import com.taehagen.spotifygood.ui.components.TrackRow
 import com.taehagen.spotifygood.ui.screens.library.LoadMoreEffect
 import com.taehagen.spotifygood.ui.screens.library.NowPlaying
@@ -311,12 +312,16 @@ internal fun TopResultCard(
                 .semantics { if (unavailable) stateDescription = unavailableLabel },
         ) {
             Column(Modifier.padding(16.dp).alpha(if (unavailable) 0.38f else 1f)) {
-                Artwork(
-                    url = ref.images.best(300),
-                    contentDescription = null,
-                    shape = if (ref.type == MediaType.ARTIST) CircleShape else RoundedCornerShape(6.dp),
-                    modifier = Modifier.size(96.dp),
-                )
+                if (ref.type == MediaType.PLAYLIST) {
+                    PlaylistArtwork(ref.uri, ref.images.best(300), null, Modifier.size(96.dp), RoundedCornerShape(6.dp))
+                } else {
+                    Artwork(
+                        url = ref.images.best(300),
+                        contentDescription = null,
+                        shape = if (ref.type == MediaType.ARTIST) CircleShape else RoundedCornerShape(6.dp),
+                        modifier = Modifier.size(96.dp),
+                    )
+                }
                 Spacer(Modifier.height(16.dp))
                 Text(
                     text = ref.name,

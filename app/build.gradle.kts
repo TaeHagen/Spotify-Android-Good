@@ -25,6 +25,8 @@ val nativeAbis: List<String> = providers.gradleProperty("native.abis")
     .getOrElse(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
 val nativeProfile: String = providers.gradleProperty("native.profile").getOrElse("release")
 val appMinSdk = 26
+/** `-Pscreenshots`: also runs the Robolectric/Roborazzi screenshot tests (images in build/outputs/roborazzi). */
+val screenshots: Boolean = providers.gradleProperty("screenshots").isPresent
 
 android {
     namespace = "com.taehagen.spotifygood"
@@ -68,6 +70,23 @@ android {
     packaging {
         // Keep .so files uncompressed and page aligned (16 KB page size support).
         jniLibs.useLegacyPackaging = false
+    }
+
+    testOptions {
+        unitTests {
+            // Screenshot tests render with Robolectric (merged resources) and only run with
+            // -Pscreenshots; the plain unit test run skips them.
+            isIncludeAndroidResources = screenshots
+            all { test ->
+                if (screenshots) {
+                    test.systemProperty("roborazzi.test.record", "true")
+                    // Maven Central rate-limits shared CI addresses; this is its Google-hosted mirror.
+                    test.systemProperty("robolectric.dependency.repo.url", "https://maven-central.storage-download.googleapis.com/maven2")
+                } else {
+                    test.exclude("**/*ScreenshotTest*")
+                }
+            }
+        }
     }
 }
 
@@ -204,4 +223,8 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(platform(libs.androidx.compose.bom))
+    testImplementation(libs.robolectric)
+    testImplementation(libs.roborazzi)
+    testImplementation(libs.roborazzi.compose)
 }

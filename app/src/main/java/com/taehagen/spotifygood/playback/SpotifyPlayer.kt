@@ -75,6 +75,8 @@ internal class SpotifyPlayer(
     /** The podcast speed in effect ([PodcastSpeed.inEffect]); controllers may choose another ([onSpeed]). */
     private val podcastSpeed: () -> Float = { PodcastSpeeds.NORMAL },
     private val onSpeed: (Float) -> Unit = {},
+    /** Package of the controller whose request is being handled ([RemotePlayback.playMeansPause]). */
+    private val requester: () -> String? = { null },
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
 
     private val context = context.applicationContext
@@ -193,6 +195,9 @@ internal class SpotifyPlayer(
                     s.status == PlaybackStatus.PLAYING || loading,
                     if (remote) PLAY_WHEN_READY_CHANGE_REASON_REMOTE else PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST,
                 )
+                // Another device plays: suppressed here, so the platform state (which Bluetooth
+                // passes on to a headset) reads paused, never "this phone plays" (RemotePlayback).
+                .setPlaybackSuppressionReason(RemotePlayback.suppressionReason(s))
                 .setPlaybackParameters(PlaybackParameters(speed))
                 // Extrapolates from this snapshot (wall clock); the next snapshot replaces it.
                 .setContentPositionMs(PositionSupplier { s.positionAt() })
@@ -277,6 +282,11 @@ internal class SpotifyPlayer(
     // ---- handlers -------------------------------------------------------------------------------
 
     override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
+        // Another device plays and the requester showed it paused (RemotePlayback): its play is a
+        // toggle, so it pauses that device.
+        if (playWhenReady && RemotePlayback.playMeansPause(playback.snapshot.value, requester())) {
+            return track(controller.pauseAsync())
+        }
         if (playWhenReady) onCommand()
         return track(if (playWhenReady) controller.resumeAsync() else controller.pauseAsync())
     }

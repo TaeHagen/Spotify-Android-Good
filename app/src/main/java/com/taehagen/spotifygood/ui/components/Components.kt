@@ -114,6 +114,7 @@ import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
 import coil3.request.crossfade
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.data.MOSAIC_TILES
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.MediaRef
@@ -520,6 +521,8 @@ fun MediaThumbnail(ref: MediaRef, modifier: Modifier = Modifier, cornerRadius: D
     when {
         ref.type == MediaType.COLLECTION && url == null -> LikedSongsTile(modifier, RoundedCornerShape(cornerRadius))
         ref.type == MediaType.ARTIST -> Artwork(url, null, modifier, CircleShape, Icons.Rounded.Person)
+        // Without an image of its own: the mosaic of its first songs (docs §9.8).
+        ref.type == MediaType.PLAYLIST && url == null -> PlaylistArtwork(ref.uri, null, null, modifier, RoundedCornerShape(cornerRadius))
         else -> Artwork(url, null, modifier, RoundedCornerShape(cornerRadius), ref.type.placeholderIcon())
     }
 }
@@ -906,11 +909,13 @@ fun DetailHeader(
     subtitle: String? = null,
     description: String? = null,
     circularImage: Boolean = false,
+    /** Four covers shown as a 2x2 mosaic when there is no [imageUrl] (a playlist without an image). */
+    mosaic: List<String> = emptyList(),
     actions: @Composable () -> Unit = {},
 ) {
     val colors = MaterialTheme.colorScheme
     val dark = LocalIsDarkTheme.current
-    val dominant = rememberDominantColor(imageUrl)
+    val dominant = rememberDominantColor(imageUrl ?: mosaic.firstOrNull())
     val tint by animateColorAsState(
         targetValue = (dominant ?: colors.surfaceContainerHighest).copy(alpha = if (dark) 0.9f else 0.45f),
         animationSpec = tween(600),
@@ -942,17 +947,22 @@ fun DetailHeader(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         val shape = if (circularImage) CircleShape else RoundedCornerShape(6.dp)
-        Artwork(
-            url = imageUrl,
-            contentDescription = null,
-            modifier = Modifier
-                .fillMaxWidth(0.62f)
-                .widthIn(max = 300.dp)
-                .aspectRatio(1f)
-                .shadow(elevation = 18.dp, shape = shape),
-            shape = shape,
-            placeholderIcon = if (circularImage) Icons.Rounded.Person else Icons.Rounded.MusicNote,
-        )
+        val artModifier = Modifier
+            .fillMaxWidth(0.62f)
+            .widthIn(max = 300.dp)
+            .aspectRatio(1f)
+            .shadow(elevation = 18.dp, shape = shape)
+        if (imageUrl == null && mosaic.size == MOSAIC_TILES) {
+            MosaicArtwork(mosaic, null, artModifier, shape)
+        } else {
+            Artwork(
+                url = imageUrl,
+                contentDescription = null,
+                modifier = artModifier,
+                shape = shape,
+                placeholderIcon = if (circularImage) Icons.Rounded.Person else Icons.Rounded.MusicNote,
+            )
+        }
         Spacer(Modifier.height(20.dp))
         Text(
             text = title,

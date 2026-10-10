@@ -10,9 +10,12 @@ import com.taehagen.spotifygood.connect.LocalDeviceDiscovery
 import com.taehagen.spotifygood.data.CatalogRepository
 import com.taehagen.spotifygood.data.EpisodeProgressStore
 import com.taehagen.spotifygood.data.HomeRepository
+import com.taehagen.spotifygood.data.LibraryEdit
 import com.taehagen.spotifygood.data.LibraryRepository
 import com.taehagen.spotifygood.data.LyricsRepository
+import com.taehagen.spotifygood.data.MOSAIC_SCAN
 import com.taehagen.spotifygood.data.PlaylistEditor
+import com.taehagen.spotifygood.data.PlaylistMosaicStore
 import com.taehagen.spotifygood.data.ResponseCache
 import com.taehagen.spotifygood.data.SearchRepository
 import com.taehagen.spotifygood.data.StoredPosition
@@ -25,6 +28,7 @@ import com.taehagen.spotifygood.engine.runWipeSteps
 import com.taehagen.spotifygood.nativebridge.AudioSinkBridge
 import com.taehagen.spotifygood.nativebridge.NativeEvents
 import com.taehagen.spotifygood.nativebridge.NativeRpc
+import com.taehagen.spotifygood.playback.MosaicBitmaps
 import com.taehagen.spotifygood.playback.OutputRouteManager
 import com.taehagen.spotifygood.playback.PlaybackRepository
 import com.taehagen.spotifygood.playback.PlaybackServiceConnector
@@ -32,10 +36,12 @@ import com.taehagen.spotifygood.playback.PlayerController
 import com.taehagen.spotifygood.playback.PodcastSpeed
 import com.taehagen.spotifygood.playback.ResumeStore
 import com.taehagen.spotifygood.playback.SleepTimer
+import com.taehagen.spotifygood.ui.screens.album.downloadedPageFlow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -150,7 +156,28 @@ class AppGraph(val app: Application) {
 
     val responseCache: ResponseCache by lazy { ResponseCache(database.responseCache(), json) }
     val catalog: CatalogRepository by lazy { CatalogRepository(rpc, responseCache, episodeProgress) }
-    val library: LibraryRepository by lazy { LibraryRepository(appScope, rpc, responseCache, engine.isOnline, episodeProgress) }
+    val library: LibraryRepository by lazy {
+        LibraryRepository(appScope, rpc, responseCache, engine.isOnline, episodeProgress).also { repo ->
+            // The playlists' current revisions: a mosaic learned at another is learned again.
+            repo.onRootlist = { rootlist ->
+                playlistMosaics.noteRevisions(rootlist.flatPlaylists().mapNotNull { e -> e.uri?.let { u -> e.revision?.let { u to it } } }.toMap())
+            }
+        }
+    }
+
+    /** The art of playlists without an image of their own (docs §9.8). */
+    val playlistMosaics: PlaylistMosaicStore by lazy {
+        PlaylistMosaicStore(
+            scope = appScope,
+            cache = responseCache,
+            firstPage = { uri -> catalog.playlistPage(uri, 0, MOSAIC_SCAN) },
+            downloadedItems = { uri -> downloadedPageFlow(uri).first()?.playlistItems() },
+            online = { engine.isOnline.value },
+        ).also { store ->
+            // An edit made here: its first items may have changed.
+            appScope.launch { library.edits.collect { if (it is LibraryEdit.PlaylistEdited) store.invalidate(it.uri) } }
+        }
+    }
     val search: SearchRepository by lazy { SearchRepository(rpc, database.recentSearches(), episodeProgress) }
     val home: HomeRepository by lazy { HomeRepository(rpc, responseCache) }
     val lyrics: LyricsRepository by lazy { LyricsRepository(rpc) }
@@ -211,6 +238,7 @@ class AppGraph(val app: Application) {
         // The playback service clears it too, but only while it runs.
         WipeStep("resume state") { resumeStore.clear() },
         WipeStep("response cache") { responseCache.clear() },
+        WipeStep("playlist mosaics") { withContext(Dispatchers.IO) { MosaicBitmaps.clear(app) } },
         WipeStep("episode progress") { episodeProgress.clear() },
         // Recent searches, downloaded collections and the rest of the account's tables.
         WipeStep("database") { withContext(Dispatchers.IO) { database.clearAllTables() } },

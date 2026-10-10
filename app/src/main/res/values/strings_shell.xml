@@ -30,6 +30,10 @@
     <string name="shell_cd_play">Play</string>
     <string name="shell_cd_pause">Pause</string>
     <string name="shell_cd_play_waiting">Play: starting once every song is loaded</string>
+    <string name="shell_fast_scroll">Fast scroll</string>
+    <string name="shell_fast_scroll_top">Scroll to top</string>
+    <string name="shell_fast_scroll_bottom">Scroll to bottom</string>
+    <string name="shell_loading_row">Loading</string>
     <string name="shell_cd_more_options_for">More options for %1$s</string>
     <string name="shell_cd_explicit">Explicit</string>
     <string name="shell_cd_suggested">Suggested</string>
