@@ -28,6 +28,7 @@
 //! (only Ogg Vorbis and MP3 are accepted); `track` for track URIs, `episode` for episode URIs;
 //! `sizeBytes` must match the file (0 = unchecked). The key is secret and never logged.
 
+mod clock;
 mod convert;
 mod disk;
 mod download;
@@ -79,7 +80,8 @@ pub(crate) fn observe_audio_keys() {
     keys::observe_audio_keys();
 }
 
-/// Logout or another account: the keys received so far and the key budget are forgotten.
+/// Logout or another account: the keys received so far, the key budget and its snapshot are
+/// forgotten.
 pub(crate) fn forget_audio_keys() {
     keys::forget_account();
 }

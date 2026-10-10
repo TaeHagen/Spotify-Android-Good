@@ -16,8 +16,10 @@
 //!    keys this process received (a streamed track), otherwise requested when this file's
 //!    download starts, paced by the key budget (`super::keys`): a pause longer than a few seconds
 //!    returns `RATE_LIMITED` (context `keyPacing` / `keyThrottled`, `retryAfterMs`) without a
-//!    request; a refusal of the file is `UNAVAILABLE` (context `keyRefused`), of the account
-//!    `PLAYBACK_REFUSED`.
+//!    request, checked once before step 1 too (no metadata requests while downloads wait). A
+//!    refused file (0x0001, decided per track and context) is relinked once to an alternative
+//!    with a file of its own; without one the song is `UNAVAILABLE` (context `keyRefused`), and
+//!    the account's refusal (`PLAYBACK_REFUSED`) only as the key budget judges it.
 //! 5. Existing `<dir>/<fileId>` that verifies → reused. Otherwise the encrypted file is
 //!    downloaded into `<dir>/<fileId>.part` (resumable, see `super::fetch`), verified, its Ogg
 //!    normalisation read, synced and renamed to `<dir>/<fileId>`.
@@ -41,6 +43,7 @@ use crate::models::{self, OfflineTrackRecord};
 use crate::{engine, rpc};
 use bytes::Bytes;
 use http::{Method, Request};
+use librespot_core::audio_key::AudioKey;
 use librespot_core::date::Date;
 use librespot_core::{FileId, Session, SpotifyId, SpotifyUri};
 use librespot_metadata::audio::AudioFileFormat;
@@ -51,7 +54,9 @@ use parking_lot::Mutex;
 use protobuf::Message;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, LazyLock, Weak};
@@ -148,6 +153,17 @@ struct Prepared {
     track: Option<models::Track>,
     episode: Option<models::Episode>,
     covers: Images,
+    /// The album (or show) of the audio, for the key budget's judgement of refusals.
+    group: u64,
+    /// The requested track's metadata (relinking after a refused key).
+    requested: Option<Track>,
+}
+
+/// A key for grouping refusals by album or show.
+fn group_of(id: &impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub async fn download_track(args: DownloadArgs) -> AppResult<OfflineTrackRecord> {
@@ -189,20 +205,34 @@ async fn run(uri_str: &str, args: &DownloadArgs, progress: &mut Progress) -> App
         .await
         .ok_or_else(|| AppError::new(ErrorCode::NotConnected, "The session has not reported its country yet"))?;
 
-    let prepared = prepare(&session, &uri, uri_str, args.bitrate, country).await?;
+    // A queue that woke while downloads must wait for their key goes back at once, without the
+    // metadata requests below.
+    keys::check_turn()?;
+    let account = Account::of(&session, country);
+    let now = Date::now_utc();
+    let mut prepared = prepare(&session, &uri, uri_str, args.bitrate, &account, &now).await?;
+    remember_file(uri_str, &file_id_hex(&prepared.file_id));
+    let key = match file_key(&session, &prepared).await {
+        // Spotify decides per track and context (license-gated releases): another release of the
+        // same recording may be granted, as an unavailable track is relinked.
+        Err(e) if keys::is_refused_file(&e) => match relink_refused(&session, uri_str, &prepared, &account, args.bitrate, &now).await {
+            Some(alt) => {
+                log::info!("{uri_str}: its audio key was refused, relinked to {:?}", alt.played_uri);
+                prepared = alt;
+                remember_file(uri_str, &file_id_hex(&prepared.file_id));
+                file_key(&session, &prepared).await?
+            }
+            None => return Err(e),
+        },
+        other => other?,
+    };
     let file_hex = file_id_hex(&prepared.file_id);
-    remember_file(uri_str, &file_hex);
     let _file_lock = lock_file(&file_hex).await;
 
     let dir = PathBuf::from(args.dir.trim());
     disk::create_dir(&dir).await?;
     let final_path = dir.join(&file_hex);
     let part_path = dir.join(format!("{file_hex}.part"));
-
-    let key = match index::global().key_for_file(&file_hex) {
-        Some(key) => key,
-        None => keys::request_key(&session, prepared.played_id, prepared.file_id).await?,
-    };
 
     let verified = match disk::verify(&final_path, prepared.format, Some(key)).await? {
         Some(v) => {
@@ -306,21 +336,28 @@ async fn get_track(session: &Session, uri: &SpotifyUri) -> AppResult<Track> {
     Ok(tokio::time::timeout(METADATA_TIMEOUT, Track::get(session, uri)).await??)
 }
 
-async fn prepare(session: &Session, uri: &SpotifyUri, uri_str: &str, bitrate: u32, country: String) -> AppResult<Prepared> {
-    let account = Account::of(session, country);
-    let now = Date::now_utc();
+/// The key of `p`'s file: from the offline index when the file is registered, else requested
+/// (paced; core's known keys first).
+async fn file_key(session: &Session, p: &Prepared) -> AppResult<AudioKey> {
+    match index::global().key_for_file(&file_id_hex(&p.file_id)) {
+        Some(key) => Ok(key),
+        None => keys::request_key(session, p.played_id, p.file_id, p.group).await,
+    }
+}
+
+async fn prepare(session: &Session, uri: &SpotifyUri, uri_str: &str, bitrate: u32, account: &Account, now: &Date) -> AppResult<Prepared> {
     match uri {
-        SpotifyUri::Episode { .. } => prepare_episode(session, uri, uri_str, bitrate, &account, &now).await,
+        SpotifyUri::Episode { .. } => prepare_episode(session, uri, uri_str, bitrate, account, now).await,
         _ => {
             let track = get_track(session, uri).await?;
-            let (played, played_uri, (fmt, file_id)) = match track_choice(&track, &account, bitrate, &now) {
+            let (played, played_uri, choice) = match track_choice(&track, account, bitrate, now) {
                 Ok(choice) => (track.clone(), None, choice),
                 Err(direct) => {
                     let mut found = None;
                     for alt in track.alternatives.iter().take(MAX_ALTERNATIVES) {
                         match get_track(session, alt).await {
                             Ok(t) => {
-                                if let Ok(choice) = track_choice(&t, &account, bitrate, &now) {
+                                if let Ok(choice) = track_choice(&t, account, bitrate, now) {
                                     let alt_uri = alt.to_uri().ok();
                                     found = Some((t, alt_uri, choice));
                                     break;
@@ -332,23 +369,72 @@ async fn prepare(session: &Session, uri: &SpotifyUri, uri_str: &str, bitrate: u3
                     found.ok_or(direct)?
                 }
             };
-            account.check_explicit(played.is_explicit || track.is_explicit)?;
             if let Some(alt) = &played_uri {
                 log::info!("{uri_str} is relinked to {alt}");
             }
-            let played_id = SpotifyId::try_from(&played.id).map_err(AppError::from)?;
-            let covers = if played.album.covers.is_empty() { track.album.covers.clone() } else { played.album.covers.clone() };
-            Ok(Prepared {
-                played_id,
-                played_uri: played_uri.filter(|u| u != uri_str),
-                format: fmt,
-                file_id,
-                track: Some(convert::track_model(uri_str, &track, &played)),
-                episode: None,
-                covers,
-            })
+            track_prepared(uri_str, &track, played, played_uri, choice, account)
         }
     }
+}
+
+/// What downloading `played` (the requested `track` or an alternative at `played_uri`) means.
+fn track_prepared(
+    uri_str: &str,
+    track: &Track,
+    played: Track,
+    played_uri: Option<String>,
+    (format, file_id): (AudioFileFormat, FileId),
+    account: &Account,
+) -> AppResult<Prepared> {
+    account.check_explicit(played.is_explicit || track.is_explicit)?;
+    let played_id = SpotifyId::try_from(&played.id).map_err(AppError::from)?;
+    let covers = if played.album.covers.is_empty() { track.album.covers.clone() } else { played.album.covers.clone() };
+    Ok(Prepared {
+        played_id,
+        played_uri: played_uri.filter(|u| u != uri_str),
+        format,
+        file_id,
+        track: Some(convert::track_model(uri_str, track, &played)),
+        episode: None,
+        covers,
+        group: group_of(&played.album.id),
+        requested: Some(track.clone()),
+    })
+}
+
+/// After Spotify refused the key of `refused`'s file (0x0001): the first relinking alternative of
+/// the requested track with an available file of its own that was not refused (another release of
+/// the recording; go-librespot #235 relinks refused tracks the same way). None for an episode or
+/// a track without one.
+async fn relink_refused(
+    session: &Session,
+    uri_str: &str,
+    refused: &Prepared,
+    account: &Account,
+    bitrate: u32,
+    now: &Date,
+) -> Option<Prepared> {
+    let requested = refused.requested.as_ref()?;
+    for alt in requested.alternatives.iter().take(MAX_ALTERNATIVES) {
+        if SpotifyId::try_from(alt).is_ok_and(|id| id == refused.played_id) {
+            continue;
+        }
+        let t = match get_track(session, alt).await {
+            Ok(t) => t,
+            Err(e) => {
+                log::debug!("relinking candidate failed: {e}");
+                continue;
+            }
+        };
+        let Ok(choice) = track_choice(&t, account, bitrate, now) else { continue };
+        if choice.1 == refused.file_id || keys::was_refused(choice.1) {
+            continue;
+        }
+        if let Ok(p) = track_prepared(uri_str, requested, t, alt.to_uri().ok(), choice, account) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 async fn prepare_episode(
@@ -384,6 +470,8 @@ async fn prepare_episode(
         track: None,
         episode: Some(convert::episode_model(uri_str, &episode, &msg)),
         covers: convert::episode_cover_images(&episode, &msg),
+        group: group_of(&episode.show_name),
+        requested: None,
     })
 }
 

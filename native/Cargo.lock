@@ -2494,6 +2494,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jni",
+ "libc",
  "librespot-audio",
  "librespot-connect",
  "librespot-core",
