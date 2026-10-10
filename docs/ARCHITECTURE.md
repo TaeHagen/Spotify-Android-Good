@@ -1819,7 +1819,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     inline at most 30 s; a longer wait ends the burst `PAUSED`, and the WorkManager resume comes
     when the engine expects 9 keys above the reserve (`download.keyBatch`, including a cool-down; ≈
     5 min at one key per 35 s, 9 songs per wake, so as many an hour as continuous), not before the
-    rows' `retryAt`. On power at that decision, at the rows' `retryAt` (no job quota while
+    rows' `retryAt` (also when the engine can't tell yet: `download.keyBatch` answers `{}` until
+    the account is known). On power at that decision, at the rows' `retryAt` (no job quota while
     charging); plugging in during the wait does not wake the queue (no receiver while nothing
     runs). In an ordinary job a burst starts no item after 7 min, so it ends before the system stops
     it. Nothing is awake between bursts. The notification says "Next songs in about N min. Plug in
@@ -1846,10 +1847,13 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   `Instant` (CLOCK_MONOTONIC) stops while the phone sleeps, and a cool-down that passed in a pocket
   would still look active when the queue wakes after real time. A snapshot (wall-clock times,
   for a hash of the account) is written to `<noBackupDir>/key_budget.json` after each answered
-  request (a blocking-pool write, no timer) and restored when a new process first needs the budget:
-  a restart (app killed mid-download) does not burst into the keys the last process spent, and a
-  throttle level and its cool-down survive it. A wall clock set back since counts as an empty
-  bucket; a snapshot of another account, or over a day old, is ignored. And:
+  request (a blocking-pool write, no timer) and restored when a new process first uses the budget
+  with the account known (`OwnedBudget`): a restart (app killed mid-download) does not burst into
+  the keys the last process spent, and a throttle level and its cool-down survive it. A budget
+  used before the account is known (a process started in the background, before its session) is
+  replaced by the snapshot then, unless a request or answer changed it already, and is never
+  stored, so it can't overwrite the account's snapshot. A wall clock set back since counts as an
+  empty bucket; a snapshot of another account, or over a day old, is ignored. And:
   * Playback first: the player never waits for the budget. Downloads leave 10 keys to it (skips,
     loads, preloads) and wait 10 s after any key request of the player.
   * Pacing: downloads take the keys above that reserve, ≥ 2 s apart: about 10 songs at once, then

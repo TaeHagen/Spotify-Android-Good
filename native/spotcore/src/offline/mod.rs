@@ -9,7 +9,7 @@
 //!   The record is *not* registered; Kotlin persists it and then calls `offline.add`. Its audio
 //!   key is paced by the process's key budget (see [`keys`], [`key_budget`]).
 //! * `download.keyBatch {keys}` → `{"inMs"}`: how long until downloads may take `keys` audio keys
-//!   in a row (the resume of a queue that runs in bursts).
+//!   in a row (the resume of a queue that runs in bursts); `{}` while the account is not known.
 //! * `download.fileId {uri}` → `{"fileId"}` (omitted when unknown): the file the last
 //!   `download.track` of `uri` in this process chose, also when it failed or was cancelled, so
 //!   Kotlin knows which `<fileId>.part` belongs to an unfinished download.
@@ -160,12 +160,15 @@ struct KeyBatchArgs {
     keys: u32,
 }
 
-/// `download.keyBatch {keys}` → `{"inMs"}`: how long until downloads may take `keys` audio keys in
+/// `download.keyBatch {keys}` → `{"inMs"}` (`{}` while the account is not known: no session yet,
+/// the budget isn't restored then): how long until downloads may take `keys` audio keys in
 /// a row (when a queue that runs in bursts resumes, docs/ARCHITECTURE.md §9.7).
 fn key_batch(args: Value) -> AppResult<Value> {
     let args: KeyBatchArgs = rpc::parse_args(args)?;
-    let wait = keys::keys_ready_in(args.keys);
-    Ok(json!({ "inMs": u64::try_from(wait.as_millis()).unwrap_or(u64::MAX) }))
+    Ok(match keys::keys_ready_in(args.keys) {
+        Some(wait) => json!({ "inMs": u64::try_from(wait.as_millis()).unwrap_or(u64::MAX) }),
+        None => json!({}),
+    })
 }
 
 #[derive(Deserialize)]
@@ -200,8 +203,10 @@ mod tests {
 
     #[tokio::test]
     async fn key_batch_rpc() {
+        // No account in unit tests: no answer (Kotlin resumes at the queue's own time), and the
+        // budget is not built for nobody.
         let out = handle("download.keyBatch", json!({"keys": 9})).await.expect("keyBatch");
-        assert!(out.get("inMs").and_then(Value::as_u64).is_some(), "{out}");
+        assert_eq!(out, json!({}));
         assert!(handle("download.keyBatch", json!({})).await.is_err());
     }
 
