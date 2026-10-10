@@ -30,6 +30,7 @@ mod pfparse;
 mod played;
 mod playlist;
 mod proto;
+pub(crate) mod push;
 mod radio;
 mod recent;
 mod refs;

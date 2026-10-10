@@ -278,6 +278,17 @@ fn invalidate_lists() {
     playlist::invalidate_rootlist();
 }
 
+/// Spotify pushed a change of the library set `name` (`catalog::push`): its snapshot goes (and
+/// the Liked Songs fallback with the `collection` set), so the next read reaches the server. An
+/// unknown set drops nothing.
+pub(crate) fn invalidate_set(name: &str) {
+    let Some(set) = Set::ALL.into_iter().find(|s| s.name() == name) else { return };
+    SNAPSHOTS.lock().remove(&set);
+    if set == Set::Collection {
+        *LIKED_FALLBACK.lock() = None;
+    }
+}
+
 /// Sorted (newest first) contents of `set`, at most `max_age` old.
 pub(crate) async fn snapshot(session: &Session, set: Set, max_age: Duration) -> AppResult<Arc<Vec<CollItem>>> {
     let user = username(session)?;
@@ -921,6 +932,21 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].uri, "spotify:show:b");
         SNAPSHOTS.lock().remove(&Set::Show);
+    }
+
+    #[test]
+    fn a_pushed_change_drops_only_its_set() {
+        let _caches = CACHES.blocking_lock();
+        SNAPSHOTS.lock().insert(Set::Collection, snap("alice", &["spotify:track:4uLU6hMCjMI75M1A2tKUQC"]));
+        SNAPSHOTS.lock().insert(Set::Artist, snap("alice", &["spotify:artist:0gxyHStUsqpMadRV0Di1Qt"]));
+        *LIKED_FALLBACK.lock() = Some(snap("alice", &["spotify:track:4uLU6hMCjMI75M1A2tKUQC"]));
+        invalidate_set("yourepisodes");
+        invalidate_set("collection");
+        assert!(cached("alice", Set::Collection, Duration::from_secs(60)).is_none());
+        assert!(cached_liked_fallback("alice").is_none());
+        assert!(cached("alice", Set::Artist, Duration::from_secs(60)).is_some());
+        invalidate_set("artist");
+        assert!(cached("alice", Set::Artist, Duration::from_secs(60)).is_none());
     }
 
     #[test]

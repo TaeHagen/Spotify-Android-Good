@@ -10,6 +10,10 @@ pub const DEVICES: &str = "devices";
 pub const QUEUE_METADATA: &str = "queueMetadata";
 pub const DOWNLOAD: &str = "download";
 pub const ERROR: &str = "error";
+/// Library changes made elsewhere (catalog::push).
+pub const PLAYLIST_CHANGED: &str = "playlistChanged";
+pub const ROOTLIST_CHANGED: &str = "rootlistChanged";
+pub const COLLECTION_CHANGED: &str = "collectionChanged";
 
 /// Serialises and posts an event to Kotlin. Cheap; never blocks on the Kotlin side.
 pub fn emit<T: Serialize>(kind: &str, payload: &T) {
