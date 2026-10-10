@@ -306,6 +306,30 @@ impl KeyBudget {
         }
     }
 
+    /// When downloads may take `n` keys in a row (at most [`CAPACITY`] − [`RESERVE`]), seen at
+    /// `now`: after a cool-down, the spacing and the player's quiet period, once the estimate holds
+    /// the reserve plus `n`. Downloads that run in bursts (the app in the background on battery)
+    /// resume then, instead of at every refilled key.
+    pub fn keys_ready_at(&mut self, now: Stamp, n: u32) -> Stamp {
+        self.refill(now);
+        let n = f64::from(n.max(1)).min(CAPACITY - RESERVE);
+        let mut at = now;
+        if let Some(until) = self.cooldown_until.filter(|until| *until > now) {
+            at = until;
+        }
+        if let Some(last) = self.last_download {
+            at = at.max(last + MIN_SPACING);
+        }
+        if let Some(last) = self.last_playback {
+            at = at.max(last + PLAYBACK_QUIET);
+        }
+        let missing = RESERVE + n - self.tokens;
+        if missing > EPSILON {
+            at = at.max(now + Duration::from_secs_f64(missing * self.refill_secs()));
+        }
+        at
+    }
+
     /// How long until the player can expect a key again after a throttle: one refill.
     pub fn playback_retry_after(&mut self, now: Stamp) -> Duration {
         self.refill(now);
@@ -604,6 +628,29 @@ mod tests {
         assert_eq!(b.playback_retry_after(T0), PLAYBACK_QUIET);
         b.answered(PB, KeyAnswer::Refused(AES_KEY_ERROR_TRANSIENT), T0);
         assert_close(b.playback_retry_after(T0), Duration::from_secs_f64(REFILL_SECS[1]));
+    }
+
+    #[test]
+    fn a_burst_of_keys_is_ready_once_it_refilled() {
+        let mut b = KeyBudget::new(T0);
+        // A full bucket: the reserve plus 9 are there at once.
+        assert_eq!(b.keys_ready_at(T0, 9), T0);
+        // A burst spent what was above the reserve.
+        drain(&mut b, T0, T0 + secs(20));
+        let now = T0 + secs(20);
+        let tokens = b.tokens(now);
+        let ready = b.keys_ready_at(now, 9);
+        assert_close(ready.since(now), Duration::from_secs_f64((RESERVE + 9.0 - tokens) * REFILL_SECS[0]));
+        // A batch, not the next key: much later than the downloads' next turn.
+        let Turn::At { at: next, .. } = b.download_turn(now) else { panic!("paced") };
+        assert!(ready.since(now) > next.since(now) * 2, "{:?} vs {:?}", ready.since(now), next.since(now));
+        // More than the bucket holds above the reserve is the whole of it.
+        assert_eq!(b.keys_ready_at(now, 50), b.keys_ready_at(now, 10));
+        // After a throttle: not before the cool-down ends (here the refill comes later still).
+        throttle(&mut b, DL, now);
+        let after = b.keys_ready_at(now, 1);
+        assert!(after.since(now) >= COOLDOWNS[0]);
+        assert_close(after.since(now), Duration::from_secs_f64((RESERVE + 1.0) * REFILL_SECS[1]));
     }
 
     const WALL: i64 = 1_800_000_000_000;

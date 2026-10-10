@@ -96,6 +96,12 @@ pub fn was_refused(file: FileId) -> bool {
     BUDGET.lock().was_refused(file.0, clock::now())
 }
 
+/// How long until downloads may take `keys` keys in a row ([`KeyBudget::keys_ready_at`]).
+pub fn keys_ready_in(keys: u32) -> Duration {
+    let now = clock::now();
+    BUDGET.lock().keys_ready_at(now, keys).since(now)
+}
+
 /// How long the player should wait before it asks for a key again after a throttle.
 pub fn playback_retry_after() -> Duration {
     BUDGET.lock().playback_retry_after(clock::now())

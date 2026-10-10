@@ -52,6 +52,9 @@ class DownloadsLogicTest {
         assertNull(downloadPauseNotice(limited, pendingCount = 40, now = now + 10 * 60_000L + PAUSE_NOTICE_GRACE_MS + 1))
         // While a run waits inline the pause is shown as long as it lasts.
         assertEquals(0, downloadPauseNotice(limited.copy(running = true), pendingCount = 40, now = now + 20 * 60_000L)?.minutes)
+        // In bursts (the app was in the background on battery) the note says so.
+        val bursts = DownloadActivity(pause = DownloadPause(DownloadPause.Reason.PACING, now + 5 * 60_000L, continuous = false))
+        assertEquals(DownloadPauseNotice(DownloadPause.Reason.PACING, 5, continuous = false), downloadPauseNotice(bursts, pendingCount = 40, now = now))
         // Nothing waits, or nothing is paused: no note (not a failure either).
         assertNull(downloadPauseNotice(limited, pendingCount = 0, now = now))
         assertNull(downloadPauseNotice(DownloadActivity(running = true), pendingCount = 40, now = now))

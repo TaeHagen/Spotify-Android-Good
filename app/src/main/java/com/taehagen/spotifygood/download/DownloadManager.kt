@@ -161,7 +161,15 @@ data class DownloadRelocation(
  * The download queue waits for Spotify's audio-key limit until [until] (epoch ms): Spotify limits
  * how fast an account gets audio keys, so downloads go at its pace (docs/ARCHITECTURE.md §9.7).
  */
-data class DownloadPause(val reason: Reason, val until: Long) {
+data class DownloadPause(
+    val reason: Reason,
+    val until: Long,
+    /**
+     * The running host waits it out (the app visible or the device on power); false: the queue went
+     * to bursts and resumes then ("plug in or open the app to download continuously").
+     */
+    val continuous: Boolean = true,
+) {
     enum class Reason {
         /** The engine's pacing: songs download in small batches as the key budget refills. */
         PACING,
@@ -252,6 +260,9 @@ class DownloadManager(
     /** The app is in the foreground ([ProcessLifecycleOwner] started). */
     @Volatile private var foreground = false
 
+    /** [foreground] as a flow: downloads run continuously while the app is visible ([DownloadConditions]). */
+    private val appVisible = MutableStateFlow(false)
+
     /** Downloaded covers for the image loader ([coverInterceptor]). */
     private val covers = OfflineCovers()
 
@@ -266,6 +277,7 @@ class DownloadManager(
     private val vault = KeyVault(storage.keyFile, credentialStore::encrypt, credentialStore::decrypt)
     internal val runner = DownloadRunner(
         appContext, database, rpc, events, engine, settings, storage, notifications, keys, mutex, index, vault,
+        DownloadConditions(appContext, appVisible),
     )
 
     /** True while [DownloadJobService] runs a job (it must not be replaced then, see [scheduleExecution]). */
@@ -453,6 +465,7 @@ class DownloadManager(
             ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
                 override fun onStart(owner: LifecycleOwner) {
                     foreground = true
+                    appVisible.value = true
                     scope.launch {
                         try {
                             if (!runner.isRunning && dao.pendingCount() > 0) scheduleExecution(kick = true)
@@ -468,6 +481,7 @@ class DownloadManager(
 
                 override fun onStop(owner: LifecycleOwner) {
                     foreground = false
+                    appVisible.value = false
                 }
             })
         }
@@ -1930,6 +1944,8 @@ class DownloadManager(
      */
     private suspend fun scheduleExecution(replace: Boolean = false, kick: Boolean = false): Unit = withContext(Dispatchers.IO) {
         try {
+            // A host that waits out a pause takes new work at once.
+            runner.nudge()
             if (runner.isRunning) return@withContext
             val pending = dao.pendingCount()
             if (pending == 0) return@withContext
@@ -1955,7 +1971,9 @@ class DownloadManager(
                 val estimate = DownloadRules.estimateBytes(pending, current.downloadQuality.kbps)
                 // Scheduling with the same id replaces the pending job: new constraint, no backoff.
                 if (isAppVisible() && scheduleUserInitiatedJob(cellular, estimate, storageNotLow)) {
-                    if (replace) cancelWorker()
+                    // A queue paused in bursts comes back to a user-initiated job: its waiting
+                    // WorkManager resume goes.
+                    if (replace) cancelWorker() else cancelWaitingResume()
                     return@withContext
                 }
                 if (job != null) {
@@ -2027,7 +2045,8 @@ class DownloadManager(
      */
     internal suspend fun scheduleResume(): Unit = withContext(Dispatchers.IO) {
         try {
-            val retryAt = dao.earliestRetryAt() ?: return@withContext
+            // In bursts the runner chose a later time (a batch of keys) than the rows' next retry.
+            val retryAt = runner.resumeAt() ?: dao.earliestRetryAt() ?: return@withContext
             if (dao.pendingCount() == 0 || storage.target.value is DownloadStorage.Target.Missing) return@withContext
             val current = settings.awaitLoaded()
             if (current.offlineMode) return@withContext
@@ -2048,6 +2067,44 @@ class DownloadManager(
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Scheduling the download resume failed", e)
+        }
+    }
+
+    /**
+     * On API 34+ with the app visible ([DownloadRules.handsToUserInitiatedJob]), a WorkManager run
+     * gives the queue to a user-initiated job: true when one runs or was scheduled (the worker then
+     * finishes), false when the worker keeps the queue.
+     */
+    internal suspend fun handToUserInitiatedJob(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            if (!DownloadRules.handsToUserInitiatedJob(Build.VERSION.SDK_INT, isAppVisible(), dao.pendingCount())) return@withContext false
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return@withContext false
+            // A job that runs (or waits out a pause) has the queue already: scheduling the same id
+            // again would stop it.
+            if (jobExecuting) return@withContext true
+            val current = settings.awaitLoaded()
+            if (current.offlineMode || storage.target.value is DownloadStorage.Target.Missing) return@withContext false
+            val estimate = DownloadRules.estimateBytes(dao.pendingCount(), current.downloadQuality.kbps)
+            val handed = scheduleUserInitiatedJob(current.downloadOverCellular, estimate, needsInternalStorage())
+            if (handed) Log.i(TAG, "The app is visible: a user-initiated job takes the download queue")
+            handed
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Handing downloads to a user-initiated job failed", e)
+            false
+        }
+    }
+
+    /**
+     * Cancels a WorkManager resume that still waits (a user-initiated job took the queue): never
+     * work that runs. Blocking: off the main thread.
+     */
+    private fun cancelWaitingResume() {
+        val workManager = WorkManager.getInstance(appContext)
+        val infos = workManager.getWorkInfosForUniqueWork(WORK_NAME).get()
+        if (DownloadRules.cancelsWaitingResume(infos.map { Pair(it.state == WorkInfo.State.RUNNING, RESUME_TAG in it.tags && !it.state.isFinished) })) {
+            workManager.cancelUniqueWork(WORK_NAME)
         }
     }
 

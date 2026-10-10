@@ -55,9 +55,9 @@ internal object DownloadRules {
     const val MIN_PACING_PAUSE_MS = 1_000L
 
     /**
-     * Longest queue pause the engine's audio-key wait is followed for (its cool-down at the top level
-     * plus the refill after it): one wake when it ends, not one at [MAX_QUEUE_PAUSE_MS] to be told to
-     * wait again.
+     * Longest queue pause the engine's audio-key wait is followed for (at most 30 min at the top
+     * throttle level, the refill included; the rest is room): one wake when it ends, not one at
+     * [MAX_QUEUE_PAUSE_MS] to be told to wait again.
      */
     const val MAX_KEY_PAUSE_MS = 60 * 60_000L
 
@@ -669,11 +669,101 @@ internal object DownloadRules {
         data object Pause : IdleStep
     }
 
-    fun idleStep(retryAt: Long?, now: Long): IdleStep {
+    fun idleStep(retryAt: Long?, now: Long, mode: DownloadMode = DownloadMode.CONTINUOUS): IdleStep {
         if (retryAt == null) return IdleStep.Finish
         val wait = retryAt - now
-        return if (wait > MAX_INLINE_WAIT_MS) IdleStep.Pause else IdleStep.Wait(wait.coerceAtLeast(MIN_WAIT_MS))
+        return if (wait > inlineWaitMs(mode)) IdleStep.Pause else IdleStep.Wait(wait.coerceAtLeast(MIN_WAIT_MS))
     }
+
+    // ---- continuous or in bursts (docs/ARCHITECTURE.md §9.7 "Who continues a paused queue") -----
+
+    /**
+     * In bursts, a run waits inline at most this long for the queue's next item (the engine's own
+     * waits of up to 10 s for the spacing and the player's quiet period are inside `download.track`):
+     * a longer wait ends the burst, and nothing holds the CPU awake until the next one.
+     */
+    const val BURST_INLINE_WAIT_MS = 30_000L
+
+    /**
+     * A burst resumes once the key budget holds this many keys above the playback reserve (of at most
+     * 10): about 5 min of refill at one key per 35 s, 9 songs per wake. The keys are the limit, so
+     * bursts download as many songs an hour as a run that waits.
+     */
+    const val BURST_KEYS = 9
+
+    /**
+     * A burst in a host that the system stops after about 10 min (an ordinary job: a worker that
+     * could not become a foreground service) starts no item after this long: the last one has 3 min
+     * to finish, and the run ends by itself instead of being stopped (a stop costs a retry).
+     */
+    const val BURST_ITEM_DEADLINE_MS = 7 * 60_000L
+
+    /**
+     * How the queue gets past waits for Spotify's key limit: [CONTINUOUS] waits them out in the
+     * running host (as fast as the limit allows), [BURSTS] ends the run at a wait and wakes again
+     * when a batch of keys is there.
+     */
+    enum class DownloadMode { CONTINUOUS, BURSTS }
+
+    /**
+     * Continuous while the app is [visible] or the device is [pluggedIn] (the screen is on anyway, or
+     * the battery doesn't matter), in a host that may run that long ([longRunningHost]: the
+     * user-initiated job, a foreground worker; an ordinary job is stopped after about 10 min).
+     * Otherwise (the app in the background on battery) in bursts: no wake lock between them.
+     */
+    fun downloadMode(visible: Boolean, pluggedIn: Boolean, longRunningHost: Boolean): DownloadMode =
+        if ((visible || pluggedIn) && longRunningHost) DownloadMode.CONTINUOUS else DownloadMode.BURSTS
+
+    /** Longest wait inside a run in [mode]. */
+    fun inlineWaitMs(mode: DownloadMode): Long = if (mode == DownloadMode.CONTINUOUS) MAX_INLINE_WAIT_MS else BURST_INLINE_WAIT_MS
+
+    /**
+     * When a queue that ended a burst at [now] resumes: once the engine expects a batch of keys
+     * ([batchInMs] from now: `download.keyBatch` for [BURST_KEYS], which includes a cool-down), and
+     * not before the queue's own [retryAt]. On power ([pluggedIn]) the next burst comes at [retryAt]
+     * already (an ordinary job has no quota while charging). Without the engine's answer, [retryAt].
+     */
+    fun burstResumeAt(retryAt: Long?, now: Long, batchInMs: Long?, pluggedIn: Boolean): Long {
+        val queue = retryAt ?: now
+        if (pluggedIn || batchInMs == null) return queue
+        return maxOf(queue, now + batchInMs.coerceIn(0L, MAX_KEY_PAUSE_MS))
+    }
+
+    /** Whether a burst that has run [elapsedMs] starts no further item ([BURST_ITEM_DEADLINE_MS]). */
+    fun burstDeadlineReached(elapsedMs: Long, mode: DownloadMode, longRunningHost: Boolean): Boolean =
+        mode == DownloadMode.BURSTS && !longRunningHost && elapsedMs >= BURST_ITEM_DEADLINE_MS
+
+    /** What a host does after a run that ended [RunOutcome.PAUSED]. */
+    enum class PausedStep {
+        /** Wait for the pause's end without the engine, then run the queue again (the host lives on). */
+        WAIT_IN_HOST,
+
+        /** Hand the queue to the delayed WorkManager resume and finish. */
+        HAND_OFF,
+    }
+
+    /** [PausedStep] in [mode] (seen again when the pause starts, and watched while it lasts). */
+    fun pausedStep(mode: DownloadMode): PausedStep =
+        if (mode == DownloadMode.CONTINUOUS) PausedStep.WAIT_IN_HOST else PausedStep.HAND_OFF
+
+    /**
+     * Whether a WorkManager run gives the queue to a user-initiated job instead (no 10-minute limit,
+     * no job quota): on API 34+ ([sdkInt]) while the app is [visible] (such a job can only be
+     * scheduled then) and something is [pending].
+     */
+    fun handsToUserInitiatedJob(sdkInt: Int, visible: Boolean, pending: Int): Boolean =
+        sdkInt >= USER_INITIATED_JOBS_SDK && visible && pending > 0
+
+    /**
+     * Whether the unique download work, whose parts are given as (running, a resume that waits),
+     * is cancelled for a user-initiated job that takes the queue: only a waiting resume, never while
+     * a part runs.
+     */
+    fun cancelsWaitingResume(parts: List<Pair<Boolean, Boolean>>): Boolean =
+        parts.none { it.first } && parts.any { it.second }
+
+    /** User-initiated data transfer jobs exist from API 34 (Android 14). */
+    const val USER_INITIATED_JOBS_SDK = 34
 
     /** What the WorkManager host does after a run that ended with an outcome. */
     enum class WorkerStep {

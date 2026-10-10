@@ -45,6 +45,8 @@ class DownloadJobService : JobService() {
             JOB_END_NOTIFICATION_POLICY_REMOVE,
         )
         val host = object : DownloadHost {
+            override val longRunning = true
+
             override suspend fun updateNotification(notification: Notification) {
                 if (!stopped) runCatching { setNotification(params, Notifications.ID_DOWNLOADS, notification, JOB_END_NOTIFICATION_POLICY_REMOVE) }
             }
@@ -52,10 +54,16 @@ class DownloadJobService : JobService() {
             override fun reportTransferred(bytes: Long) {
                 if (!stopped) runCatching { updateTransferredNetworkBytes(params, bytes, 0) }
             }
+
+            override fun reportEstimated(bytes: Long) {
+                if (!stopped) runCatching { updateEstimatedNetworkBytes(params, bytes, 0) }
+            }
         }
         run = scope.launch {
             val outcome = try {
-                manager.runner.run(host)
+                // With the app visible or on power, pauses are waited out in this job; it ends PAUSED
+                // only when the queue goes on in bursts (docs/ARCHITECTURE.md §9.7).
+                manager.runner.runHosted(host)
             } catch (e: CancellationException) {
                 // Our scope cancelled (onStopJob / onDestroy) → propagate; a run stopped by removeAll /
                 // logout while the job itself is still alive → finish without reschedule.
@@ -65,8 +73,9 @@ class DownloadJobService : JobService() {
                 Log.e(TAG, "Download run failed", e)
                 RunOutcome.RESCHEDULE
             }
-            // A queue paused until a known time resumes then through WorkManager (a user-initiated
-            // job can't be delayed, nor scheduled from the background), not on the job's backoff.
+            // In bursts (the app in the background on battery) the queue resumes through WorkManager
+            // (a user-initiated job can't be delayed, nor scheduled from the background), not on the
+            // job's backoff; opening the app brings it back to a user-initiated job.
             if (outcome == RunOutcome.PAUSED) manager.scheduleResume()
             manager.jobExecuting = false
             if (!stopped) jobFinished(params, outcome == RunOutcome.RESCHEDULE)

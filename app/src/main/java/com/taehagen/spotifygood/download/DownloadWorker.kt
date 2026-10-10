@@ -20,7 +20,9 @@ import kotlinx.coroutines.isActive
  * the worker (constraints lost, Android 15 dataSync `onTimeout` after 6 h, quota) the coroutine is
  * cancelled, the runner requeues its item (partial files are kept) and WorkManager reschedules.
  * A run that ends because the whole queue waits until a known time ([RunOutcome.PAUSED]: Spotify's
- * key limit, a rate limit) schedules one delayed request for then and succeeds.
+ * key limit, a rate limit) schedules one delayed request for then and succeeds; in the background
+ * on battery the queue runs in bursts this way. On API 34+ with the app visible the worker hands the
+ * queue to a user-initiated job instead ([DownloadManager.handToUserInitiatedJob]).
  */
 class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     private val manager: DownloadManager get() = (applicationContext as App).graph.downloads
@@ -30,6 +32,9 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
 
     override suspend fun doWork(): Result {
         val manager = manager
+        // API 34+ with the app visible: a user-initiated job takes the queue (no 10-minute limit, no
+        // job quota, pauses waited out in it).
+        if (manager.handToUserInitiatedJob()) return Result.success()
         val foreground = try {
             setForeground(getForegroundInfo())
             true
@@ -39,12 +44,15 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
             false
         }
         val host = object : DownloadHost {
+            // An ordinary job (no foreground service) is stopped after about 10 minutes: bursts only.
+            override val longRunning = foreground
+
             override suspend fun updateNotification(notification: Notification) {
                 if (foreground) manager.notifications.updateProgress(notification)
             }
         }
         val outcome = try {
-            manager.runner.run(host)
+            manager.runner.runHosted(host)
         } catch (e: CancellationException) {
             if (!currentCoroutineContext().isActive) throw e // stopped by WorkManager
             RunOutcome.STOPPED // run stopped by removeAll / logout
@@ -58,7 +66,8 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
             DownloadRules.WorkerStep.SUCCESS -> Result.success()
             DownloadRules.WorkerStep.RETRY -> Result.retry()
             DownloadRules.WorkerStep.RESUME -> {
-                manager.scheduleResume()
+                // The app came to the front during the burst: a user-initiated job goes on instead.
+                if (!manager.handToUserInitiatedJob()) manager.scheduleResume()
                 Result.success()
             }
         }
