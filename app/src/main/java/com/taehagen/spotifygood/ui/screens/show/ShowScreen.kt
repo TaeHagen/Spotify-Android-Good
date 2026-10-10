@@ -86,6 +86,8 @@ import com.taehagen.spotifygood.ui.screens.album.isRefreshing
 import com.taehagen.spotifygood.ui.screens.album.rememberRichText
 import com.taehagen.spotifygood.ui.screens.album.shareUrl
 import java.time.LocalDate
+import com.taehagen.spotifygood.ui.components.FastScroller
+import com.taehagen.spotifygood.ui.screens.album.detailTopInset
 
 @Composable
 fun ShowScreen(uri: String, contentPadding: PaddingValues, modifier: Modifier = Modifier) {
@@ -146,99 +148,102 @@ private fun ShowList(
     onRetry: () -> Unit,
 ) {
     val show = header.show
-    LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
-        item(key = "header", contentType = "header") {
-            DetailHeader(
-                title = show.name,
-                imageUrl = show.images.best(640),
-                subtitle = show.publisher,
-                modifier = Modifier.fillMaxWidth(),
-                actions = {
-                    DetailActionRow(
-                        leading = {
-                            FollowButton(following = state.following, onClick = onToggleFollow, modifier = Modifier.padding(end = 4.dp))
-                            CollectionDownloadButton(ui = state.download, onDownload = onDownload, onRemove = onRemoveDownload)
-                            MoreButton(
-                                onClick = { navigator.showActions(MediaActionTarget.ShowTarget(show.toRef())) },
-                                label = show.name,
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
+            item(key = "header", contentType = "header") {
+                DetailHeader(
+                    title = show.name,
+                    imageUrl = show.images.best(640),
+                    subtitle = show.publisher,
+                    modifier = Modifier.fillMaxWidth(),
+                    actions = {
+                        DetailActionRow(
+                            leading = {
+                                FollowButton(following = state.following, onClick = onToggleFollow, modifier = Modifier.padding(end = 4.dp))
+                                CollectionDownloadButton(ui = state.download, onDownload = onDownload, onRemove = onRemoveDownload)
+                                MoreButton(
+                                    onClick = { navigator.showActions(MediaActionTarget.ShowTarget(show.toRef())) },
+                                    label = show.name,
+                                )
+                            },
+                            trailing = {
+                                PlayFab(isPlaying = state.playback.isPlayingContext(show.uri), onClick = onPlay)
+                            },
+                        )
+                    },
+                )
+            }
+            if (!header.description.isEmpty) {
+                item(key = "about", contentType = "about") {
+                    val description = rememberRichText(header.description)
+                    Column(Modifier.padding(top = 8.dp)) {
+                        SectionHeader(stringResource(R.string.detail_about))
+                        ExpandableText(
+                            text = description,
+                            collapsedLines = 3,
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                        )
+                    }
+                }
+            }
+            item(key = "episodes-title", contentType = "section") {
+                val sort = state.list.sort
+                SectionHeader(
+                    title = stringResource(R.string.detail_all_episodes),
+                    modifier = Modifier.padding(top = 16.dp),
+                    action = {
+                        TextButton(
+                            onClick = { onSort(if (sort == EpisodeSort.NEWEST) EpisodeSort.OLDEST else EpisodeSort.NEWEST) },
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Rounded.Sort,
+                                contentDescription = stringResource(R.string.detail_sort_episodes),
+                                modifier = Modifier.size(18.dp),
                             )
-                        },
-                        trailing = {
-                            PlayFab(isPlaying = state.playback.isPlayingContext(show.uri), onClick = onPlay)
-                        },
-                    )
-                },
-            )
-        }
-        if (!header.description.isEmpty) {
-            item(key = "about", contentType = "about") {
-                val description = rememberRichText(header.description)
-                Column(Modifier.padding(top = 8.dp)) {
-                    SectionHeader(stringResource(R.string.detail_about))
-                    ExpandableText(
-                        text = description,
-                        collapsedLines = 3,
-                        modifier = Modifier.padding(horizontal = 16.dp),
+                            Spacer(Modifier.width(6.dp))
+                            Text(stringResource(if (sort == EpisodeSort.NEWEST) R.string.detail_sort_newest else R.string.detail_sort_oldest))
+                        }
+                    },
+                )
+            }
+            if (state.downloadedCopy) {
+                item(key = "downloaded", contentType = "notice") {
+                    DownloadedCopyNotice(
+                        stringResource(R.string.detail_showing_downloaded_episodes),
+                        onRetry = onRetry.takeUnless { state.offline },
                     )
                 }
             }
-        }
-        item(key = "episodes-title", contentType = "section") {
-            val sort = state.list.sort
-            SectionHeader(
-                title = stringResource(R.string.detail_all_episodes),
-                modifier = Modifier.padding(top = 16.dp),
-                action = {
-                    TextButton(
-                        onClick = { onSort(if (sort == EpisodeSort.NEWEST) EpisodeSort.OLDEST else EpisodeSort.NEWEST) },
-                    ) {
-                        Icon(
-                            Icons.AutoMirrored.Rounded.Sort,
-                            contentDescription = stringResource(R.string.detail_sort_episodes),
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(stringResource(if (sort == EpisodeSort.NEWEST) R.string.detail_sort_newest else R.string.detail_sort_oldest))
-                    }
-                },
-            )
-        }
-        if (state.downloadedCopy) {
-            item(key = "downloaded", contentType = "notice") {
-                DownloadedCopyNotice(
-                    stringResource(R.string.detail_showing_downloaded_episodes),
-                    onRetry = onRetry.takeUnless { state.offline },
+            if (state.partial) {
+                item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetryPartial) }
+            }
+            items(state.list.episodes, key = { it.uri }, contentType = { "episode" }) { episode ->
+                val downloadState = state.rowDownloads[episode.uri]
+                val playable = canStartNow(episode.playable, state.online, downloadState, episode.explicit, state.filterExplicit)
+                val showActions = { navigator.showActions(MediaActionTarget.EpisodeTarget(episode)) }
+                EpisodeRow(
+                    episode = episode,
+                    onClick = { onPlayEpisode(episode) },
+                    isCurrent = state.playback.isCurrent(episode.uri),
+                    isPlaying = state.playback.isPlayingItem(episode.uri),
+                    downloadState = downloadState,
+                    onLongClick = showActions,
+                    // Unplayable (or not downloaded while the session isn't online): dimmed, actions still in the overflow.
+                    enabled = playable,
+                    onMoreClick = showActions,
                 )
             }
-        }
-        if (state.partial) {
-            item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetryPartial) }
-        }
-        items(state.list.episodes, key = { it.uri }, contentType = { "episode" }) { episode ->
-            val downloadState = state.rowDownloads[episode.uri]
-            val playable = canStartNow(episode.playable, state.online, downloadState, episode.explicit, state.filterExplicit)
-            val showActions = { navigator.showActions(MediaActionTarget.EpisodeTarget(episode)) }
-            EpisodeRow(
-                episode = episode,
-                onClick = { onPlayEpisode(episode) },
-                isCurrent = state.playback.isCurrent(episode.uri),
-                isPlaying = state.playback.isPlayingItem(episode.uri),
-                downloadState = downloadState,
-                onLongClick = showActions,
-                // Unplayable (or not downloaded while the session isn't online): dimmed, actions still in the overflow.
-                enabled = playable,
-                onMoreClick = showActions,
-            )
-        }
-        item(key = "footer", contentType = "footer") {
-            when {
-                state.list.episodes.isEmpty() && state.list.endReached && !state.list.loading -> EmptyState(
-                    title = stringResource(R.string.detail_no_episodes),
-                    modifier = Modifier.padding(vertical = 32.dp),
-                )
-                else -> PagingFooter(loading = state.list.loading, failed = state.list.failed, onRetry = onRetryPage)
+            item(key = "footer", contentType = "footer") {
+                when {
+                    state.list.episodes.isEmpty() && state.list.endReached && !state.list.loading -> EmptyState(
+                        title = stringResource(R.string.detail_no_episodes),
+                        modifier = Modifier.padding(vertical = 32.dp),
+                    )
+                    else -> PagingFooter(loading = state.list.loading, failed = state.list.failed, onRetry = onRetryPage)
+                }
             }
         }
+        FastScroller(listState, topPadding = detailTopInset(), bottomPadding = contentPadding.calculateBottomPadding())
     }
 }
 

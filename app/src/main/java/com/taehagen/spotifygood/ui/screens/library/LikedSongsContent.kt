@@ -8,11 +8,14 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -58,9 +61,14 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
+import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.ui.appViewModel
 import com.taehagen.spotifygood.ui.components.EmptyState
 import com.taehagen.spotifygood.ui.components.ErrorState
+import com.taehagen.spotifygood.ui.components.FastScroller
+import com.taehagen.spotifygood.ui.components.PlaceholderTrackRow
+import com.taehagen.spotifygood.ui.components.VisibleRowsEffect
+import com.taehagen.spotifygood.ui.components.rememberFastScrollDatePattern
 import com.taehagen.spotifygood.ui.components.OfflineBanner
 import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.components.PlayFab
@@ -82,11 +90,26 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
     LaunchedEffect(viewModel) {
         viewModel.events.collect { navigator.showMessage(resources.getString(it.messageRes())) }
     }
-    // A filter or a sort fetches every page itself.
-    LoadMoreEffect(listState, enabled = state.canLoadMore && state.tracks.isNotEmpty() && state.filter.isEmpty() && state.sort == TrackSort.RECENTLY_ADDED) {
-        viewModel.loadMore()
-    }
     val collapsed by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 } }
+    // Lazy items before the songs (header, actions, filter, banners, a state message) and the
+    // songs: the loaded ones, then placeholders to the end (loaded by window as they come on screen).
+    val stateItem = state.isInitialLoading || (state.tracks.isEmpty() && !(state.filter.isNotEmpty() && state.canLoadMore))
+    val headerItems = 3 + (if (state.partial) 1 else 0) + (if (state.offline) 1 else 0) + (if (stateItem) 1 else 0)
+    val rowCount = state.tracks.size + state.placeholders
+    // Loads the next page near the loaded end, or the windows of rows further down.
+    VisibleRowsEffect(listState, contentStart = headerItems, contentCount = rowCount, onVisible = viewModel::onRowsVisible)
+    val datePattern = rememberFastScrollDatePattern()
+    val label: (Int) -> String? = remember(state.tracks, state.windows, state.sort, rowCount, datePattern) {
+        val tracks = state.tracks
+        val windows = state.windows
+        val sort = state.sort
+        val labelFor: (Int) -> String? = { index ->
+            val saved = if (index < tracks.size) null else windows[index]
+            val track = tracks.getOrNull(index) ?: saved?.track
+            likedScrollLabel(track, saved?.addedAt ?: track?.uri?.let(viewModel::likedAt), index, rowCount, sort, datePattern)
+        }
+        labelFor
+    }
 
     Box(modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         PullToRefreshBox(
@@ -173,18 +196,19 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
                     }
                 }
                 items(state.tracks, key = { "track:${it.uri}" }, contentType = { "track" }) { track ->
-                    val target = remember(track, state.contextUri) { MediaActionTarget.TrackTarget(track, contextUri = state.contextUri) }
-                    TrackRow(
-                        track = track,
-                        onClick = { viewModel.playTrack(track) },
-                        isCurrent = state.nowPlaying.isCurrent(track.uri),
-                        isPlaying = state.nowPlaying.isPlaying,
-                        downloadState = state.downloadStates[track.uri],
-                        onMoreClick = { navigator.showActions(target) },
-                        onLongClick = { navigator.showActions(target) },
-                        // Not downloaded while the session isn't online: it can't start (as on playlists).
-                        enabled = canStartNow(track.playable, state.online, state.downloadStates[track.uri]),
-                    )
+                    LikedTrackRow(track, state, onPlay = viewModel::playTrack, onActions = navigator::showActions)
+                }
+                if (state.placeholders > 0) {
+                    val loaded = state.tracks.size
+                    // Keyed by position: a row keeps its slot when its window (or the next page) arrives.
+                    items(count = state.placeholders, key = { "pos:${loaded + it}" }, contentType = { "track" }) { offset ->
+                        val track = state.windows[loaded + offset]?.track
+                        if (track != null) {
+                            LikedTrackRow(track, state, onPlay = viewModel::playTrack, onActions = navigator::showActions)
+                        } else {
+                            PlaceholderTrackRow()
+                        }
+                    }
                 }
                 if (state.isLoadingMore) {
                     item(key = "more", contentType = "footer") {
@@ -210,6 +234,15 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
                 }
             }
         }
+        FastScroller(
+            listState = listState,
+            contentStart = headerItems,
+            contentCount = rowCount,
+            // Below the collapsing bar, above the mini player.
+            topPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 56.dp,
+            bottomPadding = contentPadding.calculateBottomPadding(),
+            label = label,
+        )
         CollapsingBar(
             title = likedName,
             collapsed = collapsed,
@@ -226,6 +259,27 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
             onDismiss = { confirmRemove = false },
         )
     }
+}
+
+@Composable
+private fun LikedTrackRow(
+    track: Track,
+    state: LikedSongsUiState,
+    onPlay: (Track) -> Unit,
+    onActions: (MediaActionTarget) -> Unit,
+) {
+    val target = remember(track, state.contextUri) { MediaActionTarget.TrackTarget(track, contextUri = state.contextUri) }
+    TrackRow(
+        track = track,
+        onClick = { onPlay(track) },
+        isCurrent = state.nowPlaying.isCurrent(track.uri),
+        isPlaying = state.nowPlaying.isPlaying,
+        downloadState = state.downloadStates[track.uri],
+        onMoreClick = { onActions(target) },
+        onLongClick = { onActions(target) },
+        // Not downloaded while the session isn't online: it can't start (as on playlists).
+        enabled = canStartNow(track.playable, state.online, state.downloadStates[track.uri]),
+    )
 }
 
 @Composable
