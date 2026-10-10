@@ -24,16 +24,20 @@ import kotlinx.serialization.json.put
  *
  * Mutations run detached in [scope] (the app scope): if the caller is cancelled (its screen closed),
  * the write and its cache/revision bookkeeping still complete; the caller just stops waiting.
+ *
+ * Every write is recorded in [own] while it runs and with the revision it produced, so that
+ * Spotify's push of it (docs §5 `playlistChanged`) is known for this app's own ([LibraryPushes]).
  */
 class PlaylistEditor(
     private val scope: CoroutineScope,
     private val rpc: NativeRpc,
     private val library: LibraryRepository,
     private val catalog: CatalogRepository,
+    private val own: OwnLibraryEdits = OwnLibraryEdits(),
 ) {
     /** Creates a playlist (added to the library) and returns its URI. */
     suspend fun create(name: String, description: String? = null, public: Boolean = false, initialUris: List<String> = emptyList()): String =
-        detached { createNow(name, description, public, initialUris) }
+        detached { rootlistEdit { createNow(name, description, public, initialUris) } }
 
     private suspend fun createNow(name: String, description: String?, public: Boolean, initialUris: List<String>): String {
         val uri = rpc.callOffMain<CreatedPlaylist>(
@@ -45,7 +49,7 @@ class PlaylistEditor(
             },
         ).uri
         try {
-            if (initialUris.isNotEmpty()) appendItems(uri, initialUris)
+            if (initialUris.isNotEmpty()) playlistEdit(uri, { it }) { appendItems(uri, initialUris) }
         } finally {
             // The playlist exists even if adding the initial items failed.
             library.onPlaylistCreated(uri)
@@ -65,7 +69,7 @@ class PlaylistEditor(
         if (uris.isEmpty()) return null
         return detached {
             try {
-                appendItems(playlistUri, uris)
+                playlistEdit(playlistUri, { it }) { appendItems(playlistUri, uris) }
             } finally {
                 library.onPlaylistEdited(playlistUri)
             }
@@ -79,7 +83,13 @@ class PlaylistEditor(
     }
 
     private suspend fun removeItemsNow(playlistUri: String, items: List<Pair<String, Int>>, revision: String?): String? {
-        val result = retryOnStaleRevision(revision, { currentRevision(playlistUri, items) }) { rev ->
+        val result = playlistEdit(playlistUri, RevisionResult::revision) { removeRequest(playlistUri, items, revision) }
+        library.onPlaylistEdited(playlistUri)
+        return result.revision
+    }
+
+    private suspend fun removeRequest(playlistUri: String, items: List<Pair<String, Int>>, revision: String?): RevisionResult =
+        retryOnStaleRevision(revision, { currentRevision(playlistUri, items) }) { rev ->
             rpc.callOffMain<RevisionResult>(
                 "playlist.removeItems",
                 rpcArgs {
@@ -99,9 +109,6 @@ class PlaylistEditor(
                 },
             )
         }
-        library.onPlaylistEdited(playlistUri)
-        return result.revision
-    }
 
     /**
      * Moves one item. [toIndex] is the playlist4 MOV insert-before position in the list *before*
@@ -116,17 +123,19 @@ class PlaylistEditor(
 
     private suspend fun moveItemNow(playlistUri: String, fromIndex: Int, toIndex: Int, revision: String?, itemUri: String?): String? {
         val expected = listOfNotNull(itemUri?.let { it to fromIndex })
-        val result = retryOnStaleRevision(revision, { currentRevision(playlistUri, expected) }) { rev ->
-            rpc.callOffMain<RevisionResult>(
-                "playlist.moveItems",
-                rpcArgs {
-                    put("uri", playlistUri)
-                    put("fromIndex", fromIndex)
-                    put("length", 1)
-                    put("toIndex", toIndex)
-                    put("revision", rev)
-                },
-            )
+        val result = playlistEdit(playlistUri, RevisionResult::revision) {
+            retryOnStaleRevision(revision, { currentRevision(playlistUri, expected) }) { rev ->
+                rpc.callOffMain<RevisionResult>(
+                    "playlist.moveItems",
+                    rpcArgs {
+                        put("uri", playlistUri)
+                        put("fromIndex", fromIndex)
+                        put("length", 1)
+                        put("toIndex", toIndex)
+                        put("revision", rev)
+                    },
+                )
+            }
         }
         library.onPlaylistEdited(playlistUri)
         return result.revision
@@ -135,14 +144,16 @@ class PlaylistEditor(
     suspend fun updateDetails(playlistUri: String, name: String? = null, description: String? = null) {
         if (name == null && description == null) return
         detached {
-            rpc.callUnitOffMain(
-                "playlist.updateDetails",
-                rpcArgs {
-                    put("uri", playlistUri)
-                    if (name != null) put("name", name)
-                    if (description != null) put("description", description)
-                },
-            )
+            playlistEdit(playlistUri, RevisionResult::revision) {
+                rpc.callOffMain<RevisionResult>(
+                    "playlist.updateDetails",
+                    rpcArgs {
+                        put("uri", playlistUri)
+                        if (name != null) put("name", name)
+                        if (description != null) put("description", description)
+                    },
+                )
+            }
             library.onPlaylistEdited(playlistUri)
         }
     }
@@ -152,10 +163,12 @@ class PlaylistEditor(
      * `public` attribute). Owner only in the UI; the playlist must be in the library.
      */
     suspend fun setPublic(playlistUri: String, public: Boolean) = detached {
-        rpc.callUnitOffMain("playlist.setPublic", rpcArgs {
-            put("uri", playlistUri)
-            put("public", public)
-        })
+        rootlistEdit {
+            rpc.callUnitOffMain("playlist.setPublic", rpcArgs {
+                put("uri", playlistUri)
+                put("public", public)
+            })
+        }
         library.onPlaylistAttributesChanged(playlistUri)
     }
 
@@ -164,15 +177,17 @@ class PlaylistEditor(
      * (`playlist.setCollaborative`). As in Spotify, making it collaborative also makes it private.
      */
     suspend fun setCollaborative(playlistUri: String, collaborative: Boolean) = detached {
-        rpc.callUnitOffMain("playlist.setCollaborative", rpcArgs {
-            put("uri", playlistUri)
-            put("collaborative", collaborative)
-        })
+        playlistEdit(playlistUri, RevisionResult::revision) {
+            rpc.callOffMain<RevisionResult>("playlist.setCollaborative", rpcArgs {
+                put("uri", playlistUri)
+                put("collaborative", collaborative)
+            })
+        }
         library.onPlaylistAttributesChanged(playlistUri)
     }
 
     suspend fun delete(playlistUri: String) = detached {
-        rpc.callUnitOffMain("playlist.delete", rpcArgs { put("uri", playlistUri) })
+        rootlistEdit { rpc.callUnitOffMain("playlist.delete", rpcArgs { put("uri", playlistUri) }) }
         library.onPlaylistDeleted(playlistUri)
     }
 
@@ -183,6 +198,27 @@ class PlaylistEditor(
 
     /** Runs [block] in [scope]; cancelling the caller only stops it from waiting for the result. */
     private suspend fun <T> detached(block: suspend () -> T): T = scope.async { block() }.await()
+
+    /** [block] edits playlist [uri]: in flight for [own] meanwhile, then with the revision it produced. */
+    private suspend fun <T> playlistEdit(uri: String, revisionOf: (T) -> String?, block: suspend () -> T): T {
+        own.beginPlaylist(uri)
+        var revision: String? = null
+        try {
+            return block().also { revision = revisionOf(it) }
+        } finally {
+            own.endPlaylist(uri, revision)
+        }
+    }
+
+    /** [block] writes the rootlist: in flight for [own] meanwhile. */
+    private suspend fun <T> rootlistEdit(block: suspend () -> T): T {
+        own.beginRootlist()
+        try {
+            return block()
+        } finally {
+            own.endRootlist()
+        }
+    }
 
     /** Returns the revision after the last batch. */
     private suspend fun appendItems(playlistUri: String, uris: List<String>): String? {
@@ -195,7 +231,7 @@ class PlaylistEditor(
                     putStrings("uris", chunk)
                     put("position", JsonNull) // append
                 },
-            ).revision ?: revision
+            ).revision?.also { own.notePlaylistRevision(playlistUri, it) } ?: revision
         }
         return revision
     }

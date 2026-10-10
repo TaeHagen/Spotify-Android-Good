@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.data
 
+import com.taehagen.spotifygood.model.CollectionChangeItem
 import com.taehagen.spotifygood.model.Page
 import com.taehagen.spotifygood.model.Rootlist
 import com.taehagen.spotifygood.model.SavedAlbum
@@ -58,6 +59,8 @@ class LibraryRepository(
     private val online: StateFlow<Boolean>,
     /** Learns Spotify's podcast played state carried by Your Episodes pages (docs §6.5). */
     private val progress: EpisodeProgressStore? = null,
+    /** Saved states and follows written here, so that their pushed echoes are known ([LibraryPushes]). */
+    private val own: OwnLibraryEdits? = null,
 ) {
     private val saved = SavedStateStore()
 
@@ -209,6 +212,40 @@ class LibraryRepository(
         _changes.emit(Unit)
     }
 
+    // ---- changes made elsewhere (LibraryPushes) ------------------------------------------------------
+
+    /** Saved states Spotify pushed (liked or followed on another device): memory only, no request. */
+    internal fun applyRemoteSaved(items: List<CollectionChangeItem>) {
+        if (items.isEmpty()) return
+        saved.applyLookup(items.associate { it.uri to !it.removed }, saved.currentSeq())
+    }
+
+    /**
+     * The playlist list changed elsewhere (the engine dropped its copy already): its cached row goes
+     * stale; [reload]: the lists on screen load it again now.
+     */
+    internal suspend fun onRemoteRootlistChange(reload: Boolean) {
+        if (reload) cache.invalidate(CacheKeys.LIBRARY_PLAYLISTS) else cache.markStale(CacheKeys.LIBRARY_PLAYLISTS)
+    }
+
+    /**
+     * Library set [set] changed elsewhere (`collection`: Liked Songs and saved albums): its cached
+     * list goes stale; [reload]: the lists on screen load again now, and [changes] emits (the
+     * Liked Songs count, Your Episodes).
+     */
+    internal suspend fun onRemoteSetChange(set: String, reload: Boolean) {
+        val key = when (set) {
+            "collection" -> CacheKeys.LIBRARY_ALBUMS
+            "artist" -> CacheKeys.LIBRARY_ARTISTS
+            "show" -> CacheKeys.LIBRARY_SHOWS
+            else -> null
+        }
+        if (key != null) {
+            if (reload) cache.invalidate(key) else cache.markStale(key)
+        }
+        if (reload) _changes.emit(Unit)
+    }
+
     // ---- internals ----------------------------------------------------------------------------------
 
     /** `library.invalidate` (docs §6.3); best effort: an error must not keep the app's own lists stale. */
@@ -228,11 +265,18 @@ class LibraryRepository(
         try {
             val (playlists, others) = uris.partition(SpotifyUris::isPlaylist)
             for (chunk in others.chunked(MUTATION_BATCH)) {
+                own?.noteSaved(chunk, value)
                 rpc.callUnitOffMain(if (value) "library.save" else "library.remove", rpcArgs { putStrings("uris", chunk) })
+                own?.noteSaved(chunk, value)
                 done += chunk
             }
             for (playlist in playlists) {
-                rpc.callUnitOffMain(if (value) "playlist.follow" else "playlist.unfollow", rpcArgs { put("uri", playlist) })
+                own?.beginRootlist()
+                try {
+                    rpc.callUnitOffMain(if (value) "playlist.follow" else "playlist.unfollow", rpcArgs { put("uri", playlist) })
+                } finally {
+                    own?.endRootlist()
+                }
                 done += playlist
             }
         } catch (e: Throwable) {

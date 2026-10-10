@@ -409,7 +409,33 @@ during it follows this rule too. Smart shuffle is not offered for
 | `queueMetadata` | `{"tracks":[Track…],"episodes":[Episode…]}` metadata for URIs referenced by the snapshot that were not yet cached (UI merges by uri). Filled / fetched for the current track, the next 50 (the Media3 queue window) and the last 10 prev |
 | `download` | `DownloadProgress` |
 | `error` | `{"code","message","context":"playback|connect|session|…"}` user-visible, transient (a failed start of playback by this phone's own Spirc, a load or a play with nothing to play, is `playback`; commands from other devices that failed here and other Connect failures are `connect`) |
+| `playlistChanged` | `{"uri":"spotify:playlist:…","revision"?:"hex"}` a playlist of the user's changed (on any device, this one included); `revision`: its revision since, as `catalog.playlist` reports it (absent when the push didn't carry a readable one) |
+| `rootlistChanged` | `{"revision"?:"hex"}` the user's playlist list (rootlist) changed |
+| `collectionChanged` | `{"set":"collection|artist|show|listenlater|…","items":[{"uri","removed"}]}` a library set changed (`collection`: Liked Songs and saved albums); `items` empty when the push doesn't say what changed (reload the set) |
 | `log` | not used (logs go to logcat via android_logger, tag `spotcore`) |
+
+**Library pushes** (`playlistChanged`, `rootlistChanged`, `collectionChanged`;
+`catalog/push.rs`). Spotify sends every change of the user's playlists, rootlist and library sets
+to every dealer connection of the account, unasked (no subscription request exists or is made;
+librespot's Spirc and librespot-java rely on the same messages): `hm://playlist/v2/playlist/<id>`
+with a playlist4 `PlaylistModificationInfo` (`uri`, `new_revision`, `parent_revision`, `ops`),
+`hm://playlist/v2/user/<user>/rootlist` (read leniently as either modification info), and
+`hm://collection/<set>/<user>` (protobuf, not decoded: the set changed) plus
+`hm://collection/<set>/<user>/json` (JSON text `{"items":[{"type","identifier","removed",…}]}`,
+which the stock dealer dropped as bad base64, see native/vendor/README.md). The engine listens
+next to Spirc on the session's dealer, on Spirc's own prefix `hm://playlist/v2/playlist/` (the
+dealer hands every subscriber of a path its copy; a subscriber on a parent path would hide the
+ones below it, `SubscriberMap::retain`), `hm://playlist/v2/user/` and `hm://collection/`. The
+listener is registered when Spirc is created (before its task starts the dealer) and stops with
+it: the session and its dealer are rebuilt on every reconnect, so nothing outlives its session,
+logout or an account change included. A hidden session (`connectVisible` off, or hidden while
+idle) has no dealer and gets no pushes; the app's revision checks cover that (§9.9). Before an
+event goes out, the engine drops what its caches hold of the change: the playlist's header, the
+rootlist when it lists the playlist at another revision (or on `rootlistChanged`), the set's
+snapshot (and the Liked Songs fallback for `collection`). A malformed payload is dropped or
+reported without the parts that couldn't be read (a playlist push names its playlist by the
+message path then, without `revision`); nothing panics. Pushes are lost while the app's session
+is down or reconnecting, and while the dealer reconnects.
 
 ```jsonc
 // SessionEvent
@@ -1738,6 +1764,25 @@ when it is `partial` or empty. Paged lists advance by whole windows
 until `total`; an empty page before `total` is an error, not the end. Library mutations are
 optimistic (local state flips immediately, rolled back on error); playlist edits run in the
 app scope, so they complete even if their screen closes.
+Changes made elsewhere (`data/LibraryPushes.kt`) arrive as the engine's library pushes (§5).
+Spotify pushes this phone's own edits too: `OwnLibraryEdits` records the app's writes
+(`PlaylistEditor`: the playlist edits in flight and every revision they produced; rootlist writes
+and `library.save`/`remove` with the time, an echo window of 10 s), and their echoes are dropped,
+since the page that made an edit already refetches after it. For any other change, what costs
+no request happens at once: the playlist's cached pages (`catalog.playlist:<uri>:*`, its mosaic
+row included) and the playlist list are marked stale in `ResponseCache` without reloading what
+shows them (`markStale`: a reopened page revalidates), saved states change in memory (hearts,
+Follow), and the pages that show the change hear of it (`LibraryPushes.changes`; they act only
+while on screen, §9.9). What may cost requests runs 1.5 s after a burst of pushes (one per song
+added elsewhere; a like comes as a protobuf and a JSON push, taken together) and only while the
+app is in the foreground (ProcessLifecycleOwner STARTED); pushed while it is in the background,
+it is held until the app comes back: the playlist list on screen reloads (`library.playlists`,
+its names, images, lengths and revisions), mosaics of the changed playlists are learned again
+where they show (`PlaylistMosaicStore.noteRevisions`), a downloaded playlist syncs when the
+pushed revision isn't the downloaded one (`DownloadManager.requestSync`, as a fresh page does),
+a downloaded Liked Songs syncs (paced like a loaded page, at most every few minutes), and the
+lists of a changed library set reload (saved albums, artists, shows; `LibraryRepository.changes`
+for the Liked Songs count and Your Episodes). Logout and an account change drop what is held.
 Playlist art: a playlist's own image when it has one (also the server's generated covers, the
 `picture_size` URLs such as `mosaic.scdn.co`, when its attributes carry them). Without one the app
 draws Spotify's: a 2x2 mosaic of the first 4 distinct album covers among its first 20 items (local
@@ -1967,6 +2012,32 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
   loaded rows, and a new revision or total, the explicit filter, a reload or pull-to-refresh
   drops them (the rows on screen load again). A sort or a filter loads every row anyway
   (§9.8), so its scroller just jumps; offline lists show their loaded rows only.
+* Changes made elsewhere on an open page (`ui/screens/playlist/PlaylistFreshness.kt`). The page
+  reports its lifecycle (`LifecycleStartEffect`: ON_START, ON_STOP); nothing below runs while it
+  is off screen or the app is in the background, nothing runs on a timer, and a failed check or
+  refresh isn't retried by itself (the next push, start or reconnect does).
+  * A push names the playlist at a revision other than the one shown: 1 s after the first push of
+    a burst, the loaded range is fetched again (at least the first page, as many rows as are
+    loaded) and replaces the rows in place: no loading state, row keys come from the items' uids
+    so the rows that stay keep theirs and the list keeps its place; the windows of the old
+    revision are dropped (`PageWindows.clear`, their loads cancelled) and the rows on screen load
+    again; the cached page is marked stale. Not while edits are queued or a row is dragged (the
+    edits' end refreshes the rows), nor for the download. The app's own edits produce a revision
+    the page already shows (it takes the one each edit returns), and their pushes are dropped
+    before they reach it (§9.8): no second fetch.
+  * Pushed while the page is off screen: it refreshes when the page starts again, without a check.
+  * Pushes are lost while the app is in the background, while the session reconnects, and for a
+    session hidden from Connect (no dealer, §5). So the revision is checked with one small
+    request (`catalog.playlistUris` at offset 0, length 1: the revision without any metadata) when
+    the page starts (not within 30 s of the server last telling the revision shown: a rotation),
+    when it shows a fresh cached copy while on screen, and each time the session comes back ONLINE
+    (a reconnect while the page was off screen makes its next start check); the rows refresh only
+    if the revision changed. A page that failed or shows a stale copy reloads as before
+    (`reloadWhenOnline`).
+  * Liked Songs: a song liked or unliked elsewhere (`collectionChanged` of `collection`) shows like
+    a like made here while the page is on screen and ONLINE (a fully loaded list is patched,
+    otherwise its first page reloads); off screen it reloads when the page is back. It has no
+    revision to check cheaply: without a push it changes on pull-to-refresh or the next open.
 * Deep links: `https://open.spotify.com/{type}/{id}` and `spotify:{type}:{id}` intents. The
   https links can't be verified for this app: from Android 12 they reach it only after the user
   approves open.spotify.com in its "Open by default" settings. Settings › Links offers that

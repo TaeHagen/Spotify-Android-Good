@@ -10,6 +10,9 @@ import androidx.lifecycle.viewModelScope
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.data.LibraryEdit
+import com.taehagen.spotifygood.data.LibraryPushes
+import com.taehagen.spotifygood.data.SpotifyUris
+import com.taehagen.spotifygood.model.CollectionChangeItem
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.download.CollectionRef
 import com.taehagen.spotifygood.download.CollectionType
@@ -313,6 +316,10 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     /** The rows on screen last reported ([onRowsVisible]): asked again after the windows were dropped. */
     private var visibleRows: Pair<Int, Int>? = null
     private val reach = graph.engineReachFlow()
+    /** The page is on screen ([onScreenStarted]): changes made elsewhere show only then. */
+    private var screenStarted = false
+    /** Songs were liked or unliked elsewhere while the page couldn't show it: it reloads when it can. */
+    private var changedElsewhere = false
     private val refreshing = MutableStateFlow(false)
     private val sortStore = ListSortStore(graph.app)
     private val sort = MutableStateFlow(TrackSort.RECENTLY_ADDED)
@@ -508,6 +515,15 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             }
             .catch { }
             .launchIn(viewModelScope)
+        // Songs liked or unliked on another device (Spotify's push): applied while on screen, like
+        // the likes made here; otherwise once the page is back, or the session is.
+        graph.libraryPushes.collectionChanges(LibraryPushes.COLLECTION_SET)
+            .onEach { onChangedElsewhere(it.items) }
+            .catch { }
+            .launchIn(viewModelScope)
+        reach.filter { it == EngineReach.ONLINE }
+            .onEach { if (screenStarted && changedElsewhere) reloadChangedElsewhere() }
+            .launchIn(viewModelScope)
         // Refresh indicator ends with the reload.
         pager.state.onEach { if (!it.isLoading) refreshing.value = false }.launchIn(viewModelScope)
         // Pages loaded since cover their windows.
@@ -629,6 +645,45 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             null
         }
         if (tracks.isNullOrEmpty()) reloadPager() else likedPatch.update { it.liked(tracks) }
+    }
+
+    /** The page is on screen (ON_START): what changed elsewhere meanwhile shows. */
+    fun onScreenStarted() {
+        screenStarted = true
+        if (changedElsewhere && graph.engineReach() == EngineReach.ONLINE) reloadChangedElsewhere()
+    }
+
+    /** The page left the screen, or the app went to the background (ON_STOP). */
+    fun onScreenStopped() {
+        screenStarted = false
+    }
+
+    private fun reloadChangedElsewhere() {
+        changedElsewhere = false
+        reloadPager()
+    }
+
+    /**
+     * Liked Songs changed elsewhere; [items]: what changed, null when the push didn't say. Shown
+     * like a like made here ([onLikedEdit]: a fully loaded list is patched, otherwise its first page
+     * reloads), only while the page is on screen and the session ONLINE.
+     */
+    private suspend fun onChangedElsewhere(items: List<CollectionChangeItem>?) {
+        val tracks = items?.filter { SpotifyUris.typeOf(it.uri) == "track" }
+        // Only saved albums changed.
+        if (tracks != null && tracks.isEmpty()) return
+        if (!screenStarted || graph.engineReach() != EngineReach.ONLINE) {
+            changedElsewhere = true
+            return
+        }
+        val page = pager.state.value
+        if (tracks == null || !page.endReached || page.items.isEmpty() || page.error != null) {
+            reloadChangedElsewhere()
+            return
+        }
+        val (removed, added) = tracks.partition { it.removed }
+        if (removed.isNotEmpty()) onLikedEdit(LibraryEdit.LikedTracks(removed.map { it.uri }, saved = false))
+        if (added.isNotEmpty()) onLikedEdit(LibraryEdit.LikedTracks(added.map { it.uri }, saved = true))
     }
 
     fun refresh() {

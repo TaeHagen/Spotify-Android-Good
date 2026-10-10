@@ -76,6 +76,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
@@ -269,6 +270,17 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     ) { offset, limit -> windowRows(offset, limit) }
     /** The rows on screen last reported ([onRowsVisible]): asked again after the windows were dropped. */
     private var visibleRows: Pair<Int, Int>? = null
+    /**
+     * Changes made elsewhere (another device, the web player): pushed, or found by the revision
+     * check when the page starts and when the session comes online; the rows refresh in place.
+     */
+    private val freshness = PlaylistFreshness(
+        viewModelScope,
+        shown = ::refreshableRevision,
+        online = { graph.engineReach() == EngineReach.ONLINE },
+        fetchRevision = { graph.catalog.playlistRevision(uri) },
+        refresh = ::refreshFromServer,
+    )
 
     private val listUi: Flow<PlaylistListUi> = combine(
         data,
@@ -352,6 +364,18 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         graph.engineReachFlow()
             .filter { it == EngineReach.ONLINE }
             .onEach { visibleRows?.let { (first, last) -> onRowsVisible(first, last) } }
+            .catch { }
+            .launchIn(viewModelScope)
+        // Changed elsewhere: pushed by Spotify (only while the dealer is up), and checked again each
+        // time the session comes back (pushes are lost while it is away).
+        graph.libraryPushes.playlistChanges(uri)
+            .onEach { freshness.onPushed(it) }
+            .catch { }
+            .launchIn(viewModelScope)
+        graph.engineReachFlow()
+            .drop(1)
+            .filter { it == EngineReach.ONLINE }
+            .onEach { freshness.onOnline() }
             .catch { }
             .launchIn(viewModelScope)
         // Loaded rows carry the playable flags of the old explicit filter; the revision doesn't
@@ -440,6 +464,10 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             refreshing = resource is Resource.Loading,
             stale = resource is Resource.Error,
         )
+        // The refresh of the loaded range below reports its own revision.
+        if (!reloadRange && resource !is Resource.Loading) {
+            freshness.onPage(playlist.revision, fromServer = resource is Resource.Success && !resource.fromCache)
+        }
         if (reloadRange) {
             viewModelScope.launch {
                 mutationMutex.withLock {
@@ -503,6 +531,12 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         visibleRows = null
         windows.hide()
     }
+
+    /** The page is on screen (ON_START): its revision is checked, a change pushed meanwhile shows. */
+    fun onScreenStarted() = freshness.onStart()
+
+    /** The page left the screen or the app went to the background (ON_STOP): nothing refreshes. */
+    fun onScreenStopped() = freshness.onStop()
 
     private fun resetWindows() {
         windows.clear()
@@ -918,6 +952,8 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
                     revision = mutation.apply(data.value.dataOrNull()?.revision)
                     // Kept for the next queued mutation (no extra fetch, no stale overwrite).
                     if (revision != null) data.value.dataOrNull()?.let { data.value = LoadState.Ready(it.copy(revision = revision)) }
+                    // Its push is this edit's: nothing to refresh for it.
+                    if (revision != null) freshness.onPage(revision, fromServer = true)
                 } catch (e: CancellationException) {
                     pendingMutations--
                     throw e
@@ -945,26 +981,22 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
      * [force]d (after a failure) or when no local edit is pending; otherwise only the revision is
      * taken over so the next queued mutation applies to the latest version.
      */
-    private suspend fun refreshLoaded(force: Boolean) {
-        val before = data.value.dataOrNull() ?: return
+    private suspend fun refreshLoaded(force: Boolean): Boolean {
+        val before = data.value.dataOrNull() ?: return false
         try {
             val applyRows = force || canApplyServerRows()
             // Only the revision is needed while local edits are pending.
-            val first = graph.catalog.playlistPage(uri, 0, if (applyRows) PAGE_SIZE else 1)
-            val items = first.items.toMutableList()
-            var partial = first.partial
-            val wanted = minOf(maxOf(PAGE_SIZE, before.rows.size), first.total)
-            if (applyRows) {
-                while (items.size < wanted) {
-                    val next = graph.catalog.playlistPage(uri, items.size, PAGE_SIZE)
-                    if (next.items.isEmpty()) break
-                    items += next.items
-                    partial = partial || next.partial
-                }
+            val range = fetchLoadedRange(if (applyRows) before.rows.size else 0, if (applyRows) PAGE_SIZE else 1) { offset, limit ->
+                graph.catalog.playlistPage(uri, offset, limit)
             }
-            val latest = data.value.dataOrNull() ?: return
+            val first = range.first
+            val items = range.items
+            val partial = range.partial
+            val latest = data.value.dataOrNull() ?: return false
             if (applyRows && (force || canApplyServerRows())) {
                 val description = withContext(Dispatchers.Default) { parseHtml(first.description.orEmpty()) }
+                // Row keys come from the items' uids: the rows that stay keep theirs, so the list
+                // keeps its place (the loaded range is fetched whole, it doesn't shrink).
                 data.value = LoadState.Ready(
                     PlaylistData(first.copy(items = emptyList()), description, buildRows(items), first.total, first.revision, partial),
                 )
@@ -973,11 +1005,39 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             } else {
                 data.value = LoadState.Ready(latest.copy(revision = first.revision))
             }
+            freshness.onPage(first.revision, fromServer = true)
+            return true
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             // Keep the local state; the next mutation reports a conflict if the revision is stale.
+            return false
         }
+    }
+
+    /**
+     * The revision on screen when the page can be refreshed in place from the server ([freshness]):
+     * the server's rows, settled (not loading or refreshing, not a stale copy, not the download),
+     * no edit pending or being dragged. Otherwise null.
+     */
+    private fun refreshableRevision(): String? {
+        val load = data.value as? LoadState.Ready ?: return null
+        if (load.refreshing || load.stale || load.data.downloadedCopy || !canApplyServerRows()) return null
+        return load.data.revision
+    }
+
+    /**
+     * Changed elsewhere: the loaded range is fetched again and replaces the rows in place (no
+     * loading state, the scroll position stays); the windows of the old revision go with it (see
+     * init), and the cached page is marked stale so a reopened page revalidates. False when the
+     * fetch failed. Queued edits refresh the rows themselves once they are done.
+     */
+    private suspend fun refreshFromServer(): Boolean = mutationMutex.withLock {
+        if (cleared || !canApplyServerRows()) return@withLock true
+        val current = data.value.dataOrNull() ?: return@withLock false
+        if (current.downloadedCopy) return@withLock true
+        graph.catalog.markPlaylistStale(uri)
+        refreshLoaded(force = false)
     }
 
     private fun canApplyServerRows(): Boolean = pendingMutations == 0 && !dragging
@@ -1020,6 +1080,29 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         /** Not in the documented code list yet; accepted if the engine adds it. */
         const val CONFLICT_CODE = "CONFLICT"
     }
+}
+
+/** A playlist's first rows fetched again ([fetchLoadedRange]): its first page and the items. */
+internal class LoadedRange(val first: Playlist, val items: List<PlaylistItem>, val partial: Boolean)
+
+/**
+ * The first [loaded] rows of a playlist as the server has them now (at least its first page of
+ * [pageSize]), in pages of [pageSize]: as many as the page shows, so a refresh doesn't shrink the
+ * list under the user (a shorter playlist ends sooner). [loaded] 0 with [pageSize] 1 is the
+ * revision alone.
+ */
+internal suspend fun fetchLoadedRange(loaded: Int, pageSize: Int, fetch: suspend (offset: Int, limit: Int) -> Playlist): LoadedRange {
+    val first = fetch(0, pageSize)
+    val items = first.items.toMutableList()
+    var partial = first.partial
+    val wanted = minOf(maxOf(pageSize, loaded), first.total)
+    while (items.size < wanted) {
+        val next = fetch(items.size, pageSize)
+        if (next.items.isEmpty()) break
+        items += next.items
+        partial = partial || next.partial
+    }
+    return LoadedRange(first, items, partial)
 }
 
 /** The loaded rows begin with [items] (same items, same playable flags). */

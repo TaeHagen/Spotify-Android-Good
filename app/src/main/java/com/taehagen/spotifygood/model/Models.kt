@@ -630,3 +630,29 @@ data class OfflineTrackRecord(
     val episode: Episode? = null,
     val imagePath: String? = null,
 )
+
+// ---------------------------------------------------------------------------------------------
+// Library changes made elsewhere (events `playlistChanged`, `rootlistChanged`, `collectionChanged`)
+// ---------------------------------------------------------------------------------------------
+
+/** A change of the user's library that Spotify pushed (docs/ARCHITECTURE.md §5). */
+sealed interface LibraryPush
+
+/** Playlist [uri] (`spotify:playlist:<id>`) changed; [revision]: its revision since (hex), when told. */
+@Serializable
+data class PlaylistChangedPush(val uri: String, val revision: String? = null) : LibraryPush
+
+/** The rootlist (the user's playlists and folders) changed. */
+@Serializable
+data class RootlistChangedPush(val revision: String? = null) : LibraryPush
+
+/** One item of a [CollectionChangedPush]: added to the set, or [removed]. */
+@Serializable
+data class CollectionChangeItem(val uri: String, val removed: Boolean = false)
+
+/**
+ * The library set [set] changed (`collection`: Liked Songs and saved albums; `artist`, `show`,
+ * `listenlater`). [items]: what changed, when the push said so; empty: unknown (reload the set).
+ */
+@Serializable
+data class CollectionChangedPush(val set: String, val items: List<CollectionChangeItem> = emptyList()) : LibraryPush

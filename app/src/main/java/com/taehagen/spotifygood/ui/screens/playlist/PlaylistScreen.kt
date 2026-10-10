@@ -50,6 +50,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.Playlist
@@ -117,6 +118,11 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
 
     // The query survives process death (saveable) but a recreated ViewModel starts unfiltered.
     LaunchedEffect(viewModel) { if (query.isNotEmpty()) viewModel.setFilter(query) }
+    // Changes made elsewhere show while the page is on screen (and are checked for when it starts).
+    LifecycleStartEffect(viewModel) {
+        viewModel.onScreenStarted()
+        onStopOrDispose { viewModel.onScreenStopped() }
+    }
     LaunchedEffect(viewModel, navigator) {
         viewModel.events.collect { event ->
             when (event) {

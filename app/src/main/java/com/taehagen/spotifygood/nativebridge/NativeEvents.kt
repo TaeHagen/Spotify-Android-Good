@@ -1,11 +1,15 @@
 package com.taehagen.spotifygood.nativebridge
 
 import android.util.Log
+import com.taehagen.spotifygood.model.CollectionChangedPush
 import com.taehagen.spotifygood.model.DeviceList
 import com.taehagen.spotifygood.model.DownloadProgress
 import com.taehagen.spotifygood.model.Episode
+import com.taehagen.spotifygood.model.LibraryPush
 import com.taehagen.spotifygood.model.NativeErrorInfo
 import com.taehagen.spotifygood.model.PlaybackSnapshot
+import com.taehagen.spotifygood.model.PlaylistChangedPush
+import com.taehagen.spotifygood.model.RootlistChangedPush
 import com.taehagen.spotifygood.model.SessionEvent
 import com.taehagen.spotifygood.model.StoredCredentials
 import com.taehagen.spotifygood.model.Track
@@ -55,6 +59,11 @@ class NativeEvents(private val json: Json) {
     private val _errors = MutableSharedFlow<NativeErrorInfo>(extraBufferCapacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     val errors: SharedFlow<NativeErrorInfo> = _errors.asSharedFlow()
 
+    // Library changes made elsewhere (`playlistChanged`, `rootlistChanged`, `collectionChanged`):
+    // no replay, they matter to whoever listens when they come (LibraryPushes).
+    private val _libraryPushes = MutableSharedFlow<LibraryPush>(extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    val libraryPushes: SharedFlow<LibraryPush> = _libraryPushes.asSharedFlow()
+
     /** Invoked from [NativeCallbacks.onEvent] on a native thread. */
     internal fun dispatch(type: String, payload: String) {
         try {
@@ -66,6 +75,9 @@ class NativeEvents(private val json: Json) {
                 "queueMetadata" -> _queueMetadata.tryEmit(json.decodeFromString<QueueMetadataEvent>(payload))
                 "download" -> _downloads.tryEmit(json.decodeFromString<DownloadProgress>(payload))
                 "error" -> _errors.tryEmit(json.decodeFromString<NativeErrorInfo>(payload))
+                "playlistChanged" -> _libraryPushes.tryEmit(json.decodeFromString<PlaylistChangedPush>(payload))
+                "rootlistChanged" -> _libraryPushes.tryEmit(json.decodeFromString<RootlistChangedPush>(payload))
+                "collectionChanged" -> _libraryPushes.tryEmit(json.decodeFromString<CollectionChangedPush>(payload))
                 else -> Log.d(TAG, "Ignoring unknown event $type")
             }
         } catch (t: Throwable) {
