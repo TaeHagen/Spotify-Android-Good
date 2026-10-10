@@ -1133,14 +1133,27 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   * What follows from the paused state: the surfaces drawn from it (SysUI's notification and
     lock-screen controls from API 33, Auto, Wear, a headset's play key) show play while the
     device plays. Their play is then a toggle and pauses it (`playMeansPause`, in
-    `handleSetPlayWhenReady`: only while the published state is suppressed), except a voice
-    assistant's (Google app, Assistant, car assistant, Gemini), an explicit "play" or "resume".
-    Media3 controllers send that play although `playWhenReady` is set (they do for a transient
-    focus suppression), and a play/pause key toggles on `playWhenReady`, so pauses. Bluetooth
-    keys arrive as the media notification controller. Below API 33, where the notification
-    draws its own buttons, it shows pause (`getMediaButtons`). The platform position does not
-    advance while suppressed (speed 0; each update moves it), and the notification shows no
-    chronometer.
+    `handleSetPlayWhenReady` and `RemoteVolumeKeys`' play: only while the published state is
+    suppressed), except a voice assistant's (Google app, Assistant, car assistant, Gemini), an
+    explicit "play" or "resume", and any play while a media-session load is in flight (next
+    point). Media3 controllers send that play although `playWhenReady` is set (they do for a
+    transient focus suppression), and a play/pause key toggles on `playWhenReady`, so pauses.
+    Bluetooth keys arrive as the media notification controller. Below API 33, where the
+    notification draws its own buttons, it shows pause (`getMediaButtons`). The platform
+    position does not advance while suppressed (speed 0; each update moves it), and the
+    notification shows no chronometer.
+  * A controller's pick while the device plays or loads (a car's AVRCP browse list, Auto's list
+    or search, a watch; Auto-relayed voice requests too, whose requester is Auto): Media3 runs
+    it as setMediaItems, prepare (only when idle), then play, in one go for a legacy controller
+    (`MediaSessionLegacyStub`), as separate commands for a Media3 one. The load plays on this
+    phone (`local`, taking the session over), and the play belongs to it: `resumeAsync` merges it
+    into the load while unsent, else plays after it. As a toggle it would queue `player.pause`
+    behind the load, which the engine sends to the just-activated local Spirc: the pick would
+    sit paused, the other device already stopped. So no play is a toggle while a load of the
+    session is in flight (`SpotifyPlayer.localLoadPending`, the load's future), a play from
+    another controller meanwhile included. That future ends it: it completes when the pick
+    shows here, when the start failed, was dropped or cancelled, or 15 s after the load went
+    through, and a newer load replaces it; the toggle then applies again.
   * Pending commands: while a handler's future is pending Media3 publishes a placeholder, the
     current state with the command's likely outcome (`SimpleBasePlayer`; `invalidateState` is
     ignored meanwhile). A play of the paused device through the session (notification and lock
@@ -1152,10 +1165,14 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     while the session shows another device with a Bluetooth output connected
     (`placeholderSuppression`), so the play, and the seeks, skips and queue changes after it,
     read paused until the confirmed (suppressed) state follows. Not while a media-session load
-    is in flight (`handleSetMediaItems`, `onThisPhone`: Auto's load and play while mirroring),
-    which plays on this phone; without a Bluetooth output and for local playback the
-    placeholders read playing as before. The in-app buttons call `PlayerController` directly
-    and publish no placeholder.
+    is in flight (`handleSetMediaItems`, `onThisPhone`: a pick and its play while mirroring),
+    which plays on this phone: then a placeholder with `playWhenReady` reads playing, and it
+    also lifts the suppression it starts from when the other device plays or loads (Media3's
+    setMediaItems placeholder copies the current state). The load takes the session over, so
+    the phone is about to play, which is what Bluetooth should hear; a load that fails reads
+    playing until it fails, then the suppressed state of the device that plays on follows.
+    Without a Bluetooth output and for local playback the placeholders read playing as before.
+    The in-app buttons call `PlayerController` directly and publish no placeholder.
   * Volume keys go to a session in an active state that handles them
     (`MediaSessionStack.getDefaultVolumeSession`), which a paused one is not. While the session
     reads paused, `RemoteVolumeKeys` keeps a hidden platform `MediaSession` active: remote volume

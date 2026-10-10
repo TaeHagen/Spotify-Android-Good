@@ -78,10 +78,14 @@ android {
             // -Pscreenshots; the plain unit test run skips them.
             isIncludeAndroidResources = screenshots
             all { test ->
+                // Robolectric fetches its Android runtime (android-all-instrumented, ~200 MB) itself
+                // while the tests run, not through Gradle, into ~/.m2/repository on first use. The
+                // plain run has Robolectric tests too (SpotifyPlayerPlaceholderTest), so every run
+                // takes it from Maven Central's Google-hosted mirror: Maven Central rate-limits
+                // shared CI addresses.
+                test.systemProperty("robolectric.dependency.repo.url", "https://maven-central.storage-download.googleapis.com/maven2")
                 if (screenshots) {
                     test.systemProperty("roborazzi.test.record", "true")
-                    // Maven Central rate-limits shared CI addresses; this is its Google-hosted mirror.
-                    test.systemProperty("robolectric.dependency.repo.url", "https://maven-central.storage-download.googleapis.com/maven2")
                 } else {
                     test.exclude("**/*ScreenshotTest*")
                 }

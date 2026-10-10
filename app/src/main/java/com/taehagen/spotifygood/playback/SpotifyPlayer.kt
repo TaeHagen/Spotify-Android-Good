@@ -93,8 +93,20 @@ internal class SpotifyPlayer(
     /** Last remote volume we sent, so quick volume-key steps accumulate before the snapshot catches up. */
     private val remoteVolume = RemoteVolumeTarget(SystemClock::elapsedRealtime)
     private var remoteVolumeExpiry: Job? = null
-    /** The media session's last load ([handleSetMediaItems]): it plays on this phone ([getPlaceholderState]). */
+    /**
+     * The media session's last load ([handleSetMediaItems]): it plays on this phone
+     * ([localLoadPending]). Replaced by the next one.
+     */
     private var sessionLoad: ListenableFuture<*>? = null
+
+    /**
+     * A media-session load is in flight ([RemotePlayback.placeholderSuppression],
+     * [RemotePlayback.playMeansPause]). Never for long: its future ([trackLoad]) completes once
+     * the item shows on this phone, the start failed, was dropped or cancelled (a pause while the
+     * session starts, a release), or [LOAD_SETTLE_MS] after the command went through; every
+     * command before it in [PlayerController]'s queue is bounded too.
+     */
+    private val localLoadPending: Boolean get() = sessionLoad?.isDone == false
 
     private data class ItemKey(
         val track: PlaybackTrack,
@@ -116,6 +128,14 @@ internal class SpotifyPlayer(
      * (suppressed, [RemotePlayback]): what controllers see now. Main thread.
      */
     val readsPaused: Boolean get() = playbackSuppressionReason != PLAYBACK_SUPPRESSION_REASON_NONE
+
+    /**
+     * Whether a play request from [requesterPackage] pauses instead, by what the session publishes
+     * now ([RemotePlayback.playMeansPause]): the media session's play and [RemoteVolumeKeys]'. Main
+     * thread.
+     */
+    fun playMeansPause(requesterPackage: String?): Boolean =
+        RemotePlayback.playMeansPause(playback.snapshot.value, readsPaused, requesterPackage, localLoadPending)
 
     override fun getState(): State {
         val s = playback.snapshot.value
@@ -232,7 +252,9 @@ internal class SpotifyPlayer(
      * another, paused device from the notification, lock screen, widget, Auto, Wear or a headset
      * reads playing until that device reports playing (the round trip, then up to [SETTLE_MS]).
      * With a Bluetooth output connected it reads paused instead, as the state that follows does
-     * ([RemotePlayback.placeholderSuppression]); a media session load plays here and reads playing.
+     * ([RemotePlayback.placeholderSuppression]). A media-session load plays here, so while one is
+     * in flight a placeholder with `playWhenReady` reads playing, also while another device plays
+     * (the load takes over from it).
      */
     override fun getPlaceholderState(suggestedPlaceholderState: State): State {
         val suggested = suggestedPlaceholderState
@@ -241,7 +263,7 @@ internal class SpotifyPlayer(
             playWhenReady = suggested.playWhenReady,
             suggested = suggested.playbackSuppressionReason,
             bluetoothOutput = bluetoothOutput(),
-            localLoadPending = sessionLoad?.isDone == false,
+            localLoadPending = localLoadPending,
         )
         return if (reason == suggested.playbackSuppressionReason) {
             suggested
@@ -318,8 +340,10 @@ internal class SpotifyPlayer(
 
     override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
         // Another device plays and the requester showed it paused (RemotePlayback): its play is a
-        // toggle, so it pauses that device.
-        if (playWhenReady && RemotePlayback.playMeansPause(playback.snapshot.value, readsPaused, requester())) {
+        // toggle, so it pauses that device. Not while a media-session load is in flight: Media3
+        // sends play right after a controller's setMediaItems, and that play belongs to the load
+        // (resumeAsync merges it into the load or plays after it), which plays on this phone.
+        if (playWhenReady && playMeansPause(requester())) {
             return track(controller.pauseAsync())
         }
         if (playWhenReady) onCommand()

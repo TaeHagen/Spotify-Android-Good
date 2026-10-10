@@ -181,7 +181,7 @@ class PlaybackService : MediaLibraryService() {
             setVolume = { percent -> player.setDeviceVolume(percent, 0) },
             adjustVolume = { direction -> if (direction > 0) player.increaseDeviceVolume(0) else player.decreaseDeviceVolume(0) },
             playRequested = { caller ->
-                if (RemotePlayback.playMeansPause(graph.playback.snapshot.value, player.readsPaused, caller)) {
+                if (player.playMeansPause(caller)) {
                     graph.player.pause()
                 } else {
                     graph.player.resume()

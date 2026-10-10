@@ -20,6 +20,9 @@ import kotlinx.coroutines.cancel
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -49,13 +52,15 @@ class SpotifyPlayerPlaceholderTest {
     private val events = NativeEvents(json)
     private val playback = PlaybackRepository(scope, events)
 
-    /** Engine calls held until released (a Connect command's round trip). */
+    /** Engine calls held until released (a Connect command's round trip) or failed. */
     private val held = mutableMapOf<String, CompletableDeferred<Unit>>()
     private val calls = mutableListOf<String>()
+    private val args = mutableListOf<Pair<String, JsonObject>>()
     private val controller = PlayerController(
         scope = scope,
-        transport = { method, _ ->
+        transport = { method, arguments ->
             calls += method
+            args += method to arguments
             held[method]?.await()
             JsonObject(emptyMap())
         },
@@ -64,6 +69,8 @@ class SpotifyPlayerPlaceholderTest {
         lastSession = { null },
     )
     private var bluetooth: Boolean? = true
+    /** The controller whose request the session handles (`controllerForCurrentRequest`). */
+    private var requester: String? = null
     private val player: SpotifyPlayer by lazy {
         val context = RuntimeEnvironment.getApplication()
         SpotifyPlayer(
@@ -74,6 +81,7 @@ class SpotifyPlayerPlaceholderTest {
             volume = VolumeSync(context, NativeRpc(json), playback),
             audioSessionId = 0,
             downloadedQueue = { emptyList() },
+            requester = { requester },
             bluetoothOutput = { bluetooth },
         )
     }
@@ -84,7 +92,17 @@ class SpotifyPlayerPlaceholderTest {
     private val track = PlaybackTrack(uri = "spotify:track:t", uid = "u1", name = "Song")
     private val remotePaused = PlaybackSnapshot(source = PlaybackSource.REMOTE, status = PlaybackStatus.PAUSED, track = track)
     private val remotePlaying = remotePaused.copy(status = PlaybackStatus.PLAYING)
+    private val remoteLoading = remotePaused.copy(status = PlaybackStatus.LOADING)
     private val localPaused = remotePaused.copy(source = PlaybackSource.LOCAL)
+
+    /** What a controller picks (a car's browse list, Auto's list or search, a watch). */
+    private val picked = MediaItem.Builder().setMediaId("spotify:track:other").build()
+    /** The pick playing on this phone (the load took the session over). */
+    private val pickedHere = PlaybackSnapshot(
+        source = PlaybackSource.LOCAL,
+        status = PlaybackStatus.PLAYING,
+        track = PlaybackTrack(uri = "spotify:track:other", uid = "u9", name = "Other"),
+    )
 
     @After
     fun tearDown() {
@@ -112,6 +130,15 @@ class SpotifyPlayerPlaceholderTest {
         idle()
     }
 
+    /** The held engine call fails (the engine's error). */
+    private fun fail(method: String) {
+        held.remove(method)?.completeExceptionally(IllegalStateException("$method failed"))
+        idle()
+    }
+
+    /** The `play` argument of the `player.load` sent. */
+    private fun loadPlays(): Boolean? = args.single { it.first == "player.load" }.second["play"]?.jsonPrimitive?.boolean
+
     /**
      * Media3's own mapping (`MediaSessionLegacyStub`, `showPlayButtonIfPlaybackIsSuppressed` at its
      * default): no play button means platform PLAYING (READY) or BUFFERING, both "playing" to AVRCP.
@@ -130,7 +157,7 @@ class SpotifyPlayerPlaceholderTest {
                 override fun onIsPlayingChanged(isPlaying: Boolean) { published += readsPlaying() }
             },
         )
-        assertFalse(player.playWhenReady)
+        assertEquals(s.status == PlaybackStatus.PLAYING || s.status == PlaybackStatus.LOADING, player.playWhenReady)
         assertFalse(readsPlaying())
     }
 
@@ -220,5 +247,129 @@ class SpotifyPlayerPlaceholderTest {
         assertTrue(player.playWhenReady)
         assertEquals(Player.PLAYBACK_SUPPRESSION_REASON_NONE, player.playbackSuppressionReason)
         assertTrue(readsPlaying())
+    }
+
+    /**
+     * A controller's pick while another device plays or loads ([elsewhere]) with a Bluetooth output
+     * connected: Media3 runs setMediaItems, then [then] (its play), as `MediaSessionLegacyStub`
+     * does for a car's browse list, Auto's list or search and a watch, and a Media3 controller
+     * does with two commands. The load plays on this phone; nothing pauses it.
+     */
+    private fun pickWhileAnotherDevicePlays(elsewhere: PlaybackSnapshot, then: () -> Unit) {
+        start(elsewhere, true)
+        assertTrue(player.readsPaused)
+        hold("player.load")
+        requester = "com.android.bluetooth"
+        player.setMediaItems(listOf(picked))
+        then()
+        idle()
+
+        assertFalse("$calls", "player.pause" in calls)
+        // playWhenReady was set (the other device plays): the load itself plays, here.
+        assertEquals(true, loadPlays())
+        assertEquals(JsonPrimitive(true), args.single { it.first == "player.load" }.second["local"])
+        assertTrue(player.playWhenReady)
+        // The phone is about to play: that is what Bluetooth reads (and no toggle meanwhile).
+        assertEquals(Player.PLAYBACK_SUPPRESSION_REASON_NONE, player.playbackSuppressionReason)
+        assertTrue(readsPlaying())
+        assertFalse(player.readsPaused)
+
+        // The load goes through, the play after it is sent, the pick plays here.
+        release("player.load")
+        publish(pickedHere)
+        assertFalse("$calls", "player.pause" in calls)
+        assertEquals("$calls", "player.play", calls.last())
+        assertTrue(player.playWhenReady)
+        assertTrue(readsPlaying())
+    }
+
+    @Test
+    fun aPickWhileAnotherDevicePlaysPlaysHere() {
+        pickWhileAnotherDevicePlays(remotePlaying) {
+            player.prepare()
+            player.play()
+        }
+        assertEquals(listOf("player.load", "player.play"), calls)
+    }
+
+    @Test
+    fun aPickWhileAnotherDeviceLoadsPlaysHere() {
+        pickWhileAnotherDevicePlays(remoteLoading) {
+            player.prepare()
+            player.play()
+        }
+        assertEquals(listOf("player.load", "player.play"), calls)
+    }
+
+    @Test
+    fun aMedia3ControllersPickPlaysHere() {
+        // setMediaItems and play as two commands (a Media3 controller, e.g. a watch).
+        pickWhileAnotherDevicePlays(remotePlaying) {
+            idle()
+            requester = "com.google.android.wearable.app"
+            player.play()
+        }
+        assertEquals(listOf("player.load", "player.play"), calls)
+    }
+
+    @Test
+    fun aPickWithASeekBeforeItsPlayPlaysHere() {
+        pickWhileAnotherDevicePlays(remotePlaying) {
+            player.seekTo(30_000)
+            player.play()
+        }
+        assertEquals(listOf("player.load", "player.seek", "player.play"), calls)
+    }
+
+    @Test
+    fun anotherControllersPlayWhileAPickIsPendingPlaysToo() {
+        pickWhileAnotherDevicePlays(remoteLoading) {
+            idle()
+            // The notification (or a headset key) while the load is on its way: a play, not a toggle.
+            requester = "com.android.systemui"
+            player.play()
+        }
+        assertEquals(listOf("player.load", "player.play"), calls)
+    }
+
+    @Test
+    fun aPlayFromAButtonShowingPausedStillPausesTheOtherDevice() {
+        // The notification, the media notification controller (Bluetooth keys), Auto's play button.
+        listOf("com.android.systemui", "com.taehagen.spotifygood", "com.google.android.projection.gearhead").forEach { from ->
+            calls.clear()
+            start(remotePlaying, true)
+            requester = from
+            player.play()
+            idle()
+            assertEquals(from, listOf("player.pause"), calls)
+            // The device reports the pause; it plays again for the next round.
+            publish(remotePaused)
+            publish(remotePlaying)
+        }
+    }
+
+    @Test
+    fun afterAFailedPickAPlayPausesTheOtherDeviceAgain() {
+        start(remotePlaying, true)
+        hold("player.load")
+        requester = "com.google.android.projection.gearhead"
+        player.setMediaItems(listOf(picked))
+        player.prepare()
+        player.play()
+        idle()
+        assertFalse("$calls", "player.pause" in calls)
+
+        // The load fails: the play that followed it goes with it, the other device plays on, and
+        // the session reads paused again.
+        fail("player.load")
+        assertEquals(listOf("player.load"), calls)
+        assertEquals(Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS, player.playbackSuppressionReason)
+        assertFalse(readsPlaying())
+
+        // The notification shows play: its play is a toggle again.
+        requester = "com.android.systemui"
+        player.play()
+        idle()
+        assertEquals(listOf("player.load", "player.pause"), calls)
     }
 }
