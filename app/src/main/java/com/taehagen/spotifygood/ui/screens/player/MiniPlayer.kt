@@ -143,6 +143,7 @@ internal fun MiniPlayerBar(
                     PlayerArtwork(
                         url = artwork,
                         contentDescription = null,
+                        shown = { sheet.showsMiniArtwork() },
                         modifier = Modifier
                             .size(MiniArtworkSize)
                             .miniArtworkAtRest(sheet),

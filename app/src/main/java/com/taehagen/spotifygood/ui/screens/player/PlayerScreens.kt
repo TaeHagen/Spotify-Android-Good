@@ -1,11 +1,15 @@
 package com.taehagen.spotifygood.ui.screens.player
 
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.ui.appViewModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 
 /**
  * Whether the mini player has something to show: the loaded item, or after a cold start the last
@@ -53,6 +57,33 @@ fun ExpandingPlayer(
 @Composable
 fun PlayerDock(sheet: PlayerSheetState, modifier: Modifier = Modifier) {
     PlayerDockSpace(sheet = sheet, modifier = modifier)
+}
+
+/**
+ * Back on Now Playing while it is the top layer ([enabled]: open, no Queue, Lyrics or
+ * playback-refused screen over it): collapses it ([onCollapse]). On Android 14+ the predictive
+ * back gesture shrinks the player toward the mini player as it goes and springs it back when
+ * cancelled.
+ *
+ * Composed only while enabled, not merely switched on and off: the newest enabled handler takes
+ * Back, so each time Now Playing comes on top its handler is added again, above those of the pages
+ * composed since (a search query, a Library folder, edit mode), which never act on the hidden page.
+ */
+@Composable
+fun PlayerBackHandler(sheet: PlayerSheetState, enabled: Boolean, onCollapse: () -> Unit) {
+    // Outlives the handler: a gesture cut short by the handler leaving still springs back.
+    val scope = rememberCoroutineScope()
+    if (!enabled) return
+    PredictiveBackHandler { events ->
+        try {
+            events.collect { event -> sheet.previewBack(event.progress) }
+            onCollapse()
+        } catch (e: CancellationException) {
+            // Cancelled gesture: spring back (unless the player is closing anyway).
+            scope.launch { if (sheet.isExpanded) sheet.animateTo(expanded = true) }
+            throw e
+        }
+    }
 }
 
 /** Queue (now playing, next in queue, next from context, suggestions). */

@@ -11,8 +11,11 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.ViewConfiguration
+import androidx.activity.BackEventCompat
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
@@ -40,17 +43,20 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ShortNavigationBar
 import androidx.compose.material3.ShortNavigationBarItem
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -86,14 +92,18 @@ import com.taehagen.spotifygood.model.PlaybackTrack
 import com.taehagen.spotifygood.playback.SleepTimerState
 import com.taehagen.spotifygood.ui.components.PlaylistAddPrompt
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
+import com.taehagen.spotifygood.ui.navigation.LocalPageCovered
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import com.taehagen.spotifygood.ui.navigation.PageBackHandler
 import com.taehagen.spotifygood.ui.navigation.Route
 import com.taehagen.spotifygood.ui.theme.SpotifyGoodTheme
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -105,6 +115,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import java.time.Duration
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * The expanding player under Robolectric (run with `-Pscreenshots`; images in
@@ -113,8 +124,10 @@ import kotlin.math.abs
  * Frames at fixed progress values: the art must travel from the mini player's thumbnail to Now
  * Playing's slot, the mini player's content fade out early and Now Playing's fade in late, the
  * navigation bar slide away. Gestures: real touch events through the sheet (drag, fling, slow
- * release, nested scroll, a slider, a tap), each checked and captured at the end. Fake state only:
- * a generated cover through a fake image loader, no network, no view models.
+ * release, nested scroll, a tap) and on Now Playing's seek bar and volume slider, each checked and
+ * captured at the end. Also Back (plain and predictive) against the pages' own handlers, and the
+ * art's first frame where it appears. Fake state only: a generated cover through a fake image
+ * loader, no network, no view models.
  */
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
@@ -122,12 +135,15 @@ import kotlin.math.abs
 class ExpandingPlayerScreenshotTest {
     private val frames = listOf(0f, 0.15f, 0.35f, 0.5f, 0.75f, 1f)
 
+    /** Where the fake loader says each cover came from (a memory-cache hit never fades in). */
+    private var coverSource = DataSource.MEMORY_CACHE
+
     @Before
     fun fakeImages() {
         val cover = coverBitmap()
         SingletonImageLoader.setUnsafe { context ->
             ImageLoader.Builder(context)
-                .components { add(CoverInterceptor(cover)) }
+                .components { add(CoverInterceptor(cover) { coverSource }) }
                 .build()
         }
     }
@@ -224,11 +240,166 @@ class ExpandingPlayerScreenshotTest {
 
     @Test
     fun aDragDownOnASliderLeavesThePlayerOpen() = gesture("slider", expanded = true) { finger, probe, dp ->
-        val slider = probe.slider
-        finger.swipe(slider.center, slider.center + Offset(0f, 250 * dp), durationMs = 100)
+        val at = seekBarPoint(probe.seekBar, 0.5f, dp)
+        finger.swipe(at, at + Offset(0f, 250 * dp), durationMs = 100)
         assertEquals(1f, probe.sheet!!.progress, 0.001f)
         assertEquals(0, probe.scroll!!.value)
         assertTrue(probe.settled.isEmpty())
+        assertTrue(probe.seeks.isEmpty())
+    }
+
+    @Test
+    fun aSlowDragDownOnTheVolumeSliderLeavesThePlayerOpen() = gesture("volume_down", expanded = true) { finger, probe, dp ->
+        val at = probe.volume.center
+        // 2 dp steps: the slop is crossed on one of them, here before the sheet or the scroll.
+        finger.swipe(at, at + Offset(0f, 60 * dp), durationMs = 600, steps = 30)
+        assertEquals(1f, probe.sheet!!.progress, 0.001f)
+        assertEquals(0, probe.scroll!!.value)
+        assertTrue(probe.settled.isEmpty())
+        assertTrue(probe.volumes.isEmpty())
+    }
+
+    @Test
+    fun aSidewaysDragOnTheSeekBarSeeks() = gesture("seek_drag", expanded = true) { finger, probe, dp ->
+        val bar = probe.seekBar
+        val from = seekBarPoint(bar, 0.2f, dp)
+        val to = from + Offset(60 * dp, 0f)
+        // 30 steps of 2 dp, each well under the touch slop.
+        finger.swipe(from, to, durationMs = 600, steps = 30)
+        // The thumb follows from the press, less the slop the drag starts after.
+        val slop = ViewConfiguration.get(finger.view.context).scaledTouchSlop
+        val seek = probe.seeks.single()
+        assertTrue("seek $seek", seek in seekAt(bar, to.x - slop - 2 * dp, dp)..seekAt(bar, to.x + 2 * dp, dp))
+        assertEquals(1f, probe.sheet!!.progress, 0.001f)
+        assertEquals(0, probe.scroll!!.value)
+        assertTrue(probe.settled.isEmpty())
+    }
+
+    @Test
+    fun aTapThatJittersOnTheSeekBarSeeks() = gesture("seek_tap", expanded = true) { finger, probe, dp ->
+        val bar = probe.seekBar
+        val at = seekBarPoint(bar, 0.75f, dp)
+        finger.down(at)
+        finger.moveTo(at + Offset(1f, 1f), durationMs = 32, steps = 1)
+        finger.up()
+        assertEquals(seekAt(bar, at.x, dp).toFloat(), probe.seeks.single().toFloat(), SEEK_DURATION_MS * 0.01f)
+    }
+
+    @Test
+    fun aSidewaysDragOnTheVolumeSliderSetsTheVolume() = gesture("volume_drag", expanded = true) { finger, probe, dp ->
+        val row = probe.volume
+        val from = Offset(row.left + row.width * 0.4f, row.center.y)
+        finger.swipe(from, from + Offset(60 * dp, 0f), durationMs = 600, steps = 30)
+        val volumes = probe.volumes
+        // Followed the finger: many rising values, from above the starting volume.
+        assertTrue("volumes $volumes", volumes.size > 5 && volumes.first() > VOLUME && volumes.last() > volumes.first())
+        assertEquals(volumes.sorted(), volumes)
+        assertEquals(1f, probe.sheet!!.progress, 0.001f)
+    }
+
+    // ---- Back -----------------------------------------------------------------------------------
+
+    @Test
+    fun backCollapsesNowPlayingAboveAPageAddedLater() = back(guarded = false) {
+        // The player (and its Back) came first, a page with a Back of its own later (a search
+        // query typed after the mini player appeared); then Now Playing opens over it.
+        page.value = true
+        frames(100)
+        open.value = true
+        frames()
+        assertEquals(1f, probe.sheet!!.progress, 0.001f)
+        dispatcher.onBackPressed()
+        frames()
+        assertFalse(open.value)
+        assertEquals(0f, probe.sheet!!.progress, 0.001f)
+        assertEquals(0, probe.pageBacks)
+        // Collapsed, the page has Back again.
+        dispatcher.onBackPressed()
+        frames(100)
+        assertEquals(1, probe.pageBacks)
+    }
+
+    @Test
+    fun aPageComposedUnderNowPlayingLeavesBackToIt() = back(guarded = true) {
+        open.value = true
+        frames()
+        // Composed while covered, so its handler is newer than the player's.
+        page.value = true
+        frames(100)
+        dispatcher.onBackPressed()
+        frames()
+        assertFalse(open.value)
+        assertEquals(0, probe.pageBacks)
+        dispatcher.onBackPressed()
+        frames(100)
+        assertEquals(1, probe.pageBacks)
+    }
+
+    @Test
+    fun predictiveBackShrinksThePlayerThenSpringsBackOrCollapses() = back(guarded = true) {
+        page.value = true
+        open.value = true
+        frames()
+        val sheet = probe.sheet!!
+        dispatcher.dispatchOnBackStarted(backEvent(0f))
+        dispatcher.dispatchOnBackProgressed(backEvent(1f))
+        frames(100)
+        assertEquals(1f - PlayerMotion.BACK_PREVIEW_RANGE, sheet.progress, 0.01f)
+        dispatcher.dispatchOnBackCancelled()
+        frames()
+        assertTrue(open.value)
+        assertEquals(1f, sheet.progress, 0.001f)
+        dispatcher.dispatchOnBackStarted(backEvent(0f))
+        dispatcher.dispatchOnBackProgressed(backEvent(0.5f))
+        frames(100)
+        dispatcher.onBackPressed()
+        frames()
+        assertFalse(open.value)
+        assertEquals(0f, sheet.progress, 0.001f)
+        assertEquals(0, probe.pageBacks)
+    }
+
+    // ---- Art ------------------------------------------------------------------------------------
+
+    @Test
+    fun artLoadedOutOfSightShowsAtOnceWhenItAppears() {
+        // Fresh decodes, which Coil fades in from the painter's first draw.
+        coverSource = DataSource.DISK
+        val probe = Probe()
+        val cover = mutableStateOf(COVER_URL)
+        launch({ Harness(dark = true, progress = 0f, cover = { cover.value }, probe = probe) }) { scenario ->
+            scenario.onActivity { activity ->
+                val view = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0)
+                val sheet = probe.sheet!!
+                // A new cover while docked: the moving art loads it out of sight and has it on
+                // the first frame it shows (not the grey placeholder fading into it).
+                cover.value = "$COVER_URL?2"
+                runFrames(view, 300)
+                moveSheet(sheet, 0.5f)
+                assertShowsCover(view, "moving art, expanding") { sheet.artworkBounds(0.5f).center }
+                // Another while expanded: the moving art, then the thumbnail (not even placed
+                // above p 0.3) load it out of sight, and have it as the player comes down.
+                moveSheet(sheet, 1f)
+                runFrames(view, 300)
+                cover.value = "$COVER_URL?3"
+                runFrames(view, 300)
+                moveSheet(sheet, 0.5f)
+                assertShowsCover(view, "moving art, collapsing") { sheet.artworkBounds(0.5f).center }
+                moveSheet(sheet, 0f)
+                assertShowsCover(view, "thumbnail") { sheet.miniArtwork.center }
+                // One that arrives where its copy is on screen still fades in: loaded before any
+                // draw, its first frame is the placeholder the fade starts from, and the cover
+                // once the fade's 200 ms (Coil's clock, real time) have passed.
+                cover.value = "$COVER_URL?4"
+                Snapshot.sendApplyNotifications()
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(200))
+                assertShowsCover(view, "thumbnail as its fade starts", cover = false) { sheet.miniArtwork.center }
+                Thread.sleep(250)
+                Snapshot.sendApplyNotifications()
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(250))
+                assertShowsCover(view, "thumbnail after its fade") { sheet.miniArtwork.center }
+            }
+        }
     }
 
     @Test
@@ -255,6 +426,44 @@ class ExpandingPlayerScreenshotTest {
     // ---- Harnesses ------------------------------------------------------------------------------
 
     private fun percent(p: Float) = "p" + (p * 100).toInt().toString().padStart(3, '0')
+
+    /** A point on the seek bar's slider, [fraction] across: the slider is the bar's top 48 dp (its touch size). */
+    private fun seekBarPoint(bar: Rect, fraction: Float, dp: Float) = Offset(bar.left + bar.width * fraction, bar.top + 24 * dp)
+
+    /** The seek a thumb at window x [x] stands for (the 16 dp thumb travels between its half widths). */
+    private fun seekAt(bar: Rect, x: Float, dp: Float): Long {
+        val thumb = 16 * dp
+        val fraction = ((x - bar.left - thumb / 2) / (bar.width - thumb)).coerceIn(0f, 1f)
+        return (fraction * SEEK_DURATION_MS).toLong()
+    }
+
+    private fun backEvent(progress: Float) =
+        BackEventCompat(touchX = 0f, touchY = 0f, progress = progress, swipeEdge = BackEventCompat.EDGE_LEFT)
+
+    /** Puts the player at [p] at once, so the next draw is the first one at p (nothing animates). */
+    private fun moveSheet(sheet: PlayerSheetState, p: Float) {
+        sheet.draggable.dispatchRawDelta((1f - p) * sheet.collapsedBounds.top - sheet.draggable.offset)
+        Snapshot.sendApplyNotifications()
+        shadowOf(Looper.getMainLooper()).idle()
+    }
+
+    /**
+     * Draws [view] once and checks that [point] (in its coordinates) shows the cover's middle, or
+     * ([cover] false) doesn't: the grey placeholder, where a fade is starting. [point] is read
+     * after the draw, whose layout pass may have just placed Now Playing's art slot (the moving
+     * art's target).
+     */
+    private fun assertShowsCover(view: View, what: String, cover: Boolean = true, point: () -> Offset) {
+        val bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
+        view.draw(Canvas(bitmap))
+        val at = point()
+        val pixel = bitmap.getPixel(at.x.roundToInt(), at.y.roundToInt())
+        val actual = listOf(android.graphics.Color.red(pixel), android.graphics.Color.green(pixel), android.graphics.Color.blue(pixel))
+        // The gradient's middle in coverBitmap.
+        val expected = listOf(166, 92, 96)
+        val showsCover = actual.zip(expected).all { (a, e) -> abs(a - e) <= 24 }
+        assertTrue("$what shows $actual at $at", showsCover == cover)
+    }
 
     /**
      * Composes [content] in an activity, runs 800 ms of frames (the layout callbacks settle, the
@@ -292,10 +501,39 @@ class ExpandingPlayerScreenshotTest {
         }
     }
 
+    /** A [BackHarness] running in an activity, with its back dispatcher. */
+    private class BackRig(
+        val activity: ComponentActivity,
+        val probe: Probe,
+        val open: MutableState<Boolean>,
+        val page: MutableState<Boolean>,
+    ) {
+        val dispatcher get() = activity.onBackPressedDispatcher
+
+        fun frames(ms: Long = 1_500) = runFrames(activity.window.decorView, ms)
+    }
+
+    private fun back(guarded: Boolean, block: BackRig.() -> Unit) {
+        val probe = Probe()
+        val open = mutableStateOf(false)
+        val page = mutableStateOf(false)
+        launch({ BackHarness(probe, open, page, guarded) }) { scenario ->
+            scenario.onActivity { BackRig(it, probe, open, page).block() }
+        }
+    }
+
     @Composable
-    private fun Harness(dark: Boolean, progress: Float, remote: Boolean = false, title: String = LONG_TITLE) {
+    private fun Harness(
+        dark: Boolean,
+        progress: Float,
+        remote: Boolean = false,
+        title: String = LONG_TITLE,
+        cover: () -> String = { COVER_URL },
+        probe: Probe? = null,
+    ) {
         SpotifyGoodTheme(darkTheme = dark) {
             val sheet = rememberPlayerSheetStateInternal(initiallyExpanded = false)
+            SideEffect { probe?.sheet = sheet }
             LaunchedEffect(sheet) {
                 // Put the player at [progress] once the dock holds the card's measured height: an
                 // earlier change of the anchors would snap the resting sheet back to its target.
@@ -313,7 +551,7 @@ class ExpandingPlayerScreenshotTest {
                 Shell(sheet)
                 ExpandingPlayerLayout(
                     sheet = sheet,
-                    artwork = COVER_URL,
+                    artwork = cover(),
                     artworkColor = artworkColor,
                     mini = {
                         PlayerSurfaceTheme {
@@ -321,7 +559,7 @@ class ExpandingPlayerScreenshotTest {
                                 snapshot = snapshot,
                                 liked = true,
                                 indicator = indicator,
-                                artwork = COVER_URL,
+                                artwork = cover(),
                                 position = flowOf(POSITION_MS),
                                 initialPositionMs = { POSITION_MS },
                                 commands = NoCommands,
@@ -336,7 +574,7 @@ class ExpandingPlayerScreenshotTest {
                                 NowPlayingBody(
                                     snapshot = snapshot,
                                     track = snapshot.track!!,
-                                    artwork = COVER_URL,
+                                    artwork = cover(),
                                     liked = true,
                                     indicator = indicator,
                                     remoteVolumeSupported = remote,
@@ -364,14 +602,18 @@ class ExpandingPlayerScreenshotTest {
     private class Probe {
         var sheet: PlayerSheetState? = null
         var scroll: ScrollState? = null
-        var slider = Rect.Zero
+        var seekBar = Rect.Zero
+        var volume = Rect.Zero
         val settled = mutableListOf<Boolean>()
+        val seeks = mutableListOf<Long>()
+        val volumes = mutableListOf<Int>()
+        var pageBacks = 0
     }
 
     /**
      * The real sheet and surface with a stand-in Now Playing of known geometry: room for a top bar,
-     * the art slot, a slider (kept local, as Now Playing's are) and long content that scrolls. A
-     * tap on the card expands, as the shell does.
+     * the art slot, the real seek bar and volume slider (kept local, as Now Playing wraps them) and
+     * long content that scrolls. A tap on the card expands, as the shell does.
      */
     @Composable
     private fun GestureHarness(expanded: Boolean, probe: Probe) {
@@ -412,19 +654,60 @@ class ExpandingPlayerScreenshotTest {
                                     .aspectRatio(1f)
                                     .onGloballyPositioned(sheet::updateLargeArtwork),
                             )
-                            Slider(
-                                value = 0.3f,
-                                onValueChange = {},
+                            PlayerSeekBar(
+                                position = remember { mutableLongStateOf(POSITION_MS) },
+                                durationMs = SEEK_DURATION_MS,
+                                enabled = true,
+                                onSeek = { probe.seeks += it },
                                 modifier = Modifier
                                     .padding(vertical = 24.dp)
+                                    .keepDragsLocal()
+                                    .onGloballyPositioned { probe.seekBar = it.boundsInWindow() },
+                            )
+                            VolumeSlider(
+                                volume = VOLUME,
+                                onVolumeChange = { probe.volumes += it },
+                                modifier = Modifier
                                     .fillMaxWidth()
                                     .keepDragsLocal()
-                                    .onGloballyPositioned { probe.slider = it.boundsInWindow() },
+                                    .onGloballyPositioned { probe.volume = it.boundsInWindow() },
                             )
                             Spacer(Modifier.height(1_500.dp))
                         }
                     },
                 )
+            }
+        }
+    }
+
+    /**
+     * The real sheet with Now Playing's Back ([PlayerBackHandler]) following [open], as the shell
+     * wires them, and once [page] is set a page under the player with a Back of its own: a plain
+     * handler, or ([guarded]) the pages' [PageBackHandler], which the shell turns off while covered.
+     */
+    @Composable
+    private fun BackHarness(probe: Probe, open: MutableState<Boolean>, page: State<Boolean>, guarded: Boolean) {
+        SpotifyGoodTheme(darkTheme = true) {
+            val sheet = rememberPlayerSheetStateInternal(initiallyExpanded = false)
+            SideEffect { probe.sheet = sheet }
+            LaunchedEffect(sheet) {
+                snapshotFlow { open.value }.collectLatest { if (it != sheet.isExpanded) sheet.animateTo(it) }
+            }
+            CompositionLocalProvider(LocalPageCovered provides open.value) {
+                Box(Modifier.fillMaxSize()) {
+                    Shell(sheet)
+                    if (page.value) {
+                        if (guarded) PageBackHandler(enabled = true) { probe.pageBacks++ } else BackHandler { probe.pageBacks++ }
+                    }
+                    ExpandingPlayerLayout(
+                        sheet = sheet,
+                        artwork = COVER_URL,
+                        artworkColor = remember { mutableStateOf(CoverColor) },
+                        mini = { Box(Modifier.fillMaxWidth().height(58.dp)) },
+                        nowPlaying = { Box(Modifier.fillMaxSize()) },
+                    )
+                    PlayerBackHandler(sheet = sheet, enabled = open.value, onCollapse = { open.value = false })
+                }
             }
         }
     }
@@ -457,9 +740,9 @@ class ExpandingPlayerScreenshotTest {
             runFrames(view, 1_500)
         }
 
-        fun swipe(from: Offset, to: Offset, durationMs: Long, holdMs: Long = 0) {
+        fun swipe(from: Offset, to: Offset, durationMs: Long, holdMs: Long = 0, steps: Int = 12) {
             down(from)
-            moveTo(to, durationMs)
+            moveTo(to, durationMs, steps)
             if (holdMs > 0) hold(holdMs)
             up()
         }
@@ -569,10 +852,13 @@ class ExpandingPlayerScreenshotTest {
         return bitmap
     }
 
-    /** Every request gets the cover as a memory-cache hit (what the player's shared request gets in the app). */
-    private class CoverInterceptor(private val cover: Bitmap) : Interceptor {
+    /**
+     * Every request gets the cover, by default as a memory-cache hit (what a copy of the player's
+     * shared request gets once another has loaded it).
+     */
+    private class CoverInterceptor(private val cover: Bitmap, private val source: () -> DataSource) : Interceptor {
         override suspend fun intercept(chain: Interceptor.Chain): ImageResult =
-            SuccessResult(image = cover.asImage(), request = chain.request, dataSource = DataSource.MEMORY_CACHE)
+            SuccessResult(image = cover.asImage(), request = chain.request, dataSource = source())
     }
 
     private object NoCommands : PlayerCommands {
@@ -610,6 +896,9 @@ class ExpandingPlayerScreenshotTest {
         const val LONG_TITLE = "Weird Fishes / Arpeggi"
         const val SHORT_TITLE = "Nude"
         const val POSITION_MS = 96_000L
+        const val SEEK_DURATION_MS = 318_000L
+        /** About a tenth of the Connect range. */
+        const val VOLUME = 6_500
         val CoverColor = Color(0xFF7A3E8E)
     }
 }

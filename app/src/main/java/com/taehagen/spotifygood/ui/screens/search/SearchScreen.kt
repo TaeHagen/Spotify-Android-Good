@@ -1,6 +1,5 @@
 package com.taehagen.spotifygood.ui.screens.search
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -68,6 +67,7 @@ import com.taehagen.spotifygood.ui.components.TrackRow
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import com.taehagen.spotifygood.ui.navigation.PageBackHandler
 import com.taehagen.spotifygood.ui.navigation.Route
 import com.taehagen.spotifygood.ui.screens.library.BrowseError
 import com.taehagen.spotifygood.ui.screens.library.ChipRow
@@ -92,7 +92,7 @@ fun SearchScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier) {
         focusManager.clearFocus()
     }
 
-    BackHandler(enabled = queryText.isNotEmpty()) {
+    PageBackHandler(enabled = queryText.isNotEmpty()) {
         viewModel.clearQuery()
         hideKeyboard()
     }

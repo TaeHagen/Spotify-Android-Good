@@ -1,6 +1,5 @@
 package com.taehagen.spotifygood.ui.screens.library
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -98,6 +97,7 @@ import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import com.taehagen.spotifygood.ui.navigation.PageBackHandler
 import com.taehagen.spotifygood.ui.navigation.Route
 import kotlinx.coroutines.flow.Flow
 import com.taehagen.spotifygood.ui.components.FastScroller
@@ -113,7 +113,7 @@ fun LibraryScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier) 
     val navigator = LocalAppNavigator.current
     var showCreate by rememberSaveable { mutableStateOf(false) }
 
-    BackHandler(enabled = state.showEpisodes || state.folders.isNotEmpty() || state.searchActive) {
+    PageBackHandler(enabled = state.showEpisodes || state.folders.isNotEmpty() || state.searchActive) {
         viewModel.navigateUp()
     }
 

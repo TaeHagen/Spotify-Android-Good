@@ -1817,16 +1817,26 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
     at the nearer anchor; a fling (≥ 300 dp/s) follows its direction; a critically damped spring
     starts at the release velocity and stops on the anchor. Swipe up (or tap) on the mini player
     expands; swipe down anywhere on Now Playing collapses, except on the seek bar and the volume
-    slider (their vertical moves stay theirs). Now Playing's scroll comes first (nested
-    scrolling): a downward drag collapses only once the content is at its top, and while partly
-    collapsed an upward drag expands before the content scrolls. Taps don't land on a moving
-    player (Now Playing takes them from p 0.95, the mini player at 0); drags catch it.
+    slider. There `keepDragsLocal` consumes nothing before a touch slop is crossed, so the slider's
+    tap (one that jitters a little too) and sideways drag (within 30° of horizontal, Compose's
+    rule) start as anywhere; a drag that crosses the vertical slop first is held until the finger
+    lifts. Being deeper than Now Playing's scroll and the sheet, it sees each move before them, so
+    they never get one past their slop. Now Playing's scroll comes first (nested scrolling): a
+    downward drag collapses only once the content is at its top, and while partly collapsed an
+    upward drag expands before the content scrolls. Taps don't land on a moving player (Now
+    Playing takes them from p 0.95, the mini player at 0); drags catch it.
   * Back and state. The chevron, Back, "Go to …" and navigation collapse; the notification, deep
     links and the mini player expand. Predictive back (Android 14+) takes p down to 0.65 with the
     gesture, then collapses, or springs back when cancelled. The target is the navigator's saved
     Now Playing flag (`onSettle` reports a gesture's choice), so the state survives rotation and
-    process death. Queue and Lyrics stay full-screen overlays above it. With nothing loaded there
-    is no card and no gesture; a Connect device plays through the same surfaces.
+    process death. Queue and Lyrics stay full-screen overlays above it. Back goes to the top
+    layer: the newest enabled handler wins, so Now Playing's (`PlayerBackHandler`) is composed
+    only while it is on top (open, no Queue, Lyrics or playback-refused screen over it) and is
+    added again each time it comes on top, above the handlers of pages composed since. The pages'
+    own Back (a search query, a Library folder, Library search or Your Episodes, playlist edit
+    mode) is `PageBackHandler`, off while an overlay covers the pages (`LocalPageCovered`), so a
+    hidden page never takes it. With nothing loaded there is no card and no gesture; a Connect
+    device plays through the same surfaces.
   * Layout. The shell's `PlayerDock` keeps the card's place (and the pages' bottom padding) in
     the bottom stack, at the mini player's measured height. The player is drawn above everything
     as a full-window layer whose clip outline is the card interpolated toward the window (rounded
@@ -1843,10 +1853,15 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
   * The art is one element moving and scaling from the thumbnail (40 dp, 4 dp corners) to Now
     Playing's slot (8 dp corners, 24 dp shadow): laid out once at the slot's size and moved by its
     layer. At rest the thumbnail (p 0) or Now Playing's own art (p 1, so it scrolls with the page)
-    shows instead; all three make the same Coil request (same data, fixed 640 px) and share one
-    cached bitmap. The thumbnail's rect is derived from the card (`miniArtworkBounds`), the slot's
-    measured. With large fonts Now Playing switches to its compact (scrolling) layout sooner, so
-    the details never squeeze the slot to nothing.
+    shows instead; all three make the same Coil request (same data, fixed 640 px), so a copy that
+    loads after another has the cover takes that bitmap from the memory cache (a new cover
+    reaches the composed copies at once, and each may decode it). Coil starts a fade at the
+    painter's first draw, so a copy fades in only a cover that arrives while it is on screen; one
+    that arrives while it is hidden (the moving art is not even placed at rest) shows at once,
+    never as a grey square fading into the cover as the art starts to move. The thumbnail's rect
+    is derived from the card (`miniArtworkBounds`), the slot's measured. With large fonts Now
+    Playing switches to its compact (scrolling) layout sooner, so the details never squeeze the
+    slot to nothing.
   * Cost per frame: p is read only in draw, layer and placement lambdas; Now Playing is composed
     once the player moves and recomposes only when a threshold flips.
   * TalkBack: an expand action on the mini player, collapse on Now Playing's header and art.
@@ -1854,7 +1869,10 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
     Roborazzi, run with `./gradlew :app:testDebugUnitTest -Pscreenshots --tests
     '*ExpandingPlayerScreenshotTest'`) renders p = 0, 0.15, 0.35, 0.5, 0.75, 1 (light, dark, a
     Connect device, font scale 1.6, landscape; fake state, no network) and drives real touch
-    events through the sheet (drag, fling, slow release, nested scroll, a slider, a tap).
+    events through the sheet (drag, fling, slow release, nested scroll, a tap) and on the real
+    seek bar and volume slider wrapped as Now Playing wraps them (sideways drags in sub-slop
+    steps, a tap that moves 1 px, vertical drags). It also checks Back and predictive back
+    against a page's own handler, and the art's first frame where it appears.
 * Swipe to queue (`ui/components/SwipeToQueue.kt`, built into `TrackRow` and `EpisodeRow`): in
   every vertical list of tracks or episodes, including search results, artist top tracks, album
   tracks, playlists and Liked Songs (window rows too once loaded), Downloads, a show's episodes
