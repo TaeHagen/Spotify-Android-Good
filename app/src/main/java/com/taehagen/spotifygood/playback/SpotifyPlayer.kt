@@ -77,6 +77,8 @@ internal class SpotifyPlayer(
     private val onSpeed: (Float) -> Unit = {},
     /** Package of the controller whose request is being handled ([RemotePlayback.playMeansPause]). */
     private val requester: () -> String? = { null },
+    /** A Bluetooth audio output is connected (null: not watched) ([RemotePlayback.readsPaused]). */
+    private val bluetoothOutput: () -> Boolean? = { null },
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
 
     private val context = context.applicationContext
@@ -105,6 +107,12 @@ internal class SpotifyPlayer(
 
     /** Re-reads the snapshot/devices/volume. Main thread. */
     fun refresh() = invalidateState()
+
+    /**
+     * The published state reads paused while another device plays (suppressed, [RemotePlayback]):
+     * what controllers see now. Main thread.
+     */
+    val readsPaused: Boolean get() = playbackSuppressionReason != PLAYBACK_SUPPRESSION_REASON_NONE
 
     override fun getState(): State {
         val s = playback.snapshot.value
@@ -195,9 +203,10 @@ internal class SpotifyPlayer(
                     s.status == PlaybackStatus.PLAYING || loading,
                     if (remote) PLAY_WHEN_READY_CHANGE_REASON_REMOTE else PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST,
                 )
-                // Another device plays: suppressed here, so the platform state (which Bluetooth
-                // passes on to a headset) reads paused, never "this phone plays" (RemotePlayback).
-                .setPlaybackSuppressionReason(RemotePlayback.suppressionReason(s))
+                // Another device plays with a Bluetooth output connected: suppressed here, so the
+                // platform state (which Bluetooth passes on to a headset) reads paused, never "this
+                // phone plays" (RemotePlayback). Without one it reads playing.
+                .setPlaybackSuppressionReason(RemotePlayback.suppressionReason(s, bluetoothOutput()))
                 .setPlaybackParameters(PlaybackParameters(speed))
                 // Extrapolates from this snapshot (wall clock); the next snapshot replaces it.
                 .setContentPositionMs(PositionSupplier { s.positionAt() })
@@ -284,7 +293,7 @@ internal class SpotifyPlayer(
     override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
         // Another device plays and the requester showed it paused (RemotePlayback): its play is a
         // toggle, so it pauses that device.
-        if (playWhenReady && RemotePlayback.playMeansPause(playback.snapshot.value, requester())) {
+        if (playWhenReady && RemotePlayback.playMeansPause(playback.snapshot.value, readsPaused, requester())) {
             return track(controller.pauseAsync())
         }
         if (playWhenReady) onCommand()
