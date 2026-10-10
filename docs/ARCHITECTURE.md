@@ -1652,7 +1652,8 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
 
 * Material 3, dark-first theme (Spotify-like near-black, green accent); optional dynamic
   color; edge-to-edge; predictive back; adaptive (bottom bar on phones, navigation rail on
-  large screens via `NavigationSuiteScaffold`).
+  large screens: `NavigationSuiteScaffold`'s own layout, `NavigationSuiteScaffoldLayout` +
+  `NavigationSuite`, so the bar can slide away under the player).
 * Screens: Login, Premium-required, Home, Search (+ browse/recent searches), Library
   (filters: Playlists/Albums/Artists/Podcasts/Downloaded; sort; grid/list), Liked Songs,
   Album, Artist, Playlist (edit mode for owned), Show, Episode, Downloads, Now Playing
@@ -1660,8 +1661,53 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
   devices, share, sleep timer), Queue (reorder, remove, suggestions), Lyrics (synced,
   auto-scroll, tap to seek), Devices/Output sheet, Track/Album/Playlist action sheets,
   Add-to-playlist sheet, Create playlist dialog, Settings, Profile.
-* Mini player above the navigation bar (swipe/tap to expand, progress line, play/pause,
-  device indicator).
+* Expanding player (`ui/screens/player/ExpandingPlayer.kt`, math in `PlayerTransition.kt`): the
+  mini player docked above the navigation bar (progress line, play/pause, like, device
+  indicator, swipe sideways to skip) and full-screen Now Playing are one surface driven by one
+  progress p, 0 docked, 1 full screen.
+  * Gestures. `PlayerSheetState` is an `AnchoredDraggableState` with two anchors whose offset is
+    the surface's top edge (the card's top, 0), so the edge follows the finger. A release settles
+    at the nearer anchor; a fling (≥ 300 dp/s) follows its direction; a critically damped spring
+    starts at the release velocity and stops on the anchor. Swipe up (or tap) on the mini player
+    expands; swipe down anywhere on Now Playing collapses, except on the seek bar and the volume
+    slider (their vertical moves stay theirs). Now Playing's scroll comes first (nested
+    scrolling): a downward drag collapses only once the content is at its top, and while partly
+    collapsed an upward drag expands before the content scrolls. Taps don't land on a moving
+    player (Now Playing takes them from p 0.95, the mini player at 0); drags catch it.
+  * Back and state. The chevron, Back, "Go to …" and navigation collapse; the notification, deep
+    links and the mini player expand. Predictive back (Android 14+) takes p down to 0.65 with the
+    gesture, then collapses, or springs back when cancelled. The target is the navigator's saved
+    Now Playing flag (`onSettle` reports a gesture's choice), so the state survives rotation and
+    process death. Queue and Lyrics stay full-screen overlays above it. With nothing loaded there
+    is no card and no gesture; a Connect device plays through the same surfaces.
+  * Layout. The shell's `PlayerDock` keeps the card's place (and the pages' bottom padding) in
+    the bottom stack, at the mini player's measured height. The player is drawn above everything
+    as a full-window layer whose clip outline is the card interpolated toward the window (rounded
+    8 dp → 0, shadow 4 dp → 0), so touches outside it reach the page.
+  * What p does. The background goes from the art-toned card colour to Now Playing's art
+    gradient (over the surface's bounds). The mini player's content moves with the art's top edge
+    and fades out over [0, 0.3], its text pushed aside by the growing art. Now Playing's title,
+    seek bar, controls and actions fade in over [0.4, 1], riding just below the moving art (in
+    the wide layout, beside it, they ride the surface's top edge); its top bar (chevron,
+    context) fades in over [0.5, 1] riding the surface's top edge. The navigation bar slides out
+    by its own size × p (down; a rail toward the start edge). The status-bar icons turn light
+    once the surface covers half the status bar. At p 1 the page underneath is hidden from
+    accessibility services; Now Playing is hidden from them below p 0.5.
+  * The art is one element moving and scaling from the thumbnail (40 dp, 4 dp corners) to Now
+    Playing's slot (8 dp corners, 24 dp shadow): laid out once at the slot's size and moved by its
+    layer. At rest the thumbnail (p 0) or Now Playing's own art (p 1, so it scrolls with the page)
+    shows instead; all three make the same Coil request (same data, fixed 640 px) and share one
+    cached bitmap. The thumbnail's rect is derived from the card (`miniArtworkBounds`), the slot's
+    measured. With large fonts Now Playing switches to its compact (scrolling) layout sooner, so
+    the details never squeeze the slot to nothing.
+  * Cost per frame: p is read only in draw, layer and placement lambdas; Now Playing is composed
+    once the player moves and recomposes only when a threshold flips.
+  * TalkBack: an expand action on the mini player, collapse on Now Playing's header and art.
+  * Tests: the math in `PlayerTransitionTest`; `ExpandingPlayerScreenshotTest` (Robolectric +
+    Roborazzi, run with `./gradlew :app:testDebugUnitTest -Pscreenshots --tests
+    '*ExpandingPlayerScreenshotTest'`) renders p = 0, 0.15, 0.35, 0.5, 0.75, 1 (light, dark, a
+    Connect device, font scale 1.6, landscape; fake state, no network) and drives real touch
+    events through the sheet (drag, fling, slow release, nested scroll, a slider, a tap).
 * Fast scroller (`ui/components/FastScroller.kt`) on long lists: playlists and Liked Songs, the
   Downloads page, the library list, Your Episodes, a show's episodes and (long) albums. A slim
   track and a pill thumb on the right edge, between the top bar and the mini player / navigation
