@@ -26,7 +26,8 @@ import kotlin.concurrent.thread
 /**
  * Serves artwork as `content://<applicationId>.artwork/img?u=<url-encoded image url>` for
  * Android Auto / AAOS (which require local URIs) and other media controllers
- * (docs/ARCHITECTURE.md §9.4).
+ * (docs/ARCHITECTURE.md §9.4), and the mosaic of a playlist without an image of its own as
+ * `…/mosaic?u=<cover>&u=…` (four covers, composed once, [MosaicBitmaps]).
  *
  * Only Spotify CDN images (https, hosts `scdn.co` / `spotifycdn.com` and their subdomains) and files inside the
  * offline images directories of the download locations (internal storage, an SD card:
@@ -44,6 +45,10 @@ class ArtworkProvider : ContentProvider() {
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
         if (mode != "r") throw SecurityException("Artwork is read-only")
         val context = context ?: throw FileNotFoundException(uri.toString())
+        mosaicOf(context, uri)?.let { covers ->
+            val file = runBlocking { withTimeoutOrNull(FETCH_TIMEOUT_MS) { MosaicBitmaps.file(context, covers) } }
+            return openLocal(file ?: throw FileNotFoundException(uri.toString()))
+        }
         return when (val source = sourceOf(context, uri)) {
             is File -> openLocal(source)
             is String -> openRemote(context, source)
@@ -121,6 +126,7 @@ class ArtworkProvider : ContentProvider() {
     companion object {
         private const val TAG = "ArtworkProvider"
         private const val PATH = "img"
+        private const val PATH_MOSAIC = "mosaic"
         private const val PARAM_URL = "u"
         private const val MIME_TYPE = "image/jpeg"
         private const val FETCH_SIZE_PX = 640
@@ -151,6 +157,31 @@ class ArtworkProvider : ContentProvider() {
                 .appendQueryParameter(PARAM_URL, normalized)
                 .build()
         }
+
+        /**
+         * `content://` uri serving the mosaic of [covers] (four Spotify CDN cover URLs, in reading
+         * order), or null when they aren't four servable ones.
+         */
+        fun mosaicUri(context: Context, covers: List<String?>): Uri? {
+            if (covers.size != MOSAIC_COVERS || covers.any { it == null || !isAllowedHttps(it) }) return null
+            return Uri.Builder()
+                .scheme("content")
+                .authority(authority(context))
+                .appendPath(PATH_MOSAIC)
+                .apply { covers.forEach { appendQueryParameter(PARAM_URL, it) } }
+                .build()
+        }
+
+        /** The covers a mosaic uri names; null when it is not one of ours or not allowed. */
+        internal fun mosaicOf(context: Context, uri: Uri): List<String>? {
+            if (uri.scheme != "content" || uri.authority != authority(context)) return null
+            if (uri.pathSegments.firstOrNull() != PATH_MOSAIC) return null
+            return uri.getQueryParameters(PARAM_URL).takeIf { covers -> covers.size == MOSAIC_COVERS && covers.all(::isAllowedHttps) }
+        }
+
+        private fun isAllowedHttps(url: String): Boolean = Uri.parse(url).let { it.scheme == "https" && isAllowedHost(it.host) }
+
+        private const val MOSAIC_COVERS = 4
 
         /**
          * What an artwork uri points to: a [File] (offline image) or an https URL [String];

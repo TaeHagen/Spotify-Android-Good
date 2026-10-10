@@ -59,6 +59,9 @@ class LibraryRepository(
     private val progress: EpisodeProgressStore? = null,
 ) {
     private val saved = SavedStateStore()
+
+    /** Every rootlist fetched (the playlists' current revisions, for their mosaics). Installed by the app graph. */
+    @Volatile var onRootlist: ((Rootlist) -> Unit)? = null
     private val lookups = CoalescingBatcher(scope, LOOKUP_WINDOW_MS, LOOKUP_BATCH, ::resolveSaved)
 
     private val _changes = MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
@@ -298,6 +301,7 @@ class LibraryRepository(
         val seq = saved.currentSeq()
         val rootlist = rpc.callOffMain<Rootlist>("library.playlists")
         saved.applyLookup(rootlist.flatPlaylists().mapNotNull { it.uri }.associateWith { true }, seq)
+        onRootlist?.invoke(rootlist)
         return rootlist
     }
 
