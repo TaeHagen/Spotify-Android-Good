@@ -48,6 +48,7 @@ import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.Notifications
 import com.taehagen.spotifygood.MainActivity
 import com.taehagen.spotifygood.R
+import com.taehagen.spotifygood.connect.SystemRoutes
 import com.taehagen.spotifygood.download.DownloadedCollection
 import com.taehagen.spotifygood.engine.EngineHolder
 import com.taehagen.spotifygood.engine.HolderType
@@ -103,6 +104,8 @@ class PlaybackService : MediaLibraryService() {
     private lateinit var presence: PresenceController
     /** The volume keys for another device while it plays ([RemotePlayback]). */
     private lateinit var remoteVolumeKeys: RemoteVolumeKeys
+    /** Connect devices in Android's output switcher (API 30+, [SystemRouting]). */
+    private var systemRouting: SystemRouting? = null
     private var session: MediaLibrarySession? = null
     /** Guarded by [holderLock]. */
     private var playbackHolder: EngineHolder? = null
@@ -174,6 +177,7 @@ class PlaybackService : MediaLibraryService() {
             onSpeed = graph.podcastSpeed::set,
             requester = { session?.controllerForCurrentRequest?.packageName },
             bluetoothOutput = { graph.outputs.bluetoothOutput.value },
+            routingControllerId = { systemRouting?.controllerId },
         )
         remoteVolumeKeys = RemoteVolumeKeys(
             context = this,
@@ -191,6 +195,18 @@ class PlaybackService : MediaLibraryService() {
             nextRequested = { graph.player.next() },
             previousRequested = { graph.player.previous() },
         )
+        if (Build.VERSION.SDK_INT >= SystemRoutes.MIN_SDK) {
+            // Lives with the service: the route provider is enabled meanwhile, never longer.
+            systemRouting = SystemRouting(
+                context = this,
+                graph = graph,
+                onControllerChanged = {
+                    player.refresh()
+                    updateRemoteVolumeKeys()
+                },
+                setVolume = { percent -> player.setDeviceVolume(percent, 0) },
+            ).also { it.start() }
+        }
         // Follows what the session publishes, also when a Bluetooth output comes or goes while
         // another device plays: one switch between the two volume key sessions.
         player.addListener(
@@ -332,6 +348,9 @@ class PlaybackService : MediaLibraryService() {
         main.removeCallbacks(foregroundDeadline)
         coordinator.closeEffectSession()
         presence.release()
+        // Before the session: its routing session goes with it, and the route provider is disabled.
+        systemRouting?.stop()
+        systemRouting = null
         remoteVolumeKeys.release()
         clearListener()
         session?.release()
@@ -357,7 +376,7 @@ class PlaybackService : MediaLibraryService() {
         val s = graph.playback.snapshot.value
         val supported = player.isCommandAvailable(Player.COMMAND_SET_DEVICE_VOLUME_WITH_FLAGS)
         val active = RemotePlayback.volumeKeysSession(s, player.readsPaused, supported)
-        remoteVolumeKeys.update(active, player.deviceVolume, s.track?.name, s.track?.artistLine)
+        remoteVolumeKeys.update(active, player.deviceVolume, s.track?.name, s.track?.artistLine, systemRouting?.controllerId)
     }
 
     /** Playing or loading (here or on the mirrored device), or Connect presence keeps it up. */

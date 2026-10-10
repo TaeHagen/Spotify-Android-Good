@@ -4,6 +4,7 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
@@ -15,6 +16,7 @@ import coil3.intercept.Interceptor
 import coil3.memory.MemoryCache
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.crossfade
+import com.taehagen.spotifygood.connect.SystemRoutes
 import com.taehagen.spotifygood.engine.EngineHolder
 import com.taehagen.spotifygood.engine.HolderType
 import com.taehagen.spotifygood.engine.NativeStatus
@@ -40,7 +42,8 @@ class App : Application() {
 /**
  * One-time process initialisation (owned by the foundation): calls `NativeBridge.nativeInit`,
  * registers the UI engine holder with ProcessLifecycleOwner, sets up Coil and the notification
- * channels. Runs on the main thread in `Application.onCreate`, so it only does cheap work; every
+ * channels, and has the output switcher's route provider disabled unless the playback service
+ * runs. Runs on the main thread in `Application.onCreate`, so it only does cheap work; every
  * repository stays lazy (periodic download sync is scheduled by the download component itself).
  */
 object AppInitializer {
@@ -56,6 +59,9 @@ object AppInitializer {
         initNative(app, graph)
         setUpImageLoader(graph)
         registerUiHolder(graph)
+        // The output switcher's route provider is enabled only while the playback service runs; a
+        // process that died meanwhile left it enabled (checked off the main thread).
+        if (Build.VERSION.SDK_INT >= SystemRoutes.MIN_SDK) graph.routeProviderSwitch
     }
 
     private fun initNative(app: App, graph: AppGraph) {

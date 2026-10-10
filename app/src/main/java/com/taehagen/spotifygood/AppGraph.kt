@@ -10,6 +10,7 @@ import com.taehagen.spotifygood.auth.AuthRepository
 import com.taehagen.spotifygood.auth.CredentialStore
 import com.taehagen.spotifygood.connect.DevicesRepository
 import com.taehagen.spotifygood.connect.LocalDeviceDiscovery
+import com.taehagen.spotifygood.connect.RouteProviderSwitch
 import com.taehagen.spotifygood.data.CatalogRepository
 import com.taehagen.spotifygood.data.EpisodeProgressStore
 import com.taehagen.spotifygood.data.HomeRepository
@@ -154,6 +155,12 @@ class AppGraph(val app: Application) {
 
     /** Spotify Connect local-network discovery (the "send" side); runs only while the sheet is up. */
     val localDiscovery: LocalDeviceDiscovery by localDiscoveryLazy
+
+    /**
+     * Enables the output switcher's route provider while the playback service runs (docs §8); made
+     * at every process start (API 30+), which disables one a dead process left enabled.
+     */
+    internal val routeProviderSwitch: RouteProviderSwitch by lazy { RouteProviderSwitch(app, appScope) }
     val outputs: OutputRouteManager by lazy {
         OutputRouteManager(app, appScope, audioSink, rpc).also { manager ->
             appScope.launch(Dispatchers.Main) {

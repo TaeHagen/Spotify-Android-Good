@@ -125,6 +125,12 @@
                 <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
+            <!-- "More devices" in Android's output switcher (the route listing's linked item, API
+                 34+; the system requires it to resolve for this action): opens the devices sheet -->
+            <intent-filter>
+                <action android:name="android.media.action.TRANSFER_MEDIA" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
 
         <!-- Media playback + Spotify Connect presence (docs/ARCHITECTURE.md §9.4) -->
@@ -135,6 +141,23 @@
             <intent-filter>
                 <action android:name="androidx.media3.session.MediaLibraryService" />
                 <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+
+        <!-- Spotify Connect devices as routes of Android's output switcher (docs/ARCHITECTURE.md §8,
+             API 30+). Disabled here and enabled only while the playback service runs
+             (RouteProviderSwitch): Android binds every enabled provider (on Android 11 always, on
+             12-14 whenever a media notification is up with the screen on) and so would start or keep
+             this process for nothing. Bound only by the system (its binder checks the caller's uid);
+             no foreground type, it is never started. -->
+        <service
+            android:name=".connect.ConnectRouteProviderService"
+            android:enabled="false"
+            android:exported="true"
+            tools:ignore="ExportedService"
+            tools:targetApi="30">
+            <intent-filter>
+                <action android:name="android.media.MediaRoute2ProviderService" />
             </intent-filter>
         </service>
 

@@ -28,7 +28,8 @@ import com.taehagen.spotifygood.ui.theme.SpotifyGoodTheme
 /**
  * Single activity hosting the Compose UI (owned by the UI shell): edge-to-edge, splash screen,
  * notification permission request, deep links (`spotify:`, open.spotify.com), the
- * `spotifygood://auth` login redirect and media notification taps (open Now Playing).
+ * `spotifygood://auth` login redirect, media notification taps (open Now Playing) and "More devices"
+ * in Android's output switcher (open the devices sheet).
  *
  * `singleTop`: requests from outside arrive through [LinkActivity] as [EXTRA_REQUEST], so a
  * launcher tap never clears the login Custom Tab above this activity. That relies on the task's
@@ -135,6 +136,9 @@ class MainActivity : ComponentActivity() {
                     shell.showMessage(getString(R.string.shell_msg_no_link_in_share))
                 }
             }
+            // "More devices" in Android's output switcher (a listing item, API 34+): the devices
+            // sheet, whose local-network section finds the speakers and TVs to sign in.
+            ACTION_TRANSFER_MEDIA -> shell.openDevices()
             MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH -> {
                 shell.playFromSearch(
                     MediaSearchRequest(
@@ -164,6 +168,9 @@ class MainActivity : ComponentActivity() {
          */
         fun launchIntent(context: Context): Intent =
             Intent.makeMainActivity(ComponentName(context, MainActivity::class.java)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+        /** RouteListingPreference.ACTION_TRANSFER_MEDIA (API 34), forwarded by [LinkActivity]. */
+        const val ACTION_TRANSFER_MEDIA = "android.media.action.TRANSFER_MEDIA"
 
         /** MediaStore.EXTRA_MEDIA_PLAYLIST (deprecated constant, still sent by assistants). */
         const val EXTRA_MEDIA_PLAYLIST = "android.intent.extra.playlist"

@@ -196,6 +196,11 @@ fun MainScaffold(shell: ShellViewModel, modifier: Modifier = Modifier) {
         }
     }
 
+    // "More devices" in Android's output switcher (LinkActivity, ACTION_TRANSFER_MEDIA).
+    LaunchedEffect(navigator) {
+        shell.pendingOpenDevices.collect { navigator.openDevices() }
+    }
+
     // All user-visible transient errors and confirmations → one snackbar (newest wins).
     LaunchedEffect(navigator, snackbarHostState) {
         var last: String? = null

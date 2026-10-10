@@ -65,7 +65,10 @@ app/src/main/java/com/taehagen/spotifygood/
                   AudioFocusController.kt BecomingNoisyReceiver.kt OutputRouteManager.kt
                   VolumeSync.kt LibraryTree.kt SessionCommands.kt SleepTimer.kt ResumeStore.kt
                   ArtworkProvider.kt (content:// artwork for Auto/notification)
+                  SystemRouting.kt (the app's MediaRouter2: the output switcher's session)
   connect/        DevicesRepository.kt LocalDeviceDiscovery.kt (ZeroConf + Google Cast LAN discovery)
+                  ConnectRouteProviderService.kt SystemRoutes.kt RouteProviderSwitch.kt (Connect
+                  devices in Android's output switcher)
   data/           CatalogRepository.kt LibraryRepository.kt SearchRepository.kt HomeRepository.kt
                   LyricsRepository.kt PlaylistEditor.kt ResponseCache.kt
   data/db/        AppDatabase.kt Entities.kt Daos.kt
@@ -972,6 +975,123 @@ For a remote active device, smart shuffle is not supported (the command reports
     the call. Then, as for `connect.localLogin`, the engine waits up to 10 s for the device to appear
     in the cluster (the reported `deviceID`, `md5(fn)`, or a new device with that name) and returns
     its id; Kotlin transfers to it, or keeps it as the pending target when nothing plays.
+* **System output switcher (the "This phone" chip, Android 11+)**: the account's Connect devices
+  are listed in Android's own output switcher for this app's media (the device chip of the media
+  controls in quick settings and on the lock screen, the Output Switcher dialog it opens, the volume
+  panel's media output), the playing device's name shows on the chip, and a pick there moves
+  playback, as in the official app. An ordinary app can do this one way only (no
+  `MEDIA_CONTENT_CONTROL`): a route provider of its own, its own `MediaRouter2` asking for those
+  routes, and a remote media session whose volume control id is its routing session's id.
+  * **Provider (`connect/ConnectRouteProviderService`)**: a framework `MediaRoute2ProviderService`
+    (API 30), not androidx's `MediaRouteProviderService`: that one also serves the old Messenger
+    protocol without a caller check (any app's cast picker could list and drive the user's
+    speakers), and hides the session ids. Only the system binds it (its binder checks the caller's
+    uid). Routes (`SystemRoutes.routes`, pure) come from `DevicesRepository.devices` and the
+    playback snapshot as they are, pushed by the engine; the provider never scans, polls or starts
+    the engine. Each Connect device but this phone, in the sheet's order (by name) and with its
+    name, plus the device that plays even when the list doesn't name it (a session keeps its
+    device's route while it lasts, `withSessionRoutes`); none logged out, offline (the list is this
+    phone alone) or while hidden from Connect (no entry for this phone: a stale cluster whose
+    transfers fail). A route carries only the private feature `…route.feature.SPOTIFY_CONNECT`,
+    which nobody else asks for (the standard remote-playback features would hand the routes to
+    every app's cast button, and make SystemUI offer "Stop casting"); from API 34 it is visible to
+    this app alone (`setVisibilityRestricted(emptySet())`) and has a type, so SystemUI draws a
+    speaker, TV or group icon (computers, tablets, phones, consoles, cars and watches from API 35;
+    the generic speaker otherwise). A session request from another package is refused. The playing
+    device's route is connected and "Active" (client package) and takes a volume (0..100, variable
+    only when the device supports volume); the others are fixed. Brand and model are the
+    description. Extras carry the Connect id, the list position, playable and "opens the app" for
+    the router side.
+  * **Sessions**: a pick (a session request from this app's router: the system relays a pick in the
+    switcher through it, and `SystemRouting` asks for the device that plays) runs
+    `DevicesRepository.transferTo` as the devices sheet does (`play`, the stored session for a cold
+    start, the pending target when nothing plays, `DevicePicks`), in the app scope (the system may
+    unbind the provider meanwhile), then reports the session (a new id each time: the system ignores
+    an id it still knows). A failure goes to the switcher (`notifyRequestFailed`: network, nothing
+    to play, other) and, as the sheet's message, to the app's snackbar (shown if the app is visible
+    within 10 s). The device that plays already gets its session at once, nothing moves. A pick
+    between Connect devices while a session exists is a transfer within it (every other playable
+    device is a transferable route). A session follows the device that plays (`sessionDevice`, also
+    when another Spotify app moved playback): its name (the chip's text), volume and transferable
+    routes; a picked device stays the session's for up to 10 s while the snapshot catches up.
+    Releasing a session (the router does) pauses nothing. Groups of several selected routes are not
+    built (`onSelectRoute` is refused): Connect plays on one device.
+  * **Router (`playback/SystemRouting`, owned by `PlaybackService` from `onCreate` to `onDestroy`)**:
+    while logged in, `MediaRouter2.registerRouteCallback` for `{SPOTIFY_CONNECT, LOCAL_PLAYBACK}`,
+    passive (`activeScan = false`). Without a registered router asking for them SystemUI lists no
+    Connect route for the app, and the system can't relay a pick (it has no router to ask).
+    `android.media.route.feature.LOCAL_PLAYBACK` (hidden; on the system's speaker, wired and
+    Bluetooth routes from Android 11) lists "This phone" and the headsets next to the Connect
+    devices while one plays, without other providers' live-audio routes (`FEATURE_LIVE_AUDIO`
+    would pull those in, and a pick of one would cast this app to nothing).
+    * The media session's remote `DeviceInfo` carries the routing controller id
+      (`SpotifyPlayer.routingControllerId`; Media3 passes it as the platform `VolumeProvider`'s
+      volume control id, and `RemoteVolumeKeys`' provider gets it too): SystemUI's
+      `getRoutingSessionForMediaController` matches the two, names the chip after the session and
+      opens the switcher on it. Only while the session is remote: local playback is the system
+      session.
+    * Another device playing without a session (picked in the app, or started by another Spotify
+      app) gets one (`SystemRoutes.next`): `transferTo` its route, which the provider answers at
+      once. That needs the route, i.e. the provider bound (table below); a request that failed
+      waits 30 s. Two sessions crossing (a pick and that request) leave the newest. Once no device
+      plays (this phone took over, the device left) the session is released 8 s after it was
+      created or a device last played (a transfer's cluster update, a reconnect or a switch between
+      speakers can leave a short gap).
+    * "This phone", Bluetooth or wired picked in the switcher while the session is on another
+      device: the system moves the session to its own (`onTransfer(ours → system)`) and routes the
+      audio there; the app releases its session, pulls playback here as the sheet's "Tap to play
+      here" does (`transferTo(this phone)`, the same messages), clears a temporary output pick of
+      the sheet so the system's choice applies (`OutputRouteManager.select(null)`), and asks for no
+      new session for that device meanwhile. SystemUI's temporary allowlist after a pick
+      (`REASON_MEDIA_NOTIFICATION_TRANSFER`) lets the media foreground start from the background.
+    * From API 34 a route listing preference (set again on every route change: SettingsLib hides
+      the app's routes a listing leaves out) keeps the provider's order, shows devices that can't
+      play as "Can't play here", not selectable (below 34 they are left out), and adds "Other devices
+      on your network" (`SELECTION_BEHAVIOR_GO_TO_APP`, not a device), which opens the devices sheet:
+      `LinkActivity` (the listing's linked activity; the system requires it to resolve for
+      `android.media.action.TRANSFER_MEDIA`) forwards it to `MainActivity`, which opens the sheet.
+  * **Not listed**: ZeroConf speakers and Google Cast devices not yet in the account (the sheet's
+    local-network section). Listing them would need mDNS browsing whenever the system asks for an
+    active scan, which up to Android 14 is all screen-on time with any media notification (SystemUI
+    scans for each media control), and signing one in (up to 60–90 s, launching Spotify on a TV)
+    outlasts the switcher's 30 s transfer timeout. From Android 14 the "Other devices on your
+    network" entry opens the sheet instead, which browses while it is shown (Local-network
+    discovery above).
+  * **Discovery and battery**: no scan, poll or wake-up of its own. The provider is disabled in the
+    manifest and enabled only while the playback service runs (`RouteProviderSwitch`, applied off
+    the main thread; every process start disables one a dead process left enabled), because the
+    system binds every enabled provider by its own rules (`BIND_AUTO_CREATE |
+    BIND_FOREGROUND_SERVICE`: it would start the process or keep it at foreground-service
+    importance). Nothing keeps the playback service or the engine for the provider: its routes are
+    what the running engine already knows, its sessions go when the playback service goes
+    (released, then the provider is disabled), and its `onCreate` only subscribes to existing flows.
+    From Android 15 an active scan asking for our routes means the switcher dialog is open
+    (`SystemRoutes.switcherOpen`): the provider then fetches the device list once
+    (`connect.refreshDevices`, debounced natively), as the sheet does on opening; up to Android 14
+    SystemUI asks for an active scan for every media notification while the screen is on, so
+    nothing is refreshed there. When the system binds the provider:
+
+    | Android | Provider bound (while enabled) | Other apps' providers bound because of this app's router |
+    |---|---|---|
+    | 11 | always | always (Android 11 binds every provider) |
+    | 12–14 | screen on with a media notification up (SystemUI scans), or the app's router at foreground-service importance with the screen on (the playback service in the foreground), or a session exists | the same (as for any app with a cast button; our features match no one else's routes) |
+    | 15+ | the app in the foreground, the output switcher open, or a session exists | while the app is in the foreground |
+
+  * **Per version**: Android 11–13: the routes, picks, "This phone" and the chip (the routing
+    session's name; without a session the chip is disabled, as before); 14: also the listing
+    (order, "Can't play here", "Other devices on your network") and route types; 15+: more route
+    types, and opening the switcher refreshes the list. Below Android 11 none of this exists (no
+    route providers); the sheet's "More devices…" opens the Bluetooth settings there.
+  * **Left open (only a device shows it)**: from Android 15, when another device starts playing
+    while the app is in the background, nothing binds the provider, so the router can't ask for the
+    session: the chip reads "Other device", greyed out (as before), until the app comes to the
+    foreground or the switcher opens (from the volume panel, or the sheet's "More devices…"). On
+    12–14 the session follows at the next screen-on with the notification up. Not verified on
+    hardware: the hidden `LOCAL_PLAYBACK` feature on every release, OEM SystemUIs, how fast SystemUI
+    follows a session moved by another Spotify app, and the volume panel's choice between the media
+    session and `RemoteVolumeKeys`' (both carry the id). Debug with `adb shell dumpsys media_router`
+    (providers, binding, the composite preference, sessions) and SystemUI's dump of
+    `MediaDeviceManager` (playback type, volume control id, routing session).
 
 ## 9. Android app
 
@@ -1208,7 +1328,17 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     toggle), since a watch or the volume dialog may pick it as the first active session. It is
     inactive otherwise, created on first use (never during local playback). Media keys still
     reach the media session (`findMediaButtonSession` prefers the app's session whose state
-    matches its audio activity, and nothing plays here).
+    matches its audio activity, and nothing plays here). From API 30 its `VolumeProvider` carries
+    the routing session's id as volume control id, as the media session's does (System output
+    switcher, §8), so a system surface that picks either names the same device.
+  * The output switcher's routing session (§8) changes none of this: it is only the volume
+    control id of the remote `DeviceInfo` (`SpotifyPlayer.routingControllerId`), and the routing
+    framework never touches a session's `PlaybackState`, which alone Bluetooth reads. With a
+    Bluetooth output connected the session still reads paused while another device plays, and the
+    chip names the device all the same (SystemUI picks it by the playback info, not by the play
+    state). A pick of a Connect device in the switcher is a transfer (the device then plays and
+    the session reads as above); "This phone" or a headset picked there is playback on this phone,
+    which reads playing as local playback does.
   * `onTaskRemoved`: Media3 keeps its foreground service only while a session `isPlaying`,
     which a suppressed one is not; the service applies that rule with "plays elsewhere" (with
     or without a Bluetooth output), so swiping the app away keeps mirroring instead of pausing
@@ -1529,9 +1659,11 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   over), the engine stops or logs out, or the user picks "Automatic". "More devices…" opens the
   system output switcher via `androidx.mediarouter.app.SystemOutputSwitcherDialogController
   .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — lists Bluetooth and
-  other system audio outputs not yet connected (the system switcher does not cast for this app:
-  Google Cast devices are signed in from the sheet's local-network section instead, §8). Never use
-  `setCommunicationDevice` for media.
+  other system audio outputs not yet connected and, from API 30, the account's Connect devices
+  (System output switcher, §8: the same transfers as the sheet). It casts nothing else for this
+  app: Google Cast devices are signed in from the sheet's local-network section (§8), which the
+  switcher's "Other devices on your network" (API 34+) opens. Never use `setCommunicationDevice`
+  for media.
 * Device sheet (one UI for everything, like Spotify's): **This phone** (with current output
   name + icon and local output choices), then **Spotify Connect devices**, then
   "More devices…", then **Other devices on your network**: ZeroConf speakers and Google Cast
@@ -1555,6 +1687,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   / increase / decrease → `player.setVolume`. While the device plays with a Bluetooth output
   connected, the hardware volume keys reach it through `RemoteVolumeKeys` (§9.4, Remote playback
   and Bluetooth), since the media session then reads paused. In-app slider in the device sheet.
+  The output switcher's slider (route or session volume, §8) goes through the session player's
+  `setDeviceVolume` as the keys do (its in-flight target included); only the playing device takes
+  a volume there.
 
 ### 9.7 Downloads
 
@@ -2128,6 +2263,7 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
 | Paused < 10 min (wall time, `PausedIdle`) | Online | yes | mediaPlayback (Media3 timeout, bounded by an elapsed-realtime alarm) | none |
 | Paused ≥ 10 min, app background | hidden and stopped when the service lets go (other releases: hidden after 20 s, stopped after 60 s, both wall time) | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
+| Output switcher route provider (§8, API 30+) | unchanged: enabled only while the playback service runs; publishes what the engine pushes, no scan or poll; one device-list refresh when the switcher opens (Android 15+); its session goes with the service | unchanged | none of its own (the system binds it as `BIND_FOREGROUND_SERVICE`, see §8 for when) | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
 | Presence opt-in, idle (also restored after an app update, and after a reboot up to Android 14; from Android 15 a notification asks to open the app) | Online | yes | connectedDevice (low-importance) | none |
 | Home-screen widget placed (§9.4) | unchanged: pushed by the running playback service when the track, play state, like or device change, ≤ 1 per 500 ms; no `updatePeriodMillis`, alarm, polling or job; no widget, nothing collected | unchanged | none (Play from a dead process: the stored session, like a headset Play) | none |
@@ -2139,7 +2275,8 @@ Login (OAuth, other-device), Premium gate, logout, background play, notification
 lock-screen controls, home-screen widget, Bluetooth/headset buttons, Android Auto, playback resumption,
 audio focus & ducking, becoming-noisy pause, output switching (speaker/BT/wired/USB +
 system switcher), Connect send (device list, transfer, remote control incl. volume keys, signing
-in local-network ZeroConf speakers and Google Cast devices)
+in local-network ZeroConf speakers and Google Cast devices, the account's devices in Android's
+output switcher with the device's name on the media chip)
 and receive (phone as Connect device), shuffle, smart shuffle with suggestions, repeat
 all/one, queue (view, add, remove, reorder, clear, jump), autoplay, gapless,
 normalisation, streaming quality, playlists (view, create, edit, reorder, delete,
