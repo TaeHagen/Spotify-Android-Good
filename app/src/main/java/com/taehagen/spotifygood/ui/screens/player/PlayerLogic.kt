@@ -225,13 +225,61 @@ internal fun lyricsLineIndexAt(lines: List<LyricsLine>, positionMs: Long): Int {
  * Lines shown by the compact lyrics preview: [size] lines starting one line before the current one
  * (so the current line is the second), clamped to the available lines.
  */
-internal fun lyricsPreviewWindow(lineCount: Int, currentIndex: Int, size: Int = 6): IntRange {
+internal fun lyricsPreviewWindow(lineCount: Int, currentIndex: Int, size: Int = LYRICS_PREVIEW_LINES): IntRange {
     if (lineCount <= 0 || size <= 0) return IntRange.EMPTY
     val maxStart = (lineCount - size).coerceAtLeast(0)
     val start = (currentIndex - 1).coerceIn(0, maxStart)
     val end = (start + size - 1).coerceAtMost(lineCount - 1)
     return start..end
 }
+
+/** Lines in the compact lyrics preview, and single-line rows in its viewport. */
+internal const val LYRICS_PREVIEW_LINES = 6
+
+/** Rows of the preview's viewport: [size], fewer for shorter lyrics (the card fits them). */
+internal fun lyricsPreviewRows(lineCount: Int, size: Int = LYRICS_PREVIEW_LINES): Int = lineCount.coerceIn(0, size)
+
+/**
+ * Rows a preview line takes: as many as its text has (it wraps), so every line is a whole number
+ * of the viewport's rows and its edges cut between rows, never through a row of text.
+ * [textHeight] is the laid-out text, [rowTextHeight] one row of it.
+ */
+internal fun lyricsPreviewLineRows(textHeight: Int, rowTextHeight: Int): Int =
+    if (rowTextHeight <= 0) 1 else ((textHeight + rowTextHeight / 2) / rowTextHeight).coerceAtLeast(1)
+
+/**
+ * The line the scrolling preview brings to the top of its viewport: the one before the current
+ * line, so the current line takes the second row (the first row before the first line), as in
+ * [lyricsPreviewWindow]. Near the end the list stops once its last line reaches the viewport's
+ * bottom: with single-line rows that is the window's own clamp, and a long line that wraps
+ * there still leaves the current line in view.
+ */
+internal fun lyricsPreviewTopLine(lineCount: Int, currentIndex: Int): Int =
+    if (lineCount <= 0) 0 else (currentIndex - 1).coerceIn(0, lineCount - 1)
+
+/** How the preview goes from one top line to another. */
+internal enum class LyricsPreviewMove { STAY, SCROLL, SNAP }
+
+/**
+ * Playback moves the preview a line at a time (two when lines are short), and it scrolls there
+ * with the full screen's motion, either way (a small seek back or a corrected position too).
+ * Further moves snap: a seek, the song starting over, the card coming back into view a while
+ * later. Scrolling would run through every line in between.
+ */
+internal fun lyricsPreviewMove(fromTopLine: Int, toTopLine: Int, maxScrolledLines: Int = 2): LyricsPreviewMove = when {
+    toTopLine == fromTopLine -> LyricsPreviewMove.STAY
+    abs(toTopLine - fromTopLine) <= maxScrolledLines -> LyricsPreviewMove.SCROLL
+    else -> LyricsPreviewMove.SNAP
+}
+
+/**
+ * Pixels the preview scrolls to bring a line whose top is [lineTop] below the viewport's top up to
+ * it, stopping where the last line's bottom ([contentBottom], when it is laid out) meets the
+ * viewport's bottom: the list can't go further, and a scroll cut short there would stop dead
+ * instead of easing out.
+ */
+internal fun lyricsPreviewScrollDistance(lineTop: Int, contentBottom: Int?, viewportHeight: Int): Int =
+    if (contentBottom == null) lineTop else lineTop.coerceAtMost((contentBottom - viewportHeight).coerceAtLeast(0))
 
 /** Spotify sends lyrics colours as signed ARGB ints; some omit the alpha byte. */
 internal fun opaqueArgb(argb: Int): Int = if (argb ushr 24 == 0) argb or 0xFF000000.toInt() else argb

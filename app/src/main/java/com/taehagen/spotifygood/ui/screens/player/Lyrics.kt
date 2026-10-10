@@ -29,9 +29,11 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicText
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Lyrics
@@ -47,17 +49,27 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onVisibilityChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -78,6 +90,15 @@ import kotlinx.coroutines.launch
 
 /** User scrolling pauses auto-scroll for this long. */
 private const val AUTO_SCROLL_RESUME_MS = 5_000L
+
+/** The scroll to the next line, full screen and in Now Playing's preview. */
+private val LyricsScrollSpec = tween<Float>(durationMillis = 650, easing = FastOutSlowInEasing)
+
+/** A line's fade between past, current and upcoming. */
+private const val LYRICS_LINE_COLOR_MS = 300
+
+/** Space above and below each line of the preview. */
+private val PreviewLinePadding = 3.dp
 
 /** Colours of a lyrics surface: Spotify's colours when provided, else the artwork colour. */
 @Immutable
@@ -266,7 +287,7 @@ private fun SyncedLyrics(
             }
             val visible = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == target }
             if (visible != null) {
-                listState.animateScrollBy(visible.offset.toFloat(), tween(durationMillis = 650, easing = FastOutSlowInEasing))
+                listState.animateScrollBy(visible.offset.toFloat(), LyricsScrollSpec)
             } else {
                 listState.animateScrollToItem(target)
             }
@@ -324,7 +345,7 @@ private fun SyncedLyrics(
 
 @Composable
 private fun LyricLine(text: String, color: Color, onClickLabel: String, onClick: (() -> Unit)?) {
-    val animated by animateColorAsState(color, animationSpec = tween(durationMillis = 300), label = "lyricLine")
+    val animated by animateColorAsState(color, animationSpec = tween(durationMillis = LYRICS_LINE_COLOR_MS), label = "lyricLine")
     Text(
         text = text,
         style = MaterialTheme.typography.headlineSmall,
@@ -410,4 +431,145 @@ private fun LyricsMiniControls(
             size = 56.dp,
         )
     }
+}
+
+/**
+ * The synced lines of Now Playing's lyrics card: a clipped viewport of [lyricsPreviewRows]
+ * single-line rows (so the card keeps its size) over the song's lines. The current line keeps the
+ * row the window gives it ([lyricsPreviewTopLine]); as it advances the lines scroll up with the
+ * full screen's motion, and each line's colour fades between past, current and upcoming. Larger
+ * moves snap ([lyricsPreviewMove]); another song starts in place, with nothing carried over.
+ *
+ * The position is followed only while the lines can be seen: Now Playing shown (its details fade
+ * in from [PlayerMotion.DETAILS_FADE_START]) and the viewport on screen (it sits below the first
+ * screen of the scrolling layout). Otherwise nothing reads the position or moves, and on return
+ * the lines snap or scroll to the line playing. In the background the position stops (it is
+ * collected with the lifecycle), and so do frames.
+ *
+ * The viewport takes no touches: a tap reaches the card (the full lyrics), drags reach Now
+ * Playing's scroll and the sheet. TalkBack reads the [lyricsPreviewWindow] lines through the card.
+ */
+@Composable
+internal fun LyricsPreviewLines(lyrics: Lyrics, position: State<Long>, palette: LyricsPalette) {
+    val lines = lyrics.lines
+    val rows = lyricsPreviewRows(lines.size)
+    if (rows == 0) return
+    val sheet = LocalPlayerSheet.current
+    val nowPlayingShown = remember(sheet) {
+        derivedStateOf { sheet == null || sheet.progress > PlayerMotion.DETAILS_FADE_START }
+    }
+    val onScreen = remember { mutableStateOf(false) }
+    val currentIndex = remember(lines, position, nowPlayingShown) {
+        // Starts at the line playing (read without subscribing the composition to the position);
+        // while the lines can't be seen it keeps the last one and reads nothing.
+        var last = Snapshot.withoutReadObservation { lyricsLineIndexAt(lines, position.value) }
+        derivedStateOf {
+            if (nowPlayingShown.value && onScreen.value) lyricsLineIndexAt(lines, position.value).also { last = it } else last
+        }
+    }
+    val index = currentIndex.value
+    val topLine = lyricsPreviewTopLine(lines.size, index)
+    val window = lyricsPreviewWindow(lines.size, index)
+    val instrumental = stringResource(R.string.player_lyrics_instrumental)
+    val spoken = remember(lines, window, instrumental) {
+        window.map { AnnotatedString(lines[it].words.ifBlank { instrumental }) }
+    }
+    val typography = MaterialTheme.typography
+    val style = remember(typography) { typography.titleLarge.copy(fontWeight = FontWeight.Bold) }
+    // The lines use only these colours; the background can animate with the artwork.
+    val linePalette = remember(palette.highlight, palette.upcoming, palette.past) {
+        palette.copy(background = Color.Unspecified)
+    }
+    val density = LocalDensity.current
+    val measurer = rememberTextMeasurer(cacheSize = 1)
+    // One row of text, and a row of the viewport: the text with its padding.
+    val rowText = remember(measurer, style) { measurer.measure("A", style).size.height }
+    val rowHeight = rowText + 2 * with(density) { PreviewLinePadding.roundToPx() }
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(with(density) { (rowHeight * rows).toDp() })
+            .onVisibilityChanged(minFractionVisible = 0f) { onScreen.value = it }
+            // The window's lines, as the card read them before it scrolled (no list, no scroll actions).
+            .clearAndSetSemantics { this[SemanticsProperties.Text] = spoken },
+    ) {
+        key(lines) {
+            val listState = remember { LazyListState(firstVisibleItemIndex = topLine) }
+            // The line the list rests on or is scrolling to.
+            val target = remember { intArrayOf(topLine) }
+            LaunchedEffect(topLine) {
+                val from = target[0]
+                target[0] = topLine
+                when (lyricsPreviewMove(from, topLine)) {
+                    LyricsPreviewMove.STAY -> Unit
+                    LyricsPreviewMove.SNAP -> listState.scrollToItem(topLine)
+                    LyricsPreviewMove.SCROLL -> {
+                        val info = listState.layoutInfo
+                        val line = info.visibleItemsInfo.firstOrNull { it.index == topLine }
+                        if (line == null) {
+                            listState.animateScrollToItem(topLine)
+                        } else {
+                            val last = info.visibleItemsInfo.lastOrNull()?.takeIf { it.index == info.totalItemsCount - 1 }
+                            val distance = lyricsPreviewScrollDistance(
+                                lineTop = line.offset,
+                                contentBottom = last?.let { it.offset + it.size },
+                                viewportHeight = info.viewportSize.height,
+                            )
+                            if (distance != 0) listState.animateScrollBy(distance.toFloat(), LyricsScrollSpec)
+                        }
+                    }
+                }
+            }
+            LazyColumn(
+                state = listState,
+                userScrollEnabled = false,
+                overscrollEffect = null,
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                itemsIndexed(lines, key = { i, _ -> i }, contentType = { _, _ -> "line" }) { i, line ->
+                    LyricsPreviewLine(
+                        text = line.words.ifBlank { instrumental },
+                        index = i,
+                        currentIndex = currentIndex,
+                        palette = linePalette,
+                        style = style,
+                        rowText = rowText,
+                        rowHeight = rowHeight,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * One preview line, [lyricsPreviewLineRows] rows of [rowHeight] tall with its text centred (a
+ * single row: [PreviewLinePadding] above and below). Its colour is read when drawing: a fade
+ * redraws the line, nothing more.
+ */
+@Composable
+private fun LyricsPreviewLine(
+    text: String,
+    index: Int,
+    currentIndex: State<Int>,
+    palette: LyricsPalette,
+    style: TextStyle,
+    rowText: Int,
+    rowHeight: Int,
+) {
+    // Recomposes only when this line becomes current or past, not on every line change.
+    val target by remember(index, currentIndex, palette) {
+        derivedStateOf { palette.colorFor(index, currentIndex.value, synced = true) }
+    }
+    val color = animateColorAsState(target, animationSpec = tween(durationMillis = LYRICS_LINE_COLOR_MS), label = "lyricsPreviewLine")
+    BasicText(
+        text = text,
+        style = style,
+        color = { color.value },
+        modifier = Modifier.layout { measurable, constraints ->
+            val placeable = measurable.measure(constraints)
+            val height = maxOf(placeable.height, lyricsPreviewLineRows(placeable.height, rowText) * rowHeight)
+            layout(placeable.width, height) { placeable.place(0, (height - placeable.height) / 2) }
+        },
+    )
 }
