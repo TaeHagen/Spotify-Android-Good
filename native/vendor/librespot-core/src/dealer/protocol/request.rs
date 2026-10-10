@@ -97,6 +97,10 @@ pub struct PlayCommand {
     pub play_origin: PlayOrigin,
     pub options: PlayOptions,
     pub logging_params: LoggingParams,
+    // SPOTIFYGOOD: the fields a play carries that aren't parsed (e.g. `prepare_play_options`),
+    // for the vendored Spirc's log of what a remote play names
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -191,6 +195,9 @@ pub struct PlayOptions {
     pub initially_paused: Option<bool>,
     pub prefetch_level: Option<String>,
     pub system_initiated: Option<bool>,
+    // SPOTIFYGOOD: see PlayCommand::other
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -205,6 +212,9 @@ pub struct SkipTo {
     pub track_uid: Option<String>,
     pub track_uri: Option<String>,
     pub track_index: Option<u32>,
+    // SPOTIFYGOOD: see PlayCommand::other (e.g. a page index or url)
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
