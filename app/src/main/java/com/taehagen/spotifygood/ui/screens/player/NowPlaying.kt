@@ -1014,7 +1014,7 @@ private fun RemoteBanner(indicator: DeviceIndicator.Remote, onClick: () -> Unit)
 
 /**
  * Compact lyrics card under the controls. Synced lines scroll as playback advances, the highlighted
- * line in a fixed row ([LyricsPreviewLines]); unsynced lyrics show their first lines.
+ * line always whole in view ([LyricsPreviewLines]); unsynced lyrics show their first lines.
  */
 @Composable
 internal fun LyricsPreviewCard(

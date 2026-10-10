@@ -57,6 +57,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
@@ -86,6 +87,39 @@ class LyricsPreviewScreenshotTest {
     /** The line leaving at the top wraps: the scroll is two rows long, same timing. */
     @Test
     fun scrollsPastAWrappedLine() = scrollStrip("wrapped_line_dark", dark = true, lyrics = SONG.copy(colors = SPOTIFY_COLORS), from = 8, to = 9)
+
+    /** A 4-row line, then a 3-row one: 7 rows, so the 4-row line gives way to show the new one whole. */
+    @Test
+    fun aWrappedLineGivesWayToTheCurrentOne() = scrollStrip("rap_4_then_3_rows_dark", dark = true, lyrics = RAP, from = 2, to = 3)
+
+    /** A line taller than the viewport shows from its top while it plays... */
+    @Test
+    fun aLineTallerThanTheViewportShowsItsTop() = scrollStrip("rap_taller_line_dark", dark = true, lyrics = RAP, from = 5, to = 6)
+
+    /** ...and its bottom rows stay above the next line. */
+    @Test
+    fun theLineAfterATallOneShowsWhole() = scrollStrip("rap_after_taller_line_dark", dark = true, lyrics = RAP, from = 6, to = 7)
+
+    /** Two lines, the first wrapping: the viewport takes the three rows they need. */
+    @Test
+    fun shortLyricsShowEveryRow() {
+        val card = CardState(TWO_LINES, 1_000)
+        launch({ CardHarness(dark = false, card) }) { view ->
+            val frames = mutableListOf("before" to grab(view, card.bounds))
+            card.position.longValue = lineStart(0) + 100
+            frames += timed(view, card, listOf(800L)).map { (_, frame) -> "line 1" to frame }
+            card.position.longValue = lineStart(1) + 100
+            frames += timed(view, card, listOf(800L)).map { (_, frame) -> "line 2" to frame }
+            strip(frames).captureRoboImage(path("two_lines_light"))
+        }
+    }
+
+    /** Double-size text: lines wrap more, the current one still shows whole. */
+    @Test
+    fun largeFontKeepsTheCurrentLineWhole() {
+        RuntimeEnvironment.setFontScale(2f)
+        scrollStrip("font200_dark", dark = true, lyrics = SONG.copy(colors = SPOTIFY_COLORS), from = 6, to = 7)
+    }
 
     @Test
     fun aSeekSnaps() {
@@ -442,6 +476,31 @@ class LyricsPreviewScreenshotTest {
                 "Again and again",
             ),
         ).copy(colors = LyricsColors(background = 0xFF1E3264.toInt(), text = 0xFF000000.toInt(), highlightText = 0xFFFFFFFF.toInt()))
+
+        /** Long lines (about 34 characters a row here): 4 rows, then 3, and one of 7, more than the viewport. */
+        val RAP = synced(
+            listOf(
+                "Yeah",
+                "Check it",
+                "Woke up early in the city with the sirens in the rain, counting every dollar and the scars I had to gain along the way",
+                "Now the lights are on me and I'm never looking back to the corner where I started",
+                "Uh",
+                "Run it back",
+                "Every verse I ever wrote was on a napkin or receipt, every hook I ever sang was in a hallway on repeat, " +
+                    "every dream I ever had was bigger than the block, so I kept it moving, kept it pushing, never gonna stop",
+                "Never stop",
+                "Never",
+                "Stop",
+            ),
+        ).copy(colors = LyricsColors(background = 0xFF2D46B9.toInt(), text = 0xFF000000.toInt(), highlightText = 0xFFFFFFFF.toInt()))
+
+        /** Two lines, the first wrapping to two rows. */
+        val TWO_LINES = synced(
+            listOf(
+                "The first line of a very short song that wraps",
+                "The end",
+            ),
+        )
 
         /** Spotify's colours for a red song (background, upcoming text, highlight). */
         val SPOTIFY_COLORS = LyricsColors(background = 0xFFB02A3A.toInt(), text = 0xFF000000.toInt(), highlightText = 0xFFFFFFFF.toInt())
