@@ -3,6 +3,7 @@ package com.taehagen.spotifygood.ui.screens.playlist
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -52,12 +53,20 @@ import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.model.Playlist
+import com.taehagen.spotifygood.model.PlaylistItem
 import com.taehagen.spotifygood.model.PlaylistOwner
 import com.taehagen.spotifygood.model.best
 import com.taehagen.spotifygood.ui.appViewModel
 import com.taehagen.spotifygood.ui.components.DetailHeader
 import com.taehagen.spotifygood.ui.components.EmptyState
 import com.taehagen.spotifygood.ui.components.EpisodeRow
+import com.taehagen.spotifygood.ui.components.FastScroller
+import com.taehagen.spotifygood.ui.components.PlaceholderTrackRow
+import com.taehagen.spotifygood.ui.components.VisibleRowsEffect
+import com.taehagen.spotifygood.ui.components.fastScrollDate
+import com.taehagen.spotifygood.ui.components.fastScrollLetter
+import com.taehagen.spotifygood.ui.components.fastScrollPosition
+import com.taehagen.spotifygood.ui.components.rememberFastScrollDatePattern
 import com.taehagen.spotifygood.ui.components.PartialContentNotice
 import com.taehagen.spotifygood.ui.components.PlayFab
 import com.taehagen.spotifygood.ui.components.TrackRow
@@ -73,11 +82,10 @@ import com.taehagen.spotifygood.ui.screens.album.DetailScaffold
 import com.taehagen.spotifygood.ui.screens.album.DownloadedCopyNotice
 import com.taehagen.spotifygood.ui.screens.album.ExpandableText
 import com.taehagen.spotifygood.ui.screens.album.HeaderMetaText
-import com.taehagen.spotifygood.ui.screens.album.LoadMoreEffect
 import com.taehagen.spotifygood.ui.screens.library.TrackSortButton
 import com.taehagen.spotifygood.ui.screens.library.TrackSort
+import com.taehagen.spotifygood.ui.screens.library.sortKey
 import com.taehagen.spotifygood.ui.screens.library.LoadingAllProgress
-import com.taehagen.spotifygood.ui.screens.album.LoadState
 import com.taehagen.spotifygood.ui.screens.album.LoadStateContent
 import com.taehagen.spotifygood.ui.screens.album.MoreButton
 import com.taehagen.spotifygood.ui.screens.album.PagingFooter
@@ -113,12 +121,6 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
             }
         }
     }
-    LoadMoreEffect(
-        listState = listState,
-        // A filter or a sort fetches every page itself.
-        enabled = state.load is LoadState.Ready && !state.paging.failed && !state.list.filterActive && !state.list.sortActive,
-        onLoadMore = viewModel::loadMore,
-    )
     val exitEditMode = {
         viewModel.setEditMode(false)
     }
@@ -146,6 +148,7 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
             onDragStart = viewModel::beginDrag,
             onDragMove = viewModel::previewMove,
             onDragEnd = viewModel::endDrag,
+            onRowsVisible = viewModel::onRowsVisible,
         )
     }
 
@@ -253,6 +256,8 @@ private class PlaylistActions(
     val onDragStart: () -> Unit,
     val onDragMove: (Int, Int) -> Unit,
     val onDragEnd: (Int, Int) -> Unit,
+    /** Rows on screen (positions in the shown list): the next page or windows load for them. */
+    val onRowsVisible: (Int, Int) -> Unit,
 )
 
 @Composable
@@ -281,108 +286,175 @@ private fun PlaylistList(
             WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding(),
     )
 
-    LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
-        item(key = "header", contentType = "header") {
-            PlaylistHeader(playlist, state, navigator, actions)
-        }
-        if (playlist.downloadedCopy) {
-            item(key = "downloaded", contentType = "notice") {
-                DownloadedCopyNotice(
-                    stringResource(R.string.detail_showing_downloaded_tracks),
-                    onRetry = actions.onRetry.takeUnless { state.offline },
-                )
+    // Lazy items before the rows (header, notices, filter) and the rows: the loaded ones, then
+    // placeholders to the end of the playlist, loaded by window as they come on screen.
+    val headerItems = 1 +
+        (if (playlist.downloadedCopy) 1 else 0) +
+        (if (playlist.partial && !state.editMode) 1 else 0) +
+        (if (!state.editMode && playlist.total > 0) 1 else 0)
+    val placeholders = playlistPlaceholders(playlist, rows.size, state.list, state.editMode, state.online)
+    val rowCount = rows.size + placeholders
+    VisibleRowsEffect(listState, contentStart = headerItems, contentCount = rowCount, onVisible = actions.onRowsVisible)
+    val datePattern = rememberFastScrollDatePattern()
+    val shownSort = if (state.list.sortActive) state.sort else TrackSort.CUSTOM
+    val windows = state.windows
+    val loadedRows = playlist.rows
+    // Past the shown rows (own order only) the loaded rows may be ahead of them for a frame.
+    val rowAt: (Int) -> PlaylistRow? = { index -> rows.getOrNull(index)?.row ?: loadedRows.getOrNull(index) ?: windows[index] }
+    val label: (Int) -> String? = remember(rows, loadedRows, windows, shownSort, rowCount, datePattern) {
+        { index -> playlistScrollLabel(rowAt(index)?.item, index, rowCount, shownSort, datePattern) }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(state = listState, contentPadding = contentPadding, modifier = Modifier.fillMaxSize()) {
+            item(key = "header", contentType = "header") {
+                PlaylistHeader(playlist, state, navigator, actions)
             }
-        }
-        if (playlist.partial && !state.editMode) {
-            // Some rows are placeholders (their metadata failed right now).
-            item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = actions.onRetryPartial) }
-        }
-        if (!state.editMode && playlist.total > 0) {
-            item(key = "filter", contentType = "filter") {
-                Column(Modifier.padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        SearchField(
-                            value = query,
-                            onValueChange = onQueryChange,
-                            placeholder = stringResource(R.string.detail_find_in_playlist),
-                            modifier = Modifier.weight(1f),
-                        )
-                        TrackSortButton(sort = state.sort, options = TrackSort.PLAYLIST, onSort = actions.onSort)
-                    }
-                    if (state.paging.loadingAll) {
-                        LoadingAllProgress(
-                            loaded = playlist.rows.size,
-                            total = playlist.total,
-                            modifier = Modifier.padding(top = 8.dp, end = 12.dp),
-                        )
+            if (playlist.downloadedCopy) {
+                item(key = "downloaded", contentType = "notice") {
+                    DownloadedCopyNotice(
+                        stringResource(R.string.detail_showing_downloaded_tracks),
+                        onRetry = actions.onRetry.takeUnless { state.offline },
+                    )
+                }
+            }
+            if (playlist.partial && !state.editMode) {
+                // Some rows are placeholders (their metadata failed right now).
+                item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = actions.onRetryPartial) }
+            }
+            if (!state.editMode && playlist.total > 0) {
+                item(key = "filter", contentType = "filter") {
+                    Column(Modifier.padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            SearchField(
+                                value = query,
+                                onValueChange = onQueryChange,
+                                placeholder = stringResource(R.string.detail_find_in_playlist),
+                                modifier = Modifier.weight(1f),
+                            )
+                            TrackSortButton(sort = state.sort, options = TrackSort.PLAYLIST, onSort = actions.onSort)
+                        }
+                        if (state.paging.loadingAll) {
+                            LoadingAllProgress(
+                                loaded = playlist.rows.size,
+                                total = playlist.total,
+                                modifier = Modifier.padding(top = 8.dp, end = 12.dp),
+                            )
+                        }
                     }
                 }
             }
-        }
-        items(
-            rows,
-            key = { it.row.key },
-            contentType = { if (it.row.item.episode != null) "episode" else "track" },
-        ) { visible ->
-            if (state.editMode) {
-                val dragging = reorderState.draggingKey == visible.row.key
-                EditableRow(
-                    row = visible,
-                    count = playlist.rows.size,
-                    reorderState = reorderState,
-                    onRemove = { actions.onRemoveItem(visible.row.key) },
-                    onMove = actions.onMoveItem,
-                    modifier = Modifier
-                        // The dragged item follows the finger; everything else animates into place.
-                        .then(if (dragging) Modifier else Modifier.animateItem())
-                        .zIndex(if (dragging) 1f else 0f)
-                        .graphicsLayer { translationY = reorderState.translationFor(visible.row.key) }
-                        .then(
-                            if (dragging) Modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest) else Modifier,
-                        ),
-                )
-            } else {
-                PlaylistItemRow(
-                    uri = uri,
-                    visible = visible,
-                    playlist = playlist,
-                    state = state,
-                    navigator = navigator,
-                    onPlay = actions.onPlayItem,
-                    modifier = Modifier.animateItem(),
-                )
+            items(
+                rows,
+                key = { it.row.key },
+                contentType = { if (it.row.item.episode != null) "episode" else "track" },
+            ) { visible ->
+                if (state.editMode) {
+                    val dragging = reorderState.draggingKey == visible.row.key
+                    EditableRow(
+                        row = visible,
+                        count = playlist.rows.size,
+                        reorderState = reorderState,
+                        onRemove = { actions.onRemoveItem(visible.row.key) },
+                        onMove = actions.onMoveItem,
+                        modifier = Modifier
+                            // The dragged item follows the finger; everything else animates into place.
+                            .then(if (dragging) Modifier else Modifier.animateItem())
+                            .zIndex(if (dragging) 1f else 0f)
+                            .graphicsLayer { translationY = reorderState.translationFor(visible.row.key) }
+                            .then(
+                                if (dragging) Modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest) else Modifier,
+                            ),
+                    )
+                } else {
+                    PlaylistItemRow(
+                        uri = uri,
+                        visible = visible,
+                        playlist = playlist,
+                        state = state,
+                        navigator = navigator,
+                        onPlay = actions.onPlayItem,
+                        modifier = Modifier.animateItem(),
+                    )
+                }
             }
-        }
-        item(key = "footer", contentType = "footer") {
-            when {
-                playlist.total == 0 && playlist.rows.isEmpty() -> EmptyState(
-                    title = stringResource(R.string.detail_playlist_empty),
-                    message = if (meta.canEdit) stringResource(R.string.detail_playlist_empty_owned) else null,
-                    action = if (meta.canEdit) {
-                        {
-                            Button(onClick = actions.onAddSongs) {
-                                Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text(stringResource(R.string.detail_add_songs))
-                            }
-                        }
+            if (placeholders > 0) {
+                val loaded = rows.size
+                // Keyed by position: a row keeps its slot when its window (or the next page) arrives.
+                items(count = placeholders, key = { "pos:${loaded + it}" }, contentType = { "track" }) { offset ->
+                    val index = loaded + offset
+                    val row = loadedRows.getOrNull(index) ?: windows[index]
+                    if (row != null) {
+                        PlaylistItemRow(
+                            uri = uri,
+                            visible = VisibleRow(index, row),
+                            playlist = playlist,
+                            state = state,
+                            navigator = navigator,
+                            onPlay = actions.onPlayItem,
+                        )
                     } else {
-                        null
-                    },
-                    modifier = Modifier.padding(vertical = 32.dp),
-                )
-                state.list.filterActive && rows.isEmpty() && !state.paging.loadingAll -> EmptyState(
-                    title = stringResource(R.string.detail_no_matches, query.trim()),
-                    message = stringResource(R.string.detail_no_matches_message),
-                    modifier = Modifier.padding(vertical = 32.dp),
-                )
-                else -> PagingFooter(
-                    loading = state.paging.loading,
-                    failed = state.paging.failed,
-                    onRetry = actions.onRetryPage,
-                )
+                        PlaceholderTrackRow()
+                    }
+                }
+            }
+            item(key = "footer", contentType = "footer") {
+                when {
+                    playlist.total == 0 && playlist.rows.isEmpty() -> EmptyState(
+                        title = stringResource(R.string.detail_playlist_empty),
+                        message = if (meta.canEdit) stringResource(R.string.detail_playlist_empty_owned) else null,
+                        action = if (meta.canEdit) {
+                            {
+                                Button(onClick = actions.onAddSongs) {
+                                    Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(stringResource(R.string.detail_add_songs))
+                                }
+                            }
+                        } else {
+                            null
+                        },
+                        modifier = Modifier.padding(vertical = 32.dp),
+                    )
+                    state.list.filterActive && rows.isEmpty() && !state.paging.loadingAll -> EmptyState(
+                        title = stringResource(R.string.detail_no_matches, query.trim()),
+                        message = stringResource(R.string.detail_no_matches_message),
+                        modifier = Modifier.padding(vertical = 32.dp),
+                    )
+                    else -> PagingFooter(
+                        loading = state.paging.loading,
+                        failed = state.paging.failed,
+                        onRetry = actions.onRetryPage,
+                    )
+                }
             }
         }
+        // Edit mode drags rows by their handle on the same edge: no fast scroller there.
+        FastScroller(
+            listState = listState,
+            contentStart = headerItems,
+            contentCount = rowCount,
+            enabled = !state.editMode,
+            topPadding = detailTopInset(),
+            bottomPadding = contentPadding.calculateBottomPadding(),
+            label = label,
+        )
+    }
+}
+
+/**
+ * The fast scroller's bubble for the row at [index] of [count] ([item] null: not loaded yet): the
+ * first letter of what [sort] orders by, the month it was added for Recently added, else its
+ * position.
+ */
+internal fun playlistScrollLabel(item: PlaylistItem?, index: Int, count: Int, sort: TrackSort, datePattern: String): String? {
+    val key = item?.sortKey()
+    return when (sort) {
+        TrackSort.TITLE -> fastScrollLetter(key?.title)
+        TrackSort.ARTIST -> fastScrollLetter(key?.artist)
+        TrackSort.ALBUM -> fastScrollLetter(key?.album)
+        TrackSort.RECENTLY_ADDED -> key?.addedAt?.let { fastScrollDate(it, datePattern) } ?: fastScrollPosition(index, count)
+        TrackSort.CUSTOM -> fastScrollPosition(index, count)
     }
 }
 

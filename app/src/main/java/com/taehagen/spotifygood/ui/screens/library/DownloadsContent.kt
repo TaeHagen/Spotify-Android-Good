@@ -80,6 +80,8 @@ import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
 import kotlinx.coroutines.flow.Flow
+import androidx.compose.foundation.lazy.rememberLazyListState
+import com.taehagen.spotifygood.ui.components.FastScroller
 
 private sealed interface PendingRemoval {
     data class Collection(val uri: String, val name: String) : PendingRemoval
@@ -263,71 +265,75 @@ private fun DownloadsList(
     onRetryFailed: () -> Unit,
 ) {
     val content = state.content
-    LazyColumn(contentPadding = contentPaddingWith(contentPadding), modifier = Modifier.fillMaxSize()) {
-        item(key = "header", contentType = "header") {
-            StorageHeader(state = state, onRetryFailed = onRetryFailed)
-        }
-        if (state.offline) {
-            item(key = "offline", contentType = "banner") {
-                OfflineBanner(Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+    val listState = rememberLazyListState()
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(state = listState, contentPadding = contentPaddingWith(contentPadding), modifier = Modifier.fillMaxSize()) {
+            item(key = "header", contentType = "header") {
+                StorageHeader(state = state, onRetryFailed = onRetryFailed)
             }
-        }
-        collectionSection("playlists", R.string.browse_downloads_section_playlists, content.playlists, statusOf, onPlayCollection, onCollectionMore)
-        collectionSection("albums", R.string.browse_downloads_section_albums, content.albums, statusOf, onPlayCollection, onCollectionMore)
-        collectionSection("podcasts", R.string.browse_downloads_section_podcasts, content.podcasts, statusOf, onPlayCollection, onCollectionMore)
-        if (content.songs.isNotEmpty()) {
-            item(key = "songsHeader", contentType = "sectionHeader") {
-                SectionHeader(
-                    title = stringResource(R.string.browse_downloads_section_songs),
-                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 4.dp),
-                )
+            if (state.offline) {
+                item(key = "offline", contentType = "banner") {
+                    OfflineBanner(Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                }
             }
-            items(content.songs, key = { "song:${it.uri}" }, contentType = { "song" }) { entry ->
-                val track = remember(entry.uri, entry.track) { entry.track ?: Track(uri = entry.uri, name = entry.uri.substringAfterLast(':')) }
-                TrackRow(
-                    track = track,
-                    onClick = { onPlayEntry(entry) },
-                    isCurrent = state.nowPlaying.isCurrent(entry.uri),
-                    isPlaying = state.nowPlaying.isPlaying,
-                    subtitleOverride = entryStatusText(entry),
-                    downloadState = entry.state,
-                    // Not downloaded yet while the session isn't online: another download would play.
-                    enabled = canStartNow(playable = true, online = state.online, downloadState = entry.state),
-                    onMoreClick = { onEntryMore(entry) },
-                    onLongClick = { onEntryMore(entry) },
-                    trailing = if (entry.state == DownloadState.FAILED) {
-                        {
-                            IconButton(onClick = { onRetryEntry(entry) }) {
-                                Icon(Icons.Rounded.Refresh, contentDescription = stringResource(R.string.browse_retry_download))
+            collectionSection("playlists", R.string.browse_downloads_section_playlists, content.playlists, statusOf, onPlayCollection, onCollectionMore)
+            collectionSection("albums", R.string.browse_downloads_section_albums, content.albums, statusOf, onPlayCollection, onCollectionMore)
+            collectionSection("podcasts", R.string.browse_downloads_section_podcasts, content.podcasts, statusOf, onPlayCollection, onCollectionMore)
+            if (content.songs.isNotEmpty()) {
+                item(key = "songsHeader", contentType = "sectionHeader") {
+                    SectionHeader(
+                        title = stringResource(R.string.browse_downloads_section_songs),
+                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 4.dp),
+                    )
+                }
+                items(content.songs, key = { "song:${it.uri}" }, contentType = { "song" }) { entry ->
+                    val track = remember(entry.uri, entry.track) { entry.track ?: Track(uri = entry.uri, name = entry.uri.substringAfterLast(':')) }
+                    TrackRow(
+                        track = track,
+                        onClick = { onPlayEntry(entry) },
+                        isCurrent = state.nowPlaying.isCurrent(entry.uri),
+                        isPlaying = state.nowPlaying.isPlaying,
+                        subtitleOverride = entryStatusText(entry),
+                        downloadState = entry.state,
+                        // Not downloaded yet while the session isn't online: another download would play.
+                        enabled = canStartNow(playable = true, online = state.online, downloadState = entry.state),
+                        onMoreClick = { onEntryMore(entry) },
+                        onLongClick = { onEntryMore(entry) },
+                        trailing = if (entry.state == DownloadState.FAILED) {
+                            {
+                                IconButton(onClick = { onRetryEntry(entry) }) {
+                                    Icon(Icons.Rounded.Refresh, contentDescription = stringResource(R.string.browse_retry_download))
+                                }
                             }
-                        }
-                    } else {
-                        null
-                    },
-                )
+                        } else {
+                            null
+                        },
+                    )
+                }
+            }
+            if (content.episodes.isNotEmpty()) {
+                item(key = "episodesHeader", contentType = "sectionHeader") {
+                    SectionHeader(
+                        title = stringResource(R.string.browse_downloads_section_episodes),
+                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 4.dp),
+                    )
+                }
+                items(content.episodes, key = { "episode:${it.uri}" }, contentType = { "episode" }) { entry ->
+                    val episode = remember(entry.uri, entry.episode) { entry.episode ?: Episode(uri = entry.uri, name = entry.uri.substringAfterLast(':')) }
+                    EpisodeRow(
+                        episode = episode,
+                        onClick = { onPlayEntry(entry) },
+                        isCurrent = state.nowPlaying.isCurrent(entry.uri),
+                        isPlaying = state.nowPlaying.isPlaying,
+                        downloadState = entry.state,
+                        onLongClick = { onEntryMore(entry) },
+                        enabled = canStartNow(playable = true, online = state.online, downloadState = entry.state),
+                        onMoreClick = { onEntryMore(entry) },
+                    )
+                }
             }
         }
-        if (content.episodes.isNotEmpty()) {
-            item(key = "episodesHeader", contentType = "sectionHeader") {
-                SectionHeader(
-                    title = stringResource(R.string.browse_downloads_section_episodes),
-                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 4.dp),
-                )
-            }
-            items(content.episodes, key = { "episode:${it.uri}" }, contentType = { "episode" }) { entry ->
-                val episode = remember(entry.uri, entry.episode) { entry.episode ?: Episode(uri = entry.uri, name = entry.uri.substringAfterLast(':')) }
-                EpisodeRow(
-                    episode = episode,
-                    onClick = { onPlayEntry(entry) },
-                    isCurrent = state.nowPlaying.isCurrent(entry.uri),
-                    isPlaying = state.nowPlaying.isPlaying,
-                    downloadState = entry.state,
-                    onLongClick = { onEntryMore(entry) },
-                    enabled = canStartNow(playable = true, online = state.online, downloadState = entry.state),
-                    onMoreClick = { onEntryMore(entry) },
-                )
-            }
-        }
+        FastScroller(listState, bottomPadding = contentPadding.calculateBottomPadding())
     }
 }
 
