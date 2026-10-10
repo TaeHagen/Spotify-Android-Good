@@ -30,6 +30,35 @@ impl ConnectState {
         }
         .ok_or(StateError::CouldNotResolveTrackFromTransfer)?;
 
+        // SPOTIFYGOOD: a track named by its uid alone (a blank uri, no gid; see
+        // model::StartTrack) is the track of that uid the transfer's pages carry
+        let blank = |s: Option<&str>| s.is_none_or(|s| s.trim().is_empty());
+        let by_uid;
+        let track = if blank(track.uri.as_deref()) && track.gid.as_ref().is_none_or(Vec::is_empty) {
+            let uid = track.uid.as_deref().filter(|uid| !uid.is_empty());
+            let found = uid.and_then(|uid| {
+                transfer
+                    .current_session
+                    .context
+                    .pages
+                    .iter()
+                    .flat_map(|page| page.tracks.iter())
+                    .find(|t| t.uid.as_deref() == Some(uid) && !blank(t.uri.as_deref()))
+            });
+            match found {
+                Some(found) => {
+                    by_uid = ContextTrack {
+                        uri: found.uri.clone(),
+                        ..track.clone()
+                    };
+                    &by_uid
+                }
+                None => track,
+            }
+        } else {
+            track
+        };
+
         // SPOTIFYGOOD: a track the other device played from autoplay (its metadata says so, a
         // librespot device's autoplay tracks and Spotify's) is an autoplay track here too:
         // Spirc's handle_transfer goes by the provider (it strips `station:`, resolves the

@@ -3253,3 +3253,246 @@ fn a_transfer_of_a_song_that_is_twice_in_the_playlist_goes_on_after_its_copy() {
     assert_eq!(next_uids(&state)[0], "uid240");
     assert_eq!(prev_uids(&state).last().map(String::as_str), Some("uid238"));
 }
+
+/// A remote play's skip_to (as the dealer's JSON gives it)
+fn skip_to(json: &str) -> crate::core::dealer::protocol::SkipTo {
+    serde_json::from_str(json).expect("skip_to")
+}
+
+// SPOTIFYGOOD: see model::StartTrack
+#[test]
+fn a_remote_plays_start_track_is_what_it_names_and_blank_names_nothing() {
+    use crate::model::{PlayingTrack, StartTrack};
+    let start = |json: &str| StartTrack::from_skip_to(Some(&skip_to(json)));
+    let tracks = context(10, 0).pages[0]
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| ProvidedTrack {
+            uri: t.uri.clone().unwrap(),
+            uid: format!("uid{i}"),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+
+    // the log of the user's phone: a play of a 960 track playlist with `track_uri: ""` (stock
+    // took the empty uri and failed the load)
+    let named = start(r#"{"track_uri": "", "track_uid": "uid7"}"#);
+    assert_eq!(named.uri, None);
+    assert_eq!(named.locate(&tracks), Some(7));
+    let playing: Option<PlayingTrack> = skip_to(r#"{"track_uri": " ", "track_uid": "uid7"}"#)
+        .try_into()
+        .ok();
+    assert!(matches!(playing, Some(PlayingTrack::Uid(ref uid)) if uid == "uid7"));
+    // with an index, or an index alone
+    assert_eq!(
+        start(r#"{"track_uri": "", "track_index": 4}"#).locate(&tracks),
+        Some(4)
+    );
+    assert!(matches!(
+        skip_to(r#"{"track_uri": "", "track_index": 4}"#)
+            .try_into()
+            .ok(),
+        Some(PlayingTrack::Index(4))
+    ));
+    // nothing at all
+    let nothing = start(r#"{"track_uri": "", "track_uid": ""}"#);
+    assert!(!nothing.is_named());
+    assert!(PlayingTrack::try_from(skip_to(r#"{"track_uri": ""}"#)).is_err());
+    // a uid that isn't there with a valid index: not found by the uid (its page may be still to
+    // come), the index once nothing else finds it
+    let unknown = start(r#"{"track_uid": "elsewhere", "track_index": 6}"#);
+    assert_eq!(unknown.locate(&tracks), None);
+    assert!(unknown.wants_more_pages(&tracks));
+    assert_eq!(unknown.valid_index(tracks.len()), Some(6));
+    // a real uri; with the uid of another song (they disagree): the uri's song
+    let uri = track_uri(3, 0);
+    assert_eq!(
+        start(&format!(r#"{{"track_uri": "{uri}"}}"#)).locate(&tracks),
+        Some(3)
+    );
+    assert_eq!(
+        start(&format!(r#"{{"track_uri": "{uri}", "track_uid": "uid8"}}"#)).locate(&tracks),
+        Some(3)
+    );
+    // a song twice in the context: the copy of the uid, or of the index
+    let mut twice = tracks.clone();
+    twice[8].uri = uri.clone();
+    assert_eq!(
+        start(&format!(r#"{{"track_uri": "{uri}", "track_uid": "uid8"}}"#)).locate(&twice),
+        Some(8)
+    );
+    assert_eq!(
+        start(&format!(r#"{{"track_uri": "{uri}", "track_index": 8}}"#)).locate(&twice),
+        Some(8)
+    );
+    // the uri of a uid the play's own pages carry
+    let mut learned = start(r#"{"track_uri": "", "track_uid": "uid9"}"#);
+    learned.learn_from_pages(&context(10, 0).pages);
+    assert_eq!(learned.uri.as_deref(), Some(track_uri(9, 0).as_str()));
+    // what else the skip_to carries is kept for the log
+    assert!(
+        skip_to(r#"{"track_uid": "u", "page_index": 2}"#)
+            .other
+            .contains_key("page_index")
+    );
+
+    // where the load starts (once the pages it waited for are there, see handle_load)
+    use crate::model::StartAt;
+    assert_eq!(named.start_at(&tracks), Some(StartAt::Index(7)));
+    assert_eq!(nothing.start_at(&tracks), None);
+    assert_eq!(unknown.start_at(&tracks), Some(StartAt::Index(6)));
+    assert_eq!(
+        start(r#"{"track_uri": "", "track_uid": "elsewhere"}"#).start_at(&tracks),
+        Some(StartAt::First)
+    );
+    assert_eq!(
+        start(r#"{"track_index": 40}"#).start_at(&tracks),
+        Some(StartAt::First)
+    );
+    let elsewhere = track_uri(50, 1);
+    assert_eq!(
+        start(&format!(r#"{{"track_uri": "{elsewhere}"}}"#)).start_at(&tracks),
+        Some(StartAt::Outside(elsewhere))
+    );
+}
+
+// SPOTIFYGOOD: see model::StartTrack and Spirc's handle_load
+#[test]
+fn a_remote_play_into_a_long_playlist_starts_at_its_track_once_its_page_is_there() {
+    use crate::model::StartTrack;
+
+    // what handle_load does with the play: the first page of a 960 track playlist is there,
+    // the other pages resolve after it (resolve_pages_until), then the track is located and the
+    // playback starts there
+    for shuffle in [false, true] {
+        let (_rt, mut state) = state(3);
+        state.reset_context(ResetContext::Completely);
+        let mut playlist = Context {
+            uri: Some(CONTEXT_URI.to_string()),
+            url: Some(format!("context://{CONTEXT_URI}")),
+            pages: vec![default_page(0..100)],
+            ..Default::default()
+        };
+        playlist.pages.extend((1..10).map(|n| ContextPage {
+            page_url: Some(format!("hm://playlist/page/{n}")),
+            ..Default::default()
+        }));
+        let remaining = state
+            .update_context(playlist, ContextType::Default)
+            .unwrap()
+            .expect("pages to come");
+        assert_eq!(remaining.len(), 9);
+        state.set_active_context(ContextType::Default);
+
+        // the user picked the 701st song on the other device: no uri, its uid (and no index)
+        let start = StartTrack::from_skip_to(Some(&skip_to(
+            r#"{"track_uri": "", "track_uid": "uid700"}"#,
+        )));
+        let mut page = 1;
+        while start.wants_more_pages(&state.get_context(ContextType::Default).unwrap().tracks) {
+            let range = page * 100..((page + 1) * 100).min(960);
+            state
+                .fill_context_from_page(default_page(range), ContextType::Default)
+                .unwrap();
+            page += 1;
+        }
+        assert_eq!(page, 8, "it waited for the page of its track, not more");
+        let index = start
+            .locate(&state.get_context(ContextType::Default).unwrap().tracks)
+            .expect("located");
+        assert_eq!(index, 700);
+
+        state.set_current_track(index).unwrap();
+        if shuffle {
+            state.set_shuffle(true);
+            state.shuffle_new().unwrap();
+        } else {
+            state.reset_playback_to_position(Some(index)).unwrap();
+        }
+        assert_eq!(state.current_track(|t| t.uid.clone()), "uid700");
+        let next = next_uids(&state);
+        if shuffle {
+            assert!(!next.contains(&"uid700".to_string()), "{next:?}");
+            assert!(state.shuffling_context());
+        } else {
+            assert_eq!(next[..3], uids(701..704));
+            assert_eq!(prev_uids(&state).last().map(String::as_str), Some("uid699"));
+        }
+    }
+}
+
+// SPOTIFYGOOD: see model::StartTrack and the Play arm of Spirc's handle_request
+#[test]
+fn a_remote_play_with_an_empty_track_uri_parses_with_its_uid() {
+    use crate::{
+        core::dealer::protocol::{Command, Request},
+        model::StartTrack,
+    };
+    let json = format!(
+        r#"{{
+            "message_id": 7,
+            "sent_by_device_id": "desktop",
+            "command": {{
+                "endpoint": "play",
+                "context": {{
+                    "uri": "{CONTEXT_URI}",
+                    "url": "context://{CONTEXT_URI}",
+                    "metadata": {{"enable_continue_listening": "false"}}
+                }},
+                "play_origin": {{"feature_identifier": "playlist", "referrer_identifier": "your_library"}},
+                "options": {{
+                    "license": "tft",
+                    "skip_to": {{"track_uid": "uid700", "track_uri": ""}},
+                    "player_options_override": {{}},
+                    "prepare_play_options": {{"always_play_something": false}}
+                }},
+                "logging_params": {{"command_id": "x"}}
+            }}
+        }}"#
+    );
+    let request: Request = serde_json::from_str(&json).expect("request");
+    let Command::Play(play) = request.command else {
+        panic!("not a play")
+    };
+    let start = StartTrack::from_skip_to(play.options.skip_to.as_ref());
+    assert_eq!(start.uid.as_deref(), Some("uid700"));
+    assert_eq!(start.uri, None);
+    assert!(play.options.other.contains_key("prepare_play_options"));
+    // the line Spirc logs of it
+    let line =
+        crate::spirc::describe_remote_play(&play.context, &play.play_origin, &play.options, &start);
+    assert!(
+        line.contains("uid700") && line.contains("prepare_play_options"),
+        "{line}"
+    );
+}
+
+// SPOTIFYGOOD: see ConnectState::current_track_from_transfer
+#[test]
+fn a_transferred_track_named_by_its_uid_alone_is_its_pages_track() {
+    use crate::protocol::{
+        playback::Playback, session::Session as PlayingSession, transfer_state::TransferState,
+    };
+    let (_rt, state) = state(3);
+    let transfer = TransferState {
+        playback: MessageField::some(Playback {
+            current_track: MessageField::some(ContextTrack {
+                uri: Some(String::new()),
+                uid: Some("uid4".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        current_session: MessageField::some(PlayingSession {
+            context: MessageField::some(context(10, 0)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let track = state
+        .current_track_from_transfer(&transfer)
+        .expect("its track");
+    assert_eq!(track.uri, track_uri(4, 0));
+    assert_eq!(track.uid, "uid4");
+}
