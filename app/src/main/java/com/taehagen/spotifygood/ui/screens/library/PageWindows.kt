@@ -110,9 +110,19 @@ internal class PageWindows<T>(
      */
     fun hide() {
         settle?.cancel()
-        loads.values.forEach(Job::cancel)
-        loads.clear()
+        cancelLoads()
         wanted = IntRange.EMPTY
+    }
+
+    /**
+     * Cancels every load, out of [loads] first: a load waiting on the main thread (a retry's delay
+     * or [ready]) completes inside cancel() under Main.immediate, and its completion handler would
+     * remove itself from the map mid-iteration.
+     */
+    private fun cancelLoads() {
+        val pending = loads.values.toList()
+        loads.clear()
+        pending.forEach(Job::cancel)
     }
 
     /** Loads [page]; a retry waits [wait], then for [ready]. [failures]: its failed loads in a row. */
@@ -186,8 +196,7 @@ internal class PageWindows<T>(
     fun clear() {
         generation++
         settle?.cancel()
-        loads.values.forEach(Job::cancel)
-        loads.clear()
+        cancelLoads()
         partial.clear()
         wanted = IntRange.EMPTY
         if (!_windows.value.isEmpty) _windows.value = RowWindows(pageSize)

@@ -3,10 +3,12 @@ package com.taehagen.spotifygood.ui.screens.library
 import com.taehagen.spotifygood.data.ResponseCache
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -27,7 +29,12 @@ class PageWindowsTest {
      * [gate], if set). The next [fail] fetches fail, the next [partial] come back partial ("?"
      * rows); retries wait for [online].
      */
-    private class Fixture(scope: TestScope, val rows: (Int) -> String, total: Int) {
+    private class Fixture(
+        scope: TestScope,
+        val rows: (Int) -> String,
+        total: Int,
+        windowScope: CoroutineScope = scope.backgroundScope,
+    ) {
         val fetched = mutableListOf<Int>()
         val times = mutableListOf<Long>()
         val cancelled = mutableListOf<Int>()
@@ -36,7 +43,7 @@ class PageWindowsTest {
         var partial = 0
         val online = MutableStateFlow(true)
         val windows = PageWindows(
-            scope.backgroundScope,
+            windowScope,
             pageSize = 100,
             maxPages = 4,
             ready = { online.first { it } },
@@ -259,6 +266,26 @@ class PageWindowsTest {
         advanceTimeBy(WINDOW_RETRY_MAX_MS * 10)
         runCurrent()
         assertEquals(listOf(2_000), f.fetched)
+    }
+
+    @Test
+    fun loadsWaitingToRetryCancelInPlaceWithoutBreakingHideOrClear() = runTest {
+        // Main.immediate on the main thread: a load waiting in its retry delay completes inside
+        // cancel() (as with an unconfined dispatcher), and leaves the map as it completes.
+        val unconfined = CoroutineScope(backgroundScope.coroutineContext + UnconfinedTestDispatcher(testScheduler))
+        for (forget in listOf(false, true)) {
+            val f = Fixture(this, ::row, total, unconfined)
+            f.fail = 100
+            // Rows 1,495–1,505: pages 14 and 15 both load, fail and wait to retry.
+            f.windows.show(1_495, 1_505, from = 100, total = total)
+            settle()
+            assertEquals("both waiting to retry", setOf(14, 15), f.windows.loading)
+            if (forget) f.windows.clear() else f.windows.hide()
+            assertTrue(f.windows.loading.isEmpty())
+            advanceTimeBy(WINDOW_RETRY_MAX_MS * 10)
+            runCurrent()
+            assertEquals(listOf(1_400, 1_500), f.fetched.sorted())
+        }
     }
 
     @Test
