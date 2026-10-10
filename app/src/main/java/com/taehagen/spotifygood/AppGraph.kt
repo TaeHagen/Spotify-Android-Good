@@ -41,6 +41,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -159,8 +160,8 @@ class AppGraph(val app: Application) {
     val library: LibraryRepository by lazy {
         LibraryRepository(appScope, rpc, responseCache, engine.isOnline, episodeProgress).also { repo ->
             // The playlists' current revisions: a mosaic learned at another is learned again.
-            repo.onRootlist = { rootlist ->
-                playlistMosaics.noteRevisions(rootlist.flatPlaylists().mapNotNull { e -> e.uri?.let { u -> e.revision?.let { u to it } } }.toMap())
+            repo.onRootlist = { rootlist, fetched ->
+                playlistMosaics.noteRevisions(rootlist.flatPlaylists().mapNotNull { e -> e.uri?.let { u -> e.revision?.let { u to it } } }.toMap(), fetched)
             }
         }
     }
@@ -176,6 +177,8 @@ class AppGraph(val app: Application) {
         ).also { store ->
             // An edit made here: its first items may have changed.
             appScope.launch { library.edits.collect { if (it is LibraryEdit.PlaylistEdited) store.invalidate(it.uri) } }
+            // Rows shown while the session was still connecting (a cold start) fill in once it is online.
+            appScope.launch { engine.isOnline.filter { it }.collect { store.onOnline() } }
         }
     }
     val search: SearchRepository by lazy { SearchRepository(rpc, database.recentSearches(), episodeProgress) }

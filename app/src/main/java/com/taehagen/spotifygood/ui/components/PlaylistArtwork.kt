@@ -30,21 +30,21 @@ import com.taehagen.spotifygood.data.MOSAIC_TILES
 import com.taehagen.spotifygood.data.PlaylistMosaic
 import com.taehagen.spotifygood.data.mosaicTiles
 import com.taehagen.spotifygood.data.needsMosaic
-import kotlinx.coroutines.flow.filter
 
 // The art of a playlist without an image of its own (docs §9.8): the 2x2 mosaic of its first
 // songs' covers, edge to edge, as Spotify draws it.
 
 /**
  * The mosaic of the playlist [uri], learned when first shown (bounded, [com.taehagen.spotifygood.data.PlaylistMosaicStore]):
- * what memory held at once, then the store's answer, and again whenever it changes.
+ * what memory held at once, then the store's answer, and again whenever it changes, goes stale or
+ * the session comes online to learn it. Leaving the screen stops waiting for it.
  */
 @Composable
 fun rememberPlaylistMosaic(uri: String): PlaylistMosaic? {
     val store = rememberAppGraph().playlistMosaics
     val mosaic by produceState(store.peek(uri), uri, store) {
         value = store.mosaic(uri)
-        store.changes.filter { it == uri }.collect { value = store.mosaic(uri) }
+        store.changesOf(uri).collect { value = store.mosaic(uri) }
     }
     return mosaic
 }

@@ -9,9 +9,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.merge
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -100,11 +104,14 @@ private fun coverOf(item: PlaylistItem): List<Image>? {
 /**
  * The mosaics of playlists without an image of their own, learned from their first items (one
  * small first page each, [MOSAIC_SCAN] items) only when such a playlist is shown, at most
- * [concurrency] at a time and once per playlist at a time. Kept per playlist revision in memory and
- * in the response cache, so a long library scrolled through again fetches nothing: a mosaic is
- * learned again when the library lists the playlist at another revision ([noteRevisions]), after
- * an edit made here ([invalidate]; the cache row goes stale with the playlist's), or after
- * [TTL_MS] for a playlist whose revision isn't known (Home, Search). Offline, the downloaded rows.
+ * [concurrency] at a time and once per playlist at a time; a learn still waiting for its turn when
+ * no row awaits it any more (they left the screen) is dropped, so the rows on screen don't queue
+ * behind it. Kept per playlist revision in memory and in the response cache, so a long library
+ * scrolled through again fetches nothing: a mosaic is learned again when the library lists the
+ * playlist at another revision ([noteRevisions]; the rows showing it ask again), after an edit
+ * made here ([invalidate]; the cache row goes stale with the playlist's), or after [TTL_MS] for a
+ * playlist whose revision isn't known (Home, Search). Offline, the downloaded rows; one not
+ * downloaded is asked for again by its rows once the session is online ([onOnline]).
  */
 class PlaylistMosaicStore internal constructor(
     private val scope: CoroutineScope,
@@ -119,6 +126,16 @@ class PlaylistMosaicStore internal constructor(
 ) {
     private class Entry(val mosaic: PlaylistMosaic, val at: Long)
 
+    /**
+     * A learn in flight, shared by its [askers]. The last of them gone before it got a permit, it is
+     * dropped; once [fetching], it finishes and is kept whoever still awaits it.
+     */
+    private class Learn {
+        lateinit var job: Deferred<PlaylistMosaic?>
+        var askers = 0
+        var fetching = false
+    }
+
     private val lock = Any()
     /** Least recently used first. */
     private val memory = object : LinkedHashMap<String, Entry>(64, 0.75f, true) {
@@ -128,12 +145,26 @@ class PlaylistMosaicStore internal constructor(
     private val listed = ConcurrentHashMap<String, String>()
     /** When a learn of a playlist last failed: not tried again before [RETRY_MS]. */
     private val failedAt = ConcurrentHashMap<String, Long>()
-    private val inFlight = HashMap<String, Deferred<PlaylistMosaic?>>()
+    private val inFlight = HashMap<String, Learn>()
     private val permits = Semaphore(concurrency)
     private val _changes = MutableSharedFlow<String>(extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    /**
+     * Counts the times many rows may have to ask again at once: the session came online
+     * ([onOnline]), the library listed playlists at other revisions ([noteRevisions]). Each row
+     * checks it against its own playlist ([asksAgain]): one conflated value, so none is lost however
+     * many playlists that concerns (per-playlist [_changes] would drop some past its buffer).
+     */
+    private val recheck = MutableStateFlow(0)
+    /** Playlists not learned because the session was offline (and not downloaded), with the [recheck] count then. */
+    private val waitingOnline = ConcurrentHashMap<String, Int>()
 
-    /** A playlist whose mosaic changed (or went stale): its artwork asks [mosaic] again. */
-    val changes: SharedFlow<String> = _changes.asSharedFlow()
+    /**
+     * When a row of [uri] asks [mosaic] again: its mosaic changed or went stale (learned, edited
+     * here, recorded from its open page, listed at another revision), or the session came online to
+     * learn one skipped for want of it.
+     */
+    fun changesOf(uri: String): Flow<Unit> =
+        merge(_changes.filter { it == uri }.map { }, recheck.filter { asksAgain(uri, it) }.map { })
 
     init {
         cache?.addClearListener { clearMemory() }
@@ -168,14 +199,25 @@ class PlaylistMosaicStore internal constructor(
     }
 
     /**
-     * The library lists these playlists at these revisions (the rootlist's): a mosaic learned
-     * while it listed another goes stale (learned again when shown).
+     * The library lists these playlists at these revisions (the rootlist's; not [fetched]: the
+     * cached one, which only fills in what no fetch has told yet): a mosaic learned while it listed
+     * another goes stale, learned again when shown, and the rows showing it now ask again.
      */
-    fun noteRevisions(current: Map<String, String>) {
+    fun noteRevisions(current: Map<String, String>, fetched: Boolean = true) {
+        var changed = false
         for ((uri, revision) in current) {
-            val previous = listed.put(uri, revision)
-            if (previous != null && previous != revision) _changes.tryEmit(uri)
+            if (fetched) {
+                if (listed.put(uri, revision) != revision) changed = true
+            } else if (listed.putIfAbsent(uri, revision) == null) {
+                changed = true
+            }
         }
+        if (changed) recheck.update { it + 1 }
+    }
+
+    /** The session is online: the rows of playlists skipped for want of it ask again. */
+    fun onOnline() {
+        recheck.update { it + 1 }
     }
 
     /** [uri] was edited here: its mosaic is learned again when shown. */
@@ -189,6 +231,19 @@ class PlaylistMosaicStore internal constructor(
         synchronized(lock) { memory.clear() }
         listed.clear()
         failedAt.clear()
+        waitingOnline.clear()
+    }
+
+    /**
+     * Whether a row of [uri] asks again at the [recheck] [count]: skipped offline before it, or what
+     * memory keeps went stale (not while a failed learn waits [RETRY_MS]).
+     */
+    private fun asksAgain(uri: String, count: Int): Boolean {
+        waitingOnline[uri]?.let { return it < count }
+        val kept = synchronized(lock) { memory[uri] } ?: return false
+        if (valid(uri, kept)) return false
+        val failed = failedAt[uri]
+        return failed == null || clock() - failed >= RETRY_MS
     }
 
     private fun valid(uri: String, entry: Entry): Boolean {
@@ -198,22 +253,47 @@ class PlaylistMosaicStore internal constructor(
     }
 
     private suspend fun learn(uri: String): PlaylistMosaic? {
-        val job = synchronized(lock) {
-            inFlight[uri] ?: scope.async { permits.withPermit { fetch(uri) } }.also { started ->
+        val learn = synchronized(lock) {
+            val shared = inFlight[uri] ?: Learn().also { started ->
+                started.job = scope.async {
+                    permits.withPermit {
+                        synchronized(lock) { started.fetching = true }
+                        fetch(uri)
+                    }
+                }
                 inFlight[uri] = started
-                started.invokeOnCompletion { synchronized(lock) { if (inFlight[uri] === started) inFlight.remove(uri) } }
+                started.job.invokeOnCompletion { synchronized(lock) { if (inFlight[uri] === started) inFlight.remove(uri) } }
+            }
+            shared.also { it.askers++ }
+        }
+        try {
+            return learn.job.await()
+        } finally {
+            synchronized(lock) {
+                learn.askers--
+                // No row awaits it any more (they left the screen) and it hasn't started: it gives way.
+                if (learn.askers == 0 && !learn.fetching && inFlight[uri] === learn) {
+                    inFlight.remove(uri)
+                    learn.job.cancel()
+                }
             }
         }
-        return job.await()
     }
 
     private suspend fun fetch(uri: String): PlaylistMosaic? {
         val listedNow = listed[uri]
+        // Read before the session's state: coming online after this asks it again.
+        val count = recheck.value
         val tried = online()
         val mosaic = (if (tried) fetchOnline(uri, listedNow) else null) ?: fetchDownloaded(uri, listedNow)
         if (mosaic == null) {
-            // Offline without a download: tried again as soon as it is shown online.
-            if (tried) failedAt[uri] = clock()
+            if (tried) {
+                failedAt[uri] = clock()
+                waitingOnline.remove(uri)
+            } else {
+                // Offline without a download: its rows ask again once the session is online.
+                waitingOnline[uri] = count
+            }
             return null
         }
         failedAt.remove(uri)
@@ -244,6 +324,7 @@ class PlaylistMosaicStore internal constructor(
 
     private fun store(uri: String, mosaic: PlaylistMosaic) {
         synchronized(lock) { memory[uri] = Entry(mosaic, clock()) }
+        waitingOnline.remove(uri)
         val target = cache ?: return
         scope.launch {
             try {
