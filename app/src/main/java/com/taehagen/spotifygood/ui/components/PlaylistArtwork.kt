@@ -86,16 +86,7 @@ fun MosaicArtwork(urls: List<String?>, contentDescription: String?, modifier: Mo
     val requests = remember(urls, context) {
         urls.map { url -> url?.takeIf { it.isNotBlank() }?.let { ImageRequest.Builder(context).data(imageData(it)).crossfade(true).build() } }
     }
-    Layout(
-        content = {
-            requests.forEach { request ->
-                if (request != null) {
-                    AsyncImage(model = request, contentDescription = null, contentScale = ContentScale.Crop)
-                } else {
-                    Box(Modifier)
-                }
-            }
-        },
+    MosaicLayout(
         modifier = modifier
             .clip(shape)
             .background(MaterialTheme.colorScheme.surfaceVariant)
@@ -109,7 +100,21 @@ fun MosaicArtwork(urls: List<String?>, contentDescription: String?, modifier: Mo
                     Modifier
                 },
             ),
-    ) { measurables, constraints ->
+    ) {
+        requests.forEach { request ->
+            if (request != null) {
+                AsyncImage(model = request, contentDescription = null, contentScale = ContentScale.Crop)
+            } else {
+                Box(Modifier)
+            }
+        }
+    }
+}
+
+/** Lays its first [MOSAIC_TILES] children out as the tiles of a mosaic: exact quarters ([mosaicTiles]), edge to edge. */
+@Composable
+internal fun MosaicLayout(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    Layout(content = content, modifier = modifier) { measurables, constraints ->
         val width = if (constraints.hasBoundedWidth) constraints.maxWidth else constraints.minWidth
         val height = if (constraints.hasBoundedHeight) constraints.maxHeight else width
         val tiles = mosaicTiles(width, height)
