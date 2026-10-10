@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Home-screen now-playing widget (owner: widget). Like, shuffle, ±15 s and "Playing on" use the
+     media session's strings (strings_playback.xml). -->
+<resources>
+    <!-- Widget picker -->
+    <string name="widget_label">Now playing</string>
+    <string name="widget_description">See and control what\'s playing, on this phone or a Spotify Connect device</string>
+    <!-- Picker preview: sample track -->
+    <string name="widget_preview_title">Song title</string>
+    <string name="widget_preview_artist">Artist</string>
+
+    <!-- Content descriptions of the buttons -->
+    <string name="widget_play">Play</string>
+    <string name="widget_pause">Pause</string>
+    <string name="widget_previous">Previous</string>
+    <string name="widget_next">Next</string>
+    <!-- Content description of the artwork-only layouts: "<title>, <artist>. Open Now Playing" -->
+    <string name="widget_open_player">%1$s. Open Now Playing</string>
+
+    <!-- Logged in, nothing to play or resume -->
+    <string name="widget_nothing_playing">Nothing playing</string>
+    <string name="widget_nothing_playing_text">Pick something in SpotifyGood</string>
+
+    <!-- Logged out -->
+    <string name="widget_sign_in_text">Sign in to start listening</string>
+</resources>

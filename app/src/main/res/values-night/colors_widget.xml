@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Home-screen widget below Android 12, dark: the app's dark palette (near-black, brand green). -->
+<resources>
+    <color name="widget_background">#FF181818</color>
+    <color name="widget_on_surface">#FFFFFFFF</color>
+    <color name="widget_on_surface_variant">#FFB3B3B3</color>
+    <color name="widget_primary">#FF1ED760</color>
+    <color name="widget_on_primary">#FF000000</color>
+    <color name="widget_surface_variant">#FF2A2A2A</color>
+</resources>
