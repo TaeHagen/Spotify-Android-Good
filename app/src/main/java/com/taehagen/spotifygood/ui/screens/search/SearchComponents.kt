@@ -66,7 +66,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -86,7 +88,9 @@ import com.taehagen.spotifygood.ui.components.ErrorState
 import com.taehagen.spotifygood.ui.components.MediaRow
 import com.taehagen.spotifygood.ui.components.PlayFab
 import com.taehagen.spotifygood.ui.components.PlaylistArtwork
+import com.taehagen.spotifygood.ui.components.SwipeToQueueRow
 import com.taehagen.spotifygood.ui.components.TrackRow
+import com.taehagen.spotifygood.ui.components.rememberRowQueueAdd
 import com.taehagen.spotifygood.ui.screens.library.LoadMoreEffect
 import com.taehagen.spotifygood.ui.screens.library.NowPlaying
 import com.taehagen.spotifygood.ui.screens.library.PagedState
@@ -245,13 +249,26 @@ internal fun RecentSearchRow(item: RecentSearch, onClick: () -> Unit, onRemove: 
         }
     }
     when (item) {
-        is RecentSearch.Item -> MediaRow(
-            ref = item.ref,
-            onClick = onClick,
-            subtitle = typedSubtitle(item.ref.type, item.ref.subtitle),
-            trailing = remove,
-            modifier = modifier,
-        )
+        is RecentSearch.Item -> {
+            // A song or an episode swipes into the queue, as in the results (docs §9.9).
+            val queueUri = item.queueUri()
+            val onQueue = rememberRowQueueAdd(eligible = queueUri != null, uri = queueUri.orEmpty())
+            val queueLabel = stringResource(R.string.shell_action_add_to_queue)
+            SwipeToQueueRow(onQueue, modifier) { slide ->
+                MediaRow(
+                    ref = item.ref,
+                    onClick = onClick,
+                    subtitle = typedSubtitle(item.ref.type, item.ref.subtitle),
+                    trailing = remove,
+                    // TalkBack's way to the swipe (as on TrackRow).
+                    modifier = if (onQueue == null) {
+                        slide
+                    } else {
+                        slide.semantics { customActions = listOf(CustomAccessibilityAction(queueLabel) { onQueue(); true }) }
+                    },
+                )
+            }
+        }
         is RecentSearch.Query -> Row(
             modifier = modifier
                 .fillMaxWidth()

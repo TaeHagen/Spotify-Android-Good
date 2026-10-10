@@ -1,6 +1,7 @@
 package com.taehagen.spotifygood.ui.screens.search
 
 import androidx.compose.runtime.Immutable
+import com.taehagen.spotifygood.data.RecentSearch
 import com.taehagen.spotifygood.data.SearchType
 import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.ArtistRef
@@ -12,6 +13,7 @@ import com.taehagen.spotifygood.model.SearchResults
 import com.taehagen.spotifygood.model.ShowRef
 import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
+import com.taehagen.spotifygood.ui.navigation.SpotifyLinks
 import com.taehagen.spotifygood.ui.screens.album.isSameContext
 import com.taehagen.spotifygood.ui.screens.library.BrowseError
 import com.taehagen.spotifygood.ui.screens.library.NowPlaying
@@ -113,6 +115,16 @@ val SearchItem?.isPlayable: Boolean
         is SearchItem.EpisodeItem -> episode.playable
         else -> true
     }
+
+/**
+ * What a recent search's row adds to the queue when swiped start→end (docs §9.9): a song's or an
+ * episode's URI (canonical, as a tap opens it); null for a query or anything else (a plain row).
+ */
+fun RecentSearch.queueUri(): String? {
+    val ref = (this as? RecentSearch.Item)?.ref ?: return null
+    if (ref.type != MediaType.TRACK && ref.type != MediaType.EPISODE) return null
+    return SpotifyLinks.canonicalUri(ref.uri) ?: ref.uri
+}
 
 /**
  * Whether the top result [ref] is what plays (or is paused): its track / episode, or its context
