@@ -427,6 +427,8 @@ private fun QueueTrackRow(
         subtitleOverride = if (track.isEpisode) track.artistLine else null,
         isSuggestion = isSuggestion,
         onMoreClick = onMoreClick,
+        // Already the queue (its rows reorder and go instead).
+        swipeToQueue = false,
         trailing = trailing,
     )
 }
