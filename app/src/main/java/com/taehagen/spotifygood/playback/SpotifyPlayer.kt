@@ -50,7 +50,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * Every handler sends a command through [PlayerController] and completes once the engine's next
  * snapshot arrives (bounded), so controllers see the optimistic placeholder state instead of a
- * flicker back to the old state. Main thread only; call [refresh] whenever an input changed.
+ * flicker back to the old state (suppressed like the state itself while it shows another device,
+ * [getPlaceholderState]). Main thread only; call [refresh] whenever an input changed.
  */
 internal class SpotifyPlayer(
     context: Context,
@@ -92,6 +93,8 @@ internal class SpotifyPlayer(
     /** Last remote volume we sent, so quick volume-key steps accumulate before the snapshot catches up. */
     private val remoteVolume = RemoteVolumeTarget(SystemClock::elapsedRealtime)
     private var remoteVolumeExpiry: Job? = null
+    /** The media session's last load ([handleSetMediaItems]): it plays on this phone ([getPlaceholderState]). */
+    private var sessionLoad: ListenableFuture<*>? = null
 
     private data class ItemKey(
         val track: PlaybackTrack,
@@ -109,8 +112,8 @@ internal class SpotifyPlayer(
     fun refresh() = invalidateState()
 
     /**
-     * The published state reads paused while another device plays (suppressed, [RemotePlayback]):
-     * what controllers see now. Main thread.
+     * The published state reads paused while another device plays, or a play of it is pending
+     * (suppressed, [RemotePlayback]): what controllers see now. Main thread.
      */
     val readsPaused: Boolean get() = playbackSuppressionReason != PLAYBACK_SUPPRESSION_REASON_NONE
 
@@ -222,6 +225,29 @@ internal class SpotifyPlayer(
                 .setPlayerError(error)
         }
         return builder.build()
+    }
+
+    /**
+     * Media3 publishes this while a command is pending (`invalidateState` waits for it): a play of
+     * another, paused device from the notification, lock screen, widget, Auto, Wear or a headset
+     * reads playing until that device reports playing (the round trip, then up to [SETTLE_MS]).
+     * With a Bluetooth output connected it reads paused instead, as the state that follows does
+     * ([RemotePlayback.placeholderSuppression]); a media session load plays here and reads playing.
+     */
+    override fun getPlaceholderState(suggestedPlaceholderState: State): State {
+        val suggested = suggestedPlaceholderState
+        val reason = RemotePlayback.placeholderSuppression(
+            playback.snapshot.value,
+            playWhenReady = suggested.playWhenReady,
+            suggested = suggested.playbackSuppressionReason,
+            bluetoothOutput = bluetoothOutput(),
+            localLoadPending = sessionLoad?.isDone == false,
+        )
+        return if (reason == suggested.playbackSuppressionReason) {
+            suggested
+        } else {
+            suggested.buildUpon().setPlaybackSuppressionReason(reason).build()
+        }
     }
 
     private fun buildItems(w: QueueWindow, s: PlaybackSnapshot, remoteName: String?): List<MediaItemData> {
@@ -390,6 +416,7 @@ internal class SpotifyPlayer(
         // the pending Connect target nor on another active device: in a car, a speaker at home
         // would be wrong (and the stored session must not overwrite what it plays now).
         return trackLoad(controller.playAsync(withModes, toPendingTarget = false, onThisPhone = true))
+            .also { sessionLoad = it }
     }
 
     /** A controller's speed for the podcast speed (pitch is always kept). */
