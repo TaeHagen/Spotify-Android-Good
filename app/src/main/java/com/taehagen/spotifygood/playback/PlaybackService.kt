@@ -175,6 +175,7 @@ class PlaybackService : MediaLibraryService() {
         )
         remoteVolumeKeys = RemoteVolumeKeys(
             context = this,
+            sessionActivity = sessionActivity(),
             setVolume = { percent -> player.setDeviceVolume(percent, 0) },
             adjustVolume = { direction -> if (direction > 0) player.increaseDeviceVolume(0) else player.decreaseDeviceVolume(0) },
             playRequested = { caller ->

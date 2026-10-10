@@ -9,7 +9,6 @@ import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
 import android.util.Log
-import com.taehagen.spotifygood.MainActivity
 
 /**
  * The hardware volume keys for another Connect device while it plays (docs/ARCHITECTURE.md §9.4).
@@ -25,6 +24,8 @@ import com.taehagen.spotifygood.MainActivity
  */
 internal class RemoteVolumeKeys(
     private val context: Context,
+    /** Opens the app, as the media session's activity does. */
+    private val sessionActivity: PendingIntent?,
     /** Sets the remote volume (percent). */
     private val setVolume: (Int) -> Unit,
     /** Raises (`> 0`) or lowers (`< 0`) the remote volume one step. */
@@ -98,9 +99,7 @@ internal class RemoteVolumeKeys(
                     override fun onSkipToPrevious() = previousRequested()
                 },
             )
-            s.setSessionActivity(
-                PendingIntent.getActivity(context, REQUEST_OPEN, MainActivity.launchIntent(context), PendingIntent.FLAG_IMMUTABLE),
-            )
+            sessionActivity?.let(s::setSessionActivity)
             session = s
         }
     } catch (e: RuntimeException) {
@@ -111,7 +110,7 @@ internal class RemoteVolumeKeys(
     private fun caller(s: MediaSession): String? =
         if (Build.VERSION.SDK_INT >= 28) runCatching { s.currentControllerInfo.packageName }.getOrNull() else null
 
-    private fun newProvider(volume: Int) = object : VolumeProvider(VOLUME_CONTROL_ABSOLUTE, MAX_VOLUME, volume) {
+    private fun newProvider(volume: Int) = object : VolumeProvider(VolumeProvider.VOLUME_CONTROL_ABSOLUTE, MAX_VOLUME, volume) {
         override fun onSetVolumeTo(volume: Int) {
             val target = volume.coerceIn(0, MAX_VOLUME)
             currentVolume = target
@@ -129,7 +128,6 @@ internal class RemoteVolumeKeys(
     private companion object {
         const val TAG = "RemoteVolumeKeys"
         const val MAX_VOLUME = 100
-        const val REQUEST_OPEN = 6
         const val ACTIONS = PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
             PlaybackState.ACTION_STOP or PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS
     }
