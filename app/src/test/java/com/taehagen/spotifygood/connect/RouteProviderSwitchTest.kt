@@ -165,6 +165,13 @@ class RouteProviderSwitchTest {
         assertEquals(COMPONENT_ENABLED_STATE_DEFAULT, setting.state)
     }
 
+    @Test
+    fun theProviderIsNamedWithoutLoadingItsClass() {
+        // Provider builds its ComponentName from this name, so App.onCreate never loads the API 30
+        // class below Android 11; the name must still be the service's.
+        assertEquals(ConnectRouteProviderService::class.java.name, RouteProviderSwitch.PROVIDER_CLASS)
+    }
+
     private companion object {
         const val SETTLE = 2_000L
     }
