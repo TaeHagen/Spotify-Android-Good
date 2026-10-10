@@ -59,6 +59,22 @@ class CatalogRepository(
         rpc.callOffMain("catalog.playlistUris", rpcArgs { put("uri", uri); put("offset", offset); put("limit", limit) })
 
     /**
+     * The playlist's current revision, from the smallest request that tells it: one item's URI, no
+     * metadata (the open page's check for changes made elsewhere, docs §9.9).
+     */
+    suspend fun playlistRevision(uri: String): String? = playlistUrisPage(uri, 0, 1).revision
+
+    /**
+     * The cached pages of playlist [uri] go stale without reloading what shows them (it changed
+     * elsewhere; the page on screen refreshes itself): a reopened page revalidates. No request.
+     */
+    suspend fun markPlaylistStale(uri: String) {
+        cache.markStalePrefix(CacheKeys.playlistPrefix(uri))
+        val canonical = SpotifyUris.playlistKey(uri)
+        if (canonical != uri) cache.markStalePrefix(CacheKeys.playlistPrefix(canonical))
+    }
+
+    /**
      * A playlist's tracks and episodes in order (local files and other entries left out, as the
      * queue and other playlists can't take them), for a whole-playlist action: "Add to queue",
      * "Add to other playlist". At most [PLAYLIST_MAX_ITEMS] (no playlist holds more), URIs only

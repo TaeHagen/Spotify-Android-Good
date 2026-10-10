@@ -191,6 +191,32 @@ class ResponseCache(
         invalidations.tryEmit(Invalidation(prefix, prefix = true))
     }
 
+    /**
+     * Marks every key starting with [prefix] stale without reloading the [live] flows that show
+     * them: whoever shows one decides when to refetch (a change pushed while its page is in the
+     * background), the next collection revalidates it. No request.
+     */
+    suspend fun markStalePrefix(prefix: String) {
+        try {
+            dao.markStale(prefix)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "markStale $prefix* failed", e)
+        }
+    }
+
+    /** [markStalePrefix] for one [key]. */
+    suspend fun markStale(key: String) {
+        try {
+            dao.markStaleKey(key)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "markStale $key failed", e)
+        }
+    }
+
     suspend fun clear() {
         dao.clear()
         clearListeners.forEach { runCatching(it) }

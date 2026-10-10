@@ -135,9 +135,14 @@ impl WebsocketMessage {
 
         let payload = self.payloads.pop().ok_or(ProtocolError::Empty)?;
         let bytes = match payload {
-            MessagePayloadValue::String(string) => BASE64_STANDARD
-                .decode(string)
-                .map_err(ProtocolError::Base64)?,
+            // SPOTIFYGOOD: some messages, such as the collection updates
+            // (`hm://collection/collection/<user>/json`), carry plain JSON text instead of base64:
+            // they were dropped with a base64 warning. Passed on as JSON, as upstream does since
+            // librespot PR #1786.
+            MessagePayloadValue::String(string) => match BASE64_STANDARD.decode(&string) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(PayloadValue::Json(string)),
+            },
             MessagePayloadValue::Bytes(bytes) => bytes,
             MessagePayloadValue::Json(json) => return Ok(PayloadValue::Json(json.to_string())),
         };
@@ -192,5 +197,41 @@ fn handle_transfer_encoding(
             "read bytes mismatched with expected bytes",
         )),
         Err(why) => Err(ProtocolError::GZip(why).into()),
+    }
+}
+
+// SPOTIFYGOOD: the payload forms a message arrives in
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(json: &str) -> WebsocketMessage {
+        serde_json::from_str(json).expect("a dealer message")
+    }
+
+    #[test]
+    fn plain_json_text_is_passed_on_as_json() {
+        let mut msg = message(
+            r#"{"type":"message","uri":"hm://collection/collection/alice/json","headers":{},
+                "payloads":["{\"items\":[{\"type\":\"track\",\"identifier\":\"4uLU6hMCjMI75M1A2tKUQC\",\"removed\":false}]}"]}"#,
+        );
+        match msg.handle_payload() {
+            Ok(PayloadValue::Json(text)) => assert!(text.starts_with("{\"items\"")),
+            other => panic!("expected JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn base64_is_still_decoded() {
+        // "\x0a\x02hi" in base64
+        let mut msg = message(
+            r#"{"type":"message","uri":"hm://playlist/v2/playlist/x","payloads":["CgJoaQ=="]}"#,
+        );
+        match msg.handle_payload() {
+            Ok(PayloadValue::Raw(bytes)) => assert_eq!(bytes, b"\x0a\x02hi"),
+            other => panic!("expected bytes, got {other:?}"),
+        }
+        let mut empty = message(r#"{"type":"message","uri":"hm://playlist/v2/playlist/x"}"#);
+        assert!(matches!(empty.handle_payload(), Ok(PayloadValue::Empty)));
     }
 }

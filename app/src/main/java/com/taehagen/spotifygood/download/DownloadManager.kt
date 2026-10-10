@@ -1461,6 +1461,20 @@ class DownloadManager(
     }
 
     /**
+     * Spotify pushed a change of Liked Songs (a song liked or unliked on another device): a
+     * downloaded Liked Songs syncs, as [requestSync] paces it (at most every few minutes).
+     */
+    suspend fun requestLikedSongsSync() {
+        try {
+            collectionDao.syncStates().filter { it.type == CollectionType.LIKED_SONGS.wire }.forEach { requestSync(it.uri) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not ask Liked Songs to sync", e)
+        }
+    }
+
+    /**
      * In the foreground and online: re-lists the downloaded Liked Songs and playlists whose last sync
      * is [DownloadRules.FOREGROUND_STALE_MS] old (they change on other devices; albums and shows keep
      * the daily cadence), so opening the app picks up remote changes also when the session stayed

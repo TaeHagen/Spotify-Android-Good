@@ -15,6 +15,7 @@
 use super::{config, player_host, state};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{EngineSettings, StoredCredentials};
+use crate::catalog::push::{self, PushTask};
 use crate::connect;
 use librespot_connect::Spirc;
 use librespot_core::authentication::Credentials;
@@ -49,6 +50,9 @@ pub(crate) struct Live {
 pub(crate) struct Device {
     pub spirc: Arc<Spirc>,
     pub task: JoinHandle<()>,
+    /// The library push listener on Spirc's dealer (`catalog::push`): it goes with the device
+    /// (dropped, it stops), and the dealer with the session, so none outlives its session.
+    pub pushes: Option<PushTask>,
 }
 
 fn next_generation() -> u64 {
@@ -150,9 +154,11 @@ pub(crate) async fn connect(
     if let Err(e) = spirc.set_autoplay(settings.autoplay) {
         log::warn!("autoplay setting not applied: {e}");
     }
+    // Before the task runs: it starts the dealer, which takes no listeners while it starts.
+    let pushes = push::listen(session);
     let task = tokio::spawn(task);
     connect::attach(attachment);
-    Ok(Live { generation, session: session.clone(), device: Some(Device { spirc, task }) })
+    Ok(Live { generation, session: session.clone(), device: Some(Device { spirc, task, pushes }) })
 }
 
 /// Connects `session` without Spirc (not visible to Spotify Connect): the same login steps
@@ -179,7 +185,9 @@ pub(crate) async fn connect_hidden(session: &Session, credentials: Credentials) 
 /// connect state and closes the dealer, so the device leaves the cluster) and the Player is
 /// released from the session. Bounded like a teardown.
 pub(crate) async fn hide(live: &mut Live) {
-    let Some(Device { spirc, task }) = live.device.take() else { return };
+    let Some(Device { spirc, task, pushes }) = live.device.take() else { return };
+    // Spirc closes the dealer: its library pushes end now.
+    drop(pushes);
     connect::clear_restore();
     connect::detach(live.generation);
     stop_spirc(&live.session, &spirc, task).await;
@@ -237,7 +245,8 @@ pub(crate) async fn teardown(live: Live, restore: bool) {
     state::set_online(None);
     connect::detach(live.generation);
     let Live { session, device, .. } = live;
-    if let Some(Device { spirc, task }) = device {
+    if let Some(Device { spirc, task, pushes }) = device {
+        drop(pushes);
         stop_spirc(&session, &spirc, task).await;
         // The Spirc task has ended (or was aborted): now the handle may go.
         drop(spirc);

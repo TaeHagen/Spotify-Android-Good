@@ -572,6 +572,22 @@ pub(crate) fn invalidate_rootlist() {
     *ROOTLIST.lock() = None;
 }
 
+/// Spotify pushed a change of playlist `uri` (now at `revision`, when known; `catalog::push`):
+/// its header is dropped, and the rootlist when it lists the playlist at another revision (its
+/// decorations, length, name and images, are the old ones). A playlist the rootlist doesn't list,
+/// or lists at that revision already (an edit made here, read back since), leaves it.
+pub(crate) fn note_remote_change(uri: &str, revision: Option<&str>) {
+    let Some(p) = parse_kind(uri, UriKind::Playlist) else { return };
+    forget_header(&p.uri());
+    let mut root = ROOTLIST.lock();
+    let stale = root.as_ref().is_some_and(|r| {
+        r.find(&p.id).is_some_and(|(i, _)| revision.is_none() || r.items[i].revision.as_deref() != revision)
+    });
+    if stale {
+        *root = None;
+    }
+}
+
 /// Drops the rootlist and the playlist headers (logout / account switch, see
 /// `catalog::clear_user_state`): header lookups that failed with 403 depend on the account.
 pub(crate) fn forget_account() {
@@ -1415,6 +1431,34 @@ mod tests {
         forget_account();
         assert!(cached_rootlist("alice", day).is_none());
         assert!(HEADERS.lock().is_empty());
+    }
+
+    #[test]
+    fn a_pushed_change_drops_the_header_and_a_rootlist_listing_another_revision() {
+        let _caches = CACHES.blocking_lock();
+        let items = parse_rootlist_page(&rootlist_fixture());
+        let listed = items.iter().find_map(|i| Some((parse_kind(&i.uri, UriKind::Playlist)?.uri(), i.revision.clone()?)));
+        let (uri, revision) = listed.expect("a decorated playlist in the fixture");
+        let day = Duration::from_secs(86_400);
+        let fill = |items: Vec<RootItem>| {
+            *ROOTLIST.lock() = Some(Arc::new(Rootlist { revision: vec![1], items, fetched: Instant::now(), owner: "alice".into() }));
+        };
+        fill(items.clone());
+        HEADERS.lock().put(uri.clone(), (Instant::now(), None));
+        // Listed at that revision already (an edit made here, read back): the rootlist stays.
+        note_remote_change(&uri, Some(&revision));
+        assert!(cached_rootlist("alice", day).is_some());
+        assert!(HEADERS.lock().peek(&uri).is_none());
+        // Another playlist, or garbage: nothing changes.
+        note_remote_change("spotify:playlist:0000000000000000000000", Some("00"));
+        note_remote_change("not a uri", None);
+        assert!(cached_rootlist("alice", day).is_some());
+        // Another revision, or none told: the rootlist goes.
+        note_remote_change(&uri, Some("ffff"));
+        assert!(cached_rootlist("alice", day).is_none());
+        fill(items);
+        note_remote_change(&uri, None);
+        assert!(cached_rootlist("alice", day).is_none());
     }
 
     #[test]

@@ -90,6 +90,16 @@ internal object SpotifyUris {
 
     fun isPlaylist(uri: String) = typeOf(uri) == "playlist"
 
+    /**
+     * A playlist's canonical URI (`spotify:playlist:<id>`, also for the legacy user-scoped form, as
+     * the engine names playlists in its pushes); any other URI as it is.
+     */
+    fun playlistKey(uri: String): String {
+        if (!isPlaylist(uri)) return uri
+        val id = uri.substringAfterLast(':')
+        return if (id.isEmpty()) uri else "spotify:playlist:$id"
+    }
+
     /** Types `library.contains` / `library.save` understand (docs §6.3). */
     fun isLibraryItem(uri: String): Boolean = typeOf(uri) in LIBRARY_TYPES
 

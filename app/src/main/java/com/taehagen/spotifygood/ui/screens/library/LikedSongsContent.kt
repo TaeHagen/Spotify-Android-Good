@@ -58,6 +58,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
@@ -89,6 +90,11 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
 
     LaunchedEffect(viewModel) {
         viewModel.events.collect { navigator.showMessage(resources.getString(it.messageRes())) }
+    }
+    // Songs liked or unliked elsewhere show while the page is on screen.
+    LifecycleStartEffect(viewModel) {
+        viewModel.onScreenStarted()
+        onStopOrDispose { viewModel.onScreenStopped() }
     }
     val collapsed by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 } }
     // Lazy items before the songs (header, actions, filter, banners, a state message) and the

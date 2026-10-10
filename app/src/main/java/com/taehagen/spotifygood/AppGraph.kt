@@ -2,6 +2,9 @@ package com.taehagen.spotifygood
 
 import android.app.Application
 import android.util.Log
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import coil3.SingletonImageLoader
 import com.taehagen.spotifygood.auth.AuthRepository
 import com.taehagen.spotifygood.auth.CredentialStore
@@ -11,9 +14,12 @@ import com.taehagen.spotifygood.data.CatalogRepository
 import com.taehagen.spotifygood.data.EpisodeProgressStore
 import com.taehagen.spotifygood.data.HomeRepository
 import com.taehagen.spotifygood.data.LibraryEdit
+import com.taehagen.spotifygood.data.LibraryPushEffects
+import com.taehagen.spotifygood.data.LibraryPushes
 import com.taehagen.spotifygood.data.LibraryRepository
 import com.taehagen.spotifygood.data.LyricsRepository
 import com.taehagen.spotifygood.data.MOSAIC_SCAN
+import com.taehagen.spotifygood.data.OwnLibraryEdits
 import com.taehagen.spotifygood.data.PlaylistEditor
 import com.taehagen.spotifygood.data.PlaylistMosaicStore
 import com.taehagen.spotifygood.data.ResponseCache
@@ -25,6 +31,7 @@ import com.taehagen.spotifygood.download.DownloadManager
 import com.taehagen.spotifygood.engine.SpotifyEngine
 import com.taehagen.spotifygood.engine.WipeStep
 import com.taehagen.spotifygood.engine.runWipeSteps
+import com.taehagen.spotifygood.model.CollectionChangeItem
 import com.taehagen.spotifygood.nativebridge.AudioSinkBridge
 import com.taehagen.spotifygood.nativebridge.NativeEvents
 import com.taehagen.spotifygood.nativebridge.NativeRpc
@@ -41,6 +48,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -86,6 +95,8 @@ class AppGraph(val app: Application) {
             onAccountChanged = { removePreviousAccountData() },
         ).also { engine ->
             engine.setOfflineIndexProvider { downloads.offlineRecords() }
+            // Library changes made elsewhere come from the running engine: followed from its start.
+            appScope.launch { libraryPushes }
         }
     }
     val engine: SpotifyEngine by engineLazy
@@ -158,7 +169,7 @@ class AppGraph(val app: Application) {
     val responseCache: ResponseCache by lazy { ResponseCache(database.responseCache(), json) }
     val catalog: CatalogRepository by lazy { CatalogRepository(rpc, responseCache, episodeProgress) }
     val library: LibraryRepository by lazy {
-        LibraryRepository(appScope, rpc, responseCache, engine.isOnline, episodeProgress).also { repo ->
+        LibraryRepository(appScope, rpc, responseCache, engine.isOnline, episodeProgress, ownLibraryEdits).also { repo ->
             // The playlists' current revisions: a mosaic learned at another is learned again.
             repo.onRootlist = { rootlist, fetched ->
                 playlistMosaics.noteRevisions(rootlist.flatPlaylists().mapNotNull { e -> e.uri?.let { u -> e.revision?.let { u to it } } }.toMap(), fetched)
@@ -184,7 +195,58 @@ class AppGraph(val app: Application) {
     val search: SearchRepository by lazy { SearchRepository(rpc, database.recentSearches(), episodeProgress) }
     val home: HomeRepository by lazy { HomeRepository(rpc, responseCache) }
     val lyrics: LyricsRepository by lazy { LyricsRepository(rpc) }
-    val playlists: PlaylistEditor by lazy { PlaylistEditor(appScope, rpc, library, catalog) }
+    val playlists: PlaylistEditor by lazy { PlaylistEditor(appScope, rpc, library, catalog, ownLibraryEdits) }
+
+    /** Library writes made here: their pushed echoes are not changes made elsewhere. */
+    val ownLibraryEdits: OwnLibraryEdits by lazy { OwnLibraryEdits() }
+
+    /** ProcessLifecycleOwner STARTED: an activity of the app is visible. */
+    private val appForeground: StateFlow<Boolean> by lazy {
+        MutableStateFlow(false).also { flow ->
+            appScope.launch(Dispatchers.Main) {
+                ProcessLifecycleOwner.get().lifecycle.addObserver(
+                    object : DefaultLifecycleObserver {
+                        override fun onStart(owner: LifecycleOwner) {
+                            flow.value = true
+                        }
+
+                        override fun onStop(owner: LifecycleOwner) {
+                            flow.value = false
+                        }
+                    },
+                )
+            }
+        }
+    }
+
+    /**
+     * Library changes made elsewhere, pushed by the engine (docs §5 `playlistChanged`,
+     * `rootlistChanged`, `collectionChanged`; §9.8): cached rows go stale, open pages refresh, and
+     * in the foreground the playlist list, mosaics and downloads follow.
+     */
+    val libraryPushes: LibraryPushes by lazy {
+        LibraryPushes(appScope, appForeground, ownLibraryEdits, PushEffects()).also { pushes ->
+            pushes.start(events.libraryPushes)
+            // Logout or another account: what was pushed for the previous one is dropped.
+            responseCache.addClearListener { pushes.clear() }
+        }
+    }
+
+    private inner class PushEffects : LibraryPushEffects {
+        override suspend fun playlistStale(uri: String) = catalog.markPlaylistStale(uri)
+
+        override suspend fun rootlistStale(reload: Boolean) = library.onRemoteRootlistChange(reload)
+
+        override suspend fun setStale(set: String, reload: Boolean) = library.onRemoteSetChange(set, reload)
+
+        override fun savedChanged(items: List<CollectionChangeItem>) = library.applyRemoteSaved(items)
+
+        override fun playlistRevisions(revisions: Map<String, String>) = playlistMosaics.noteRevisions(revisions)
+
+        override suspend fun syncPlaylistDownload(uri: String, revision: String?) = downloads.requestSync(uri, revision)
+
+        override suspend fun syncLikedSongsDownload() = downloads.requestLikedSongsSync()
+    }
 
     val downloads: DownloadManager by lazy {
         DownloadManager(app, appScope, database, rpc, events, engine, settings, credentialStore).also { manager ->
