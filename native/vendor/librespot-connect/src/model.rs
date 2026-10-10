@@ -223,7 +223,8 @@ fn named(value: Option<String>) -> Option<String> {
 // tell of the uid, or a local load's PlayingTrack. Stock looked it up by one of them (the uri if
 // any): a remote play from a client that sends `track_uri: ""` with the uid failed, a uid on a
 // page not resolved yet, or an index past it, played another track, and a song that is twice in
-// the context started at its first copy.
+// the context started at its first copy. It is looked up by its position first (the index, if
+// the track there is the one named), then by its uid, then by its uri (see locate).
 /// The start track of a load
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StartTrack {
@@ -278,36 +279,55 @@ impl StartTrack {
         self.uri.is_some() || self.uid.is_some() || self.index.is_some()
     }
 
-    /// The position of the track in `tracks` (the context, in its order): the track of the uid
-    /// (if it is the uri's song, when both are given), else the uri's copy at the index, else the
-    /// uri's first copy, else the index (only when neither a uri nor a uid is given)
+    /// The position of the track in `tracks` (the context, in its order):
+    /// 1. the index, if the track there is the one the uid and the uri name (an index alone is
+    ///    taken as it is); a track there that isn't (the context changed since the other device
+    ///    loaded it) is looked for:
+    /// 2. by its uid (the copy of a song that is twice), if that is the uri's song,
+    /// 3. by its uri, the copy nearest to the index (the first without one)
     pub(crate) fn locate(&self, tracks: &[ProvidedTrack]) -> Option<usize> {
-        let of_uid = self.uid.as_ref().and_then(|uid| {
-            tracks
-                .iter()
-                .position(|t| &t.uid == uid)
-                .filter(|&i| self.uri.as_ref().is_none_or(|uri| &tracks[i].uri == uri))
-        });
-        if of_uid.is_some() {
-            return of_uid;
-        }
-        if let Some(uri) = self.uri.as_ref() {
-            return self
-                .index
-                .filter(|&i| tracks.get(i).is_some_and(|t| &t.uri == uri))
-                .or_else(|| tracks.iter().position(|t| &t.uri == uri));
-        }
-        if self.uid.is_some() {
-            return None;
-        }
-        self.index.filter(|&i| i < tracks.len())
+        self.of_index(tracks)
+            .or_else(|| self.of_uid(tracks))
+            .or_else(|| self.of_uri(tracks))
     }
 
-    /// Whether the track may be on a page of the context still to come: its uid isn't in
-    /// `tracks` yet, or its index is past them (a uri alone plays at once, outside the context)
+    /// The index, if the track there is the one named (step 1 of locate)
+    fn of_index(&self, tracks: &[ProvidedTrack]) -> Option<usize> {
+        self.valid_index(tracks.len())
+            .filter(|&i| self.uid.as_ref().is_none_or(|uid| &tracks[i].uid == uid))
+            .filter(|&i| self.uri.as_ref().is_none_or(|uri| &tracks[i].uri == uri))
+    }
+
+    /// The track of the uid, if it is the uri's song (step 2 of locate)
+    fn of_uid(&self, tracks: &[ProvidedTrack]) -> Option<usize> {
+        let uid = self.uid.as_ref()?;
+        tracks
+            .iter()
+            .position(|t| &t.uid == uid)
+            .filter(|&i| self.uri.as_ref().is_none_or(|uri| &tracks[i].uri == uri))
+    }
+
+    /// The copy of the uri nearest to the index (step 3 of locate)
+    fn of_uri(&self, tracks: &[ProvidedTrack]) -> Option<usize> {
+        let uri = self.uri.as_ref()?;
+        let near = self.index.unwrap_or_default();
+        tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| &t.uri == uri)
+            .min_by_key(|(i, _)| i.abs_diff(near))
+            .map(|(i, _)| i)
+    }
+
+    /// Whether the track may be on a page of the context still to come: neither the track at the
+    /// index nor the uid's track is in `tracks`, and the index is past them (the track there is
+    /// looked at first, see locate) or a uid is given (a uri alone plays at once, outside the
+    /// context)
     pub(crate) fn wants_more_pages(&self, tracks: &[ProvidedTrack]) -> bool {
-        self.locate(tracks).is_none()
-            && (self.uid.is_some() || self.index.is_some_and(|i| i >= tracks.len()))
+        if self.of_index(tracks).is_some() || self.of_uid(tracks).is_some() {
+            return false;
+        }
+        self.index.is_some_and(|i| i >= tracks.len()) || self.uid.is_some()
     }
 
     /// The index, when it is one of `len` tracks
