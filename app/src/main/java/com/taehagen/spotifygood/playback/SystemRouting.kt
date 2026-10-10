@@ -30,6 +30,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.launch
@@ -37,8 +40,10 @@ import kotlinx.coroutines.withContext
 
 /**
  * The app's side of Android's system output switcher (docs/ARCHITECTURE.md §8, "System output
- * switcher"), owned by the [PlaybackService] from its creation to its destruction (API 30+): the
- * app's `MediaRouter2`, the router the system lists routes for and asks for sessions through.
+ * switcher"), owned by the [PlaybackService] from its creation to its destruction (Android 12+,
+ * [SystemRoutes.MIN_SDK]): the app's `MediaRouter2`, the router the system lists routes for and asks
+ * for sessions through. It changes no component state (the provider is enabled while logged in,
+ * [com.taehagen.spotifygood.connect.RouteProviderSwitch]); the provider follows [running].
  *
  * * While logged in it asks for the Connect routes ([ConnectRouteProviderService]) and the system's
  *   own (this phone, Bluetooth, wired: [SystemRoutes.FEATURE_LOCAL_PLAYBACK]), passively: no scan.
@@ -49,8 +54,9 @@ import kotlinx.coroutines.withContext
  *   names the chip after the session and opens the switcher on it. Another device playing without
  *   a session gets one ([SystemRoutes.next]: a session request for its route, which the provider
  *   answers at once), whenever the router knows the route (the system binds the provider when the
- *   app is in the foreground, the switcher opens, and on Android 12–14 also while the playback
- *   service is in the foreground with the screen on). Released once no device plays (after a grace).
+ *   app is in the foreground, the switcher opens, and on Android 12–14 also while the screen is on
+ *   with a media control in quick settings). Released at once when playback came back to this
+ *   phone from its device, else once no device plays for a grace.
  * * "This phone" or a Bluetooth / wired output picked in the switcher while the session is on
  *   another device (the system transfers the session to its own): playback comes back here, as
  *   the devices sheet's "Tap to play here" does, and the switcher's output wins over a pick in the
@@ -61,7 +67,7 @@ import kotlinx.coroutines.withContext
  *
  * Main thread.
  */
-@RequiresApi(30)
+@RequiresApi(31)
 internal class SystemRouting(
     context: Context,
     private val graph: AppGraph,
@@ -85,6 +91,8 @@ internal class SystemRouting(
 
     /** The later of our session's creation and the last time a device played ([SystemRoutes.next]). */
     private var heldSince = 0L
+    /** A device played while our current session existed ([SystemRoutes.handedBack]). */
+    private var sawDevicePlay = false
     private var attempt: AdoptAttempt? = null
     private val recheck = Runnable { reconcile() }
 
@@ -96,8 +104,7 @@ internal class SystemRouting(
         private set
 
     fun start() {
-        current = this
-        graph.routeProviderSwitch.set(true)
+        active.value = this
         scope.launch {
             graph.engine.isLoggedIn.collect { loggedIn -> if (loggedIn) register() else unregister() }
         }
@@ -114,9 +121,8 @@ internal class SystemRouting(
         scope.cancel()
         main.removeCallbacks(recheck)
         unregister()
-        // Nothing of it outlives the service: the system unbinds a disabled provider.
-        graph.routeProviderSwitch.set(false)
-        if (current === this) current = null
+        // The provider lists nothing without it (and leaves the engine alone while bound).
+        active.compareAndSet(this, null)
     }
 
     private fun register() {
@@ -145,6 +151,7 @@ internal class SystemRouting(
         main.removeCallbacks(recheck)
         ours()?.let { release(it) }
         attempt = null
+        sawDevicePlay = false
         if (Build.VERSION.SDK_INT >= SystemRoutes.LISTING_SDK) Api34.setListing(router, null)
         runCatching { router.unregisterRouteCallback(routeCallback) }
         runCatching { router.unregisterTransferCallback(transferCallback) }
@@ -159,7 +166,10 @@ internal class SystemRouting(
 
     private fun release(controller: MediaRouter2.RoutingController) {
         runCatching { controller.release() }.onFailure { Log.w(TAG, "Cannot release the routing session", it) }
-        if (controller.id == controllerId) setControllerId(null)
+        if (controller.id == controllerId) {
+            setControllerId(null)
+            sawDevicePlay = false
+        }
     }
 
     private fun setControllerId(id: String?) {
@@ -179,12 +189,16 @@ internal class SystemRouting(
         if (!registered) return
         main.removeCallbacks(recheck)
         val now = clock()
-        val target = SystemRoutes.target(graph.devices.devices.value, graph.playback.snapshot.value)?.id
+        val snapshot = graph.playback.snapshot.value
+        val target = SystemRoutes.target(graph.devices.devices.value, snapshot)?.id
         if (target != null) heldSince = now
         val ours = ours()
+        if (ours?.id != controllerId) sawDevicePlay = false
         setControllerId(ours?.id)
+        if (target != null && ours != null) sawDevicePlay = true
         val route = target?.let(::routeOf)
-        when (val step = SystemRoutes.next(target, ours != null, heldSince, route != null, attempt, now)) {
+        val backHere = SystemRoutes.handedBack(snapshot, sawDevicePlay)
+        when (val step = SystemRoutes.next(target, ours != null, heldSince, route != null, attempt, now, backHere)) {
             is RoutingStep.Adopt -> {
                 attempt = AdoptAttempt(step.deviceId, now)
                 // The provider answers at once for the device that plays (no transfer).
@@ -237,6 +251,8 @@ internal class SystemRouting(
                 // A session of ours: a pick in the switcher, or the request for the device that plays.
                 heldSince = clock()
                 attempt = null
+                // Its device may not show in the snapshot yet: the release grace applies.
+                sawDevicePlay = false
                 setControllerId(newController.id)
                 // One session at a time (a pick and the request for the playing device may cross).
                 router.controllers.filter { it !== system && it !== newController && !it.isReleased }.forEach { release(it) }
@@ -335,8 +351,16 @@ internal class SystemRouting(
     companion object {
         private const val TAG = "SystemRouting"
 
-        /** The running instance (the playback service's), for the route provider's volume requests. */
-        @Volatile var current: SystemRouting? = null
-            private set
+        private val active = MutableStateFlow<SystemRouting?>(null)
+
+        /**
+         * The running instance (the playback service's), or null: the route provider publishes
+         * routes and takes requests only meanwhile, so a provider the system binds while the service
+         * doesn't run does nothing (never creates or starts the engine).
+         */
+        val running: StateFlow<SystemRouting?> = active.asStateFlow()
+
+        /** [running]'s value: the route provider's volume requests go through it. */
+        val current: SystemRouting? get() = active.value
     }
 }

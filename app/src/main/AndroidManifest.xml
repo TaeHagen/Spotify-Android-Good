@@ -144,12 +144,12 @@
             </intent-filter>
         </service>
 
-        <!-- Spotify Connect devices as routes of Android's output switcher (docs/ARCHITECTURE.md §8,
-             API 30+). Disabled here and enabled only while the playback service runs
-             (RouteProviderSwitch): Android binds every enabled provider (on Android 11 always, on
-             12-14 whenever a media notification is up with the screen on) and so would start or keep
-             this process for nothing. Bound only by the system (its binder checks the caller's uid);
-             no foreground type, it is never started. -->
+        <!-- Spotify Connect devices as routes of Android's output switcher (docs/ARCHITECTURE.md §8).
+             Disabled here; RouteProviderSwitch enables it while an account is logged in, from
+             Android 12 (Android 11 would bind it for good), and changes it only at a login or logout:
+             each change is a package-wide PACKAGE_CHANGED (widgets reset, launchers reload). Bound
+             only by the system (its binder checks the caller's uid); while the playback service
+             doesn't run it lists nothing and touches nothing. No foreground type: never started. -->
         <service
             android:name=".connect.ConnectRouteProviderService"
             android:enabled="false"

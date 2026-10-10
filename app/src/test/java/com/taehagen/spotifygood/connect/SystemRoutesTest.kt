@@ -239,6 +239,31 @@ class SystemRoutesTest {
         assertEquals(RoutingStep.None, SystemRoutes.next(null, hasSession = false, heldSinceMs = since, routeKnown = false, attempt = null, nowMs = since + 60_000))
     }
 
+    @Test
+    fun playbackBackOnThisPhoneReleasesTheSessionAtOnce() {
+        val since = 10_000L
+        // Remote, then local with the session still there: this phone plays, the chip must say so.
+        val back = SystemRoutes.handedBack(local, sawDevicePlay = true)
+        assertTrue(back)
+        assertEquals(RoutingStep.Release, SystemRoutes.next(null, hasSession = true, heldSinceMs = since, routeKnown = false, attempt = null, nowMs = since + 1, backHere = back))
+        // A session just created for a pick, the snapshot still local: the grace applies.
+        val fresh = SystemRoutes.handedBack(local, sawDevicePlay = false)
+        assertFalse(fresh)
+        assertEquals(
+            RoutingStep.RecheckAt(since + SystemRoutes.RELEASE_GRACE_MS),
+            SystemRoutes.next(null, hasSession = true, heldSinceMs = since, routeKnown = false, attempt = null, nowMs = since + 1, backHere = fresh),
+        )
+        // Nothing plays anywhere (the device stopped or left): the grace applies too.
+        val none = SystemRoutes.handedBack(PlaybackSnapshot.EMPTY, sawDevicePlay = true)
+        assertFalse(none)
+        assertEquals(
+            RoutingStep.RecheckAt(since + SystemRoutes.RELEASE_GRACE_MS),
+            SystemRoutes.next(null, hasSession = true, heldSinceMs = since, routeKnown = false, attempt = null, nowMs = since + 1, backHere = none),
+        )
+        // While a device plays nothing is released, whatever came before.
+        assertEquals(RoutingStep.None, SystemRoutes.next("kitchen", hasSession = true, heldSinceMs = since, routeKnown = true, attempt = null, nowMs = since + 1, backHere = false))
+    }
+
     // ---- discovery ------------------------------------------------------------------------------------
 
     @Test

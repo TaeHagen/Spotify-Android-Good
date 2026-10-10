@@ -13,7 +13,6 @@ import com.taehagen.spotifygood.App
 import com.taehagen.spotifygood.AppGraph
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.playback.SystemRouting
-import com.taehagen.spotifygood.playback.VolumeMath
 import com.taehagen.spotifygood.ui.components.BackgroundMessages
 import com.taehagen.spotifygood.ui.screens.player.DevicePicks
 import com.taehagen.spotifygood.ui.screens.player.message
@@ -24,6 +23,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -53,9 +54,11 @@ import java.util.UUID
  * * Volume: the playing device's, through the media session player (the remote volume path of the
  *   volume keys).
  *
- * Enabled only while the playback service runs ([RouteProviderSwitch]). Main thread.
+ * Enabled while an account is logged in, from Android 12 ([RouteProviderSwitch], [RouteProviderRule]);
+ * it lists routes and takes requests only while the playback service runs ([SystemRouting.running]):
+ * bound otherwise it publishes nothing and touches nothing. Main thread.
  */
-@RequiresApi(30)
+@RequiresApi(31)
 class ConnectRouteProviderService : MediaRoute2ProviderService() {
     private lateinit var graph: AppGraph
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -88,17 +91,30 @@ class ConnectRouteProviderService : MediaRoute2ProviderService() {
         graph = (application as App).graph
         val moreDevices = if (Build.VERSION.SDK_INT >= SystemRoutes.LISTING_SDK) getString(R.string.system_route_more_devices) else null
         scope.launch {
-            combine(
-                combine(graph.devices.devices, graph.playback.snapshot, ::Pair),
-                graph.engine.isLoggedIn,
-                graph.engine.isOnline,
-                ::Triple,
-            ).collect { (state, loggedIn, online) ->
-                val (devices, snapshot) = state
-                // Logged out: no routes and no sessions (the router side lets its own go too).
+            SystemRouting.running.flatMapLatest { routing ->
+                if (routing == null) {
+                    // The system binds an enabled provider by its own rules, also while the playback
+                    // service doesn't run (screen on with a media control on Android 12–14, another
+                    // foreground app's router): nothing to list then, and nothing of the app is
+                    // created or started (no engine, no repository).
+                    flowOf(null)
+                } else {
+                    // The playback service made these (its player and router use them).
+                    combine(
+                        combine(graph.devices.devices, graph.playback.snapshot, ::Pair),
+                        graph.engine.isLoggedIn,
+                        graph.engine.isOnline,
+                        ::Triple,
+                    )
+                }
+            }.collect { inputs ->
+                val (state, loggedIn, online) = inputs ?: Triple(null, false, false)
+                // Logged out or no router: no routes and no sessions (the router lets its own go too).
                 if (!loggedIn) sessions.keys.toList().forEach(::release)
-                target = SystemRoutes.target(devices, snapshot)?.id
-                fresh = SystemRoutes.routes(devices, snapshot, loggedIn, online, listing = moreDevices != null, moreDevicesName = moreDevices)
+                target = state?.let { (devices, snapshot) -> SystemRoutes.target(devices, snapshot)?.id }
+                fresh = state?.let { (devices, snapshot) ->
+                    SystemRoutes.routes(devices, snapshot, loggedIn, online, listing = moreDevices != null, moreDevicesName = moreDevices)
+                }.orEmpty()
                 update()
             }
         }
@@ -286,10 +302,13 @@ class ConnectRouteProviderService : MediaRoute2ProviderService() {
             notifyRequestFailed(requestId, REASON_INVALID_COMMAND)
             return
         }
-        val percent = volume.coerceIn(0, VOLUME_MAX)
-        // The session player's remote volume (its in-flight target, the volume keys' base).
         val routing = SystemRouting.current
-        if (routing != null) routing.setVolume(percent) else graph.player.setVolume(VolumeMath.percentToConnect(percent))
+        if (routing == null) {
+            notifyRequestFailed(requestId, REASON_INVALID_COMMAND)
+            return
+        }
+        // The session player's remote volume (its in-flight target, the volume keys' base).
+        routing.setVolume(volume.coerceIn(0, VOLUME_MAX))
     }
 
     override fun onSelectRoute(requestId: Long, sessionId: String, routeId: String) {
@@ -303,7 +322,9 @@ class ConnectRouteProviderService : MediaRoute2ProviderService() {
 
     override fun onDiscoveryPreferenceChanged(preference: RouteDiscoveryPreference) {
         val open = SystemRoutes.switcherOpen(Build.VERSION.SDK_INT, preference.shouldPerformActiveScan(), preference.preferredFeatures)
-        if (open && !switcherOpen && graph.engine.isOnline.value) {
+        // Only for a running playback service's online session: a bound provider starts nothing.
+        val online = SystemRouting.current != null && graph.engineIfCreated()?.isOnline?.value == true
+        if (open && !switcherOpen && online) {
             // The user looks at the switcher: the list again, as the devices sheet fetches it on
             // opening (one request, debounced in the engine). Nothing else is ever scanned here.
             graph.appScope.launch {

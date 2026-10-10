@@ -104,7 +104,7 @@ class PlaybackService : MediaLibraryService() {
     private lateinit var presence: PresenceController
     /** The volume keys for another device while it plays ([RemotePlayback]). */
     private lateinit var remoteVolumeKeys: RemoteVolumeKeys
-    /** Connect devices in Android's output switcher (API 30+, [SystemRouting]). */
+    /** Connect devices in Android's output switcher (Android 12+, [SystemRouting]). */
     private var systemRouting: SystemRouting? = null
     private var session: MediaLibrarySession? = null
     /** Guarded by [holderLock]. */
@@ -196,7 +196,8 @@ class PlaybackService : MediaLibraryService() {
             previousRequested = { graph.player.previous() },
         )
         if (Build.VERSION.SDK_INT >= SystemRoutes.MIN_SDK) {
-            // Lives with the service: the route provider is enabled meanwhile, never longer.
+            // Lives with the service: the route provider lists routes meanwhile (it is enabled while
+            // logged in; nothing here changes a component state).
             systemRouting = SystemRouting(
                 context = this,
                 graph = graph,
@@ -348,7 +349,7 @@ class PlaybackService : MediaLibraryService() {
         main.removeCallbacks(foregroundDeadline)
         coordinator.closeEffectSession()
         presence.release()
-        // Before the session: its routing session goes with it, and the route provider is disabled.
+        // Before the session: its routing session goes with it, and the route provider lists nothing.
         systemRouting?.stop()
         systemRouting = null
         remoteVolumeKeys.release()

@@ -136,8 +136,11 @@ internal object SystemRoutes {
     const val EXTRA_PLAYABLE = "com.taehagen.spotifygood.route.extra.PLAYABLE"
     const val EXTRA_OPENS_APP = "com.taehagen.spotifygood.route.extra.OPENS_APP"
 
-    /** MediaRoute2ProviderService and MediaRouter2 (Android 11). */
-    const val MIN_SDK = 30
+    /**
+     * The output switcher integration: MediaRoute2ProviderService and MediaRouter2 exist from
+     * Android 11, but Android 11 binds an enabled provider for good ([RouteProviderRule.MIN_SDK]).
+     */
+    const val MIN_SDK = RouteProviderRule.MIN_SDK
 
     /**
      * Route types, the listing preference (order, "Can't play here", "More devices") and the
@@ -305,11 +308,14 @@ internal object SystemRoutes {
      * The router side's next step. [target]: the device that plays ([SystemRoutes.target]);
      * [hasSession] / [heldSinceMs]: our routing session and the later of its creation and the last
      * time a device played; [routeKnown]: the router knows the target's route (the provider is
-     * bound); [attempt]: the last session request.
+     * bound); [attempt]: the last session request; [backHere]: the session showed a device playing
+     * and playback is on this phone now ([handedBack]).
      *
      * Another device plays without a session: ask for one on its route, once per device (again
-     * after [ADOPT_RETRY_MS] when it failed). No device plays any more: release the session after
-     * [RELEASE_GRACE_MS].
+     * after [ADOPT_RETRY_MS] when it failed). Playback came back to this phone from the session's
+     * device: release it at once, the chip names this phone again. No device plays any more for
+     * another reason (nothing plays anywhere, a gap of a transfer or a reconnect, a session just
+     * created whose device the snapshot doesn't show yet): release it after [RELEASE_GRACE_MS].
      */
     fun next(
         target: String?,
@@ -318,6 +324,7 @@ internal object SystemRoutes {
         routeKnown: Boolean,
         attempt: AdoptAttempt?,
         nowMs: Long,
+        backHere: Boolean = false,
     ): RoutingStep = when {
         target != null && hasSession -> RoutingStep.None
         target != null -> {
@@ -325,6 +332,7 @@ internal object SystemRoutes {
             if (routeKnown && !waiting) RoutingStep.Adopt(target) else RoutingStep.None
         }
         !hasSession -> RoutingStep.None
+        backHere -> RoutingStep.Release
         nowMs - heldSinceMs >= RELEASE_GRACE_MS -> RoutingStep.Release
         else -> RoutingStep.RecheckAt(heldSinceMs + RELEASE_GRACE_MS)
     }
@@ -342,6 +350,15 @@ internal object SystemRoutes {
                 else -> ListingBehavior.NOT_SELECTABLE
             }
         }
+
+    /**
+     * Playback came back to this phone from the device a routing session showed: the snapshot
+     * shows playback here (`source` local), and the session [sawDevicePlay] (a device played while
+     * it existed). A session just created for a pick, whose device the snapshot doesn't show yet,
+     * hasn't: it keeps the release grace.
+     */
+    fun handedBack(snapshot: PlaybackSnapshot, sawDevicePlay: Boolean): Boolean =
+        sawDevicePlay && snapshot.source == PlaybackSource.LOCAL
 
     /**
      * Whether a discovery preference means the output switcher dialog is open for this app: an

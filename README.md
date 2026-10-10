@@ -17,15 +17,15 @@ over JNI). Requires a Spotify Premium account.
   offers "Sign in". It is updated only when what plays changes, never on a schedule.
 - **Output switching:** speaker, Bluetooth, wired or USB from the app's device sheet or the
   system output switcher; routing follows device changes.
-- **Android's output switcher (Android 11 and later):** your Spotify Connect devices are listed in
+- **Android's output switcher (Android 12 and later):** your Spotify Connect devices are listed in
   the system's own picker, the "This phone" chip of the media controls in quick settings and on
   the lock screen (and the volume panel's media output). Picking one moves playback there, picking
   "This phone" or a headset brings it back, and while another device plays the chip shows its
   name and the switcher's slider sets its volume. From Android 14 the list keeps the app's order,
   shows devices that can't play as such, and "Other devices on your network" opens the app's device
   sheet to sign in speakers and TVs. Nothing scans for it: the list is the one the app already has
-  while playback runs, and the system part is switched off whenever the playback service isn't
-  running.
+  while playback runs, and with nothing playing the system part lists nothing and does no work. Not
+  on Android 11, where Android would keep the app running all day for it.
 - **Spotify Connect:**
   - send: pick a device, transfer playback, control the remote device including volume
     keys. With nothing playing, picking a device makes the next play start there.

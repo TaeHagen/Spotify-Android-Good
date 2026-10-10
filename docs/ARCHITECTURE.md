@@ -975,7 +975,7 @@ For a remote active device, smart shuffle is not supported (the command reports
     the call. Then, as for `connect.localLogin`, the engine waits up to 10 s for the device to appear
     in the cluster (the reported `deviceID`, `md5(fn)`, or a new device with that name) and returns
     its id; Kotlin transfers to it, or keeps it as the pending target when nothing plays.
-* **System output switcher (the "This phone" chip, Android 11+)**: the account's Connect devices
+* **System output switcher (the "This phone" chip, Android 12+)**: the account's Connect devices
   are listed in Android's own output switcher for this app's media (the device chip of the media
   controls in quick settings and on the lock screen, the Output Switcher dialog it opens, the volume
   panel's media output), the playing device's name shows on the chip, and a pick there moves
@@ -1033,10 +1033,13 @@ For a remote active device, smart shuffle is not supported (the command reports
     * Another device playing without a session (picked in the app, or started by another Spotify
       app) gets one (`SystemRoutes.next`): `transferTo` its route, which the provider answers at
       once. That needs the route, i.e. the provider bound (table below); a request that failed
-      waits 30 s. Two sessions crossing (a pick and that request) leave the newest. Once no device
-      plays (this phone took over, the device left) the session is released 8 s after it was
-      created or a device last played (a transfer's cluster update, a reconnect or a switch between
-      speakers can leave a short gap).
+      waits 30 s. Two sessions crossing (a pick and that request) leave the newest. When playback
+      comes back to this phone from the session's device (the snapshot shows local playback and a
+      device played while the session existed, `SystemRoutes.handedBack`) the session is released
+      at once, so the chip names this phone again. Otherwise, once no device plays (nothing plays
+      anywhere, the device left, a session just created for a pick whose device the snapshot doesn't
+      show yet) it is released 8 s after it was created or a device last played (a transfer's
+      cluster update, a reconnect or a switch between speakers can leave a short gap).
     * "This phone", Bluetooth or wired picked in the switcher while the session is on another
       device: the system moves the session to its own (`onTransfer(ours → system)`) and routes the
       audio there; the app releases its session, pulls playback here as the sheet's "Tap to play
@@ -1057,31 +1060,59 @@ For a remote active device, smart shuffle is not supported (the command reports
     outlasts the switcher's 30 s transfer timeout. From Android 14 the "Other devices on your
     network" entry opens the sheet instead, which browses while it is shown (Local-network
     discovery above).
-  * **Discovery and battery**: no scan, poll or wake-up of its own. The provider is disabled in the
-    manifest and enabled only while the playback service runs (`RouteProviderSwitch`, applied off
-    the main thread; every process start disables one a dead process left enabled), because the
-    system binds every enabled provider by its own rules (`BIND_AUTO_CREATE |
-    BIND_FOREGROUND_SERVICE`: it would start the process or keep it at foreground-service
-    importance). Nothing keeps the playback service or the engine for the provider: its routes are
-    what the running engine already knows, its sessions go when the playback service goes
-    (released, then the provider is disabled), and its `onCreate` only subscribes to existing flows.
-    From Android 15 an active scan asking for our routes means the switcher dialog is open
-    (`SystemRoutes.switcherOpen`): the provider then fetches the device list once
-    (`connect.refreshDevices`, debounced natively), as the sheet does on opening; up to Android 14
-    SystemUI asks for an active scan for every media notification while the screen is on, so
-    nothing is refreshed there. When the system binds the provider:
+  * **Discovery and battery**: no scan, poll or wake-up of its own, and no component toggling
+    with the playback service. The provider is disabled in the manifest; `RouteProviderSwitch`
+    (pure rule `RouteProviderRule`) enables it while an account is logged in, from Android 12. Every
+    change of a component's enabled state makes PackageManager send a package-wide
+    `PACKAGE_CHANGED`: AppWidgetService resets every placed now-playing widget to its initial layout
+    and sends it `APPWIDGET_UPDATE` (a full redraw), launchers reload the package, and the system
+    rescans its route providers. So the state changes at a login or logout only (applied 2 s after
+    the last change, latest wins, off the main thread): its inputs are the stored credentials at
+    every process start (a login or logout the previous process didn't apply) and the engine's
+    login state once it read them (`isLoggedIn`, or credentials still stored: a Keystore briefly
+    unavailable keeps it enabled), and it writes only when the component's setting differs, so an
+    ordinary process start, a playback service start or stop and an app switch write nothing.
+    * The system binds an enabled provider by its own rules (`BIND_AUTO_CREATE |
+      BIND_FOREGROUND_SERVICE`: it starts the process if needed and holds it at bound-service
+      importance meanwhile), also while the playback service doesn't run. A bound provider then
+      does nothing: it lists routes and takes requests only while `SystemRouting` runs
+      (`SystemRouting.running`, the playback service's lifetime), and otherwise publishes an empty
+      list once and creates nothing (no engine, no repository: `onCreate` only subscribes to that
+      flow; the switcher-open refresh needs a running service and an online session). Its routes
+      are what the running engine already knows, its sessions go with the playback service
+      (released by the router), and nothing keeps the service or the engine for it. The cost of a
+      bind is the process start when the process isn't running (`App.onCreate`: the native library
+      and its idle runtime, the notification channels) and the process staying resident while bound;
+      no CPU, socket, timer or wake-up while idle.
+    * Android 11 is left out (`RouteProviderRule.MIN_SDK = 31`), checked in the `android-11.0.0_r1`
+      sources: `MediaRoute2ProviderServiceProxy.shouldBind()` returns `mRunning`, i.e. every enabled
+      provider is bound as soon as the user's record exists (the first router or manager, SystemUI's
+      at boot; `getOrCreateUserRecordLocked` starts the `UserHandler` and its watcher, and
+      `disposeUserIfNeededLocked` never drops the current user's record); `onBindingDied` binds
+      again; and `MediaRoute2ProviderWatcher` rescans on `PACKAGE_RESTARTED` and calls
+      `rebindIfDisconnected()`, so even a force stop is undone. Enabled there, the process would be
+      started at every boot and kept resident at bound-service importance all day, logged in or not
+      playing, never cached or frozen. Android 12 bound providers only while someone looks (below),
+      Android 15 stopped the keep-alive (`enable_prevention_of_keep_alive_route_providers`, no
+      `PACKAGE_RESTARTED` rescan, no rebind after a binding died).
+    * From Android 15 an active scan asking for our routes means the switcher dialog is open
+      (`SystemRoutes.switcherOpen`): the provider then fetches the device list once
+      (`connect.refreshDevices`, debounced natively), as the sheet does on opening; up to Android 14
+      SystemUI asks for an active scan for every media notification while the screen is on, so
+      nothing is refreshed there. When the system binds the provider (enabled, i.e. logged in):
 
-    | Android | Provider bound (while enabled) | Other apps' providers bound because of this app's router |
+    | Android | Provider bound | Other apps' providers bound because of this app's router |
     |---|---|---|
-    | 11 | always | always (Android 11 binds every provider) |
-    | 12–14 | screen on with a media notification up (SystemUI scans), or the app's router at foreground-service importance with the screen on (the playback service in the foreground), or a session exists | the same (as for any app with a cast button; our features match no one else's routes) |
-    | 15+ | the app in the foreground, the output switcher open, or a session exists | while the app is in the foreground |
+    | 11 | not offered (would be: always) | — (no router) |
+    | 12–14 | screen on with a media control in quick settings (SystemUI scans for each, resumption cards included), or any app's router at foreground-service importance with the screen on (ours: the playback service in the foreground), or a session exists | the same (as for any app with a cast button; our features match no one else's routes) |
+    | 15+ | the app in the foreground, another foreground app's router, the output switcher open, or a session exists | while the app is in the foreground |
 
-  * **Per version**: Android 11–13: the routes, picks, "This phone" and the chip (the routing
+  * **Per version**: Android 12–13: the routes, picks, "This phone" and the chip (the routing
     session's name; without a session the chip is disabled, as before); 14: also the listing
     (order, "Can't play here", "Other devices on your network") and route types; 15+: more route
-    types, and opening the switcher refreshes the list. Below Android 11 none of this exists (no
-    route providers); the sheet's "More devices…" opens the Bluetooth settings there.
+    types, and opening the switcher refreshes the list. Android 11 and below: none of this (Android
+    11 for the reason above; below it there are no route providers); the sheet's "More devices…"
+    opens the system switcher (Android 11) or the Bluetooth settings there.
   * **Left open (only a device shows it)**: from Android 15, when another device starts playing
     while the app is in the background, nothing binds the provider, so the router can't ask for the
     session: the chip reads "Other device", greyed out (as before), until the app comes to the
@@ -1328,8 +1359,8 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     toggle), since a watch or the volume dialog may pick it as the first active session. It is
     inactive otherwise, created on first use (never during local playback). Media keys still
     reach the media session (`findMediaButtonSession` prefers the app's session whose state
-    matches its audio activity, and nothing plays here). From API 30 its `VolumeProvider` carries
-    the routing session's id as volume control id, as the media session's does (System output
+    matches its audio activity, and nothing plays here). With a routing session (Android 12+) its
+    `VolumeProvider` carries the routing session's id as volume control id, as the media session's does (System output
     switcher, §8), so a system surface that picks either names the same device.
   * The output switcher's routing session (§8) changes none of this: it is only the volume
     control id of the remote `DeviceInfo` (`SpotifyPlayer.routingControllerId`), and the routing
@@ -1400,7 +1431,9 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
     first at once, then at most one per 500 ms, the latest winning (a track change brings several
     snapshots). When the service goes the widget shows the stored session (its other buttons would
     find the session gone). The receiver draws every widget on placement, reboot and app update,
-    and on a resize below 12 (from 12 only when the artwork's size step changes): the live state
+    on the `PACKAGE_CHANGED` of a component change (the output switcher's route provider at a login
+    or logout, §8: AppWidgetService first resets the widget to its initial layout), and on a resize
+    below 12 (from 12 only when the artwork's size step changes): the live state
     while the service runs, else from the credential file check and the resume store, without the
     engine. Artwork: one software bitmap all widgets and layouts share, decoded by Coil square
     and exactly at a step of 256 / 384 / 512 / 640 px (`WidgetArtSize`; a stable cache key while
@@ -1659,7 +1692,7 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   over), the engine stops or logs out, or the user picks "Automatic". "More devices…" opens the
   system output switcher via `androidx.mediarouter.app.SystemOutputSwitcherDialogController
   .showDialog(context)` (API 30+; on 26–29 falls back to Bluetooth settings) — lists Bluetooth and
-  other system audio outputs not yet connected and, from API 30, the account's Connect devices
+  other system audio outputs not yet connected and, from Android 12, the account's Connect devices
   (System output switcher, §8: the same transfers as the sheet). It casts nothing else for this
   app: Google Cast devices are signed in from the sheet's local-network section (§8), which the
   switcher's "Other devices on your network" (API 34+) opens. Never use `setCommunicationDevice`
@@ -2263,7 +2296,7 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
 | Paused < 10 min (wall time, `PausedIdle`) | Online | yes | mediaPlayback (Media3 timeout, bounded by an elapsed-realtime alarm) | none |
 | Paused ≥ 10 min, app background | hidden and stopped when the service lets go (other releases: hidden after 20 s, stopped after 60 s, both wall time) | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
-| Output switcher route provider (§8, API 30+) | unchanged: enabled only while the playback service runs; publishes what the engine pushes, no scan or poll; one device-list refresh when the switcher opens (Android 15+); its session goes with the service | unchanged | none of its own (the system binds it as `BIND_FOREGROUND_SERVICE`, see §8 for when) | none |
+| Output switcher route provider (§8, Android 12+) | unchanged: enabled while logged in (changed only at login and logout); lists routes only while the playback service runs, from what the engine pushes, no scan or poll; one device-list refresh when the switcher opens (Android 15+); bound otherwise it does nothing (the system may start the process for it, see §8 for when) | unchanged | none of its own (the system binds it as `BIND_FOREGROUND_SERVICE`) | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
 | Presence opt-in, idle (also restored after an app update, and after a reboot up to Android 14; from Android 15 a notification asks to open the app) | Online | yes | connectedDevice (low-importance) | none |
 | Home-screen widget placed (§9.4) | unchanged: pushed by the running playback service when the track, play state, like or device change, ≤ 1 per 500 ms; no `updatePeriodMillis`, alarm, polling or job; no widget, nothing collected | unchanged | none (Play from a dead process: the stored session, like a headset Play) | none |
