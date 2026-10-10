@@ -27,11 +27,22 @@ over JNI). Requires a Spotify Premium account.
     started at boot play media later). The phone is only listed as a Connect target while it
     can actually play.
 - **Play modes:** shuffle, smart shuffle (suggestions mixed into the context), repeat all,
-  repeat one, autoplay, radio, podcast playback speed (0.5× to 3.5×, one speed for all
-  episodes, on this phone).
-- **Queue:** view, add, remove, reorder, clear, jump.
-- **Library:** playlists (create, rename, edit, reorder, delete, follow), Liked Songs, saved
-  albums, artists and podcasts, follow artists.
+  repeat one, autoplay, radio. In-app plays keep the current shuffle and repeat; podcasts play
+  in order.
+- **Podcasts:** playback speed (0.5× to 3.5×, one speed for all episodes, on this phone),
+  ±15 s, resume points (newest of this phone's and Spotify's wins, on every way an episode
+  starts), Mark as played / unplayed, Your Episodes, "End of episode" sleep timer.
+- **Queue:** view, add, remove, reorder, clear, jump; add whole albums and playlists.
+- **Library:** playlists (create, rename, edit, reorder, delete, follow, make public, private
+  or collaborative, add albums, playlists and episodes with an "already added" check), Liked
+  Songs, saved albums, artists and podcasts, follow artists. Liked Songs and playlists can be
+  sorted (recently added, title, artist, album, custom order) and filtered; a sorted list plays
+  in the order shown.
+- **Android Auto and voice:** browse the library and downloads (also offline), paged lists,
+  search, and "play X" requests from Assistant or Auto, matched against your own playlists and
+  downloads first.
+- **Hide explicit content:** the app's setting and the account's own (family) filter both
+  apply, online and offline.
 - **Browse:** search across all types with recent searches, home feed, album, artist,
   playlist, show and episode pages, synced lyrics, share links and deep links
   (`spotify:` URIs and open.spotify.com links). On Android 12 and later, open.spotify.com
@@ -40,7 +51,9 @@ over JNI). Requires a Spotify Premium account.
   to SpotifyGood works without that.
 - **Downloads:** tracks, albums, playlists, Liked Songs and podcasts for offline playback in
   the app. Files stay encrypted and their keys are protected by the Android Keystore.
-  - Optional Wi-Fi only, collection auto-sync, storage management.
+  - Optional Wi-Fi only, collection auto-sync, storage management, internal storage or an SD
+    card as the download location (downloads move safely between them; a removed card's
+    downloads come back when it is reinserted).
   - Offline mode. Downloaded music keeps playing without a gap when the network goes away
     mid-song, and downloaded albums, playlists and shows can be browsed and played offline.
 
@@ -50,7 +63,7 @@ over JNI). Requires a Spotify Premium account.
 |------|------|
 | `app/` | Android app (Compose UI, Media3 `MediaLibraryService`, Room, WorkManager / user-initiated jobs) |
 | `native/spotcore/` | Rust engine: session, Connect, catalog (Spotify internal APIs), downloads, JNI bridge |
-| `native/vendor/` | Patched copies of librespot-core, -connect and -playback 0.8.0 (see `native/vendor/README.md`) |
+| `native/vendor/` | Patched copies of librespot-core, -connect, -playback and -audio 0.8.0 (see `native/vendor/README.md`) |
 | `docs/ARCHITECTURE.md` | Design, the Kotlin–Rust contract (RPC methods, events, JSON shapes), battery rules |
 
 ## Building
@@ -72,7 +85,8 @@ Gradle properties:
 - `-Pnative.abis=arm64-v8a`: build fewer ABIs (default `arm64-v8a,armeabi-v7a,x86_64`).
 - `-Pnative.profile=dev`: faster unoptimised native builds.
 
-Tests: `./gradlew :app:testDebugUnitTest` and `cd native && cargo test -p spotcore`.
+Tests: `./gradlew :app:testDebugUnitTest` and
+`cd native && cargo test -p spotcore -p librespot-connect -p librespot-playback -p librespot-audio`.
 
 ## Known limitations
 
