@@ -74,8 +74,11 @@ import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.asImage
 import coil3.decode.DataSource
+import coil3.fetch.Fetcher
+import coil3.fetch.ImageFetchResult
 import coil3.intercept.Interceptor
 import coil3.request.ImageResult
+import coil3.request.Options
 import coil3.request.SuccessResult
 import com.github.takahirom.roborazzi.captureRoboImage
 import com.taehagen.spotifygood.model.ActiveDeviceRef
@@ -97,6 +100,9 @@ import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.PageBackHandler
 import com.taehagen.spotifygood.ui.navigation.Route
 import com.taehagen.spotifygood.ui.theme.SpotifyGoodTheme
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
@@ -138,12 +144,22 @@ class ExpandingPlayerScreenshotTest {
     /** Where the fake loader says each cover came from (a memory-cache hit never fades in). */
     private var coverSource = DataSource.MEMORY_CACHE
 
+    /** The covers under [SLOW_COVER_URL]: downloads held until a test lets them go. */
+    private lateinit var slowCovers: SlowCovers
+
     @Before
     fun fakeImages() {
         val cover = coverBitmap()
+        slowCovers = SlowCovers(Bitmap.createScaledBitmap(cover, 640, 640, true))
         SingletonImageLoader.setUnsafe { context ->
             ImageLoader.Builder(context)
-                .components { add(CoverInterceptor(cover) { coverSource }) }
+                .components {
+                    add(CoverInterceptor(cover) { coverSource })
+                    add(slowCovers)
+                }
+                // Coil's engine (slow covers only) on the main looper the tests drive.
+                .fetcherCoroutineContext(Dispatchers.Main.immediate)
+                .decoderCoroutineContext(Dispatchers.Main.immediate)
                 .build()
         }
     }
@@ -398,6 +414,37 @@ class ExpandingPlayerScreenshotTest {
                 Snapshot.sendApplyNotifications()
                 shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(250))
                 assertShowsCover(view, "thumbnail after its fade") { sheet.miniArtwork.center }
+            }
+        }
+    }
+
+    @Test
+    fun aCoverStillDownloadingAsThePlayerExpandsIsOnNowPlayingWhenItLands() {
+        val probe = Probe()
+        val cover = mutableStateOf(COVER_URL)
+        launch({ Harness(dark = true, progress = 0f, cover = { cover.value }, probe = probe) }) { scenario ->
+            scenario.onActivity { activity ->
+                val view = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0)
+                val sheet = probe.sheet!!
+                // A new cover on a slow network: the thumbnail and the moving art start downloading it.
+                cover.value = SLOW_COVER_URL
+                runFrames(view, 100)
+                val first = slowCovers.downloads.toList()
+                assertTrue(first.isNotEmpty())
+                // The player starts to expand: Now Playing composes and starts a download of its own.
+                moveSheet(sheet, 0.5f)
+                runFrames(view, 100)
+                val started = slowCovers.downloads.size
+                assertTrue("Now Playing's own download", started > first.size)
+                // The first downloads finish mid-flight. Now Playing's copy takes the cover from the
+                // memory cache (no new download) and drops its own.
+                first.forEach { it.done.complete(Unit) }
+                runFrames(view, 100)
+                assertEquals(started, slowCovers.downloads.size)
+                assertTrue(slowCovers.downloads.drop(first.size).all { it.dropped })
+                // Landed: Now Playing's art shows the cover from its first frame, not its placeholder.
+                moveSheet(sheet, 1f)
+                assertShowsCover(view, "Now Playing's art as the player lands") { sheet.largeArtwork.center }
             }
         }
     }
@@ -854,11 +901,48 @@ class ExpandingPlayerScreenshotTest {
 
     /**
      * Every request gets the cover, by default as a memory-cache hit (what a copy of the player's
-     * shared request gets once another has loaded it).
+     * shared request gets once another has loaded it). Slow covers go on to Coil's engine.
      */
     private class CoverInterceptor(private val cover: Bitmap, private val source: () -> DataSource) : Interceptor {
         override suspend fun intercept(chain: Interceptor.Chain): ImageResult =
-            SuccessResult(image = cover.asImage(), request = chain.request, dataSource = source())
+            if (chain.request.data.toString().startsWith(SLOW_COVER_URL)) {
+                chain.proceed()
+            } else {
+                SuccessResult(image = cover.asImage(), request = chain.request, dataSource = source())
+            }
+    }
+
+    /**
+     * Downloads of the covers under [SLOW_COVER_URL], each held until the test completes it. They
+     * run inside Coil's engine, so its memory cache works as in the app: a request that misses it
+     * makes a download of its own, as Coil joins none in flight. [cover] is 640 px, the size the
+     * player asks for, so the cached bitmap serves its later requests.
+     */
+    private class SlowCovers(private val cover: Bitmap) : Fetcher.Factory<coil3.Uri> {
+        class Download {
+            val done = CompletableDeferred<Unit>()
+
+            /** Cancelled before it was done (its request was replaced or went away). */
+            var dropped = false
+        }
+
+        val downloads = mutableListOf<Download>()
+
+        override fun create(data: coil3.Uri, options: Options, imageLoader: ImageLoader): Fetcher? =
+            if (!data.toString().startsWith(SLOW_COVER_URL)) {
+                null
+            } else {
+                Fetcher {
+                    val download = Download().also { downloads += it }
+                    try {
+                        download.done.await()
+                    } catch (e: CancellationException) {
+                        download.dropped = true
+                        throw e
+                    }
+                    ImageFetchResult(image = cover.asImage(), isSampled = false, dataSource = DataSource.NETWORK)
+                }
+            }
     }
 
     private object NoCommands : PlayerCommands {
@@ -893,6 +977,7 @@ class ExpandingPlayerScreenshotTest {
 
     private companion object {
         const val COVER_URL = "https://i.scdn.co/image/fake-cover"
+        const val SLOW_COVER_URL = "https://i.scdn.co/image/slow-cover"
         const val LONG_TITLE = "Weird Fishes / Arpeggi"
         const val SHORT_TITLE = "Nude"
         const val POSITION_MS = 96_000L

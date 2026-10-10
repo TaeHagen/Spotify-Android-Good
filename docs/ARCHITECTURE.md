@@ -1956,11 +1956,14 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
     Playing's slot (8 dp corners, 24 dp shadow): laid out once at the slot's size and moved by its
     layer. At rest the thumbnail (p 0) or Now Playing's own art (p 1, so it scrolls with the page)
     shows instead; all three make the same Coil request (same data, fixed 640 px), so a copy that
-    loads after another has the cover takes that bitmap from the memory cache (a new cover
-    reaches the composed copies at once, and each may decode it). Coil starts a fade at the
-    painter's first draw, so a copy fades in only a cover that arrives while it is on screen; one
-    that arrives while it is hidden (the moving art is not even placed at rest) shows at once,
-    never as a grey square fading into the cover as the art starts to move. The thumbnail's rect
+    loads after another has the cover takes that bitmap from the memory cache. Coil joins no
+    request in flight, and Now Playing's copy starts only once the player moves, so a copy still
+    loading when another gets the cover (`loadedArtwork`) asks again: a memory-cache hit now,
+    which drops its own download. Now Playing's art therefore has the cover the moving art lands
+    with, not its placeholder. Coil starts a fade at the painter's first draw, so a copy fades in
+    only a cover that arrives while it is on screen (one taken from another copy too); one that
+    arrives while it is hidden (the moving art is not even placed at rest) shows at once, never
+    as a grey square fading into the cover as the art starts to move. The thumbnail's rect
     is derived from the card (`miniArtworkBounds`), the slot's measured. With large fonts Now
     Playing switches to its compact (scrolling) layout sooner, so the details never squeeze the
     slot to nothing.
@@ -1974,7 +1977,8 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
     events through the sheet (drag, fling, slow release, nested scroll, a tap) and on the real
     seek bar and volume slider wrapped as Now Playing wraps them (sideways drags in sub-slop
     steps, a tap that moves 1 px, vertical drags). It also checks Back and predictive back
-    against a page's own handler, and the art's first frame where it appears.
+    against a page's own handler, and the art's first frame where it appears, also with a cover
+    still downloading as the player expands.
 * Swipe to queue (`ui/components/SwipeToQueue.kt`, built into `TrackRow` and `EpisodeRow`): in
   every vertical list of tracks or episodes, including search results, artist top tracks, album
   tracks, playlists and Liked Songs (window rows too once loaded), Downloads, a show's episodes
