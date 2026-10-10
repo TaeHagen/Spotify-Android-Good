@@ -1905,9 +1905,12 @@ impl SpircTask {
             PlayerEvent::Unavailable {
                 track_id, reason, ..
             } => {
+                // SPOTIFYGOOD: a key refused for now (KeyThrottled) is transient too
                 let transient = matches!(
                     reason,
-                    UnavailableReason::KeyTemporarilyDenied | UnavailableReason::NetworkError
+                    UnavailableReason::KeyTemporarilyDenied
+                        | UnavailableReason::KeyThrottled
+                        | UnavailableReason::NetworkError
                 );
                 let is_current =
                     self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()?;

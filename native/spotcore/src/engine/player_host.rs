@@ -146,6 +146,8 @@ async fn drop_player(player: Arc<Player>) {
 }
 
 fn create(session: &Session, settings: &EngineSettings) -> Arc<Player> {
+    // The Player's key requests count for the downloads' key budget (playback goes first).
+    crate::offline::observe_audio_keys();
     let mixer = mixer_or_default();
     let player = Player::new(config::player_config(settings), session.clone(), mixer.get_soft_volume(), || {
         Box::new(AndroidSink::new())

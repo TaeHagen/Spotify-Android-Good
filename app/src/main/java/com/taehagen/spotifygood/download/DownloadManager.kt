@@ -157,6 +157,20 @@ data class DownloadRelocation(
     val unreadable: Int = 0,
 )
 
+/**
+ * The download queue waits for Spotify's audio-key limit until [until] (epoch ms): Spotify limits
+ * how fast an account gets audio keys, so downloads go at its pace (docs/ARCHITECTURE.md §9.7).
+ */
+data class DownloadPause(val reason: Reason, val until: Long) {
+    enum class Reason {
+        /** The engine's pacing: songs download in small batches as the key budget refills. */
+        PACING,
+
+        /** Spotify throttled (keys, or the CDN): a cool-down of minutes, then on by itself. */
+        LIMITED,
+    }
+}
+
 /** What the downloader is doing right now (Downloads screen header, banners). */
 data class DownloadActivity(
     val running: Boolean = false,
@@ -167,6 +181,8 @@ data class DownloadActivity(
     val remaining: Int = 0,
     /** Why the last run stopped early (storage, account …); null when it did not. */
     val lastError: String? = null,
+    /** The queue waits for Spotify's audio-key limit (while running, or rescheduled for it). */
+    val pause: DownloadPause? = null,
 ) {
     /** 0..1 for [currentUri] while its size is known. */
     val progress: Float? get() = if (totalBytes > 0) (bytes.toFloat() / totalBytes).coerceIn(0f, 1f) else null
@@ -431,6 +447,7 @@ class DownloadManager(
         scope.launch { followCovers() }
         scope.launch { watchExplicitFilter() }
         scope.launch { repairExplicitFailures() }
+        scope.launch { repairThrottleFailures() }
         scope.launch(Dispatchers.Main) {
             // Back in the app: resume a queue that stopped (storage was full, retries ran out …).
             ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
@@ -648,8 +665,12 @@ class DownloadManager(
     private suspend fun retryFailedNow() {
         mutex.withLock {
             val unavailable = collectionDao.unavailableUrisJsons().flatMapTo(HashSet()) { decodeItems(it) }
-            val uris = DownloadRules.retryable(dao.retryRows(), unavailable, appContext.getString(R.string.data_dl_error_unplayable))
-            uris.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+            val rows = dao.retryRows()
+            val uris = DownloadRules.retryable(rows, unavailable, appContext.getString(R.string.data_dl_error_unplayable))
+            // Songs Spotify refused queue after the others (see DownloadRules.keepsAttempts).
+            val keep = DownloadRules.keepsAttempts(uris, rows, appContext.getString(R.string.data_dl_error_refused_item))
+            uris.filter { it !in keep }.chunked(SQL_CHUNK).forEach { dao.requeueFailed(it) }
+            keep.toList().chunked(SQL_CHUNK).forEach { dao.requeueFailedKeepingAttempts(it) }
         }
         // Downloads on an SD card that is no longer used count as failed: downloaded again.
         if (missingCard.value.stranded.isNotEmpty()) downloadItemsNow(missingCard.value.stranded.toList())
@@ -1310,6 +1331,37 @@ class DownloadManager(
     }
 
     /**
+     * Once per installation: earlier versions read Spotify's audio-key throttle (a playlist
+     * downloaded too fast) as an account refusal, which failed every pending download, or as a
+     * network error retried until the attempts ran out. Those failed downloads go back into the
+     * queue ([DownloadRules.throttleRepair]), downloaded at the pace the engine now keeps.
+     */
+    private suspend fun repairThrottleFailures() {
+        try {
+            val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (withContext(Dispatchers.IO) { prefs.getInt(KEY_THROTTLE_REPAIR, 0) } >= THROTTLE_REPAIR_VERSION) return
+            val reasons = setOf(
+                appContext.getString(R.string.data_dl_error_refused),
+                appContext.getString(R.string.data_dl_error_network),
+                appContext.getString(R.string.data_dl_error_rate_limited),
+            )
+            val requeued = mutex.withLock {
+                val uris = DownloadRules.throttleRepair(dao.retryRows(), reasons)
+                database.withTransaction { uris.chunked(SQL_CHUNK).sumOf { dao.requeueFailedOnly(it) } }
+            }
+            withContext(Dispatchers.IO) { prefs.edit().putInt(KEY_THROTTLE_REPAIR, THROTTLE_REPAIR_VERSION).commit() }
+            if (requeued > 0) {
+                Log.i(TAG, "Key throttle repair: queued $requeued failed downloads again")
+                scheduleExecution(kick = true)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Key throttle repair failed; retried at the next start", e)
+        }
+    }
+
+    /**
      * Re-syncs downloaded collections with their sources (new/removed items) and re-validates
      * downloads older than 30 days. Holds the engine (DOWNLOAD) meanwhile; does nothing when the
      * session cannot come online. Concurrent calls are coalesced.
@@ -1964,15 +2016,51 @@ class DownloadManager(
         }
     }
 
+    /**
+     * The run ended because the whole queue waits until the earliest `retryAt` ([RunOutcome.PAUSED]:
+     * Spotify's audio-key pacing or cool-down, a rate limit, a connectivity pause): one delayed
+     * WorkManager request wakes the queue then. Called by the host before it finishes. No backoff and
+     * a fresh request, so a pause never counts against the worker's retries; WorkManager because a
+     * user-initiated job can neither be delayed nor scheduled from the background. A user action,
+     * coming back to the app or coming online may start the queue earlier ([DownloadRules.replaceWork]
+     * replaces the waiting resume); removals that empty the queue cancel it.
+     */
+    internal suspend fun scheduleResume(): Unit = withContext(Dispatchers.IO) {
+        try {
+            val retryAt = dao.earliestRetryAt() ?: return@withContext
+            if (dao.pendingCount() == 0 || storage.target.value is DownloadStorage.Target.Missing) return@withContext
+            val current = settings.awaitLoaded()
+            if (current.offlineMode) return@withContext
+            val delayMs = DownloadRules.resumeDelayMs(retryAt, System.currentTimeMillis())
+            val request = OneTimeWorkRequestBuilder<DownloadWorker>()
+                .setConstraints(workConstraints(current.downloadOverCellular, needsInternalStorage()))
+                .setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, WORK_BACKOFF_S, TimeUnit.SECONDS)
+                .addTag(RESUME_TAG)
+                .build()
+            val workManager = WorkManager.getInstance(appContext)
+            // The worker that asks is still running: replacing it would cancel it. The resume is
+            // appended instead and starts its delay when the worker succeeds a moment later.
+            val running = workManager.getWorkInfosForUniqueWork(WORK_NAME).get().any { it.state == WorkInfo.State.RUNNING }
+            workManager.enqueueUniqueWork(WORK_NAME, if (running) ExistingWorkPolicy.APPEND_OR_REPLACE else ExistingWorkPolicy.REPLACE, request)
+            Log.i(TAG, "The download queue resumes in $delayMs ms")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Scheduling the download resume failed", e)
+        }
+    }
+
+    private fun workConstraints(cellular: Boolean, storageNotLow: Boolean): Constraints = Constraints.Builder()
+        .setRequiredNetworkType(if (cellular) NetworkType.CONNECTED else NetworkType.UNMETERED)
+        .setRequiresStorageNotLow(storageNotLow)
+        .build()
+
     /** Blocking (reads the pending work): call off the main thread. See [scheduleExecution]. */
     private fun enqueueWorker(cellular: Boolean, storageNotLow: Boolean, replace: Boolean, kick: Boolean) {
         val network = if (cellular) NetworkType.CONNECTED else NetworkType.UNMETERED
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(network)
-            .setRequiresStorageNotLow(storageNotLow)
-            .build()
         val request = OneTimeWorkRequestBuilder<DownloadWorker>()
-            .setConstraints(constraints)
+            .setConstraints(workConstraints(cellular, storageNotLow))
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, WORK_BACKOFF_S, TimeUnit.SECONDS)
             .build()
         val workManager = WorkManager.getInstance(appContext)
@@ -1989,6 +2077,7 @@ class DownloadManager(
             stale = existing != null &&
                 (existing.constraints.requiredNetworkType != network || existing.constraints.requiresStorageNotLow() != storageNotLow),
             runAttempts = existing?.runAttemptCount ?: 0,
+            resume = existing?.tags?.contains(RESUME_TAG) == true,
         )
         workManager.enqueueUniqueWork(WORK_NAME, if (recreate) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP, request)
     }
@@ -2030,6 +2119,9 @@ class DownloadManager(
     internal companion object {
         private const val TAG = "DownloadManager"
         const val WORK_NAME = "downloads"
+
+        /** Tag of the delayed request that resumes a paused queue ([scheduleResume]). */
+        const val RESUME_TAG = "downloads-resume"
         const val SYNC_WORK_NAME = "download-sync"
         const val JOB_ID = 0x5D0D
         private const val EMPTY_ITEMS = "[]"
@@ -2056,6 +2148,8 @@ class DownloadManager(
         private const val PREFS = "downloads"
         private const val KEY_EXPLICIT_REPAIR = "explicitFilterRepair"
         private const val EXPLICIT_REPAIR_VERSION = 1
+        private const val KEY_THROTTLE_REPAIR = "keyThrottleRepair"
+        private const val THROTTLE_REPAIR_VERSION = 1
         private const val JOB_BACKOFF_MS = 30_000L
         private const val WORK_BACKOFF_S = 30L
         private const val SYNC_BACKOFF_MIN = 15L

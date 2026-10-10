@@ -397,6 +397,7 @@ async fn configure_start(args: StartArgs) -> AppResult<u64> {
         crate::catalog::metadata::clear_cache();
         crate::catalog::clear_user_state();
         *CATALOG_FILTER.lock() = None;
+        crate::offline::forget_audio_keys();
     }
     if restart {
         update_status(|s| {
@@ -507,7 +508,9 @@ async fn logout() -> AppResult<Value> {
     crate::catalog::metadata::clear_cache();
     crate::catalog::clear_user_state();
     *CATALOG_FILTER.lock() = None;
-    let dirs = [runtime::credentials_dir(), runtime::streaming_cache_dir(), runtime::librespot_tmp_dir()];
+    // The account's audio keys and its key budget.
+    crate::offline::forget_audio_keys();
+    let dirs =[runtime::credentials_dir(), runtime::streaming_cache_dir(), runtime::librespot_tmp_dir()];
     let cleanup = tokio::task::spawn_blocking(move || {
         for dir in dirs {
             match std::fs::remove_dir_all(&dir) {

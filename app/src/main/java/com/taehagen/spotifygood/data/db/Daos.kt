@@ -195,6 +195,13 @@ interface DownloadDao {
     )
     suspend fun requeueFailed(uris: List<String>): Int
 
+    /** Like [requeueFailed], keeping the rows' attempts: they queue after rows not tried yet ([nextRunnable]). */
+    @Query(
+        "UPDATE downloads SET state = 'queued', retryAt = NULL, error = NULL " +
+            "WHERE uri IN (:uris) AND state IN ('failed','cancelled')",
+    )
+    suspend fun requeueFailedKeepingAttempts(uris: List<String>): Int
+
     /** Like [requeueFailed] for failed items only: one the user cancelled stays cancelled. */
     @Query(
         "UPDATE downloads SET state = 'queued', attempts = 0, retryAt = NULL, error = NULL " +

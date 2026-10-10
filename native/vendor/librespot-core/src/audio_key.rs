@@ -1,4 +1,10 @@
-use std::{collections::HashMap, io::Write, time::Duration};
+// SPOTIFYGOOD: VecDeque, Arc, Mutex, OnceLock, PoisonError (known keys, KeyObserver)
+use std::{
+    collections::{HashMap, VecDeque},
+    io::Write,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
+    time::Duration,
+};
 
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use bytes::Bytes;
@@ -61,6 +67,106 @@ pub fn is_permanent_denial(err: &Error) -> bool {
     )
 }
 
+// SPOTIFYGOOD: the code of an `AesKeyError` answer (see KeyAnswer)
+/// The code the access point refused the key with, if the error is such a refusal.
+pub fn key_error_code(err: &Error) -> Option<u16> {
+    match err.error.downcast_ref::<AudioKeyError>() {
+        Some(AudioKeyError::AesKey { code }) => Some(*code),
+        _ => None,
+    }
+}
+
+// SPOTIFYGOOD: who asks for an audio key (see KeyObserver)
+/// Who requests an audio key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyRequester {
+    /// The player (loads and preloads): [AudioKeyManager::request].
+    Playback,
+    /// The app's downloader: [AudioKeyManager::request_as].
+    Download,
+}
+
+// SPOTIFYGOOD: how a key request to the access point ended (see KeyObserver)
+/// How the access point answered one key request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAnswer {
+    /// The key.
+    Key,
+    /// An `AesKeyError` with this code ([AES_KEY_ERROR_PERMANENT], [AES_KEY_ERROR_TRANSIENT] …).
+    Refused(u16),
+    /// No answer within the response timeout.
+    Timeout,
+    /// The request could not be sent, or the session went away before the answer.
+    Failed,
+}
+
+impl KeyAnswer {
+    /// The answer `result` of a request is.
+    pub fn of(result: &Result<AudioKey, Error>) -> Self {
+        match result {
+            Ok(_) => KeyAnswer::Key,
+            Err(e) => match e.error.downcast_ref::<AudioKeyError>() {
+                Some(AudioKeyError::AesKey { code }) => KeyAnswer::Refused(*code),
+                Some(AudioKeyError::Timeout) => KeyAnswer::Timeout,
+                _ => KeyAnswer::Failed,
+            },
+        }
+    }
+}
+
+// SPOTIFYGOOD: Spotify limits how fast an account gets audio keys (librespot #1319): the app
+// paces its downloads against every request of the process, the player's included.
+/// Sees every key request that goes to the access point (not those answered from the keys this
+/// process already has, see [known_key]), by whom, and how it ended. Called on the requesting
+/// task: keep it short and never block.
+pub trait KeyObserver: Send + Sync {
+    /// A request is about to be sent.
+    fn requested(&self, requester: KeyRequester);
+    /// The request ended.
+    fn answered(&self, requester: KeyRequester, answer: KeyAnswer);
+}
+
+static KEY_OBSERVER: OnceLock<Arc<dyn KeyObserver>> = OnceLock::new();
+
+/// Installs the process's [KeyObserver]. Only the first call takes effect (false after it).
+pub fn set_key_observer(observer: Arc<dyn KeyObserver>) -> bool {
+    KEY_OBSERVER.set(observer).is_ok()
+}
+
+// SPOTIFYGOOD: an audio file's key never changes. A track played again (repeat, back), a
+// preloaded track loaded later and a download of a streamed track need no new request.
+/// Keys of the files this process received (the most recent last, bounded).
+const KNOWN_KEYS: usize = 512;
+
+static KNOWN: Mutex<VecDeque<(FileId, AudioKey)>> = Mutex::new(VecDeque::new());
+
+fn known_keys() -> MutexGuard<'static, VecDeque<(FileId, AudioKey)>> {
+    KNOWN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The key of `file` if this process received it already.
+pub fn known_key(file: FileId) -> Option<AudioKey> {
+    known_keys()
+        .iter()
+        .rev()
+        .find(|(f, _)| *f == file)
+        .map(|(_, key)| *key)
+}
+
+fn remember_key(file: FileId, key: AudioKey) {
+    let mut known = known_keys();
+    known.retain(|(f, _)| *f != file);
+    if known.len() >= KNOWN_KEYS {
+        known.pop_front();
+    }
+    known.push_back((file, key));
+}
+
+/// Forgets every key received so far (logout, another account).
+pub fn forget_keys() {
+    known_keys().clear();
+}
+
 component! {
     AudioKeyManager : AudioKeyManagerInner {
         sequence: SeqGenerator<u32> = SeqGenerator::new(0),
@@ -105,7 +211,39 @@ impl AudioKeyManager {
         Ok(())
     }
 
+    // SPOTIFYGOOD: a request of the player (see request_as)
     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
+        self.request_as(KeyRequester::Playback, track, file).await
+    }
+
+    // SPOTIFYGOOD: answered from the keys this process received when it has the file's key, else
+    // sent to the access point, seen by the KeyObserver
+    /// The key of `file` (of `track`), requested by `requester`.
+    pub async fn request_as(
+        &self,
+        requester: KeyRequester,
+        track: SpotifyId,
+        file: FileId,
+    ) -> Result<AudioKey, Error> {
+        if let Some(key) = known_key(file) {
+            return Ok(key);
+        }
+        let observer = KEY_OBSERVER.get();
+        if let Some(observer) = observer {
+            observer.requested(requester);
+        }
+        let result = self.request_from_ap(track, file).await;
+        if let Ok(key) = &result {
+            remember_key(file, *key);
+        }
+        if let Some(observer) = observer {
+            observer.answered(requester, KeyAnswer::of(&result));
+        }
+        result
+    }
+
+    // SPOTIFYGOOD: was the body of `request`
+    async fn request_from_ap(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
         let (tx, rx) = oneshot::channel();
 
         let seq = self.lock(move |inner| {
@@ -170,5 +308,16 @@ mod tests {
         assert!(!is_permanent_denial(&timeout));
 
         assert!(!is_permanent_denial(&Error::permission_denied("other")));
+
+        assert_eq!(key_error_code(&permanent), Some(AES_KEY_ERROR_PERMANENT));
+        assert_eq!(key_error_code(&transient), Some(AES_KEY_ERROR_TRANSIENT));
+        assert_eq!(key_error_code(&timeout), None);
+        assert_eq!(KeyAnswer::of(&Err(transient)), KeyAnswer::Refused(2));
+        assert_eq!(KeyAnswer::of(&Err(timeout)), KeyAnswer::Timeout);
+        assert_eq!(
+            KeyAnswer::of(&Err(AudioKeyError::Channel.into())),
+            KeyAnswer::Failed
+        );
+        assert_eq!(KeyAnswer::of(&Ok(AudioKey([0; 16]))), KeyAnswer::Key);
     }
 }

@@ -78,6 +78,27 @@ internal class DownloadNotifications(private val context: Context) {
         return builder.build()
     }
 
+    /**
+     * Ongoing notification while the queue waits within the run ([message]: Spotify's download pace
+     * and when it goes on); the bar stays at [done] of [total].
+     */
+    fun waiting(message: String, done: Int, total: Int): Notification {
+        ensureChannel()
+        val builder = base(Notifications.CHANNEL_DOWNLOADS)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_DEFERRED)
+            .addAction(0, context.getString(R.string.data_dl_notif_cancel), cancelIntent())
+            .setContentTitle(context.getString(R.string.data_dl_notif_title))
+            .setContentText(message)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+        if (total > 0) builder.setProgress(total * PROGRESS_SCALE, done.coerceIn(0, total) * PROGRESS_SCALE, false)
+        return builder.build()
+    }
+
     /** WorkManager foreground info (dataSync type on API 29+). */
     fun foregroundInfo(notification: Notification): ForegroundInfo =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

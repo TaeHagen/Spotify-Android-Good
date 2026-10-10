@@ -43,6 +43,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -61,6 +62,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.taehagen.spotifygood.R
 import com.taehagen.spotifygood.download.CollectionDownloadStatus
 import com.taehagen.spotifygood.download.CollectionType
+import com.taehagen.spotifygood.download.DownloadPause
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.ui.screens.album.canStartNow
 import com.taehagen.spotifygood.model.Episode
@@ -79,6 +81,7 @@ import com.taehagen.spotifygood.ui.navigation.AppNavigator
 import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import com.taehagen.spotifygood.ui.components.FastScroller
@@ -426,6 +429,33 @@ private fun entryStatusText(entry: DownloadEntry): String? = when (entry.state) 
     DownloadState.COMPLETED, DownloadState.CANCELLED -> null
 }
 
+/** "Spotify is limiting downloads. Continuing in about 8 min." ([DownloadPauseNotice]). */
+@Composable
+private fun pauseNoticeText(notice: DownloadPauseNotice): String {
+    val paced = notice.reason == DownloadPause.Reason.PACING
+    if (notice.minutes <= 0) {
+        return stringResource(if (paced) R.string.browse_downloads_paced_soon else R.string.browse_downloads_limited_soon)
+    }
+    val minutes = pluralStringResource(R.plurals.browse_downloads_minutes, notice.minutes, notice.minutes)
+    return stringResource(if (paced) R.string.browse_downloads_paced else R.string.browse_downloads_limited, minutes)
+}
+
+/** The wall clock, read again every [PAUSE_TICK_MS] while [ticking] (a pause's minutes left). */
+@Composable
+private fun rememberNow(ticking: Boolean): Long {
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(ticking) {
+        now = System.currentTimeMillis()
+        while (ticking) {
+            delay(PAUSE_TICK_MS)
+            now = System.currentTimeMillis()
+        }
+    }
+    return now
+}
+
+private const val PAUSE_TICK_MS = 20_000L
+
 @Composable
 private fun StorageHeader(state: DownloadsUiState, onRetryFailed: () -> Unit) {
     val context = LocalContext.current
@@ -452,6 +482,17 @@ private fun StorageHeader(state: DownloadsUiState, onRetryFailed: () -> Unit) {
                     text = pluralStringResource(R.plurals.browse_downloads_pending, content.pendingCount, content.pendingCount),
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(start = if (activity.running) 8.dp else 0.dp),
+                )
+            }
+            // Spotify limits how fast songs download (its audio keys): say when the queue goes on
+            // instead of letting it look stuck.
+            val notice = downloadPauseNotice(activity, content.pendingCount, rememberNow(ticking = activity.pause != null))
+            if (notice != null) {
+                Text(
+                    text = pauseNoticeText(notice),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
                 )
             }
             val reason = activity.lastError

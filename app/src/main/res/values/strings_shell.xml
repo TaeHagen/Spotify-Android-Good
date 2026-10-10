@@ -159,6 +159,7 @@
     <!-- Errors -->
     <string name="shell_error_network">No connection. Check your network and try again.</string>
     <string name="shell_error_rate_limited">Spotify is busy right now. Try again in a moment.</string>
+    <string name="shell_error_playback_limited">Spotify is limiting how fast songs that aren\'t downloaded can start. Try again in a minute; downloaded songs still play.</string>
     <string name="shell_error_not_found">This isn\'t available.</string>
     <string name="shell_error_premium">Spotify Premium is required for this.</string>
     <string name="shell_error_session">Your session expired. Log in again.</string>

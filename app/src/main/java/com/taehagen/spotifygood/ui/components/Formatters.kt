@@ -79,7 +79,12 @@ fun friendlyErrorMessage(context: Context, code: String?, message: String? = nul
 }
 
 fun friendlyErrorMessage(context: Context, info: NativeErrorInfo): String =
-    friendlyErrorMessage(context, info.code, info.message)
+    if (info.code == NativeErrorCode.RATE_LIMITED && info.context == "playback") {
+        // The player's audio keys: Spotify limits how fast songs that aren't downloaded can start.
+        context.getString(R.string.shell_error_playback_limited)
+    } else {
+        friendlyErrorMessage(context, info.code, info.message)
+    }
 
 fun friendlyErrorMessage(context: Context, error: Throwable): String = when (error) {
     is NativeException -> friendlyErrorMessage(context, error.code, error.info.message)

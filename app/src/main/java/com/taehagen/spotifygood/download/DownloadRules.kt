@@ -38,6 +38,29 @@ internal object DownloadRules {
     /** First queue pause after a rate limit without a server delay (doubles per consecutive limit). */
     const val RATE_LIMIT_PAUSE_MS = 60_000L
 
+    /**
+     * `context` of a `download.track` `RATE_LIMITED`: the engine's own audio-key pacing (Spotify
+     * limits how fast an account gets keys, docs/ARCHITECTURE.md §9.7). Not a failure: the queue
+     * waits `retryAfterMs`.
+     */
+    const val KEY_PACING = "keyPacing"
+
+    /** `context` of a `download.track` `RATE_LIMITED`: Spotify throttled audio keys; the engine's cool-down. */
+    const val KEY_THROTTLED = "keyThrottled"
+
+    /** `context` of a `download.track` `UNAVAILABLE`: Spotify refused this file's audio key (0x0001). */
+    const val KEY_REFUSED = "keyRefused"
+
+    /** Shortest queue pause for the key pacing (the engine rounds its own up). */
+    const val MIN_PACING_PAUSE_MS = 1_000L
+
+    /**
+     * Longest queue pause the engine's audio-key wait is followed for (its cool-down at the top level
+     * plus the refill after it): one wake when it ends, not one at [MAX_QUEUE_PAUSE_MS] to be told to
+     * wait again.
+     */
+    const val MAX_KEY_PAUSE_MS = 60 * 60_000L
+
     /** Consecutive connectivity failures while online after which the whole queue pauses. */
     const val CONNECTIVITY_TRIP = 3
 
@@ -55,6 +78,15 @@ internal object DownloadRules {
     const val REQUEST_SYNC_CHANGED_MS = 30_000L
 
     const val MAX_QUEUE_PAUSE_MS = 30 * 60_000L
+
+    /**
+     * Longest wait inside a run for the queue's next item (a retry backoff, a queue pause): a longer
+     * one ends the run ([RunOutcome.PAUSED], [idleStep]).
+     */
+    const val MAX_INLINE_WAIT_MS = 2 * 60_000L
+
+    /** Shortest inline wait. */
+    const val MIN_WAIT_MS = 250L
 
     /** Rate-limit pauses one run waits out before it hands the queue back to the system. */
     const val MAX_THROTTLED_PER_RUN_MS = 5 * 60_000L
@@ -85,7 +117,6 @@ internal object DownloadRules {
     /** Codes after which no further download can succeed in this run (account-wide conditions). */
     private val STOP_RUN = setOf(
         NativeErrorCode.PREMIUM_REQUIRED,
-        NativeErrorCode.PLAYBACK_REFUSED,
         NativeErrorCode.BAD_CREDENTIALS,
         NativeErrorCode.NOT_LOGGED_IN,
     )
@@ -113,6 +144,14 @@ internal object DownloadRules {
         /** Account-wide failure: fail what is pending and stop the run. */
         data object StopRun : FailureAction
 
+        /**
+         * Spotify refused audio keys for the account (`PLAYBACK_REFUSED` from `download.track`, as
+         * the engine judges it from refusals of songs of several albums with no key for a day): this
+         * item fails and the run stops, but what was not tried yet stays queued (the judgement can
+         * be wrong; "Resume", the app coming back or a user action try again).
+         */
+        data object AccountRefused : FailureAction
+
         /** The device went offline: requeue without counting an attempt and wait for the network. */
         data object WaitForNetwork : FailureAction
 
@@ -125,13 +164,33 @@ internal object DownloadRules {
          * queue pauses ([QueueBreaker]) rather than every item trying again.
          */
         data object Throttled : FailureAction
+
+        /**
+         * The engine paces audio keys ([KEY_PACING]): back to the queue without counting an attempt,
+         * the whole queue waits the engine's `retryAfterMs` (no growth: it is not a failure).
+         */
+        data object Paced : FailureAction
     }
 
-    /** Decides what to do with an item that failed with [code] after [previousAttempts] earlier failures. */
-    fun onFailure(code: String, previousAttempts: Int, online: Boolean, retryAfterMs: Long? = null): FailureAction {
+    /** Whether an error with [code] and [context] is the engine's audio-key pacing. */
+    fun isKeyPacing(code: String, context: String?) = code == NativeErrorCode.RATE_LIMITED && context == KEY_PACING
+
+    /**
+     * Decides what to do with an item that failed with [code] (and the error's [context]) after
+     * [previousAttempts] earlier failures.
+     */
+    fun onFailure(
+        code: String,
+        previousAttempts: Int,
+        online: Boolean,
+        retryAfterMs: Long? = null,
+        context: String? = null,
+    ): FailureAction {
         val attempts = previousAttempts + 1
         return when {
             code in STOP_RUN -> FailureAction.StopRun
+            code == NativeErrorCode.PLAYBACK_REFUSED -> FailureAction.AccountRefused
+            isKeyPacing(code, context) -> FailureAction.Paced
             code == NativeErrorCode.RATE_LIMITED -> FailureAction.Throttled
             code in CONNECTIVITY && !online -> FailureAction.WaitForNetwork
             code in PERMANENT -> FailureAction.Fail(attempts)
@@ -154,6 +213,11 @@ internal object DownloadRules {
     }
 
     /**
+     * Minutes left until [until] at [now], rounded up (0 once it passed): "continuing in about N min".
+     */
+    fun minutesUntil(until: Long, now: Long): Int = ((until - now).coerceAtLeast(0L) + 59_999L).div(60_000L).toInt()
+
+    /**
      * Whether a run that has waited [throttledMs] for rate-limit pauses in total should stop and
      * reschedule (the pause stays on the rows) rather than keep the engine, the job and its wake lock.
      */
@@ -170,6 +234,26 @@ internal object DownloadRules {
 
     /** Codes that say something about connectivity (for [QueueBreaker]). */
     fun isConnectivity(code: String) = code in CONNECTIVITY
+
+    /**
+     * What the queue waits for after a queue pause of [pauseMs] (from [now]) for an error with
+     * [code] and [context]: Spotify's audio-key pacing or limit ([DownloadPause], shown to the user),
+     * or null for the other pauses (connectivity, the Keystore).
+     */
+    fun pauseFor(code: String, context: String?, pauseMs: Long, now: Long): DownloadPause? = when {
+        isKeyPacing(code, context) -> DownloadPause(DownloadPause.Reason.PACING, now + pauseMs)
+        code == NativeErrorCode.RATE_LIMITED -> DownloadPause(DownloadPause.Reason.LIMITED, now + pauseMs)
+        else -> null
+    }
+
+    /**
+     * The one-time repair of downloads earlier versions failed because of Spotify's audio-key
+     * throttle (they read it as an account refusal and failed every pending row with it, or as a
+     * network error retried until the attempts ran out): the FAILED [rows] stored with one of
+     * [reasons] go back into the queue, paced like any other download.
+     */
+    fun throttleRepair(rows: List<RetryRow>, reasons: Set<String>): List<String> =
+        rows.filter { it.state == DownloadState.FAILED && it.error in reasons }.map { it.uri }
 
     /**
      * Which of [candidates] may be deleted: those not part of any of [keptCollections] (item lists of
@@ -570,8 +654,62 @@ internal object DownloadRules {
      * does not match the setting ([stale]) or a user action finds it waiting out a retry backoff
      * ([kick] after [runAttempts] > 0).
      */
-    fun replaceWork(replace: Boolean, kick: Boolean, enqueued: Boolean, stale: Boolean, runAttempts: Int): Boolean =
-        replace || (enqueued && (stale || (kick && runAttempts > 0)))
+    fun replaceWork(replace: Boolean, kick: Boolean, enqueued: Boolean, stale: Boolean, runAttempts: Int, resume: Boolean = false): Boolean =
+        replace || (enqueued && (stale || (kick && (runAttempts > 0 || resume))))
+
+    /** What a run does when no item may run now: the earliest pending row waits until [retryAt] (null: nothing is pending). */
+    sealed interface IdleStep {
+        /** The queue is drained. */
+        data object Finish : IdleStep
+
+        /** Wait [ms] inside the run. */
+        data class Wait(val ms: Long) : IdleStep
+
+        /** End the run with [RunOutcome.PAUSED]: the queue resumes at [retryAt] by itself. */
+        data object Pause : IdleStep
+    }
+
+    fun idleStep(retryAt: Long?, now: Long): IdleStep {
+        if (retryAt == null) return IdleStep.Finish
+        val wait = retryAt - now
+        return if (wait > MAX_INLINE_WAIT_MS) IdleStep.Pause else IdleStep.Wait(wait.coerceAtLeast(MIN_WAIT_MS))
+    }
+
+    /** What the WorkManager host does after a run that ended with an outcome. */
+    enum class WorkerStep {
+        /** `Result.success()`. */
+        SUCCESS,
+
+        /** `Result.retry()` (system backoff, counted against [maxRetries][workerStep]). */
+        RETRY,
+
+        /** Schedule the delayed resume ([DownloadManager.scheduleResume]), then `Result.success()`. */
+        RESUME,
+    }
+
+    /**
+     * [WorkerStep] of a run that ended with [outcome] in the [runAttempts]-th retry of its work: a
+     * pause until a known time is resumed then (never counted as a retry), only a failure to make
+     * progress takes the system backoff, at most [maxRetries] times.
+     */
+    fun workerStep(outcome: RunOutcome, runAttempts: Int, maxRetries: Int): WorkerStep = when (outcome) {
+        RunOutcome.FINISHED, RunOutcome.STOPPED -> WorkerStep.SUCCESS
+        RunOutcome.PAUSED -> WorkerStep.RESUME
+        RunOutcome.RESCHEDULE -> if (runAttempts < maxRetries) WorkerStep.RETRY else WorkerStep.SUCCESS
+    }
+
+    /** Initial delay of the resume for a queue held back until [retryAt], at [now]. */
+    fun resumeDelayMs(retryAt: Long, now: Long): Long = (retryAt - now).coerceIn(0L, MAX_KEY_PAUSE_MS)
+
+    /**
+     * Which of the FAILED [uris] "Retry failed" puts back keeping their attempts: songs Spotify refused
+     * the audio of ([refusedReason]) queue after the others then, so a refused album does not hold
+     * the head of the queue (it fails again, without a key request, within the engine's day).
+     */
+    fun keepsAttempts(uris: List<String>, rows: List<RetryRow>, refusedReason: String): Set<String> {
+        val refused = rows.filterTo(HashSet()) { it.error == refusedReason }.mapTo(HashSet()) { it.uri }
+        return uris.filterTo(HashSet()) { it in refused }
+    }
 
     /** A downloaded collection's recorded unavailable members and when they were last looked up. */
     data class UnavailableMembers(val collection: String, val members: Set<String>, val checkedAt: Long?)
@@ -849,7 +987,9 @@ internal object DownloadRules {
 /**
  * Run-wide view of failures (docs/ARCHITECTURE.md §9.7), so that a condition of the whole service
  * pauses the whole queue instead of every item spending its attempts on it:
- * * a rate limit pauses at once ([DownloadRules.rateLimitPauseMs]);
+ * * the engine's audio-key pacing pauses for its delay ([DownloadRules.KEY_PACING]);
+ * * a rate limit (the engine's audio-key cool-down included) pauses at once
+ *   ([DownloadRules.rateLimitPauseMs]);
  * * connectivity failures while the session is online (CDN unreachable while the AP works) pause
  *   after [DownloadRules.CONNECTIVITY_TRIP] consecutive items ([DownloadRules.connectivityPauseMs]);
  *   each failure still counts as an attempt of its item.
@@ -883,11 +1023,23 @@ internal class QueueBreaker {
         return pause
     }
 
-    /** How long to pause the whole queue after an item failed with [code]; null = go on. */
-    fun onFailure(code: String, online: Boolean, retryAfterMs: Long?): Long? {
+    /**
+     * How long to pause the whole queue after an item failed with [code] (and [context]); null = go
+     * on. The engine's audio-key pacing ([DownloadRules.KEY_PACING]) pauses for exactly its delay and
+     * changes no count: it says nothing about the service or the network.
+     */
+    fun onFailure(code: String, online: Boolean, retryAfterMs: Long?, context: String? = null): Long? {
+        if (DownloadRules.isKeyPacing(code, context)) {
+            return (retryAfterMs ?: DownloadRules.BASE_BACKOFF_MS).coerceIn(DownloadRules.MIN_PACING_PAUSE_MS, DownloadRules.MAX_QUEUE_PAUSE_MS)
+        }
         if (code == NativeErrorCode.RATE_LIMITED) {
             connectivityFailures = 0
-            return DownloadRules.rateLimitPauseMs(retryAfterMs, ++rateLimits)
+            val pause = DownloadRules.rateLimitPauseMs(retryAfterMs, ++rateLimits)
+            // The engine's own key cool-down is exact (it is computed here): followed in full.
+            if (context == DownloadRules.KEY_THROTTLED && retryAfterMs != null) {
+                return maxOf(pause, retryAfterMs.coerceAtMost(DownloadRules.MAX_KEY_PAUSE_MS))
+            }
+            return pause
         }
         if (!DownloadRules.isConnectivity(code)) {
             connectivityFailures = 0

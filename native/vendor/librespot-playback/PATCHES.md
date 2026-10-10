@@ -7,7 +7,8 @@ below. `Cargo.lock`, `Cargo.toml.orig` and `.cargo_vcs_info.json` were removed, 
 `grep -rn SPOTIFYGOOD src/` lists them all, so the patch can be re-applied when upgrading.
 
 **Requires the vendored `librespot-core`.** The patch uses
-`librespot_core::audio_key::is_permanent_denial`, which stock core 0.8.0 does not have.
+`librespot_core::audio_key::{is_permanent_denial, key_error_code}`, which stock core 0.8.0 does not
+have; its key requests go through core's known keys and `KeyObserver` (the app's key budget).
 
 **Requires the vendored `librespot-audio`.** The bounded waits for a stream's data use
 `StreamLoaderController::{read_position, fetch_range, range_available_at, is_loader_gone}`, and
@@ -25,8 +26,10 @@ on errors (see "Stalls" below).
 2. **No `std::process::exit`.** Stock code exits the process if `Sink::stop()` fails, if
    `Sink::start()` fails while a track starts, and on internal state-invariant violations. On
    Android that kills the app.
-3. **Audio-key refusals (librespot #1649 / PR #1763).** Transient key failures are retried. A
-   permanent denial aborts the load, and the reason reaches the app.
+3. **Audio-key refusals (librespot #1649 / PR #1763, #1319).** An unanswered key request is
+   retried once. A permanent denial aborts the load, and the reason reaches the app. A key Spotify
+   refused for now (its key limit for the account, `AesKeyError` other than 0x0001) is not retried:
+   the limit refills about one key per 30 s, quick retries only spend more of it.
 4. **Runtime settings.** Downloads, bitrate, normalisation and gapless can change without
    recreating the Player (and with it the Sink / AudioTrack and the Spirc binding).
 5. **Resources.** Named threads, a 1-worker player runtime instead of one worker per CPU core,
@@ -115,7 +118,9 @@ pub enum UnavailableReason {
                            // no alternative, no supported format, offline availability Err)
     NetworkError,          // metadata / CDN / token fetch failed (includes "never logged in")
     KeyDenied,             // audio key permanently refused (AesKeyError 0x0001): don't retry
-    KeyTemporarilyDenied,  // key failed transiently after retries (throttled, timeout, AP down)
+    KeyTemporarilyDenied,  // key failed transiently after the retry (timeout, AP down)
+    KeyThrottled,          // key refused for now (AesKeyError other than 0x0001: Spotify's key
+                           // limit), not retried
     DecodeError,           // opened but undecodable (corrupt, wrong key, rate/channels), or seek failed
     OfflineFileError,      // OfflineSource returned a track but its file could not be read
     Other,                 // unsupported URI, local file missing, loader thread died
@@ -134,8 +139,8 @@ arm), which needed no change.
 | `src/lib.rs` | `pub mod offline;` |
 | `src/config.rs` | `PlayerConfig::offline_source` (+ default `None`); `NormalisationSettings` + helpers. |
 | `player.rs` imports | `process::exit` removed; `FutureExt` instead of `TryFutureExt`; new imports. |
-| `player.rs` consts | `AUDIO_KEY_RETRIES = 3`, `AUDIO_KEY_RETRY_DELAY = 1 s`, `PLAYER_RUNTIME_WORKER_THREADS = 1`, `LOADER_JOIN_TIMEOUT = 1 s`, `LOADER_JOIN_POLL = 10 ms`, `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT = 250 ms`, `AUDIO_KEY_COOLDOWN = 30 s`. |
-| `UnavailableReason`, `KeyFailure`, `classify_audio_key_error` | New. Classification: `is_permanent_denial` → abort; session invalid / `SessionError::NotConnected` → no retry; everything else → retry. |
+| `player.rs` consts | `AUDIO_KEY_RETRIES = 1`, `AUDIO_KEY_RETRY_DELAY = 2 s`, `PLAYER_RUNTIME_WORKER_THREADS = 1`, `LOADER_JOIN_TIMEOUT = 1 s`, `LOADER_JOIN_POLL = 10 ms`, `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT = 250 ms`, `AUDIO_KEY_COOLDOWN = 30 s`. |
+| `UnavailableReason`, `KeyFailure`, `classify_audio_key_error` | New. Classification: `is_permanent_denial` → abort; another `AesKeyError` code (`key_error_code`) → `Throttled`, no retry (`KeyThrottled`); session invalid / `SessionError::NotConnected` → no retry; everything else (timeout, channel) → retry. |
 | `PlayerCommand` | `SetOfflineSource`, `SetBitrate`, `SetNormalisation`, `SetGapless` (+ `Debug` arms). |
 | `PlayerEvent::Unavailable` | `reason` field. |
 | `Player::new` | `thread::Builder` named `lrs-player`; runtime `new_multi_thread().worker_threads(1).thread_name("lrs-player-rt")`, ended with `shutdown_timeout(PLAYER_RUNTIME_SHUTDOWN_TIMEOUT)` instead of a plain drop (which waits for every blocking task, e.g. a hanging getaddrinfo). |
@@ -144,9 +149,10 @@ arm), which needed no change.
 | `PlayerPreload::Loading`, `PlayerState::Loading` | loader output `Result<_, UnavailableReason>` instead of `Result<_, ()>`. |
 | `cached_file_is_cut`, `CACHED_SHORTFALL_MAX`, `load_remote_track` | A file from librespot's cache that is shorter than its track (more than 3 s for Ogg, whose last page gives its duration exactly; more than a tenth for the others, whose duration is estimated) fails its decoder like an unreadable cached file: it is removed and downloaded again (the stock retry). A cache save that failed partway left a cut file that loaded as complete (the vendored librespot-core saves atomically now; this catches the files saved before), and every play of the track ended at the cut (round 21). Downloaded (offline) files aren't checked. |
 | `PlayerTrackLoader::load_track` / `load_remote_track` / `load_local_track` | Return `Result<PlayerLoadedTrackData, UnavailableReason>`. Offline hook. Key retry. No cache deletion after a key failure. Local files: `duration.as_secs().max(1)` (stock divides by zero for files < 1 s). |
-| `PlayerTrackLoader::request_audio_key` | New: request with retries. While the cool-down runs, a single attempt. |
-| `KeyRetryBrake`, `AUDIO_KEY_BRAKE`, `audio_key_brake` | New: the process-wide key-retry cool-down. Retries that run out on a transient failure start `AUDIO_KEY_COOLDOWN`; a key ends it. |
-| `mod spotifygood_tests` | New: unit tests for the cool-down (`cargo test -p librespot-playback --lib spotifygood`). |
+| `PlayerTrackLoader::request_audio_key` | New: request with a retry of an unanswered request; a throttled key is returned at once (`KeyThrottled`). While the cool-down runs, a single attempt. |
+| `KeyRetryBrake`, `AUDIO_KEY_BRAKE`, `audio_key_brake` | New: the process-wide key-retry cool-down. Retries that run out on a transient failure, or a throttled key, start `AUDIO_KEY_COOLDOWN`; a key ends it. |
+| `reopen_waits` | `KeyThrottled` is a reason that can pass (the reopened track stays paused at its position). |
+| `mod spotifygood_tests` | New: unit tests for the cool-down and the key classification (`cargo test -p librespot-playback --lib spotifygood`). |
 | poll loop | `Unavailable` carries the reason (load and preload). The `else { exit(1) }` after a failed sink start is now a debug log; the player is already paused. |
 | `PlayerState::{is_playing, decoder, playing_to_end_of_track, paused_to_playing, playing_to_paused}`, start-playback check, `handle_player_stop`, `handle_packet` | `exit(1)` → `panic!`. A panic only ends the player thread: `Player::is_invalid()` becomes true and the engine can create a new Player. |
 | `ensure_sink_stopped` | `sink.stop()` error: log, mark the sink closed, call the sink callback (was `exit(1)`). |
@@ -208,17 +214,24 @@ arm), which needed no change.
   and the current track's gain is recomputed from its normalisation data. `normalisation_type:
   Auto` still follows `set_auto_normalise_as_album`.
 * **Key retry timing.**
-  * Up to 4 attempts (1 + 3 retries) with 1 s between them. Each attempt has core's 1.5 s
-    timeout, so worst case ≈ 9 s before the load finishes.
+  * A key the process received already (core's known keys) needs no request.
+  * Up to 2 attempts (1 + 1 retry) of an unanswered request, 2 s apart. Each attempt has core's
+    1.5 s timeout, so worst case ≈ 5 s before the load finishes.
+  * A key refused for now (`AesKeyError` other than 0x0001) is not retried: `KeyThrottled` at
+    once, and the cool-down below starts. The engine stops playback on the first such load
+    (spotcore `connect/player_events.rs`) instead of letting Spirc skip through the queue.
   * A superseded load keeps retrying in its own thread; the result is discarded.
-  * Cool-down: once the retries ran out on a transient failure, every key request of the
-    process (all loaders and Players) makes a single attempt for `AUDIO_KEY_COOLDOWN` (30 s); a
-    failed single attempt starts it again, and any key that arrives ends it. So a run of skips
-    after throttling costs one request per track instead of four.
+  * Cool-down: once the retries ran out on a transient failure, or a key was refused for now,
+    every key request of the process (all loaders and Players) makes a single attempt for
+    `AUDIO_KEY_COOLDOWN` (30 s); a failed single attempt starts it again, and any key that
+    arrives ends it. So a run of skips after throttling costs one request per track instead of
+    two.
   * Permanent denial → `Unavailable(KeyDenied)` at once, with no "without decryption" attempt.
-  * Transient exhaustion → the file is still tried without decryption (some files are not
-    encrypted). If that fails → `Unavailable(KeyTemporarilyDenied)`. A cached file is never
-    deleted after a key failure.
+  * Transient exhaustion or a throttled key → the file is still tried without decryption (some
+    files are not encrypted). If that fails → `Unavailable(KeyTemporarilyDenied)` /
+    `Unavailable(KeyThrottled)`. A cached file is never deleted after a key failure.
+  * Every request that goes to the access point counts for the app's key budget (vendored core's
+    `KeyObserver`): the player never waits for it, the app's downloads yield to it.
 * **Bounded drop.** `Player::drop` returns within about `LOADER_JOIN_TIMEOUT` +
   `PLAYER_RUNTIME_SHUTDOWN_TIMEOUT` plus the current packet. Loaders still running then are
   detached; the runtime shutdown cancels their I/O, so they end soon after with their result
