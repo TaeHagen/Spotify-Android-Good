@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.ui.screens.search
 
+import com.taehagen.spotifygood.data.RecentSearch
 import com.taehagen.spotifygood.data.SearchType
 import com.taehagen.spotifygood.model.AlbumRef
 import com.taehagen.spotifygood.model.ArtistRef
@@ -12,6 +13,7 @@ import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.screens.library.NowPlaying
 import com.taehagen.spotifygood.ui.screens.library.debouncedInput
+import com.taehagen.spotifygood.ui.screens.library.toMediaRef
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
@@ -190,5 +192,21 @@ class SearchLogicTest {
         assertEquals(TopPlay.EpisodeByUri(episode.uri), topPlay(episode, null, NowPlaying()))
         // Unplayable: nothing at all.
         assertNull(topPlay(songRef, SearchItem.Song(track.copy(playable = false)), NowPlaying(track.uri, null, true)))
+    }
+
+    @Test
+    fun aRecentSongOrEpisodeSwipesIntoTheQueueAndNothingElseDoes() {
+        // A song or an episode played from search: the swipe adds it (its URI, canonical as a tap opens it).
+        assertEquals(track.uri, RecentSearch.Item(track.toMediaRef()).queueUri())
+        val episode = MediaRef(MediaType.EPISODE, "spotify:episode:e", "E", "Show")
+        assertEquals(episode.uri, RecentSearch.Item(episode).queueUri())
+        val shared = MediaRef(MediaType.TRACK, "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC?si=x", "Shared")
+        assertEquals("spotify:track:4uLU6hMCjMI75M1A2tKUQC", RecentSearch.Item(shared).queueUri())
+        // An artist, an album, a playlist, a show, a typed query: plain rows, no swipe.
+        assertNull(RecentSearch.Item(ArtistRef("spotify:artist:x", "X").toMediaRef()).queueUri())
+        assertNull(RecentSearch.Item(album.toMediaRef()).queueUri())
+        assertNull(RecentSearch.Item(MediaRef(MediaType.PLAYLIST, "spotify:playlist:p", "P")).queueUri())
+        assertNull(RecentSearch.Item(MediaRef(MediaType.SHOW, "spotify:show:s", "S")).queueUri())
+        assertNull(RecentSearch.Query("radiohead").queueUri())
     }
 }

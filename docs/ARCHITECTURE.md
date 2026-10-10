@@ -1858,7 +1858,10 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
 * Swipe to queue (`ui/components/SwipeToQueue.kt`, built into `TrackRow` and `EpisodeRow`): in
   every vertical list of tracks or episodes, including search results, artist top tracks, album
   tracks, playlists and Liked Songs (window rows too once loaded), Downloads, a show's episodes
-  and Your Episodes. Swiping a row start→end (mirrored right to left) slides it with the finger
+  and Your Episodes. On the Search tab's Recent searches (`RecentSearchRow`, a `MediaRow`) the
+  song and episode rows swipe too (`RecentSearch.queueUri`); artists, albums, playlists, shows and
+  typed queries there stay plain rows. Horizontal carousels, the top result card and Home's
+  quick-access tiles have no swipe. Swiping a row start→end (mirrored right to left) slides it with the finger
   over a green background with the queue icon on the leading side. Past the threshold (28 % of
   the row's width or 96 dp, whichever is smaller) the icon pops, the green deepens and a soft
   haptic tick plays; coming back below it reverts. Letting go there adds the item through the
