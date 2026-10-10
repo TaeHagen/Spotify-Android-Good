@@ -100,6 +100,11 @@ import com.taehagen.spotifygood.ui.navigation.LocalAppNavigator
 import com.taehagen.spotifygood.ui.navigation.MediaActionTarget
 import com.taehagen.spotifygood.ui.navigation.Route
 import kotlinx.coroutines.flow.Flow
+import com.taehagen.spotifygood.ui.components.FastScroller
+import com.taehagen.spotifygood.ui.components.fastScrollDate
+import com.taehagen.spotifygood.ui.components.fastScrollLetter
+import com.taehagen.spotifygood.ui.components.fastScrollPosition
+import com.taehagen.spotifygood.ui.components.rememberFastScrollDatePattern
 
 @Composable
 fun LibraryScreen(contentPadding: PaddingValues, modifier: Modifier = Modifier) {
@@ -355,6 +360,17 @@ private fun SortViewRow(sort: LibrarySort, view: LibraryView, onSort: (LibrarySo
 
 private fun AppNavigator.openLibraryItem(item: LibraryItem) = open(item.toMediaRef())
 
+/**
+ * The fast scroller's bubble for the library item at [index] of [count]: the first letter of the
+ * name (or creator) it is sorted by, the month it was added, else its position.
+ */
+internal fun libraryScrollLabel(item: LibraryItem?, index: Int, count: Int, sort: LibrarySort, datePattern: String): String? = when (sort) {
+    LibrarySort.ALPHABETICAL -> fastScrollLetter(item?.name)
+    LibrarySort.CREATOR -> fastScrollLetter(item?.creator?.takeIf { it.isNotBlank() } ?: item?.name)
+    LibrarySort.RECENTLY_ADDED -> item?.addedAt?.let { fastScrollDate(it, datePattern) } ?: fastScrollPosition(index, count)
+    LibrarySort.RECENT -> fastScrollPosition(index, count)
+}
+
 @Composable
 private fun LibraryList(
     state: LibraryUiState,
@@ -368,36 +384,53 @@ private fun LibraryList(
     val listState = rememberLazyListState()
     ScrollToTopOnChange("${state.folders.lastOrNull()?.id}|${state.filter}") { listState.scrollToItem(0) }
 
-    LazyColumn(state = listState, contentPadding = contentPaddingWith(contentPadding), modifier = Modifier.fillMaxSize()) {
-        state.folders.lastOrNull()?.let { folder ->
-            item(key = "back", contentType = "back") { BackRow(title = folder.name, onClick = onBack) }
-        }
-        items(state.pinned, key = { it.key }, contentType = { "pinned" }) { entry ->
-            PinnedRow(entry = entry, onClick = { onPinnedClick(entry, navigator, onOpenEpisodes) })
-        }
-        items(state.items, key = { it.key }, contentType = { if (it.kind == LibraryItemKind.FOLDER) "folder" else "item" }) { item ->
-            if (item.kind == LibraryItemKind.FOLDER) {
-                FolderRow(item = item, onClick = { onOpenFolder(item) })
-            } else {
-                val ref = remember(item) { item.toMediaRef() }
-                MediaRow(
-                    ref = ref,
-                    onClick = { navigator.openLibraryItem(item) },
-                    subtitle = typedSubtitle(ref.type, item.creator),
-                    onLongClick = { item.actionTarget(state.user?.username)?.let(navigator::showActions) },
-                    trailing = if (item.id in state.downloaded) {
-                        { CollectionDownloadBadge(item.id, downloadState) }
-                    } else {
-                        null
-                    },
-                )
+    // Before the items: the folder's back row and the pinned rows.
+    val itemsStart = (if (state.folders.isNotEmpty()) 1 else 0) + state.pinned.size
+    val datePattern = rememberFastScrollDatePattern()
+    val items = state.items
+    val sort = state.sort
+    val label: (Int) -> String? = remember(items, sort, datePattern) {
+        { index -> libraryScrollLabel(items.getOrNull(index), index, items.size, sort, datePattern) }
+    }
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(state = listState, contentPadding = contentPaddingWith(contentPadding), modifier = Modifier.fillMaxSize()) {
+            state.folders.lastOrNull()?.let { folder ->
+                item(key = "back", contentType = "back") { BackRow(title = folder.name, onClick = onBack) }
+            }
+            items(state.pinned, key = { it.key }, contentType = { "pinned" }) { entry ->
+                PinnedRow(entry = entry, onClick = { onPinnedClick(entry, navigator, onOpenEpisodes) })
+            }
+            items(state.items, key = { it.key }, contentType = { if (it.kind == LibraryItemKind.FOLDER) "folder" else "item" }) { item ->
+                if (item.kind == LibraryItemKind.FOLDER) {
+                    FolderRow(item = item, onClick = { onOpenFolder(item) })
+                } else {
+                    val ref = remember(item) { item.toMediaRef() }
+                    MediaRow(
+                        ref = ref,
+                        onClick = { navigator.openLibraryItem(item) },
+                        subtitle = typedSubtitle(ref.type, item.creator),
+                        onLongClick = { item.actionTarget(state.user?.username)?.let(navigator::showActions) },
+                        trailing = if (item.id in state.downloaded) {
+                            { CollectionDownloadBadge(item.id, downloadState) }
+                        } else {
+                            null
+                        },
+                    )
+                }
+            }
+            if (state.items.isEmpty() && state.pinned.isEmpty()) {
+                item(key = "empty", contentType = "empty") {
+                    LibraryEmpty(state, Modifier.fillParentMaxHeight(0.7f))
+                }
             }
         }
-        if (state.items.isEmpty() && state.pinned.isEmpty()) {
-            item(key = "empty", contentType = "empty") {
-                LibraryEmpty(state, Modifier.fillParentMaxHeight(0.7f))
-            }
-        }
+        FastScroller(
+            listState = listState,
+            contentStart = itemsStart,
+            contentCount = items.size,
+            bottomPadding = contentPadding.calculateBottomPadding(),
+            label = label,
+        )
     }
 }
 
@@ -692,46 +725,49 @@ private fun YourEpisodesList(
     val listState = rememberLazyListState()
     val episodes = state.episodes
     LoadMoreEffect(listState, enabled = episodes.canLoadMore && episodes.items.isNotEmpty(), onLoadMore = onLoadMore)
-    LazyColumn(state = listState, contentPadding = contentPaddingWith(contentPadding), modifier = Modifier.fillMaxSize()) {
-        item(key = "back", contentType = "back") {
-            BackRow(title = stringResource(R.string.browse_library_your_episodes), onClick = onBack)
-        }
-        if (state.episodesPartial) {
-            item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetryPartial) }
-        }
-        items(episodes.items, key = { "episode:${it.uri}" }, contentType = { "episode" }) { episode ->
-            EpisodeRow(
-                episode = episode,
-                onClick = { onPlay(episode) },
-                isCurrent = state.nowPlaying.isCurrent(episode.uri),
-                isPlaying = state.nowPlaying.isPlaying,
-                // Which ones play offline (a tap of another says it isn't available offline).
-                downloadState = DownloadState.COMPLETED.takeIf { episode.uri in state.downloadedUris },
-                onLongClick = { onActions(episode) },
-                onMoreClick = { onActions(episode) },
-            )
-        }
-        when {
-            episodes.isLoading -> item(key = "loading", contentType = "footer") {
-                Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(Modifier.size(32.dp))
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(state = listState, contentPadding = contentPaddingWith(contentPadding), modifier = Modifier.fillMaxSize()) {
+            item(key = "back", contentType = "back") {
+                BackRow(title = stringResource(R.string.browse_library_your_episodes), onClick = onBack)
+            }
+            if (state.episodesPartial) {
+                item(key = "partial", contentType = "notice") { PartialContentNotice(onRetry = onRetryPartial) }
+            }
+            items(episodes.items, key = { "episode:${it.uri}" }, contentType = { "episode" }) { episode ->
+                EpisodeRow(
+                    episode = episode,
+                    onClick = { onPlay(episode) },
+                    isCurrent = state.nowPlaying.isCurrent(episode.uri),
+                    isPlaying = state.nowPlaying.isPlaying,
+                    // Which ones play offline (a tap of another says it isn't available offline).
+                    downloadState = DownloadState.COMPLETED.takeIf { episode.uri in state.downloadedUris },
+                    onLongClick = { onActions(episode) },
+                    onMoreClick = { onActions(episode) },
+                )
+            }
+            when {
+                episodes.isLoading -> item(key = "loading", contentType = "footer") {
+                    Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(Modifier.size(32.dp))
+                    }
+                }
+                episodes.error != null -> item(key = "error", contentType = "footer") {
+                    ErrorState(
+                        message = stringResource(episodes.error.toBrowseError().messageRes()),
+                        onRetry = onRetry,
+                        modifier = if (episodes.items.isEmpty()) Modifier.fillParentMaxHeight(0.6f) else Modifier,
+                    )
+                }
+                episodes.items.isEmpty() && episodes.endReached -> item(key = "empty", contentType = "footer") {
+                    EmptyState(
+                        title = stringResource(R.string.browse_library_episodes_empty_title),
+                        message = stringResource(R.string.browse_library_episodes_empty_message),
+                        icon = Icons.Rounded.Podcasts,
+                        modifier = Modifier.fillParentMaxHeight(0.6f),
+                    )
                 }
             }
-            episodes.error != null -> item(key = "error", contentType = "footer") {
-                ErrorState(
-                    message = stringResource(episodes.error.toBrowseError().messageRes()),
-                    onRetry = onRetry,
-                    modifier = if (episodes.items.isEmpty()) Modifier.fillParentMaxHeight(0.6f) else Modifier,
-                )
-            }
-            episodes.items.isEmpty() && episodes.endReached -> item(key = "empty", contentType = "footer") {
-                EmptyState(
-                    title = stringResource(R.string.browse_library_episodes_empty_title),
-                    message = stringResource(R.string.browse_library_episodes_empty_message),
-                    icon = Icons.Rounded.Podcasts,
-                    modifier = Modifier.fillParentMaxHeight(0.6f),
-                )
-            }
         }
+        FastScroller(listState, bottomPadding = contentPadding.calculateBottomPadding())
     }
 }

@@ -19,6 +19,9 @@ import com.taehagen.spotifygood.model.Track
 import com.taehagen.spotifygood.playback.EngineReach
 import com.taehagen.spotifygood.playback.PlayRequest
 import com.taehagen.spotifygood.ui.components.SessionMessenger
+import com.taehagen.spotifygood.ui.components.fastScrollDate
+import com.taehagen.spotifygood.ui.components.fastScrollLetter
+import com.taehagen.spotifygood.ui.components.fastScrollPosition
 import com.taehagen.spotifygood.ui.components.isPlaceholder
 import com.taehagen.spotifygood.ui.screens.album.engineReach
 import com.taehagen.spotifygood.ui.screens.album.engineReachFlow
@@ -91,7 +94,36 @@ data class LikedSongsUiState(
     val online: Boolean = true,
     /** A sorted play waits for the rest of the pages ([SortedPlayStarter]): the Play button shows it. */
     val playPending: Boolean = false,
+    /**
+     * Rows shown after [tracks] as placeholders, to the end of Liked Songs: in its own order while
+     * ONLINE, past the loaded pages, they load by window as they come on screen ([windows]).
+     */
+    val placeholders: Int = 0,
+    /** Songs past the loaded pages, loaded where the list is looked at (fast scroll). */
+    val windows: RowWindows<SavedTrack> = RowWindows(LIKED_PAGE_SIZE),
 )
+
+/** Liked Songs' page size (also its windows'). */
+const val LIKED_PAGE_SIZE = 100
+
+/**
+ * Placeholder rows after the [loaded] songs of [total]: only in the server's own order (no filter,
+ * not sorted: those load every page), for the server's list while ONLINE.
+ */
+internal fun likedPlaceholders(loaded: Int, total: Int?, fromDownload: Boolean, filter: String, sort: TrackSort, online: Boolean): Int =
+    if (total == null || fromDownload || filter.isNotEmpty() || sort != TrackSort.RECENTLY_ADDED || !online) 0 else (total - loaded).coerceAtLeast(0)
+
+/**
+ * The fast scroller's bubble for the song at [index] of [count] ([track] null: not loaded yet): the
+ * first letter of what [sort] orders by, the month it was liked ([addedAt]) in the own order, else
+ * its position.
+ */
+internal fun likedScrollLabel(track: Track?, addedAt: Long?, index: Int, count: Int, sort: TrackSort, datePattern: String): String? = when (sort) {
+    TrackSort.TITLE -> fastScrollLetter(track?.name)
+    TrackSort.ARTIST -> fastScrollLetter(track?.artists?.firstOrNull()?.name)
+    TrackSort.ALBUM -> fastScrollLetter(track?.album?.name)
+    TrackSort.RECENTLY_ADDED, TrackSort.CUSTOM -> addedAt?.let { fastScrollDate(it, datePattern) } ?: fastScrollPosition(index, count)
+}
 
 /**
  * Library page messages. Write results (download / removal) go through [SessionMessenger], so they
@@ -127,6 +159,7 @@ private data class LikedMeta(
     val online: Boolean,
     val listPlayback: ListPlayback,
     val playPending: Boolean,
+    val windows: RowWindows<SavedTrack>,
 )
 
 private data class LikedListMeta(
@@ -134,6 +167,7 @@ private data class LikedListMeta(
     val lastSorted: SortedPlays.Entry?,
     val listPlayback: ListPlayback,
     val playPending: Boolean,
+    val windows: RowWindows<SavedTrack>,
 )
 
 /** Likes and unlikes made in the app, applied to a fully loaded Liked Songs instead of paging it again. */
@@ -255,11 +289,20 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
         private set
 
     private val partialPages = PartialPages()
+    /** When each loaded song was liked (the bubble's month in the own order). */
+    private val likedAtByUri = ConcurrentHashMap<String, Long>()
     private val pager = PagedLoader<SavedTrack>(viewModelScope, PAGE_SIZE, { it.track.uri }) { offset, limit ->
         val page = graph.library.likedTracks(offset, limit)
         partialPages.record(offset, page.partial)
+        noteLikedAt(page.items)
         PageResult(page.items, page.total)
     }
+    /** Songs past the loaded pages, by page, where the list is looked at ([onRowsVisible]). */
+    private val windows = PageWindows(viewModelScope, PAGE_SIZE) { offset, limit ->
+        graph.library.likedTracks(offset, limit).items.also(::noteLikedAt)
+    }
+    /** The rows on screen last reported ([onRowsVisible]): asked again after the windows were dropped. */
+    private var visibleRows: Pair<Int, Int>? = null
     private val reach = graph.engineReachFlow()
     private val refreshing = MutableStateFlow(false)
     private val sortStore = ListSortStore(graph.app)
@@ -372,7 +415,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             refreshing,
             partialPages.partial,
             reach,
-            combine(sort, SortedPlays.last, graph.listPlaybackFlow(), plays.waiting, ::LikedListMeta),
+            combine(sort, SortedPlays.last, graph.listPlaybackFlow(), plays.waiting, windows.windows, ::LikedListMeta),
         ) { download, refreshing, partial, reach, list ->
             LikedMeta(
                 download, refreshing, partial,
@@ -382,6 +425,7 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
                 online = reach == EngineReach.ONLINE,
                 listPlayback = list.listPlayback,
                 playPending = list.playPending,
+                windows = list.windows,
             )
         },
         graph.nowPlayingFlow(),
@@ -412,6 +456,8 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             listIsCurrent = isListPlaying(ListSortStore.LIKED_SONGS, contextUri, meta.listPlayback, lastSorted),
             online = online,
             playPending = meta.playPending,
+            placeholders = likedPlaceholders(source.tracks.size, source.total, source.fromDownload, filter, sort, online),
+            windows = meta.windows,
         )
     }.flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LikedSongsUiState())
@@ -455,6 +501,8 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
             .launchIn(viewModelScope)
         // Refresh indicator ends with the reload.
         pager.state.onEach { if (!it.isLoading) refreshing.value = false }.launchIn(viewModelScope)
+        // Pages loaded since cover their windows.
+        pager.state.map { it.items.size }.distinctUntilChanged().onEach { windows.dropBelow(it) }.launchIn(viewModelScope)
         // A downloaded Liked Songs follows likes made elsewhere (another device): a loaded server page
         // asks the download to sync (at most every few minutes; pull-to-refresh always does).
         combine(contextUri, pager.state.map { !it.isLoading && it.error == null && it.items.isNotEmpty() }.distinctUntilChanged(), ::Pair)
@@ -499,6 +547,37 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     private fun reloadPager() {
         likedPatch.value = LikedPatch()
         pager.reload()
+        // The windows were of the old list: the rows on screen load again.
+        windows.clear()
+        visibleRows?.let { (first, last) -> onRowsVisible(first, last) }
+    }
+
+    private fun noteLikedAt(items: List<SavedTrack>) {
+        items.forEach { saved -> saved.addedAt?.let { likedAtByUri[saved.track.uri] = it } }
+    }
+
+    /** When [uri] was liked, if a loaded page said so. */
+    fun likedAt(uri: String): Long? = likedAtByUri[uri]
+
+    /**
+     * Rows [first]..[last] (positions in the shown list) are on screen. In the own order the next
+     * page continues the loaded ones when they come near their end; rows farther down
+     * (placeholders reached by scrolling or a fast scroll) load by window ([PageWindows]), only
+     * their pages. A filter or a sort loads every page itself.
+     */
+    fun onRowsVisible(first: Int, last: Int) {
+        visibleRows = first to last
+        val current = state.value
+        if (current.fromDownload || current.filter.isNotEmpty() || sorted) return
+        val page = pager.state.value
+        val loaded = page.items.size
+        val nextPage = page.canLoadMore && page.items.isNotEmpty() && last >= loaded - LOAD_AHEAD && first < loaded + PAGE_SIZE
+        if (nextPage) pager.loadMore()
+        val total = page.total ?: return
+        if (graph.engineReach() == EngineReach.ONLINE && total > loaded) {
+            val continued = nextPage || page.isLoading
+            windows.show(first, last, from = if (continued) loaded + PAGE_SIZE else loaded, total = total)
+        }
     }
 
     /**
@@ -642,8 +721,10 @@ class LikedSongsViewModel(private val graph: AppGraph) : ViewModel() {
     }
 
     private companion object {
-        const val PAGE_SIZE = 100
+        const val PAGE_SIZE = LIKED_PAGE_SIZE
         const val FILTER_DEBOUNCE_MS = 200L
+        /** The next page loads when the rows on screen come this close to the loaded end. */
+        const val LOAD_AHEAD = 15
     }
 }
 
