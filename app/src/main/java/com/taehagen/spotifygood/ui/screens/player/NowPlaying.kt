@@ -51,7 +51,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -1013,9 +1012,12 @@ private fun RemoteBanner(indicator: DeviceIndicator.Remote, onClick: () -> Unit)
     }
 }
 
-/** Compact lyrics card under the controls; the highlighted line follows playback. */
+/**
+ * Compact lyrics card under the controls. Synced lines scroll as playback advances, the highlighted
+ * line in a fixed row ([LyricsPreviewLines]); unsynced lyrics show their first lines.
+ */
 @Composable
-private fun LyricsPreviewCard(
+internal fun LyricsPreviewCard(
     lyrics: Lyrics,
     position: State<Long>,
     fallbackColor: State<Color>,
@@ -1024,10 +1026,6 @@ private fun LyricsPreviewCard(
 ) {
     val colors = rememberLyricsPalette(lyrics, fallbackColor.value)
     val synced = lyrics.syncType != LyricsSyncType.UNSYNCED
-    val currentIndex by remember(lyrics, synced, position) {
-        derivedStateOf { if (synced) lyricsLineIndexAt(lyrics.lines, position.value) else -1 }
-    }
-    val window = lyricsPreviewWindow(lyrics.lines.size, currentIndex)
     Surface(
         onClick = onOpen,
         color = colors.background,
@@ -1052,15 +1050,19 @@ private fun LyricsPreviewCard(
                 )
             }
             Spacer(Modifier.height(12.dp))
-            for (index in window) {
-                val line = lyrics.lines[index]
-                Text(
-                    text = line.words.ifBlank { stringResource(R.string.player_lyrics_instrumental) },
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold,
-                    color = colors.colorFor(index, currentIndex, synced),
-                    modifier = Modifier.padding(vertical = 3.dp),
-                )
+            if (synced) {
+                LyricsPreviewLines(lyrics = lyrics, position = position, palette = colors)
+            } else {
+                for (index in lyricsPreviewWindow(lyrics.lines.size, currentIndex = -1)) {
+                    val line = lyrics.lines[index]
+                    Text(
+                        text = line.words.ifBlank { stringResource(R.string.player_lyrics_instrumental) },
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = colors.colorFor(index, currentIndex = -1, synced = false),
+                        modifier = Modifier.padding(vertical = 3.dp),
+                    )
+                }
             }
         }
     }

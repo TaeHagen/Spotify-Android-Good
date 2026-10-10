@@ -2080,6 +2080,20 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
   neither selected nor verified, or link handling off (checked again on every resume); if the
   Spotify app holds the domain, its "Open supported links" has to go off first. Shared links
   always work.
+* Lyrics preview on Now Playing (`LyricsPreviewCard`, lines in `LyricsPreviewLines`): synced
+  lines scroll in a clipped viewport of six single-line rows (fewer for short lyrics), so the
+  card keeps its size; a line that wraps takes whole rows, so the edges cut between rows of
+  text. The line before the current one is at the top (the current line second, the first
+  before any line) until the last line reaches the bottom. A move of one or two lines
+  scrolls like the full screen (650 ms, fast-out-slow-in) and the colours fade (300 ms); longer
+  moves (a seek, a restart, the card back in view) snap, and another song starts in place. The
+  position is read only while Now Playing is shown (p > 0.4) and the card is on screen (it sits
+  below the first screen), and the list takes no touches: a tap opens the full lyrics, drags
+  scroll Now Playing or collapse it. TalkBack reads the six-line window, as before. Unsynced
+  lyrics show their first six lines, still. Tests: `PlayerLogicTest` (rows, top line,
+  scroll-or-snap, end clamp), `LyricsPreviewScreenshotTest` (filmstrips, TalkBack, visibility
+  and touch checks; it pauses Robolectric's choreographer, which otherwise answers each frame
+  request at once and moves the clock ahead, so an animation ends within one step).
 * Offline: banner + downloaded-only filtering when offline mode or no network.
 * Voice search sent to the activity (`MEDIA_PLAY_FROM_SEARCH`, forwarded by `LinkActivity`):
   `ShellViewModel.playFromSearch` holds the engine (a UI holder, taken at once: the request
