@@ -172,6 +172,7 @@ class PlaybackService : MediaLibraryService() {
             podcastSpeed = { graph.podcastSpeed.inEffect.value },
             onSpeed = graph.podcastSpeed::set,
             requester = { session?.controllerForCurrentRequest?.packageName },
+            bluetoothOutput = { graph.outputs.bluetoothOutput.value },
         )
         remoteVolumeKeys = RemoteVolumeKeys(
             context = this,
@@ -179,11 +180,22 @@ class PlaybackService : MediaLibraryService() {
             setVolume = { percent -> player.setDeviceVolume(percent, 0) },
             adjustVolume = { direction -> if (direction > 0) player.increaseDeviceVolume(0) else player.decreaseDeviceVolume(0) },
             playRequested = { caller ->
-                if (RemotePlayback.playMeansPause(graph.playback.snapshot.value, caller)) graph.player.pause() else graph.player.resume()
+                if (RemotePlayback.playMeansPause(graph.playback.snapshot.value, player.readsPaused, caller)) {
+                    graph.player.pause()
+                } else {
+                    graph.player.resume()
+                }
             },
             pauseRequested = { graph.player.pause() },
             nextRequested = { graph.player.next() },
             previousRequested = { graph.player.previous() },
+        )
+        // Follows what the session publishes, also when a Bluetooth output comes or goes while
+        // another device plays: one switch between the two volume key sessions.
+        player.addListener(
+            object : Player.Listener {
+                override fun onEvents(player: Player, events: Player.Events) = updateRemoteVolumeKeys()
+            },
         )
 
         val provider = PlaybackNotificationProvider(this).apply { setSmallIcon(R.drawable.ic_notification) }
@@ -336,11 +348,15 @@ class PlaybackService : MediaLibraryService() {
 
     // ---- paused lifetime ----------------------------------------------------------------------
 
-    /** Hands the volume keys to [RemoteVolumeKeys] while another device plays. Main thread. */
+    /**
+     * Hands the volume keys to [RemoteVolumeKeys] while another device plays and the session reads
+     * paused (a Bluetooth output is connected), else back to the session. Main thread.
+     */
     private fun updateRemoteVolumeKeys() {
         val s = graph.playback.snapshot.value
         val supported = player.isCommandAvailable(Player.COMMAND_SET_DEVICE_VOLUME_WITH_FLAGS)
-        remoteVolumeKeys.update(RemotePlayback.volumeKeysSession(s, supported), player.deviceVolume, s.track?.name, s.track?.artistLine)
+        val active = RemotePlayback.volumeKeysSession(s, player.readsPaused, supported)
+        remoteVolumeKeys.update(active, player.deviceVolume, s.track?.name, s.track?.artistLine)
     }
 
     /** Playing or loading (here or on the mirrored device), or Connect presence keeps it up. */
@@ -452,6 +468,8 @@ class PlaybackService : MediaLibraryService() {
                 graph.engine.state.map { },
                 graph.player.failure.map { },
                 graph.podcastSpeed.inEffect.map { },
+                // A Bluetooth output decides how another device's playback reads (RemotePlayback).
+                graph.outputs.bluetoothOutput.map { },
             ).collect {
                 player.refresh()
                 updateRemoteVolumeKeys()

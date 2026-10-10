@@ -1,5 +1,6 @@
 package com.taehagen.spotifygood.playback
 
+import android.media.AudioDeviceInfo
 import androidx.media3.common.Player
 import com.taehagen.spotifygood.model.PlaybackSnapshot
 import com.taehagen.spotifygood.model.PlaybackSource
@@ -16,24 +17,57 @@ class RemotePlaybackTest {
         status = PlaybackStatus.PLAYING,
         track = PlaybackTrack(uri = "spotify:track:t"),
     )
+    private val remoteLoading = remotePlaying.copy(status = PlaybackStatus.LOADING)
     private val localPlaying = remotePlaying.copy(source = PlaybackSource.LOCAL)
+    private val suppressed = Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS
+    private val none = Player.PLAYBACK_SUPPRESSION_REASON_NONE
 
     @Test
-    fun onlyAnotherDevicePlayingIsSuppressed() {
-        val suppressed = Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS
-        val none = Player.PLAYBACK_SUPPRESSION_REASON_NONE
-        assertEquals(suppressed, RemotePlayback.suppressionReason(remotePlaying))
-        // Loading there (a play just sent) reads paused here too, never "this phone plays".
-        assertEquals(suppressed, RemotePlayback.suppressionReason(remotePlaying.copy(status = PlaybackStatus.LOADING)))
-        // Local playback stays exactly as it was: the platform state says playing.
-        assertEquals(none, RemotePlayback.suppressionReason(localPlaying))
-        assertEquals(none, RemotePlayback.suppressionReason(localPlaying.copy(status = PlaybackStatus.LOADING)))
-        // The other device paused or stopped: an honest pause, nothing to suppress.
-        assertEquals(none, RemotePlayback.suppressionReason(remotePlaying.copy(status = PlaybackStatus.PAUSED)))
-        assertEquals(none, RemotePlayback.suppressionReason(remotePlaying.copy(status = PlaybackStatus.STOPPED)))
-        // Nothing shown (the session is idle then).
-        assertEquals(none, RemotePlayback.suppressionReason(remotePlaying.copy(track = null)))
-        assertEquals(none, RemotePlayback.suppressionReason(PlaybackSnapshot()))
+    fun anotherDevicePlayingReadsPausedOnlyWithABluetoothOutput() {
+        // A headset or car may read the session: paused, never "this phone plays".
+        assertEquals(suppressed, RemotePlayback.suppressionReason(remotePlaying, bluetoothOutput = true))
+        assertEquals(suppressed, RemotePlayback.suppressionReason(remoteLoading, bluetoothOutput = true))
+        assertTrue(RemotePlayback.readsPaused(remotePlaying, bluetoothOutput = true))
+        // Outputs not watched (the engine starting or stopping): the safe side.
+        assertEquals(suppressed, RemotePlayback.suppressionReason(remotePlaying, bluetoothOutput = null))
+        assertTrue(RemotePlayback.readsPaused(remoteLoading, bluetoothOutput = null))
+        // No Bluetooth output: nothing reads the session, it reads playing (pause, moving position).
+        assertEquals(none, RemotePlayback.suppressionReason(remotePlaying, bluetoothOutput = false))
+        assertEquals(none, RemotePlayback.suppressionReason(remoteLoading, bluetoothOutput = false))
+        assertFalse(RemotePlayback.readsPaused(remotePlaying, bluetoothOutput = false))
+    }
+
+    @Test
+    fun localPlaybackAndAPausedDeviceAreNeverSuppressed() {
+        listOf(true, false, null).forEach { bluetooth ->
+            // Local playback stays exactly as it was: the platform state says playing.
+            assertEquals("$bluetooth", none, RemotePlayback.suppressionReason(localPlaying, bluetooth))
+            assertEquals("$bluetooth", none, RemotePlayback.suppressionReason(localPlaying.copy(status = PlaybackStatus.LOADING), bluetooth))
+            // The other device paused or stopped: an honest pause, nothing to suppress.
+            assertEquals("$bluetooth", none, RemotePlayback.suppressionReason(remotePlaying.copy(status = PlaybackStatus.PAUSED), bluetooth))
+            assertEquals("$bluetooth", none, RemotePlayback.suppressionReason(remotePlaying.copy(status = PlaybackStatus.STOPPED), bluetooth))
+            // Nothing shown (the session is idle then).
+            assertEquals("$bluetooth", none, RemotePlayback.suppressionReason(remotePlaying.copy(track = null), bluetooth))
+            assertEquals("$bluetooth", none, RemotePlayback.suppressionReason(PlaybackSnapshot(), bluetooth))
+        }
+    }
+
+    @Test
+    fun bluetoothMediaOutputsAreA2dpLeAudioAndBroadcast() {
+        listOf(
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            AudioDeviceInfo.TYPE_BLE_SPEAKER,
+            AudioDeviceInfo.TYPE_BLE_BROADCAST,
+        ).forEach { assertTrue("$it", RemotePlayback.isBluetoothMediaOutput(it)) }
+        // No AVRCP or media control there: calls only, a hearing aid, wired, USB, the speaker.
+        listOf(
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_HEARING_AID,
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
+        ).forEach { assertFalse("$it", RemotePlayback.isBluetoothMediaOutput(it)) }
     }
 
     @Test
@@ -48,33 +82,51 @@ class RemotePlaybackTest {
             "com.google.android.wearable.app",
             null,
         ).forEach { requester ->
-            assertTrue("$requester", RemotePlayback.playMeansPause(remotePlaying, requester))
-            assertTrue("$requester", RemotePlayback.playMeansPause(remotePlaying.copy(status = PlaybackStatus.LOADING), requester))
+            assertTrue("$requester", RemotePlayback.playMeansPause(remotePlaying, suppressed = true, requester))
+            assertTrue("$requester", RemotePlayback.playMeansPause(remoteLoading, suppressed = true, requester))
         }
     }
 
     @Test
-    fun anAssistantsPlayAndEveryPlayOutsideRemotePlaybackStayAPlay() {
+    fun aPlayStaysAPlayWhenTheSessionReadsPlayingOrAnAssistantAsks() {
         RemotePlayback.VOICE_ASSISTANTS.forEach { assistant ->
-            assertFalse(assistant, RemotePlayback.playMeansPause(remotePlaying, assistant))
+            assertFalse(assistant, RemotePlayback.playMeansPause(remotePlaying, suppressed = true, assistant))
         }
+        // No Bluetooth output: the session reads playing (pause shown), a play (a Media3 controller
+        // sends one although playWhenReady is set) must not pause the device.
+        assertFalse(RemotePlayback.playMeansPause(remotePlaying, suppressed = false, "com.android.systemui"))
         // The other device paused: play resumes it.
-        assertFalse(RemotePlayback.playMeansPause(remotePlaying.copy(status = PlaybackStatus.PAUSED), "com.android.systemui"))
-        // Playing here: the session reads playing, a play is a play (Media3 resolves the toggle).
-        assertFalse(RemotePlayback.playMeansPause(localPlaying, "com.android.systemui"))
-        assertFalse(RemotePlayback.playMeansPause(localPlaying.copy(status = PlaybackStatus.PAUSED), null))
-        assertFalse(RemotePlayback.playMeansPause(PlaybackSnapshot(), null))
+        assertFalse(RemotePlayback.playMeansPause(remotePlaying.copy(status = PlaybackStatus.PAUSED), true, "com.android.systemui"))
+        // Playing here: a play is a play (Media3 resolves the toggle).
+        assertFalse(RemotePlayback.playMeansPause(localPlaying, suppressed = false, "com.android.systemui"))
+        assertFalse(RemotePlayback.playMeansPause(localPlaying.copy(status = PlaybackStatus.PAUSED), false, null))
+        assertFalse(RemotePlayback.playMeansPause(PlaybackSnapshot(), false, null))
     }
 
     @Test
-    fun theVolumeKeysSessionOnlyWhileAnotherDevicePlaysAndTakesAVolume() {
-        assertTrue(RemotePlayback.volumeKeysSession(remotePlaying, volumeSupported = true))
-        assertTrue(RemotePlayback.volumeKeysSession(remotePlaying.copy(status = PlaybackStatus.LOADING), true))
+    fun theVolumeKeysSessionOnlyWhileTheSessionReadsPausedForAPlayingDeviceWithAVolume() {
+        assertTrue(RemotePlayback.volumeKeysSession(remotePlaying, suppressed = true, volumeSupported = true))
+        assertTrue(RemotePlayback.volumeKeysSession(remoteLoading, suppressed = true, volumeSupported = true))
+        // No Bluetooth output: the session reads playing and takes the keys itself.
+        assertFalse(RemotePlayback.volumeKeysSession(remotePlaying, suppressed = false, volumeSupported = true))
         // A device with a fixed volume: the keys stay the phone's, as before.
-        assertFalse(RemotePlayback.volumeKeysSession(remotePlaying, volumeSupported = false))
+        assertFalse(RemotePlayback.volumeKeysSession(remotePlaying, suppressed = true, volumeSupported = false))
         // Paused there: the session is inactive, the keys go to the phone (as before the change).
-        assertFalse(RemotePlayback.volumeKeysSession(remotePlaying.copy(status = PlaybackStatus.PAUSED), true))
+        assertFalse(RemotePlayback.volumeKeysSession(remotePlaying.copy(status = PlaybackStatus.PAUSED), true, true))
         // Local playback: the media session in its playing state takes them itself.
-        assertFalse(RemotePlayback.volumeKeysSession(localPlaying, true))
+        assertFalse(RemotePlayback.volumeKeysSession(localPlaying, suppressed = false, volumeSupported = true))
+    }
+
+    @Test
+    fun aBluetoothOutputComingOrGoingSwitchesEveryRuleTogether() {
+        // The mode follows the output while the device plays; the toggle and the volume key session
+        // follow the state the session then publishes.
+        listOf(true to true, false to false, null to true).forEach { (bluetooth, paused) ->
+            val reads = RemotePlayback.readsPaused(remotePlaying, bluetooth)
+            assertEquals("$bluetooth", paused, reads)
+            assertEquals("$bluetooth", if (paused) suppressed else none, RemotePlayback.suppressionReason(remotePlaying, bluetooth))
+            assertEquals("$bluetooth", paused, RemotePlayback.playMeansPause(remotePlaying, reads, "com.android.systemui"))
+            assertEquals("$bluetooth", paused, RemotePlayback.volumeKeysSession(remotePlaying, reads, volumeSupported = true))
+        }
     }
 }
