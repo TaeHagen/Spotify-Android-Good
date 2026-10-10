@@ -35,6 +35,17 @@
     <string name="data_dl_error_key">Re-download required: this download can no longer be decrypted.</string>
     <string name="data_dl_error_missing_file">The downloaded file is missing. Download it again.</string>
     <string name="data_dl_paused">%1$d of %2$d downloaded. The rest continue when the network allows.</string>
+    <string name="data_dl_error_refused_item">Spotify refused to provide this song\'s audio.</string>
+    <string name="data_dl_error_key_paced">Waiting for its turn: Spotify limits how fast songs can be downloaded.</string>
+    <string name="data_dl_error_key_limited">Spotify is limiting downloads. Continues by itself.</string>
+    <!-- Spotify limits how fast an account gets audio keys (docs/ARCHITECTURE.md §9.7). %1$s: "3 min" -->
+    <string name="data_dl_notif_paced">Spotify limits how fast songs download. Next songs in about %1$s</string>
+    <string name="data_dl_notif_limited">Spotify is limiting downloads. Continuing in about %1$s</string>
+    <string name="data_dl_paused_limited">%1$d of %2$d downloaded. Spotify is limiting downloads: the rest continue in about %3$s.</string>
+    <plurals name="data_dl_minutes">
+        <item quantity="one">%d min</item>
+        <item quantity="other">%d min</item>
+    </plurals>
     <string name="data_dl_error_keystore">The device\'s key storage is busy. Will retry.</string>
     <string name="data_dl_error_location">The download location isn\'t available. Insert the SD card again, or choose another location in Settings.</string>
     <string name="data_dl_error_volume">On an SD card that isn\'t available. It plays again once the card is back.</string>

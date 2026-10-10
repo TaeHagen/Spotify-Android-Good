@@ -46,7 +46,7 @@
     <string name="playback_error_unavailable">That isn\'t available right now.</string>
     <string name="playback_error_not_available_offline">That isn\'t downloaded. Download it to play it offline.</string>
     <string name="playback_error_not_found">Couldn\'t find that.</string>
-    <string name="playback_error_rate_limited">Too many requests. Try again in a moment.</string>
+    <string name="playback_error_rate_limited">Spotify is limiting playback right now. Try again in a minute.</string>
     <string name="playback_error_not_logged_in">You\'re not logged in.</string>
     <string name="playback_error_timeout">The device didn\'t respond. Try again.</string>
     <string name="playback_error_generic">Something went wrong. Try again.</string>

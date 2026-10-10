@@ -144,9 +144,14 @@ stored credentials. An HTTP 401/407/511 (rejected bearer token, proxy authentica
 (librespot #1649; AesKeyError 0x0001). The engine stops after 3 consecutive refused loads
 instead of skipping through the queue, and the app shows a dedicated explanation screen. Only
 loads count: a refused preload never stops the playing track. 3 loads failing transiently
-(audio key timeout or rate limit, network) also stop playback, with `RATE_LIMITED`
-(`retryAfterMs` 60000) or `NETWORK`. A track plays or a new `player.load` resets the count.
-Kotlin maps them to `NativeException(code, message)`.
+(audio key timeout, network) also stop playback, with `RATE_LIMITED` (`retryAfterMs` 60000) or
+`NETWORK`. A load whose key Spotify refused for now (AesKeyError other than 0x0001: Spotify's
+key limit, §9.7 "Audio-key pacing") stops playback at once (every next load would be refused
+the same way), with `RATE_LIMITED` and `retryAfterMs` the time one key takes to refill; Kotlin
+says "Spotify is limiting how fast songs that aren't downloaded can start" (context `playback`).
+A track plays or a new `player.load` resets the count. Kotlin maps them to
+`NativeException(code, message)`. `download.track` errors name an audio-key condition in
+`context` (§6.4): `keyPacing` / `keyThrottled` (`RATE_LIMITED`), `keyRefused` (`UNAVAILABLE`).
 
 ### 3.4 JSON conventions
 
@@ -630,7 +635,7 @@ returned as an authoritative but shorter list:
 
 | method | args | result |
 |---|---|---|
-| `download.track` | `{"uri","bitrate":160,"dir":"<location>/audio","imageDir":"<location>/images"}` (the chosen download location, §9.7) | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`; waits ≤ 10 s for the session country, else `NOT_CONNECTED`; a CDN `429` asking for more than 30 s, or a second `429`, fails at once with `RATE_LIMITED` and the server's `retryAfterMs`) |
+| `download.track` | `{"uri","bitrate":160,"dir":"<location>/audio","imageDir":"<location>/images"}` (the chosen download location, §9.7) | `OfflineTrackRecord` (progress via `download` events; cancellable; resumes `.part`; waits ≤ 10 s for the session country, else `NOT_CONNECTED`; a CDN `429` asking for more than 30 s, or a second `429`, fails at once with `RATE_LIMITED` and the server's `retryAfterMs`). The audio key is requested when the file's download starts, paced by the key budget (§9.7 "Audio-key pacing"): a turn more than 10 s away fails at once, without a key request, with `RATE_LIMITED`, `retryAfterMs` and `context` `keyPacing` (the engine's pace: not a failure) or `keyThrottled` (Spotify throttled keys: the cool-down); a throttled key (AesKeyError other than 0x0001, or two unanswered requests) fails the same way (`keyThrottled`), never retried in the call; 0x0001 is `UNAVAILABLE` with `context` `keyRefused` (this song), or `PLAYBACK_REFUSED` once 3 different files were refused with no key received in between (the account) |
 | `download.fileId` | `{"uri"}` | `{"fileId"}` (omitted when unknown): the file the last `download.track` of `uri` in this process chose, also after it failed or was cancelled |
 | `offline.setIndex` | `{"tracks":[OfflineTrackRecord],"seq"?}` | `{}` or `{"rejected":["uri",…]}` (replaces the in-memory resolver index, except URIs changed after `seq`; malformed records are skipped) |
 | `offline.add` / `offline.remove` | `{"tracks":[…],"seq"?}` / `{"uris":[…],"seq"?}` | `{}` (`add` may also return `"rejected"`; `remove` matches a record's `uri` only, never its `playedUri`, and never deletes files — Kotlin owns deletion) |
@@ -1599,7 +1604,46 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   waits inline (≤ 2 min) or reschedules; a completed download resets the breaker. A Keystore that
   cannot seal a finished download's key (after ~15 s of retries) requeues it without an attempt
   (the file stays) and pauses the queue 30 s, doubling. A job or worker that starts for an empty
-  queue finishes at once, and removals that empty the queue cancel the scheduled work.
+  queue finishes at once, and removals that empty the queue cancel the scheduled work. The
+  engine's key pacing (`RATE_LIMITED`, context `keyPacing`, below) is no failure: the item is
+  requeued without an attempt and the queue waits exactly `retryAfterMs` (≤ 105 s: inline, the
+  run keeps its engine), no breaker count changes; its cool-down after a throttle (`keyThrottled`,
+  ≥ 5 min) takes the rate-limit path above (the run reschedules). While the queue waits for either,
+  the Downloads header says so ("Spotify limits how fast songs can be downloaded. Next songs in
+  about 2 min" / "Spotify is limiting downloads. Continuing in about 10 min", `DownloadPause`,
+  re-read every 20 s while shown; still shown after the run rescheduled), the run's notification
+  too, and a run that ends for it posts "x of y downloaded. Spotify is limiting downloads: the rest
+  continue in about N min". A song Spotify refuses (`keyRefused`) fails alone ("Spotify refused to
+  provide this song's audio", retryable); the account's refusal stops the run as before.
+* Audio-key pacing (`spotcore/src/offline/key_budget.rs`, `keys.rs`): Spotify limits how fast an
+  account gets audio keys (librespot #1319; zotify #186, #253): reports fit a bucket of about
+  20–32 keys refilled about one per 30–33 s, after which every request is answered AesKeyError
+  0x0002 until it refilled, for playback and downloads alike (they share the account's budget; the
+  official apps use another key path, PlayPlay, that librespot cannot). Earlier versions requested a
+  download's key every few seconds and retried a refusal 4 times, so about 30 songs into a playlist
+  downloads and streaming both stopped. Every key request of the process (the player's included,
+  through vendored core's `KeyObserver`) goes into one estimate of that bucket (20 keys, one refilled
+  per 35 s), and:
+  * Playback first: the player never waits for the budget. Downloads leave 10 keys to it (skips,
+    loads, preloads) and wait 10 s after any key request of the player.
+  * Pacing: downloads take the keys above that reserve, ≥ 2 s apart: about 10 songs at once, then
+    batches of up to 3 once the bucket refilled (≤ 105 s apart, so the radio rests in between), on
+    average one per 35 s (≈ 100 an hour; a 100-song playlist takes ≈ 55 min). A key is requested
+    only when its file's download starts; a key the process already has (a streamed track, core's
+    known keys) or the offline index has costs no request.
+  * Throttle: any AesKeyError other than 0x0001, or two unanswered requests in a row, from either
+    side, empties the estimate and stops download keys for at least 5, 10, 20, 30 min (level 1–4);
+    each level also assumes a slower refill (50, 70, 100, 110 s per key), and downloads resume when
+    the reserve plus a batch refilled from empty (≈ 10, 13, 20, 30 min). Signals during a cool-down
+    don't escalate; a level is forgotten after an hour without a throttle. Nothing is retried while
+    throttled and nothing wakes up for it: Kotlin pauses the queue (`retryAt`) and the existing job /
+    worker reschedule picks it up.
+  * Refusal (0x0001): a refusal of that file (license-gated tracks, go-librespot #235 / #317), the
+    account's only once 3 different files were refused with no key received in between.
+  * Logout or another account forgets the budget and the known keys.
+  Once per installation, failed downloads earlier versions stored with "refused for this account",
+  "Network error" or "limiting requests" (the throttle as they read it) are queued again
+  (`DownloadRules.throttleRepair`).
 * Collection sync: when online (engine start + daily periodic work), re-fetch downloaded
   playlists/albums/liked songs, enqueue new items, remove items that left (unless also part
   of another downloaded collection). Likes and playlist edits made in the app
@@ -2129,6 +2173,7 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
 | Paused ≥ 10 min, app background | hidden and stopped when the service lets go (other releases: hidden after 20 s, stopped after 60 s, both wall time) | no | none | none |
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
+| Downloads waiting for Spotify's key limit (§9.7) | Online while the pace is inline (≤ 105 s between batches of ≤ 3 songs, the radio idle in between); a cool-down (≥ 5 min) ends the run, the session goes with its holder | no | none during a cool-down (the job / worker reschedules with system backoff) | job's / Worker's while inline, else none |
 | Presence opt-in, idle (also restored after an app update, and after a reboot up to Android 14; from Android 15 a notification asks to open the app) | Online | yes | connectedDevice (low-importance) | none |
 | Home-screen widget placed (§9.4) | unchanged: pushed by the running playback service when the track, play state, like or device change, ≤ 1 per 500 ms; no `updatePeriodMillis`, alarm, polling or job; no widget, nothing collected | unchanged | none (Play from a dead process: the stored session, like a headset Play) | none |
 | Nothing | stopped | no | none | none |

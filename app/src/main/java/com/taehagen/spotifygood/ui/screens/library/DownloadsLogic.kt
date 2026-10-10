@@ -4,6 +4,8 @@ import androidx.compose.runtime.Immutable
 import com.taehagen.spotifygood.download.CollectionType
 import com.taehagen.spotifygood.download.DownloadActivity
 import com.taehagen.spotifygood.download.DownloadItem
+import com.taehagen.spotifygood.download.DownloadPause
+import com.taehagen.spotifygood.download.DownloadRules
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.Track
@@ -121,6 +123,21 @@ fun buildDownloadsContent(
  */
 fun canResumeDownloads(activity: DownloadActivity, pendingCount: Int): Boolean =
     !activity.running && pendingCount > 0 && activity.lastError != null
+
+/** The header's note while the queue waits for Spotify's audio-key limit: why, and the minutes left. */
+@Immutable
+data class DownloadPauseNotice(val reason: DownloadPause.Reason, val minutes: Int)
+
+/**
+ * What the header says while [activity] waits for Spotify's audio-key limit with [pendingCount] items
+ * queued, at [now]: the minutes left rounded up (0: the pause is over, the queue continues any
+ * moment). Null when the queue doesn't wait for it.
+ */
+fun downloadPauseNotice(activity: DownloadActivity, pendingCount: Int, now: Long): DownloadPauseNotice? {
+    val pause = activity.pause ?: return null
+    if (pendingCount <= 0) return null
+    return DownloadPauseNotice(pause.reason, DownloadRules.minutesUntil(pause.until, now))
+}
 
 private val PENDING_STATES = setOf(DownloadState.QUEUED, DownloadState.PREPARING, DownloadState.DOWNLOADING)
 

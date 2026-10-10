@@ -157,6 +157,20 @@ data class DownloadRelocation(
     val unreadable: Int = 0,
 )
 
+/**
+ * The download queue waits for Spotify's audio-key limit until [until] (epoch ms): Spotify limits
+ * how fast an account gets audio keys, so downloads go at its pace (docs/ARCHITECTURE.md §9.7).
+ */
+data class DownloadPause(val reason: Reason, val until: Long) {
+    enum class Reason {
+        /** The engine's pacing: songs download in small batches as the key budget refills. */
+        PACING,
+
+        /** Spotify throttled (keys, or the CDN): a cool-down of minutes, then on by itself. */
+        LIMITED,
+    }
+}
+
 /** What the downloader is doing right now (Downloads screen header, banners). */
 data class DownloadActivity(
     val running: Boolean = false,
@@ -167,6 +181,8 @@ data class DownloadActivity(
     val remaining: Int = 0,
     /** Why the last run stopped early (storage, account …); null when it did not. */
     val lastError: String? = null,
+    /** The queue waits for Spotify's audio-key limit (while running, or rescheduled for it). */
+    val pause: DownloadPause? = null,
 ) {
     /** 0..1 for [currentUri] while its size is known. */
     val progress: Float? get() = if (totalBytes > 0) (bytes.toFloat() / totalBytes).coerceIn(0f, 1f) else null
@@ -431,6 +447,7 @@ class DownloadManager(
         scope.launch { followCovers() }
         scope.launch { watchExplicitFilter() }
         scope.launch { repairExplicitFailures() }
+        scope.launch { repairThrottleFailures() }
         scope.launch(Dispatchers.Main) {
             // Back in the app: resume a queue that stopped (storage was full, retries ran out …).
             ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
@@ -1310,6 +1327,37 @@ class DownloadManager(
     }
 
     /**
+     * Once per installation: earlier versions read Spotify's audio-key throttle (a playlist
+     * downloaded too fast) as an account refusal, which failed every pending download, or as a
+     * network error retried until the attempts ran out. Those failed downloads go back into the
+     * queue ([DownloadRules.throttleRepair]), downloaded at the pace the engine now keeps.
+     */
+    private suspend fun repairThrottleFailures() {
+        try {
+            val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (withContext(Dispatchers.IO) { prefs.getInt(KEY_THROTTLE_REPAIR, 0) } >= THROTTLE_REPAIR_VERSION) return
+            val reasons = setOf(
+                appContext.getString(R.string.data_dl_error_refused),
+                appContext.getString(R.string.data_dl_error_network),
+                appContext.getString(R.string.data_dl_error_rate_limited),
+            )
+            val requeued = mutex.withLock {
+                val uris = DownloadRules.throttleRepair(dao.retryRows(), reasons)
+                database.withTransaction { uris.chunked(SQL_CHUNK).sumOf { dao.requeueFailedOnly(it) } }
+            }
+            withContext(Dispatchers.IO) { prefs.edit().putInt(KEY_THROTTLE_REPAIR, THROTTLE_REPAIR_VERSION).commit() }
+            if (requeued > 0) {
+                Log.i(TAG, "Key throttle repair: queued $requeued failed downloads again")
+                scheduleExecution(kick = true)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Key throttle repair failed; retried at the next start", e)
+        }
+    }
+
+    /**
      * Re-syncs downloaded collections with their sources (new/removed items) and re-validates
      * downloads older than 30 days. Holds the engine (DOWNLOAD) meanwhile; does nothing when the
      * session cannot come online. Concurrent calls are coalesced.
@@ -2056,6 +2104,8 @@ class DownloadManager(
         private const val PREFS = "downloads"
         private const val KEY_EXPLICIT_REPAIR = "explicitFilterRepair"
         private const val EXPLICIT_REPAIR_VERSION = 1
+        private const val KEY_THROTTLE_REPAIR = "keyThrottleRepair"
+        private const val THROTTLE_REPAIR_VERSION = 1
         private const val JOB_BACKOFF_MS = 30_000L
         private const val WORK_BACKOFF_S = 30L
         private const val SYNC_BACKOFF_MIN = 15L

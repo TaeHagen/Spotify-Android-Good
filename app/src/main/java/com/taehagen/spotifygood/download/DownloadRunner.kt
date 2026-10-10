@@ -115,7 +115,10 @@ internal class KeyCache {
  * registers it with `offline.add` (numbered with the commit, see [OfflineIndexSync]). Failures are
  * retried with exponential backoff up to [DownloadRules.MAX_ATTEMPTS]; a rate limit, or repeated
  * connectivity failures while online, pause the whole queue ([QueueBreaker]: every pending row is
- * held back, so the loop waits inline for a short pause and reschedules for a long one).
+ * held back, so the loop waits inline for a short pause and reschedules for a long one). So does
+ * the engine's audio-key pacing ([DownloadRules.KEY_PACING], not a failure: Spotify limits how fast
+ * an account gets keys, songs download in small batches), and its cool-down after Spotify throttled
+ * keys ([DownloadRules.KEY_THROTTLED], minutes); both show as a [DownloadPause].
  *
  * Lock order: [runLock] before [commitLock] (the manager's mutation lock).
  */
@@ -145,6 +148,9 @@ internal class DownloadRunner(
 
     /** Kept across runs (runLock orders them), so pauses keep growing while a condition lasts. */
     private val breaker = QueueBreaker()
+
+    /** The queue pause Spotify's audio-key limit imposed last ([DownloadRules.pauseFor]), until an item starts. */
+    @Volatile private var keyPause: DownloadPause? = null
 
     private val _activity = MutableStateFlow(DownloadActivity())
     val activity: StateFlow<DownloadActivity> = _activity.asStateFlow()
@@ -277,6 +283,7 @@ internal class DownloadRunner(
                     val retryAt = dao.earliestRetryAt() ?: break // nothing pending at all
                     val wait = retryAt - now
                     if (wait > MAX_INLINE_WAIT_MS) return RunOutcome.RESCHEDULE
+                    showKeyPause(host, stats, now)
                     delay(wait.coerceAtLeast(MIN_WAIT_MS))
                     continue
                 }
@@ -319,13 +326,21 @@ internal class DownloadRunner(
                 holder.release()
                 // The user's Cancel marks the queue cancelled after this block (runSession).
                 val pending = dao.pendingCount()
+                val now = System.currentTimeMillis()
+                val pause = keyPause?.takeIf { it.until > now && pending > 0 }
                 when (DownloadRules.runNotice(stats.stopMessage != null, cancelRequested, pending, stats.processed)) {
                     DownloadRules.RunNotice.COMPLETE -> notifications.showSummary(stats.completed, stats.failed)
-                    DownloadRules.RunNotice.PAUSED ->
-                        notifications.showStopped(context.getString(R.string.data_dl_paused, stats.completed, stats.completed + pending))
+                    DownloadRules.RunNotice.PAUSED -> notifications.showStopped(
+                        if (pause != null) {
+                            context.getString(R.string.data_dl_paused_limited, stats.completed, stats.completed + pending, minutes(pause.until, now))
+                        } else {
+                            context.getString(R.string.data_dl_paused, stats.completed, stats.completed + pending)
+                        },
+                    )
                     DownloadRules.RunNotice.NONE -> Unit
                 }
-                _activity.value = DownloadActivity(lastError = stats.stopMessage)
+                // A pause for Spotify's key limit stays on the Downloads screen until the queue runs again.
+                _activity.value = DownloadActivity(lastError = stats.stopMessage, pause = pause)
             }
         }
     }
@@ -361,6 +376,27 @@ internal class DownloadRunner(
         val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return false
         val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork) ?: return false
         return !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+    }
+
+    /**
+     * The queue waits inline for Spotify's audio-key limit ([keyPause]): the Downloads screen and the
+     * run's notification say so ("next songs in about N min") instead of the last item's progress.
+     */
+    private suspend fun showKeyPause(host: DownloadHost, stats: RunStats, now: Long) {
+        val pause = keyPause?.takeIf { it.until > now } ?: return
+        val pending = dao.pendingCount()
+        _activity.value = DownloadActivity(running = true, remaining = pending, pause = pause)
+        val text = context.getString(
+            if (pause.reason == DownloadPause.Reason.PACING) R.string.data_dl_notif_paced else R.string.data_dl_notif_limited,
+            minutes(pause.until, now),
+        )
+        host.updateNotification(notifications.waiting(text, stats.processed, stats.processed + pending))
+    }
+
+    /** "3 min" until [until] (at least 1). */
+    private fun minutes(until: Long, now: Long): String {
+        val minutes = DownloadRules.minutesUntil(until, now).coerceAtLeast(1)
+        return context.resources.getQuantityString(R.plurals.data_dl_minutes, minutes, minutes)
     }
 
     /** How long until a pending item may run; null when one may run now or nothing is pending. */
@@ -407,6 +443,7 @@ internal class DownloadRunner(
         val quality = settings.awaitLoaded().downloadQuality.kbps
         // Removed since it was picked: nothing to download.
         if (dao.markPreparing(item.uri, quality) == 0) return@coroutineScope ItemResult.Done
+        keyPause = null
         val title = displayTitle(item.metadataJson)
         val total = stats.processed + dao.pendingCount()
         _activity.value = DownloadActivity(running = true, currentUri = item.uri, remaining = total - stats.processed)
@@ -620,8 +657,8 @@ internal class DownloadRunner(
         val message = describe(e)
         val online = engine.isOnline.value
         val now = System.currentTimeMillis()
-        val pauseMs = breaker.onFailure(e.code, online, e.info.retryAfterMs)
-        val result = when (val action = DownloadRules.onFailure(e.code, item.attempts, online, e.info.retryAfterMs)) {
+        val pauseMs = breaker.onFailure(e.code, online, e.info.retryAfterMs, e.info.context)
+        val result = when (val action = DownloadRules.onFailure(e.code, item.attempts, online, e.info.retryAfterMs, e.info.context)) {
             DownloadRules.FailureAction.StopRun -> {
                 dao.markFailed(item.uri, item.attempts + 1, message)
                 stats.failed++
@@ -654,12 +691,19 @@ internal class DownloadRunner(
                     ItemResult.Done
                 }
             }
+            DownloadRules.FailureAction.Paced -> {
+                // Not an attempt and not a failure: the engine paces Spotify's audio keys (no key
+                // was requested). The item waits with the rest of the queue for its turn.
+                dao.scheduleRetry(item.uri, item.attempts, now + (pauseMs ?: DownloadRules.MIN_PACING_PAUSE_MS), message)
+                ItemResult.Done
+            }
         }
         if (pauseMs != null && result !is ItemResult.StopRun) {
             // Hold every pending row back: the loop then waits (inline or rescheduled) instead of
             // starting the next item against a service that is refusing them all.
-            Log.i(TAG, "Pausing the download queue for $pauseMs ms (${e.code})")
+            Log.i(TAG, "Pausing the download queue for $pauseMs ms (${e.code}${e.info.context?.let { " $it" } ?: ""})")
             dao.deferPending(now + pauseMs)
+            keyPause = DownloadRules.pauseFor(e.code, e.info.context, pauseMs, now)
         }
         return result
     }
@@ -668,9 +712,17 @@ internal class DownloadRunner(
         NativeErrorCode.PREMIUM_REQUIRED -> context.getString(R.string.data_dl_error_premium)
         NativeErrorCode.PLAYBACK_REFUSED -> context.getString(R.string.data_dl_error_refused)
         NativeErrorCode.NOT_LOGGED_IN, NativeErrorCode.BAD_CREDENTIALS -> context.getString(R.string.data_dl_error_login)
-        NativeErrorCode.NOT_FOUND, NativeErrorCode.UNAVAILABLE -> context.getString(R.string.data_dl_error_unavailable)
+        NativeErrorCode.NOT_FOUND, NativeErrorCode.UNAVAILABLE -> context.getString(
+            if (e.info.context == DownloadRules.KEY_REFUSED) R.string.data_dl_error_refused_item else R.string.data_dl_error_unavailable,
+        )
         NativeErrorCode.NETWORK, NativeErrorCode.NOT_CONNECTED -> context.getString(R.string.data_dl_error_network)
-        NativeErrorCode.RATE_LIMITED -> context.getString(R.string.data_dl_error_rate_limited)
+        NativeErrorCode.RATE_LIMITED -> context.getString(
+            when (e.info.context) {
+                DownloadRules.KEY_PACING -> R.string.data_dl_error_key_paced
+                DownloadRules.KEY_THROTTLED -> R.string.data_dl_error_key_limited
+                else -> R.string.data_dl_error_rate_limited
+            },
+        )
         else -> e.info.message.ifBlank { context.getString(R.string.data_dl_error_generic) }
     }
 

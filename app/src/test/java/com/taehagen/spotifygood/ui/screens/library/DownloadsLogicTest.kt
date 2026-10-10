@@ -3,11 +3,13 @@ package com.taehagen.spotifygood.ui.screens.library
 import com.taehagen.spotifygood.download.CollectionType
 import com.taehagen.spotifygood.download.DownloadActivity
 import com.taehagen.spotifygood.download.DownloadItem
+import com.taehagen.spotifygood.download.DownloadPause
 import com.taehagen.spotifygood.model.DownloadState
 import com.taehagen.spotifygood.model.Episode
 import com.taehagen.spotifygood.model.Track
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -34,6 +36,22 @@ class DownloadsLogicTest {
         assertFalse(canResumeDownloads(stopped, pendingCount = 0))
         assertFalse(canResumeDownloads(stopped.copy(running = true), pendingCount = 3))
         assertFalse(canResumeDownloads(DownloadActivity(running = false), pendingCount = 3))
+    }
+
+    @Test
+    fun theHeaderSaysWhenSpotifysKeyLimitLetsTheQueueGoOn() {
+        val now = 1_000_000L
+        val paced = DownloadActivity(running = true, pause = DownloadPause(DownloadPause.Reason.PACING, now + 90_000L))
+        assertEquals(DownloadPauseNotice(DownloadPause.Reason.PACING, 2), downloadPauseNotice(paced, pendingCount = 40, now = now))
+        // After a throttle the run was handed back to the system: still said while nothing runs.
+        val limited = DownloadActivity(running = false, pause = DownloadPause(DownloadPause.Reason.LIMITED, now + 10 * 60_000L))
+        assertEquals(DownloadPauseNotice(DownloadPause.Reason.LIMITED, 10), downloadPauseNotice(limited, pendingCount = 40, now = now))
+        // The pause is over but the system has not run the queue yet: "continuing shortly".
+        assertEquals(0, downloadPauseNotice(limited, pendingCount = 40, now = now + 11 * 60_000L)?.minutes)
+        // Nothing waits, or nothing is paused: no note (not a failure either).
+        assertNull(downloadPauseNotice(limited, pendingCount = 0, now = now))
+        assertNull(downloadPauseNotice(DownloadActivity(running = true), pendingCount = 40, now = now))
+        assertFalse(canResumeDownloads(limited, pendingCount = 40))
     }
 
     @Test
