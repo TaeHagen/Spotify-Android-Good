@@ -152,8 +152,15 @@ private fun AlbumList(
                 }
             }
         }
-        // Long albums only (a short one is shorter than the scroller's minimum).
-        FastScroller(listState, topPadding = detailTopInset(), bottomPadding = contentPadding.calculateBottomPadding())
+        // Long albums only (a short one is shorter than the scroller's minimum). The rows are the
+        // tracks (and disc titles); the header, notices, footer and More by are measured apart.
+        FastScroller(
+            listState,
+            contentStart = 1 + (if (content.downloadedCopy) 1 else 0) + (if (album.partial) 1 else 0),
+            contentCount = content.discs.sumOf { it.tracks.size } + (if (content.multiDisc) content.discs.size else 0),
+            topPadding = detailTopInset(),
+            bottomPadding = contentPadding.calculateBottomPadding(),
+        )
     }
 }
 

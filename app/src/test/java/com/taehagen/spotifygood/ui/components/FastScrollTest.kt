@@ -220,7 +220,33 @@ class FastScrollTest {
     }
 
     @Test
-    fun placeholdersOnlyInTheOwnOrderOnline() {
+    fun aTallHeaderCountedAsARowFlipsTheScrollerItsOwnRangeKeepsIt() {
+        // A 564 px header and 40 rows of 64 px on a 1,000 px screen: at the top, and further down.
+        val top = listOf(FastScrollItem(0, 0, 564)) + (1..7).map { FastScrollItem(it, 564 + (it - 1) * 64, 64) }
+        val down = (20 until 36).map { FastScrollItem(it, (it - 20) * 64, 64) }
+        // The header counted as a row: long while it is on screen only.
+        val skewed = FastScrollSizes(defaultRowPx = 64f)
+        assertTrue(skewed.geometry(top, contentStart = 0, contentCount = 41, totalItems = 41, viewportPx = 1_000, paddingPx = 0).isLong)
+        assertFalse(skewed.geometry(down, contentStart = 0, contentCount = 41, totalItems = 41, viewportPx = 1_000, paddingPx = 0).isLong)
+        // The rows after it: the header is measured once and remembered.
+        val sizes = FastScrollSizes(defaultRowPx = 64f)
+        assertTrue(sizes.geometry(top, contentStart = 1, contentCount = 40, totalItems = 41, viewportPx = 1_000, paddingPx = 0).isLong)
+        assertTrue(sizes.geometry(down, contentStart = 1, contentCount = 40, totalItems = 41, viewportPx = 1_000, paddingPx = 0).isLong)
+    }
+
+    @Test
+    fun onceThereTheScrollerStaysDownToTwoAndAHalfScreens() {
+        // 2.8 screens: none to begin with, kept once there.
+        val list = FastScrollGeometry(emptyList(), 64f, contentCount = 44, trailingPx = 0f, viewportPx = 1_000, paddingPx = 0)
+        assertFalse(list.isLong)
+        assertTrue(list.isLong(had = true))
+        // Below 2.5 screens it goes.
+        val shorter = FastScrollGeometry(emptyList(), 64f, contentCount = 38, trailingPx = 0f, viewportPx = 1_000, paddingPx = 0)
+        assertFalse(shorter.isLong(had = true))
+    }
+
+    @Test
+    fun placeholdersOnlyInTheOwnOrderNotOffline() {
         val playlist = PlaylistData(
             meta = Playlist(uri = "spotify:playlist:x", name = "x"),
             description = RichText.EMPTY,
@@ -229,17 +255,19 @@ class FastScrollTest {
             revision = "r",
         )
         val own = PlaylistListUi()
-        assertEquals(4_900, playlistPlaceholders(playlist, 100, own, editMode = false, online = true))
-        assertEquals(0, playlistPlaceholders(playlist, 100, own, editMode = true, online = true))
-        assertEquals(0, playlistPlaceholders(playlist, 100, own, editMode = false, online = false))
-        assertEquals(0, playlistPlaceholders(playlist, 100, own.copy(sortActive = true), editMode = false, online = true))
-        assertEquals(0, playlistPlaceholders(playlist, 100, own.copy(filterActive = true), editMode = false, online = true))
-        assertEquals(0, playlistPlaceholders(playlist.copy(downloadedCopy = true), 100, own, editMode = false, online = true))
+        // Also while the session reconnects (not ONLINE, not offline): the list keeps its length.
+        assertEquals(4_900, playlistPlaceholders(playlist, 100, own, editMode = false, offline = false))
+        assertEquals(0, playlistPlaceholders(playlist, 100, own, editMode = true, offline = false))
+        assertEquals(0, playlistPlaceholders(playlist, 100, own, editMode = false, offline = true))
+        assertEquals(0, playlistPlaceholders(playlist, 100, own.copy(sortActive = true), editMode = false, offline = false))
+        assertEquals(0, playlistPlaceholders(playlist, 100, own.copy(filterActive = true), editMode = false, offline = false))
+        assertEquals(0, playlistPlaceholders(playlist.copy(downloadedCopy = true), 100, own, editMode = false, offline = false))
 
-        assertEquals(4_900, likedPlaceholders(100, 5_000, fromDownload = false, filter = "", sort = TrackSort.RECENTLY_ADDED, online = true))
-        assertEquals(0, likedPlaceholders(100, 5_000, fromDownload = false, filter = "x", sort = TrackSort.RECENTLY_ADDED, online = true))
-        assertEquals(0, likedPlaceholders(100, 5_000, fromDownload = false, filter = "", sort = TrackSort.TITLE, online = true))
-        assertEquals(0, likedPlaceholders(100, 5_000, fromDownload = true, filter = "", sort = TrackSort.RECENTLY_ADDED, online = true))
-        assertEquals(0, likedPlaceholders(100, null, fromDownload = false, filter = "", sort = TrackSort.RECENTLY_ADDED, online = true))
+        assertEquals(4_900, likedPlaceholders(100, 5_000, fromDownload = false, filter = "", sort = TrackSort.RECENTLY_ADDED, offline = false))
+        assertEquals(0, likedPlaceholders(100, 5_000, fromDownload = false, filter = "", sort = TrackSort.RECENTLY_ADDED, offline = true))
+        assertEquals(0, likedPlaceholders(100, 5_000, fromDownload = false, filter = "x", sort = TrackSort.RECENTLY_ADDED, offline = false))
+        assertEquals(0, likedPlaceholders(100, 5_000, fromDownload = false, filter = "", sort = TrackSort.TITLE, offline = false))
+        assertEquals(0, likedPlaceholders(100, 5_000, fromDownload = true, filter = "", sort = TrackSort.RECENTLY_ADDED, offline = false))
+        assertEquals(0, likedPlaceholders(100, null, fromDownload = false, filter = "", sort = TrackSort.RECENTLY_ADDED, offline = false))
     }
 }

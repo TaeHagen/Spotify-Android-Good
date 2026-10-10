@@ -52,6 +52,7 @@ import com.taehagen.spotifygood.ui.screens.library.SortedStart
 import com.taehagen.spotifygood.ui.screens.library.SortedPlays
 import com.taehagen.spotifygood.ui.screens.library.PageWindows
 import com.taehagen.spotifygood.ui.screens.library.RowWindows
+import com.taehagen.spotifygood.ui.screens.library.WindowPage
 import com.taehagen.spotifygood.ui.screens.library.SortedPlayStarter
 import com.taehagen.spotifygood.ui.screens.library.SORTED_PLAY_WAIT_MS
 import com.taehagen.spotifygood.ui.screens.library.sortedPlayRequest
@@ -197,11 +198,12 @@ internal const val WINDOW_PAGE_SIZE = 100
 /**
  * Rows the playlist page shows as placeholders after the [shown] ones, to the end of the playlist:
  * they load by window as they come on screen (a fast scroll seeks the whole playlist). Only in its
- * own order with the server's rows while ONLINE; none sorted or filtered (every row is loaded for
- * it), in edit mode (the loaded rows are edited) or for the download.
+ * own order with the server's rows, and not [offline]: kept while the session (re)connects, so the
+ * list keeps its length and place (they load once it is ONLINE); none sorted or filtered (every row
+ * is loaded for it), in edit mode (the loaded rows are edited) or for the download.
  */
-internal fun playlistPlaceholders(playlist: PlaylistData, shown: Int, list: PlaylistListUi, editMode: Boolean, online: Boolean): Int =
-    if (editMode || list.sortActive || list.filterActive || playlist.downloadedCopy || !online) 0 else (playlist.total - shown).coerceAtLeast(0)
+internal fun playlistPlaceholders(playlist: PlaylistData, shown: Int, list: PlaylistListUi, editMode: Boolean, offline: Boolean): Int =
+    if (editMode || list.sortActive || list.filterActive || playlist.downloadedCopy || offline) 0 else (playlist.total - shown).coerceAtLeast(0)
 
 @Immutable
 internal data class AddSongsUi(
@@ -259,8 +261,12 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
     private var loadAllJob: Job? = null
     /** Play and row taps: a sorted one waits for every row ([playlistPlayWaits]). */
     private val listPlays = SortedPlayStarter(viewModelScope, graph.player.userCommands)
-    /** Rows past the loaded ones, by page, where the list is looked at ([onRowsVisible]). */
-    private val windows = PageWindows(viewModelScope, WINDOW_PAGE_SIZE) { offset, limit -> windowRows(offset, limit) }
+    /** Rows past the loaded ones, by page, where the list is looked at ([onRowsVisible]); retries wait for the session. */
+    private val windows = PageWindows(
+        viewModelScope,
+        WINDOW_PAGE_SIZE,
+        ready = { graph.engineReachFlow().first { it == EngineReach.ONLINE } },
+    ) { offset, limit -> windowRows(offset, limit) }
     /** The rows on screen last reported ([onRowsVisible]): asked again after the windows were dropped. */
     private var visibleRows: Pair<Int, Int>? = null
 
@@ -341,6 +347,12 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         data.map { it.dataOrNull()?.rows?.size ?: 0 }
             .distinctUntilChanged()
             .onEach { windows.dropBelow(it) }
+            .launchIn(viewModelScope)
+        // ONLINE again (the placeholders stayed while it reconnected): the rows on screen load.
+        graph.engineReachFlow()
+            .filter { it == EngineReach.ONLINE }
+            .onEach { visibleRows?.let { (first, last) -> onRowsVisible(first, last) } }
+            .catch { }
             .launchIn(viewModelScope)
         // Loaded rows carry the playable flags of the old explicit filter; the revision doesn't
         // change, so the live page alone wouldn't replace them.
@@ -464,12 +476,16 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
      * Rows [first]..[last] (positions in the shown list) are on screen. In the playlist's own order
      * the next page continues the loaded rows when they come near their end; rows farther down
      * (placeholders reached by scrolling or a fast scroll) load by window ([PageWindows]), only
-     * their pages. A sort or a filter loads every row itself.
+     * their pages. A sort or a filter loads every row itself. Without windows the window loads
+     * and retries stop ([PageWindows.hide]).
      */
     fun onRowsVisible(first: Int, last: Int) {
         visibleRows = first to last
-        val playlist = data.value.dataOrNull() ?: return
-        if (needsAllRows() || playlist.allLoaded) return
+        val playlist = data.value.dataOrNull()
+        if (playlist == null || needsAllRows() || playlist.allLoaded) {
+            windows.hide()
+            return
+        }
         val loaded = playlist.rows.size
         val nextPage = !paging.value.failed && last >= loaded - LOAD_AHEAD && first < loaded + PAGE_SIZE
         if (nextPage) loadMore()
@@ -477,7 +493,15 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         if (!editMode.value && graph.engineReach() == EngineReach.ONLINE && !playlist.downloadedCopy) {
             val continued = nextPage || pageJob?.isActive == true
             windows.show(first, last, from = if (continued) loaded + PAGE_SIZE else loaded, total = playlist.total)
+        } else {
+            windows.hide()
         }
+    }
+
+    /** The list left the screen (or the app went to the background): window loads and retries stop. */
+    fun onRowsHidden() {
+        visibleRows = null
+        windows.hide()
     }
 
     private fun resetWindows() {
@@ -485,8 +509,11 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         visibleRows?.let { (first, last) -> viewModelScope.launch { onRowsVisible(first, last) } }
     }
 
-    /** A window's rows, or null when they can't be shown (another revision: the playlist reloads). */
-    private suspend fun windowRows(offset: Int, limit: Int): List<PlaylistRow>? {
+    /**
+     * A window's rows, partial when some are placeholders (loaded again), or null when they can't
+     * be shown (another revision: the playlist reloads).
+     */
+    private suspend fun windowRows(offset: Int, limit: Int): WindowPage<PlaylistRow>? {
         val page = graph.catalog.playlistPage(uri, offset, limit)
         val latest = data.value.dataOrNull() ?: return null
         if (latest.downloadedCopy) return null
@@ -495,7 +522,7 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
             mutationMutex.withLock { if (canApplyServerRows()) refreshLoaded(force = false) }
             return null
         }
-        return page.items.mapIndexed { i, item -> PlaylistRow("w:${offset + i}", item) }
+        return WindowPage(page.items.mapIndexed { i, item -> PlaylistRow("w:${offset + i}", item) }, page.partial)
     }
 
     /** Loads the next page when the list is scrolled near its end. */
@@ -831,8 +858,12 @@ internal class PlaylistViewModel(graph: AppGraph, private val uri: String) : Det
         }
     }
 
-    /** Some rows came back as placeholders: re-fetch the loaded range (not while edits are pending). */
+    /**
+     * Some rows came back as placeholders: re-fetch the loaded range (not while edits are pending)
+     * and the windows on screen.
+     */
     fun retryPartial() {
+        resetWindows()
         viewModelScope.launch {
             mutationMutex.withLock { if (canApplyServerRows()) refreshLoaded(force = false) }
         }

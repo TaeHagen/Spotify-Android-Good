@@ -619,7 +619,7 @@ class ExpandingPlayerScreenshotTest {
  * runs Compose's recompositions here but no view traversals, so without the draws (which measure,
  * lay out and update the layers) a layout callback's state change would only land at the capture.
  */
-private fun runFrames(view: View, ms: Long) {
+internal fun runFrames(view: View, ms: Long) {
     val looper = shadowOf(Looper.getMainLooper())
     val canvas = Canvas(Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888))
     var left = ms

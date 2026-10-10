@@ -97,7 +97,7 @@ internal fun LikedSongsContent(contentPadding: PaddingValues, modifier: Modifier
     val headerItems = 3 + (if (state.partial) 1 else 0) + (if (state.offline) 1 else 0) + (if (stateItem) 1 else 0)
     val rowCount = state.tracks.size + state.placeholders
     // Loads the next page near the loaded end, or the windows of rows further down.
-    VisibleRowsEffect(listState, contentStart = headerItems, contentCount = rowCount, onVisible = viewModel::onRowsVisible)
+    VisibleRowsEffect(listState, contentStart = headerItems, contentCount = rowCount, onHidden = viewModel::onRowsHidden, onVisible = viewModel::onRowsVisible)
     val datePattern = rememberFastScrollDatePattern()
     val label: (Int) -> String? = remember(state.tracks, state.windows, state.sort, rowCount, datePattern) {
         val tracks = state.tracks

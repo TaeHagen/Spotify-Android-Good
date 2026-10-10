@@ -153,6 +153,7 @@ fun PlaylistScreen(uri: String, contentPadding: PaddingValues, modifier: Modifie
             onDragMove = viewModel::previewMove,
             onDragEnd = viewModel::endDrag,
             onRowsVisible = viewModel::onRowsVisible,
+            onRowsHidden = viewModel::onRowsHidden,
         )
     }
 
@@ -262,6 +263,8 @@ private class PlaylistActions(
     val onDragEnd: (Int, Int) -> Unit,
     /** Rows on screen (positions in the shown list): the next page or windows load for them. */
     val onRowsVisible: (Int, Int) -> Unit,
+    /** The list left the screen: window loads stop. */
+    val onRowsHidden: () -> Unit,
 )
 
 @Composable
@@ -296,9 +299,9 @@ private fun PlaylistList(
         (if (playlist.downloadedCopy) 1 else 0) +
         (if (playlist.partial && !state.editMode) 1 else 0) +
         (if (!state.editMode && playlist.total > 0) 1 else 0)
-    val placeholders = playlistPlaceholders(playlist, rows.size, state.list, state.editMode, state.online)
+    val placeholders = playlistPlaceholders(playlist, rows.size, state.list, state.editMode, state.offline)
     val rowCount = rows.size + placeholders
-    VisibleRowsEffect(listState, contentStart = headerItems, contentCount = rowCount, onVisible = actions.onRowsVisible)
+    VisibleRowsEffect(listState, contentStart = headerItems, contentCount = rowCount, onHidden = actions.onRowsHidden, onVisible = actions.onRowsVisible)
     val datePattern = rememberFastScrollDatePattern()
     val shownSort = if (state.list.sortActive) state.sort else TrackSort.CUSTOM
     val windows = state.windows

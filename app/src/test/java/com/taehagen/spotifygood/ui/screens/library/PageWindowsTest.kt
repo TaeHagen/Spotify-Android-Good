@@ -1,8 +1,11 @@
 package com.taehagen.spotifygood.ui.screens.library
 
+import com.taehagen.spotifygood.data.ResponseCache
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
@@ -19,25 +22,44 @@ class PageWindowsTest {
 
     private fun row(index: Int) = "row$index"
 
-    /** Windows over rows "row0".."row4999" whose fetches are recorded (and held by [gate], if set). */
+    /**
+     * Windows over rows "row0".."row4999" whose fetches are recorded with their time (and held by
+     * [gate], if set). The next [fail] fetches fail, the next [partial] come back partial ("?"
+     * rows); retries wait for [online].
+     */
     private class Fixture(scope: TestScope, val rows: (Int) -> String, total: Int) {
         val fetched = mutableListOf<Int>()
+        val times = mutableListOf<Long>()
         val cancelled = mutableListOf<Int>()
         var gate: CompletableDeferred<Unit>? = null
         var fail = 0
-        val windows = PageWindows(scope.backgroundScope, pageSize = 100, maxPages = 4) { offset, limit ->
+        var partial = 0
+        val online = MutableStateFlow(true)
+        val windows = PageWindows(
+            scope.backgroundScope,
+            pageSize = 100,
+            maxPages = 4,
+            ready = { online.first { it } },
+        ) { offset, limit ->
             fetched += offset
+            times += scope.testScheduler.currentTime
             try {
                 gate?.await()
             } catch (e: CancellationException) {
                 cancelled += offset
                 throw e
             }
-            if (fail > 0) {
-                fail--
-                null
-            } else {
-                (offset until minOf(total, offset + limit)).map(rows)
+            val indices = offset until minOf(total, offset + limit)
+            when {
+                fail > 0 -> {
+                    fail--
+                    null
+                }
+                partial > 0 -> {
+                    partial--
+                    WindowPage(indices.map { "?" }, partial = true)
+                }
+                else -> WindowPage(indices.map(rows))
             }
         }
     }
@@ -194,5 +216,124 @@ class PageWindowsTest {
         advanceTimeBy(WINDOW_RETRY_MS * 2)
         runCurrent()
         assertEquals(listOf(2_000), f.fetched)
+    }
+
+    @Test
+    fun theRetriesComeLessOftenUpToAMinute() = runTest {
+        val f = fixture()
+        f.fail = 100
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        advanceTimeBy(213_000)
+        runCurrent()
+        assertEquals(listOf(3_000L, 6_000L, 12_000L, 24_000L, 48_000L, 60_000L, 60_000L), f.times.zipWithNext { a, b -> b - a })
+        assertNull(f.windows.windows.value[2_000])
+    }
+
+    @Test
+    fun aRetryWaitsForTheSession() = runTest {
+        val f = fixture()
+        f.fail = 1
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        f.online.value = false
+        advanceTimeBy(WINDOW_RETRY_MAX_MS * 10)
+        runCurrent()
+        assertEquals(listOf(2_000), f.fetched)
+        f.online.value = true
+        runCurrent()
+        assertEquals(listOf(2_000, 2_000), f.fetched)
+        assertEquals("row2000", f.windows.windows.value[2_000])
+    }
+
+    @Test
+    fun aFailedPageIsNotRetriedAfterHide() = runTest {
+        val f = fixture()
+        f.fail = 100
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        assertEquals("waiting to retry", setOf(20), f.windows.loading)
+        // The list left the screen.
+        f.windows.hide()
+        assertTrue(f.windows.loading.isEmpty())
+        advanceTimeBy(WINDOW_RETRY_MAX_MS * 10)
+        runCurrent()
+        assertEquals(listOf(2_000), f.fetched)
+    }
+
+    @Test
+    fun afterHideShowLoadsWhatIsMissingAgain() = runTest {
+        val f = fixture()
+        f.windows.show(3_000, 3_010, from = 100, total = total)
+        settle()
+        f.gate = CompletableDeferred()
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        // Hidden: the load on its way stops; the loaded page stays.
+        f.windows.hide()
+        runCurrent()
+        assertEquals(listOf(2_000), f.cancelled)
+        assertEquals("row3000", f.windows.windows.value[3_000])
+        // The same rows on screen again: the missing page loads, the loaded one doesn't.
+        f.gate = null
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        assertEquals("row2000", f.windows.windows.value[2_000])
+        f.windows.show(3_000, 3_010, from = 100, total = total)
+        settle()
+        assertEquals(listOf(3_000, 2_000, 2_000), f.fetched)
+    }
+
+    @Test
+    fun aPartialPageLoadsAgainWhileOnScreenUntilComplete() = runTest {
+        val f = fixture()
+        f.partial = 1
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        // What came shows, placeholders included; the page loads again a little later.
+        assertEquals("?", f.windows.windows.value[2_000])
+        advanceTimeBy(ResponseCache.PARTIAL_RETRY_DELAY_MS + 1)
+        runCurrent()
+        assertEquals("row2000", f.windows.windows.value[2_000])
+        // Complete: not loaded again, also when seen again.
+        advanceTimeBy(WINDOW_RETRY_MAX_MS * 10)
+        f.windows.show(3_000, 3_010, from = 100, total = total)
+        settle()
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        assertEquals(listOf(2_000, 2_000, 3_000), f.fetched)
+    }
+
+    @Test
+    fun aPartialPageLoadsAgainAtMostTwice() = runTest {
+        val f = fixture()
+        f.partial = 100
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        advanceTimeBy(WINDOW_RETRY_MAX_MS * 10)
+        runCurrent()
+        assertEquals(1 + ResponseCache.PARTIAL_RETRIES, f.fetched.size)
+        assertEquals("?", f.windows.windows.value[2_000])
+        // Seen again later: not loaded again either.
+        f.windows.show(3_000, 3_010, from = 100, total = total)
+        settle()
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        assertEquals(listOf(2_000, 2_000, 2_000, 3_000), f.fetched)
+    }
+
+    @Test
+    fun aPartialPageScrolledAwayLoadsAgainWhenBack() = runTest {
+        val f = fixture()
+        f.partial = 1
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        // Scrolled away before its load again: that one is cancelled, and runs once it is back.
+        f.windows.show(3_000, 3_010, from = 100, total = total)
+        settle()
+        f.windows.show(2_000, 2_010, from = 100, total = total)
+        settle()
+        assertEquals(listOf(2_000, 3_000, 2_000), f.fetched)
+        assertEquals("row2000", f.windows.windows.value[2_000])
     }
 }
