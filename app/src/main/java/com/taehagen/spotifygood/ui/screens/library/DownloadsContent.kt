@@ -437,7 +437,14 @@ private fun pauseNoticeText(notice: DownloadPauseNotice): String {
         return stringResource(if (paced) R.string.browse_downloads_paced_soon else R.string.browse_downloads_limited_soon)
     }
     val minutes = pluralStringResource(R.plurals.browse_downloads_minutes, notice.minutes, notice.minutes)
-    return stringResource(if (paced) R.string.browse_downloads_paced else R.string.browse_downloads_limited, minutes)
+    return stringResource(
+        when {
+            !paced -> R.string.browse_downloads_limited
+            notice.continuous -> R.string.browse_downloads_paced
+            else -> R.string.browse_downloads_bursts
+        },
+        minutes,
+    )
 }
 
 /** The wall clock, read again every [PAUSE_TICK_MS] while [ticking] (a pause's minutes left). */

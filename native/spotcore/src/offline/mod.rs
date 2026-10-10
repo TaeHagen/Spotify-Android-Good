@@ -8,6 +8,8 @@
 //! * `download.track {uri, bitrate, dir, imageDir}` → `OfflineTrackRecord` (see [`download`]).
 //!   The record is *not* registered; Kotlin persists it and then calls `offline.add`. Its audio
 //!   key is paced by the process's key budget (see [`keys`], [`key_budget`]).
+//! * `download.keyBatch {keys}` → `{"inMs"}`: how long until downloads may take `keys` audio keys
+//!   in a row (the resume of a queue that runs in bursts).
 //! * `download.fileId {uri}` → `{"fileId"}` (omitted when unknown): the file the last
 //!   `download.track` of `uri` in this process chose, also when it failed or was cancelled, so
 //!   Kotlin knows which `<fileId>.part` belongs to an unfinished download.
@@ -95,6 +97,7 @@ pub async fn handle(method: &str, args: Value) -> AppResult<Value> {
     match method {
         "download.track" => download::handle(args).await,
         "download.fileId" => download::handle_file_id(args),
+        "download.keyBatch" => key_batch(args),
         "offline.setIndex" => register(args, true).await,
         "offline.add" => register(args, false).await,
         "offline.remove" => remove(args),
@@ -153,6 +156,19 @@ async fn register(args: Value, replace: bool) -> AppResult<Value> {
 }
 
 #[derive(Deserialize)]
+struct KeyBatchArgs {
+    keys: u32,
+}
+
+/// `download.keyBatch {keys}` → `{"inMs"}`: how long until downloads may take `keys` audio keys in
+/// a row (when a queue that runs in bursts resumes, docs/ARCHITECTURE.md §9.7).
+fn key_batch(args: Value) -> AppResult<Value> {
+    let args: KeyBatchArgs = rpc::parse_args(args)?;
+    let wait = keys::keys_ready_in(args.keys);
+    Ok(json!({ "inMs": u64::try_from(wait.as_millis()).unwrap_or(u64::MAX) }))
+}
+
+#[derive(Deserialize)]
 struct RemoveArgs {
     uris: Vec<String>,
     #[serde(default)]
@@ -181,6 +197,13 @@ fn begin_index(args: Value) -> AppResult<Value> {
 mod tests {
     use super::*;
     use crate::offline::index::tests::{record, scratch_dir, ALT_URI, TRACK_URI};
+
+    #[tokio::test]
+    async fn key_batch_rpc() {
+        let out = handle("download.keyBatch", json!({"keys": 9})).await.expect("keyBatch");
+        assert!(out.get("inMs").and_then(Value::as_u64).is_some(), "{out}");
+        assert!(handle("download.keyBatch", json!({})).await.is_err());
+    }
 
     /// The global index is shared by every test in the process: only this test uses it.
     #[tokio::test]

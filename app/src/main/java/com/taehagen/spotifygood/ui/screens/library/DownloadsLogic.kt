@@ -124,9 +124,12 @@ fun buildDownloadsContent(
 fun canResumeDownloads(activity: DownloadActivity, pendingCount: Int): Boolean =
     !activity.running && pendingCount > 0 && activity.lastError != null
 
-/** The header's note while the queue waits for Spotify's audio-key limit: why, and the minutes left. */
+/**
+ * The header's note while the queue waits for Spotify's audio-key limit: why, the minutes left, and
+ * whether the queue waits in a running job ([continuous]) or resumes in a burst.
+ */
 @Immutable
-data class DownloadPauseNotice(val reason: DownloadPause.Reason, val minutes: Int)
+data class DownloadPauseNotice(val reason: DownloadPause.Reason, val minutes: Int, val continuous: Boolean = true)
 
 /**
  * What the header says while [activity] waits for Spotify's audio-key limit with [pendingCount] items
@@ -139,7 +142,7 @@ fun downloadPauseNotice(activity: DownloadActivity, pendingCount: Int, now: Long
     val pause = activity.pause ?: return null
     if (pendingCount <= 0) return null
     if (!activity.running && now > pause.until + PAUSE_NOTICE_GRACE_MS) return null
-    return DownloadPauseNotice(pause.reason, DownloadRules.minutesUntil(pause.until, now))
+    return DownloadPauseNotice(pause.reason, DownloadRules.minutesUntil(pause.until, now), pause.continuous)
 }
 
 /** How long after its end a pause stays in the header while no run came back. */

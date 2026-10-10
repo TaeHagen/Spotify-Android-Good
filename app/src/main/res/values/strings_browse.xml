@@ -154,8 +154,10 @@
     <string name="browse_downloads_retry_failed">Retry failed downloads</string>
     <string name="browse_downloads_resume">Resume</string>
     <!-- Spotify limits how fast an account gets audio keys: downloads go at its pace. %1$s: "8 min" -->
-    <string name="browse_downloads_paced">Spotify limits how fast songs can be downloaded. Next songs in about %1$s.</string>
-    <string name="browse_downloads_paced_soon">Spotify limits how fast songs can be downloaded. Next songs any moment now.</string>
+    <string name="browse_downloads_paced">Downloading at Spotify\'s pace. Next songs in about %1$s.</string>
+    <string name="browse_downloads_paced_soon">Downloading at Spotify\'s pace. Next songs any moment now.</string>
+    <!-- In the background on battery downloads run in bursts. -->
+    <string name="browse_downloads_bursts">Next songs in about %1$s. Plug in or open the app to download continuously.</string>
     <string name="browse_downloads_limited">Spotify is limiting downloads. Continuing in about %1$s.</string>
     <string name="browse_downloads_limited_soon">Spotify is limiting downloads. Continuing shortly.</string>
     <plurals name="browse_downloads_minutes">

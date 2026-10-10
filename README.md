@@ -117,8 +117,10 @@ Screenshots (Robolectric + Roborazzi, test dependencies only): `./gradlew :app:t
   apps use a key path librespot can't). So big downloads proceed at a measured pace: about 10
   songs at once, then a few songs every minute or two (about 100 an hour; a 100-song playlist
   takes roughly an hour), always leaving room for songs you stream, and the Downloads screen says
-  when the next ones follow. If Spotify throttles anyway, downloads pause for 10 minutes to about
-  an hour and continue by themselves, and a song that can't start right then stops playback with
+  when the next ones follow. With the app open or the phone plugged in, downloads continue in one
+  go; in the background on battery they come in bursts of about 9 songs every 5 minutes or so, with
+  nothing awake in between. If Spotify throttles anyway, downloads pause for 10 to 30 minutes
+  and continue by themselves, and a song that can't start right then stops playback with
   "Spotify is limiting how fast songs that aren't downloaded can start" instead of skipping
   through the queue.
 - Catalog, search, home and library calls use Spotify's internal web/desktop endpoints,

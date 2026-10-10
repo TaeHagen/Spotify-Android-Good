@@ -31,6 +31,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
@@ -38,9 +39,14 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -51,6 +57,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -86,12 +93,25 @@ internal enum class RunOutcome {
 
 /** The execution environment of a run: a user-initiated job (API 34+) or a WorkManager worker. */
 internal interface DownloadHost {
+    /**
+     * The host may run for hours: the user-initiated job, a worker that became a foreground service.
+     * Only such a host waits out pauses continuously ([DownloadRules.downloadMode]); an ordinary job
+     * is stopped after about 10 minutes.
+     */
+    val longRunning: Boolean
+
     /** Shows [notification] as the run's ongoing notification (called at most ~1/s). */
     suspend fun updateNotification(notification: Notification)
 
-    /** Bytes transferred so far in this run (user-initiated jobs report them to the system). */
+    /** Bytes transferred so far by this host (user-initiated jobs report them to the system). */
     fun reportTransferred(bytes: Long) {}
+
+    /** Bytes this host is expected to transfer in all (user-initiated jobs report them to the system). */
+    fun reportEstimated(bytes: Long) {}
 }
+
+/** When a paused queue goes on ([DownloadRunner.resumeAt]), and how ([DownloadRules.DownloadMode]). */
+internal data class PausedRun(val until: Long, val mode: DownloadRules.DownloadMode)
 
 /** Memo of decrypted audio keys (uri → hex) so engine restarts do not hit the Keystore per row. */
 internal class KeyCache {
@@ -145,6 +165,7 @@ internal class DownloadRunner(
     private val commitLock: Mutex,
     private val index: OfflineIndexSync,
     private val vault: KeyVault,
+    private val conditions: DownloadConditions,
 ) {
     private val dao = database.downloads()
     private val json: Json = rpc.json
@@ -153,7 +174,8 @@ internal class DownloadRunner(
     private class CurrentItem(val uri: String, val job: Deferred<ItemResult>)
 
     @Volatile private var current: CurrentItem? = null
-    @Volatile private var session: Deferred<RunOutcome>? = null
+    /** The run or a host's wait for a pause (what Cancel and [stop] cancel). */
+    @Volatile private var session: Job? = null
     @Volatile private var cancelRequested = false
 
     /** Kept across runs (runLock orders them), so pauses keep growing while a condition lasts. */
@@ -161,6 +183,15 @@ internal class DownloadRunner(
 
     /** The queue pause Spotify's audio-key limit imposed last ([DownloadRules.pauseFor]), until an item starts. */
     @Volatile private var keyPause: DownloadPause? = null
+
+    /** Why and until when the last run ended [RunOutcome.PAUSED] ([pause]). */
+    @Volatile private var pausedRun: PausedRun? = null
+
+    /** New work arrived ([nudge]): a host waiting out a pause runs the queue again now. */
+    private val nudges = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    /** Bytes the earlier runs of the current host transferred ([runHosted]). */
+    @Volatile private var hostedBytes = 0L
 
     private val _activity = MutableStateFlow(DownloadActivity())
     val activity: StateFlow<DownloadActivity> = _activity.asStateFlow()
@@ -182,6 +213,144 @@ internal class DownloadRunner(
             // running): pick them up instead of leaving them stranded.
             if (dao.nextPending() == null) return RunOutcome.FINISHED
         }
+    }
+
+    /**
+     * Runs the queue in [host] (docs/ARCHITECTURE.md §9.7 "Who continues a paused queue"). A run
+     * that ends [RunOutcome.PAUSED] while downloads may go on continuously (the app visible or the
+     * device on power, in a host that may run long) is waited out here, without the engine, and the
+     * queue runs again when the pause ends or new work arrives. PAUSED comes back when the queue
+     * continues in bursts instead (also when the app leaves or the power goes during the wait): the
+     * host hands it to [DownloadManager.scheduleResume] at [resumeAt].
+     */
+    suspend fun runHosted(host: DownloadHost): RunOutcome {
+        hostedBytes = 0L
+        var outcome = run(host)
+        while (outcome == RunOutcome.PAUSED) {
+            val paused = pausedRun ?: return outcome
+            if (paused.mode != DownloadRules.DownloadMode.CONTINUOUS) return outcome
+            if (DownloadRules.pausedStep(conditions.mode(host.longRunning)) == DownloadRules.PausedStep.HAND_OFF) {
+                return pauseForBursts(host)
+            }
+            when (waitOutPause(host, paused.until)) {
+                WaitEnd.CANCELLED -> return RunOutcome.STOPPED
+                WaitEnd.BURSTS -> return pauseForBursts(host)
+                WaitEnd.DUE, WaitEnd.NUDGED -> outcome = run(host)
+            }
+        }
+        return outcome
+    }
+
+    /** When the paused queue resumes ([pause]); null when it was not paused. */
+    fun resumeAt(): Long? = pausedRun?.until
+
+    /** New work was queued: a host waiting out a pause starts it now. */
+    fun nudge() {
+        nudges.tryEmit(Unit)
+    }
+
+    private enum class WaitEnd { DUE, NUDGED, BURSTS, CANCELLED }
+
+    /**
+     * Waits until [until] (the pause's end) without the engine, as long as the mode stays
+     * continuous; the job's notification says when the next songs come (refreshed every minute) and
+     * its Cancel action works as during a run.
+     */
+    private suspend fun waitOutPause(host: DownloadHost, until: Long): WaitEnd = coroutineScope {
+        cancelRequested = false
+        val receiver = notifications.registerCancelReceiver(::requestCancel)
+        val waiting = async {
+            val refresh = launch {
+                while (true) {
+                    showHostWait(host, until)
+                    delay(HOST_WAIT_REFRESH_MS)
+                }
+            }
+            val ends = merge(
+                conditions.modes(host.longRunning).filter { it == DownloadRules.DownloadMode.BURSTS }.map { WaitEnd.BURSTS },
+                nudges.map { WaitEnd.NUDGED },
+            )
+            try {
+                withTimeoutOrNull((until - System.currentTimeMillis()).coerceAtLeast(0L)) { ends.first() } ?: WaitEnd.DUE
+            } finally {
+                refresh.cancel()
+            }
+        }
+        session = waiting
+        try {
+            waiting.await()
+        } catch (e: CancellationException) {
+            if (!isActive || !cancelRequested) throw e
+            withContext(NonCancellable) { dao.cancelAllPending() }
+            WaitEnd.CANCELLED
+        } finally {
+            session = null
+            notifications.unregister(receiver)
+        }
+    }
+
+    /** The host waits out a pause: the Downloads screen and the job's notification say until when. */
+    private suspend fun showHostWait(host: DownloadHost, until: Long) {
+        val now = System.currentTimeMillis()
+        val pending = dao.pendingCount()
+        val pause = keyPause?.takeIf { it.until > now }
+        _activity.value = DownloadActivity(remaining = pending, pause = pause)
+        val text = context.getString(
+            when (pause?.reason) {
+                DownloadPause.Reason.PACING -> R.string.data_dl_notif_paced
+                DownloadPause.Reason.LIMITED -> R.string.data_dl_notif_limited
+                null -> R.string.data_dl_notif_waiting
+            },
+            minutes(until, now),
+        )
+        host.updateNotification(notifications.waiting(text, 0, 0))
+        host.reportTransferred(hostedBytes)
+        host.reportEstimated(hostedBytes + DownloadRules.estimateBytes(pending, settings.awaitLoaded().downloadQuality.kbps))
+    }
+
+    /**
+     * The queue paused continuously, but the app left (or the power went) before or while it waited:
+     * on in bursts. The resume is set for a batch of keys and the notification says so.
+     */
+    private suspend fun pauseForBursts(host: DownloadHost): RunOutcome {
+        val now = System.currentTimeMillis()
+        pause(host, now, DownloadRules.DownloadMode.BURSTS)
+        val until = pausedRun?.until ?: now
+        val pending = dao.pendingCount()
+        val shown = keyPause?.takeIf { it.until > now && pending > 0 }
+        _activity.value = DownloadActivity(pause = shown)
+        if (pending > 0) notifications.showStopped(context.getString(R.string.data_dl_notif_bursts, minutes(until, now)))
+        return RunOutcome.PAUSED
+    }
+
+    /**
+     * Ends the run [RunOutcome.PAUSED]: the whole queue waits longer than a run waits inline. When it
+     * goes on depends on the mode ([mode], else seen now): continuous at the queue's next `retryAt`
+     * (the host waits for it), in bursts once a batch of keys is there
+     * ([DownloadRules.burstResumeAt], `download.keyBatch`).
+     */
+    private suspend fun pause(host: DownloadHost, now: Long, mode: DownloadRules.DownloadMode = conditions.mode(host.longRunning)): RunOutcome {
+        val retryAt = dao.earliestRetryAt()
+        val until = when (mode) {
+            DownloadRules.DownloadMode.CONTINUOUS -> retryAt ?: now
+            DownloadRules.DownloadMode.BURSTS -> DownloadRules.burstResumeAt(retryAt, now, keyBatchInMs(), conditions.pluggedIn())
+        }
+        pausedRun = PausedRun(until, mode)
+        keyPause = keyPause?.let { it.copy(until = maxOf(it.until, until), continuous = mode == DownloadRules.DownloadMode.CONTINUOUS) }
+        Log.i(TAG, "The download queue pauses for ${until - now} ms ($mode)")
+        return RunOutcome.PAUSED
+    }
+
+    /** How long until the engine expects [DownloadRules.BURST_KEYS] audio keys in a row; null if unknown. */
+    private suspend fun keyBatchInMs(): Long? = try {
+        withTimeoutOrNull(NATIVE_CALL_TIMEOUT_MS) {
+            withContext(Dispatchers.Default) { rpc.callRaw("download.keyBatch", rpcArgs { put("keys", DownloadRules.BURST_KEYS) }) }
+        }?.jsonObject?.get("inMs")?.jsonPrimitive?.longOrNull
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Log.w(TAG, "Could not ask the engine for its key budget", e)
+        null
     }
 
     /** Cancel action: stops the run and marks everything pending as cancelled. */
@@ -251,13 +420,15 @@ internal class DownloadRunner(
     }
 
     private suspend fun sessionBody(host: DownloadHost): RunOutcome {
+        pausedRun = null
         dao.resetInterrupted()
         // Started for a queue that was emptied meanwhile (removals): no session, no notification.
         if (dao.pendingCount() == 0) return RunOutcome.FINISHED
         // Everything pending is held back (backoff, queue pause) for longer than a run waits: do not
         // bring the engine up only to find that out.
-        val paused = pausedForMs(System.currentTimeMillis())
-        if (paused != null && paused > DownloadRules.MAX_INLINE_WAIT_MS) return RunOutcome.PAUSED
+        val startedAt = System.currentTimeMillis()
+        val paused = pausedForMs(startedAt)
+        if (paused != null && paused > DownloadRules.inlineWaitMs(conditions.mode(host.longRunning))) return pause(host, startedAt)
         // The settings as stored: a cold-started job must not act on the defaults shown before load.
         if (meteredNotAllowed(settings.awaitLoaded())) return RunOutcome.RESCHEDULE
         // Where the downloads go, before a session is brought up for them: a chosen card that is
@@ -273,6 +444,7 @@ internal class DownloadRunner(
         val holder = engine.acquire(HolderType.DOWNLOAD)
         val receiver = notifications.registerCancelReceiver(::requestCancel)
         val stats = RunStats()
+        val burstStart = SystemClock.elapsedRealtime()
         _activity.value = DownloadActivity(running = true)
         try {
             host.updateNotification(notifications.progress(null, 0, 0, 0f))
@@ -289,12 +461,14 @@ internal class DownloadRunner(
                 currentCoroutineContext().ensureActive()
                 val now = System.currentTimeMillis()
                 val item = dao.nextRunnable(now)
+                // Continuous or in bursts, seen at every decision (the app may leave, the power go).
+                val mode = conditions.mode(host.longRunning)
                 if (item == null) {
-                    when (val step = DownloadRules.idleStep(dao.earliestRetryAt(), now)) {
+                    when (val step = DownloadRules.idleStep(dao.earliestRetryAt(), now, mode)) {
                         DownloadRules.IdleStep.Finish -> break // nothing pending at all
                         DownloadRules.IdleStep.Pause -> {
                             stats.endedForKeyLimit = keyPause != null
-                            return RunOutcome.PAUSED
+                            return pause(host, now, mode)
                         }
                         is DownloadRules.IdleStep.Wait -> {
                             showKeyPause(host, stats, now)
@@ -308,6 +482,13 @@ internal class DownloadRunner(
                     // mobile data against the setting; the manager re-creates the work.
                     Log.i(TAG, "On a metered network with mobile data downloads off: rescheduling")
                     return RunOutcome.RESCHEDULE
+                }
+                if (DownloadRules.burstDeadlineReached(SystemClock.elapsedRealtime() - burstStart, mode, host.longRunning)) {
+                    // An ordinary job is stopped at about 10 min: this burst ends by itself first.
+                    Log.i(TAG, "Burst time is up: the next songs follow in the next burst")
+                    keyPause = keyPause ?: DownloadPause(DownloadPause.Reason.PACING, now)
+                    stats.endedForKeyLimit = true
+                    return pause(host, now, mode)
                 }
                 // The chosen location (setting) and its space, checked per item: a card can go or
                 // fill up at any time.
@@ -327,7 +508,7 @@ internal class DownloadRunner(
                     }
                     ItemResult.Pause -> {
                         stats.endedForKeyLimit = keyPause != null
-                        return RunOutcome.PAUSED
+                        return pause(host, System.currentTimeMillis())
                     }
                     is ItemResult.StopRun -> {
                         // An account refusal leaves what was not tried queued (Resume tries again).
@@ -351,15 +532,22 @@ internal class DownloadRunner(
                 // that ended for anything else, says that instead.
                 val pause = keyPause?.takeIf { stats.endedForKeyLimit && it.until > now && pending > 0 }
                 if (pause == null) keyPause = null
+                hostedBytes += stats.transferredBytes
+                // A host that waits the pause out keeps its own notification: no "paused" notice.
+                val hostWaits = pausedRun?.mode == DownloadRules.DownloadMode.CONTINUOUS
                 when (DownloadRules.runNotice(stats.stopMessage != null, cancelRequested, pending, stats.processed)) {
                     DownloadRules.RunNotice.COMPLETE -> notifications.showSummary(stats.completed, stats.failed)
-                    DownloadRules.RunNotice.PAUSED -> notifications.showStopped(
-                        if (pause != null) {
-                            context.getString(R.string.data_dl_paused_limited, stats.completed, stats.completed + pending, minutes(pause.until, now))
-                        } else {
-                            context.getString(R.string.data_dl_paused, stats.completed, stats.completed + pending)
-                        },
-                    )
+                    DownloadRules.RunNotice.PAUSED -> if (!hostWaits) {
+                        val done = stats.completed
+                        notifications.showStopped(
+                            when {
+                                pause == null -> context.getString(R.string.data_dl_paused, done, done + pending)
+                                pause.reason == DownloadPause.Reason.PACING ->
+                                    context.getString(R.string.data_dl_paused_bursts, done, done + pending, minutes(pause.until, now))
+                                else -> context.getString(R.string.data_dl_paused_limited, done, done + pending, minutes(pause.until, now))
+                            },
+                        )
+                    }
                     DownloadRules.RunNotice.NONE -> Unit
                 }
                 // A pause for Spotify's key limit stays on the Downloads screen until the queue runs again.
@@ -472,7 +660,9 @@ internal class DownloadRunner(
         if (dao.markPreparing(item.uri, quality) == 0) return@coroutineScope ItemResult.Done
         keyPause = null
         val title = displayTitle(item.metadataJson)
-        val total = stats.processed + dao.pendingCount()
+        val pendingNow = dao.pendingCount()
+        val total = stats.processed + pendingNow
+        host.reportEstimated(hostedBytes + stats.transferredBytes + DownloadRules.estimateBytes(pendingNow, quality))
         _activity.value = DownloadActivity(running = true, currentUri = item.uri, remaining = total - stats.processed)
         host.updateNotification(notifications.progress(title, stats.processed, total, 0f))
         val progress = launch(start = CoroutineStart.UNDISPATCHED) { trackProgress(item.uri, title, total, host, stats) }
@@ -492,7 +682,7 @@ internal class DownloadRunner(
                 breaker.onSuccess()
                 stats.completed++
                 stats.transferredBytes += record.sizeBytes
-                host.reportTransferred(stats.transferredBytes)
+                host.reportTransferred(hostedBytes + stats.transferredBytes)
             }
             ItemResult.Done
         } catch (e: CancellationException) {
@@ -607,7 +797,7 @@ internal class DownloadRunner(
                 )
                 val fraction = if (p.totalBytes > 0) p.bytes.toFloat() / p.totalBytes else 0f
                 host.updateNotification(notifications.progress(title, stats.processed, total, fraction))
-                host.reportTransferred(stats.transferredBytes + p.bytes)
+                host.reportTransferred(hostedBytes + stats.transferredBytes + p.bytes)
             }
         }
     }
@@ -802,6 +992,7 @@ internal class DownloadRunner(
         const val SEAL_RETRY_MS = 1_000L
         const val SEAL_ATTEMPTS = 5
         const val STOP_TIMEOUT_MS = 5_000L
+        const val HOST_WAIT_REFRESH_MS = 60_000L
         const val MAX_NETWORK_WAITS = 5
     }
 }

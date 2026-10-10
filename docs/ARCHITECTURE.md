@@ -1775,9 +1775,10 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   queue finishes at once, and removals that empty the queue cancel the scheduled work.
   A run whose whole queue is held back until a known time, longer than it waits inline (Spotify's
   key pacing or cool-down, a rate limit, a connectivity or Keystore pause, a retry backoff), ends
-  `RunOutcome.PAUSED`: the job finishes without its backoff (`jobFinished(false)`), the worker
-  succeeds, and `DownloadManager.scheduleResume` enqueues one delayed WorkManager request (tag
-  `downloads-resume`, the same constraints, `setInitialDelay` to the earliest `retryAt`; appended
+  `RunOutcome.PAUSED`; what follows depends on the mode (next bullet). Handed to WorkManager, the
+  job finishes without its backoff (`jobFinished(false)`), the worker succeeds, and
+  `DownloadManager.scheduleResume` enqueues one delayed WorkManager request (tag
+  `downloads-resume`, the same constraints, `setInitialDelay` to the runner's resume time; appended
   after the worker that asks, so its own success starts the delay instead of a replace cancelling
   it; a user-initiated job can neither be delayed nor scheduled from the background). One wake, at
   that time; a fresh request, so pauses never count against the worker's 8 retries (only
@@ -1800,6 +1801,39 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   attempts). The account's refusal (`PLAYBACK_REFUSED` from `download.track`, below) fails that
   item and stops the run, but leaves what was not tried queued: "Resume", the app coming back or a
   user action try again.
+* Who continues a paused queue: continuous or in bursts (`DownloadRules.downloadMode`, seen at each
+  decision: every item, every wait, every pause; `DownloadConditions`: the app's visibility and the
+  sticky battery broadcast, a power connected / disconnected receiver only while a host waits).
+  At about 100 songs an hour (the key limit) a big download takes hours, so waiting it all out in a
+  job would keep the CPU awake for hours, mostly idle.
+  * Continuous while the app is visible or the device is plugged in, in a host that may run long
+    (the user-initiated job; a worker that became a foreground service): waits up to 2 min stay
+    inline (the engine kept); a longer pause ends the run `PAUSED` and the host waits it out
+    without the engine (`DownloadRunner.runHosted`: the job stays alive, its notification says
+    "Downloading at Spotify's pace. Next songs in about N min", refreshed every minute, with
+    Cancel; transferred and estimated bytes are reported for the whole job), then runs the queue
+    again. New work (`scheduleExecution` nudges) ends the wait at once. If the app leaves on
+    battery during the wait, the queue switches to bursts right then.
+  * Bursts in the background on battery, or in an ordinary job (a worker that could not become a
+    foreground service: stopped after about 10 min): a run downloads while keys are there and waits
+    inline at most 30 s; a longer wait ends the burst `PAUSED`, and the WorkManager resume comes
+    when the engine expects 9 keys above the reserve (`download.keyBatch`, including a cool-down; ≈
+    5 min at one key per 35 s, 9 songs per wake, so as many an hour as continuous), not before the
+    rows' `retryAt`. On power at that decision, at the rows' `retryAt` (no job quota while
+    charging); plugging in during the wait does not wake the queue (no receiver while nothing
+    runs). In an ordinary job a burst starts no item after 7 min, so it ends before the system stops
+    it. Nothing is awake between bursts. The notification says "Next songs in about N min. Plug in
+    or open the app to download continuously".
+  * Hosts by API level: on API 34+ a queue started from the app runs in the user-initiated job and
+    stays there while visible or on power; in the background on battery it goes to WorkManager
+    bursts at its next pause. Opening the app brings it back: the onStart kick schedules the
+    user-initiated job and cancels the waiting resume, and a WorkManager run that starts (or ends a
+    burst) while the app is visible hands the queue to a user-initiated job instead
+    (`handToUserInitiatedJob`). Below API 34 the worker continues it (continuous as a foreground
+    service, which it can start while the app is visible; bursts otherwise).
+  * Pacing waits are longer than the 105 s between batches when the player used the reserve
+    (streaming and skipping while downloading: up to the reserve plus a batch, ≈ 7 min) and after a
+    throttle (the longer of the cool-down and the refill from empty, 10 to 30 min).
 * Audio-key pacing (`spotcore/src/offline/key_budget.rs`, `keys.rs`): Spotify limits how fast an
   account gets audio keys (librespot #1319; zotify #186, #253): reports fit a bucket of about
   20–32 keys refilled about one per 30–33 s, after which every request is answered AesKeyError
@@ -1827,7 +1861,7 @@ Manual DI: `App` creates `AppGraph` (lazy singletons). ViewModels get dependenci
   * Throttle: any AesKeyError other than 0x0001, from either side, empties the estimate and stops
     download keys for at least 5, 10, 20, 30 min (level 1–4); each level also assumes a slower
     refill (50, 70, 100, 110 s per key), and downloads resume when the reserve plus a batch refilled
-    from empty (≈ 10, 13, 20, 30 min; at level 4 ≈ 50). Signals during a cool-down don't escalate;
+    from empty (≈ 10, 13, 20, 30 min). Signals during a cool-down don't escalate;
     a level is forgotten after an hour without a throttle. Nothing is retried while throttled:
     Kotlin pauses the queue (`retryAt`) and its resume wakes it once, when the cool-down ends.
   * Unanswered requests are no throttle: every report of the limit quotes 0x0002, and a stale
@@ -2377,7 +2411,8 @@ don't reload it, pull-to-refresh starts it over, and a list not fully loaded yet
 | Remote device playing, our session mirrors | Online | yes | mediaPlayback | none |
 | Output switcher route provider (§8, Android 12+) | unchanged: enabled while logged in (changed only at login and logout); lists routes only while the playback service runs, from what the engine pushes, no scan or poll; one device-list refresh when the switcher opens (Android 15+); bound otherwise it does nothing (the system may start the process for it, see §8 for when) | unchanged | none of its own (the system binds it as `BIND_FOREGROUND_SERVICE`) | none |
 | Downloading (app in background) | Online | no (no Spirc) | dataSync (WorkManager) | Worker's |
-| Downloads waiting for Spotify's key limit (§9.7) | Online while the pace is inline (≤ 105 s between batches of ≤ 3 songs, the radio idle in between); a cool-down (≥ 5 min) ends the run (`PAUSED`), the session goes with its holder | no | none during a cool-down: one delayed WorkManager request wakes the queue when it ends (measured on the boot-time clock, so time asleep counts) | job's / Worker's while inline, else none |
+| Downloads waiting for Spotify's key limit, app visible or on power (§9.7) | Online while the pace is inline (≤ 2 min); a longer pause ends the run, the session goes with its holder | no | the user-initiated job (or foreground worker) stays and waits it out | the job's / Worker's (continuous) |
+| Downloads in the background on battery (§9.7) | Online during a burst only (≈ 9 songs, ≤ 30 s inline waits, ≤ 7 min in an ordinary job) | no | none between bursts: one delayed WorkManager request per burst, when 9 keys are expected (≈ 5 min; boot-time clock, so time asleep counts) | none between bursts |
 | Presence opt-in, idle (also restored after an app update, and after a reboot up to Android 14; from Android 15 a notification asks to open the app) | Online | yes | connectedDevice (low-importance) | none |
 | Home-screen widget placed (§9.4) | unchanged: pushed by the running playback service when the track, play state, like or device change, ≤ 1 per 500 ms; no `updatePeriodMillis`, alarm, polling or job; no widget, nothing collected | unchanged | none (Play from a dead process: the stored session, like a headset Play) | none |
 | Nothing | stopped | no | none | none |
